@@ -227,12 +227,18 @@ async function conectar() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) { qrAtual = await QRCode.toDataURL(qr); console.log('QR gerado - acesse /qr'); }
-    if (connection === 'open') { conectado=true; qrAtual=null; console.log('WhatsApp conectado!'); console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', ')); }
+    if (connection === 'open') { conectado=true; qrAtual=null; console.log('WhatsApp conectado!'); console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', ')); console.log('Listener messages.upsert ativo: '+(sock.ev.listenerCount('messages.upsert'))+' listeners'); }
     if (connection === 'close') {
       conectado = false;
       const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (codigo !== DisconnectReason.loggedOut) setTimeout(conectar, 5000);
-      else qrAtual = null;
+      console.log('Conexao encerrada, codigo: '+codigo+'. Reconectando em 5s...');
+      if (codigo !== DisconnectReason.loggedOut) {
+        sock = null;
+        setTimeout(conectar, 5000);
+      } else {
+        qrAtual = null;
+        console.log('Sessao expirada. Acesse /qr para reconectar.');
+      }
     }
   });
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
