@@ -255,6 +255,7 @@ async function processarMensagem(msg) {
 
     const m    = msg.message;
     const tipo = Object.keys(m || {})[0];
+    console.log(`🧩 Tipo de mensagem: ${tipo} | keys: ${JSON.stringify(Object.keys(m || {}))}`);
     let texto     = '';
     let imagemB64 = null;
 
