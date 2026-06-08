@@ -249,6 +249,7 @@ async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
     const fromMe = msg.key.fromMe;
+    console.log(`🔍 JID recebido: ${jid} | fromMe: ${fromMe} | monitorado: ${GRUPOS_MONITORADOS.includes(jid)}`);
     if (fromMe) return;
     if (!GRUPOS_MONITORADOS.includes(jid)) return;
 
