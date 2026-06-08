@@ -68,29 +68,29 @@ const PROGRAMAS_LINK = {
   'Finnair Plus':'https://www.finnair.com/br/gb/finnair-plus',
   'Aeroplan':'https://www.aircanada.com/home/ca/en/aco/flights'
 };
-const RODAPE = '`Dica de emissao encontrada por @davileles - Clube do Viajante`';
-const BALCAO = '`Faca parte do Balcao clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
 
 function formatarMensagemCDV(d) {
-  const n = '\n';
-  const cpm     = PROGRAMAS_CPM[d.programa] || 0;
-  const num     = parseInt(String(d.pontos||'0').replace(/[^0-9]/g,'')) || 0;
-  const valR    = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
-  const valStr  = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
-  const link    = PROGRAMAS_LINK[d.programa] || '';
-  const trecho  = d.tipoVoo==='internacional' ? ' o trecho em '+(d.cabine||'Economica') : '';
-  const pts     = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
-  let msg = '';
+  var n = '\n';
+  var rodape = '`Dica de emissao encontrada por @davileles - Clube do Viajante`';
+  var balcao = '`Faca parte do Balcao clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
+  var cpm = PROGRAMAS_CPM[d.programa] || 0;
+  var num = parseInt(String(d.pontos||'0').replace(/[^0-9]/g,'')) || 0;
+  var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
+  var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
+  var link = PROGRAMAS_LINK[d.programa] || '';
+  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Economica') : '';
+  var pts = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
+  var msg = '';
   msg += '*'+d.origem+' - '+d.destino+' por '+pts+' pontos OU '+valStr+trecho+'*'+n+n;
-  msg += RODAPE+n+n;
+  msg += rodape+n+n;
   msg += 'Voce pode comprar essa passagem no Balcao de Milhas CDV por aproximadamente '+valStr+' o trecho + taxa de embarque.'+n+n;
-  msg += BALCAO+n+n;
-  msg += '\u{1F6EB} *DATAS DE IDA*'+n+(d.datasIda||'-')+n+n;
-  msg += '\u{1F6EC} *DATAS DE VOLTA*'+n+(d.datasVolta||'-')+n+n;
-  msg += '\u{1F39F}\uFE0F *PROGRAMA* '+d.programa+n+n;
+  msg += balcao+n+n;
+  msg += '\uD83D\uDEEB *DATAS DE IDA*'+n+(d.datasIda||'-')+n+n;
+  msg += '\uD83D\uDEEC *DATAS DE VOLTA*'+n+(d.datasVolta||'-')+n+n;
+  msg += '\uD83C\uDF9F\uFE0F *PROGRAMA* '+d.programa+n+n;
   msg += '\u2708\uFE0F *CIA AEREA* '+d.cia+n+n;
-  msg += '\u{1F517} *LINK* '+link+n+n;
-  msg += RODAPE;
+  msg += '\uD83D\uDD17 *LINK* '+link+n+n;
+  msg += rodape;
   return msg;
 }
 
@@ -268,7 +268,6 @@ app.get('/painel', (req, res) => {
   const pendentes   = filaPendentes.filter(o => o.status==='pendente');
   const processados = filaPendentes.filter(o => o.status!=='pendente');
   const emBuffer    = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-
   const renderCard = (o) => {
     const data = new Date(o.timestamp).toLocaleString('pt-BR');
     const d    = o.dadosExtraidos || {};
@@ -281,7 +280,6 @@ app.get('/painel', (req, res) => {
     if (o.status==='rejeitado') return '<div class="card"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+'<span style="margin-left:auto">'+data+'</span></div><div style="padding:12px 16px"><span class="ok-rej">Rejeitado</span></div></div>';
     return '<div class="card" id="card-'+o.id+'"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+prog+'<span style="margin-left:auto;font-size:12px;color:#555">'+data+'</span></div><div class="card-body"><div class="col"><div class="col-title">Original ('+o.tipoConteudo+')</div>'+imgsHtml+textoHtml+'</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-'+o.id+'">'+o.mensagemFormatada+'</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar('+o.id+')">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar('+o.id+')">Rejeitar</button><span id="fb-'+o.id+'" style="font-size:13px;margin-left:auto"></span></div></div>';
   };
-
   res.send('<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Painel CDV</title><style>'+PAINEL_CSS+'</style></head><body><header><h1>Painel'+(pendentes.length>0?' <span class="badge">'+pendentes.length+'</span>':'')+'</h1><nav class="nav"><a href="/">Inicio</a><a href="/painel">Atualizar</a></nav></header><div class="container">'+(emBuffer>0?'<div class="buffer-bar">'+emBuffer+' item(ns) aguardando janela de '+JANELA_AGRUPAMENTO_MS/60000+' min...</div>':'')+(pendentes.length===0&&emBuffer===0?'<div class="empty">Nenhuma oferta pendente.</div>':pendentes.map(renderCard).join(''))+(processados.length>0?'<div class="sep">Processados recentemente</div>'+processados.slice(0,10).map(renderCard).join(''):'')+'</div><script>async function aprovar(id){const msg=document.getElementById("msg-"+id).value;const fb=document.getElementById("fb-"+id);fb.textContent="Enviando...";fb.style.color="#aaa";const r=await fetch("/painel/aprovar/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mensagem:msg})});const d=await r.json();if(d.ok){fb.style.color="#22c55e";fb.textContent="Enviado!";setTimeout(()=>{const c=document.getElementById("card-"+id);if(c)c.style.opacity=".35"},800)}else{fb.style.color="#ef4444";fb.textContent="Erro: "+d.erro}}async function rejeitar(id){const fb=document.getElementById("fb-"+id);const r=await fetch("/painel/rejeitar/"+id,{method:"POST"});const d=await r.json();if(d.ok){fb.style.color="#555";fb.textContent="Rejeitado";setTimeout(()=>{const c=document.getElementById("card-"+id);if(c)c.style.opacity=".35"},400)}}'+(emBuffer>0?'setTimeout(()=>location.reload(),30000);':'')+'</script></body></html>');
 });
 
@@ -340,7 +338,6 @@ app.get('/grupos', async (req, res) => {
   } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
 });
 
-// ── START ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
   console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', '));
