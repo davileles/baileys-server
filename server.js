@@ -19,7 +19,10 @@ const GRUPOS = {
   cdv_emissao: '120363172490263905@g.us',
 };
 
-const GRUPOS_MONITORADOS        = ['120363427512561555@g.us'];
+const GRUPOS_MONITORADOS        = [
+  '120363427512561555@g.us',
+  '120363409136599326@g.us',
+];
 const GRUPO_DESTINO_PASSAGENS   = 'cdv_emissao';
 const JANELA_AGRUPAMENTO_MS     = 3 * 60 * 1000; // 3 minutos
 
