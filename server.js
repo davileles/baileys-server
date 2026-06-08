@@ -80,50 +80,119 @@ async function chamarClaude(system, userContent, maxTokens = 2048) {
   }
 }
 
+// ── CONSTANTES CDV ───────────────────────────────────────────────────────────
+const PROGRAMAS_CPM = {
+  'Smiles': 18, 'Azul Fidelidade': 15, 'Azul pelo Mundo': 15,
+  'LATAM Pass': 26, 'Iberia Plus': 58, 'Privilege Club': 58,
+  'Executive Club': 58, 'TAP': 43, 'AAdvantage': 100, 'SUMA': 80,
+  'Flying Club': 50, 'Finnair Plus': 58, 'Aeroplan': 50
+};
+const PROGRAMAS_LINK = {
+  'Smiles': 'https://www.smiles.com.br/home',
+  'Azul Fidelidade': 'https://www.voeazul.com.br/br/pt/home',
+  'Azul pelo Mundo': 'https://azulpelomundo.voeazul.com.br',
+  'LATAM Pass': 'https://www.latamairlines.com/br/pt',
+  'Iberia Plus': 'https://www.iberia.com/',
+  'Privilege Club': 'https://www.qatarairways.com/',
+  'Executive Club': 'https://www.britishairways.com/',
+  'TAP': 'https://www.flytap.com/',
+  'AAdvantage': 'https://www.aa.com.br/',
+  'SUMA': 'https://www.aireuropa.com/en/flights/home',
+  'Flying Club': 'https://www.virginatlantic.com/',
+  'Finnair Plus': 'https://www.finnair.com/br/gb/finnair-plus',
+  'Aeroplan': 'https://www.aircanada.com/home/ca/en/aco/flights'
+};
+const RODAPE_MILHAS = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
+const BALCAO_LINK   = '`Faça parte do Balcão clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
+
+function formatarMensagemCDV(dados) {
+  const { origem, destino, pontos, programa, cia, cabine, tipoVoo, datasIda, datasVolta } = dados;
+  const cpm        = PROGRAMAS_CPM[programa] || 0;
+  const milhasNum  = parseInt(String(pontos || '0').replace(/\D/g, '')) || 0;
+  const valorReais = cpm > 0 ? Math.round((milhasNum / 1000) * cpm) : 0;
+  const valorStr   = valorReais > 0 ? 'R$ ' + valorReais.toLocaleString('pt-BR') : '—';
+  const linkProg   = PROGRAMAS_LINK[programa] || '';
+  const trechoInfo = tipoVoo === 'internacional' ? ` o trecho em ${cabine || 'Econômica'}` : '';
+  const pontosFormatado = milhasNum > 0 ? milhasNum.toLocaleString('pt-BR') : (pontos || '—');
+
+  let msg = '';
+  msg += `*${origem} - ${destino} por ${pontosFormatado} pontos OU ${valorStr}${trechoInfo}*
+
+`;
+  msg += RODAPE_MILHAS + '
+
+';
+  msg += `Você pode comprar essa passagem no Balcão de Milhas CDV por aproximadamente ${valorStr} o trecho + taxa de embarque.
+
+`;
+  msg += BALCAO_LINK + '
+
+';
+  msg += `🛫 *DATAS DE IDA*
+${datasIda || '—'}
+
+`;
+  msg += `🛬 *DATAS DE VOLTA*
+${datasVolta || '—'}
+
+`;
+  msg += `🎟️ *PROGRAMA* ${programa}
+
+`;
+  msg += `✈️ *CIA AÉREA* ${cia}
+
+`;
+  msg += `🔗 *LINK* ${linkProg}
+
+`;
+  msg += RODAPE_MILHAS;
+  return msg;
+}
+
 // ── PASSO 1: CLASSIFICAR CADA ITEM INDIVIDUALMENTE ───────────────────────────
 async function classificarItens(itens) {
   const system = `Você é um especialista em passagens aéreas com milhas/pontos para o mercado brasileiro.
-Sua tarefa é extrair informações de ofertas de passagem. Seja GENEROSO na classificação — se o conteúdo mencionar qualquer combinação de: rota aérea (origem/destino), programa de milhas/pontos, quantidade de milhas/pontos ou companhia aérea, classifique como válido.
+Seja GENEROSO na classificação — qualquer menção a rota aérea, milhas/pontos, programa de fidelidade ou companhia aérea deve ser classificada como válida.
 Responda APENAS com JSON válido, sem markdown.`;
 
   const resultados = [];
-
   for (let i = 0; i < itens.length; i++) {
     const item = itens[i];
     const content = [];
-
     if (item.imagemBase64) {
       content.push({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: item.imagemBase64 } });
     }
     content.push({
       type: 'text',
-      text: `Analise este item (${i + 1} de ${itens.length}) e extraia as informações.
+      text: `Analise este item e extraia informações de passagem aérea.
 ${item.texto ? `Texto: ${item.texto}` : ''}
 
 Responda com este JSON:
 {
   "valido": true,
   "indice": ${i},
-  "origem": "GRU",
-  "destino": "MIA",
-  "companhia": "LATAM",
-  "programa": "LATAM Pass",
-  "milhas": "25000",
+  "origem": "Rio de Janeiro",
+  "destino": "Buenos Aires",
+  "origemCodigo": "GIG",
+  "destinoCodigo": "AEP",
+  "cia": "GOL",
+  "programa": "Smiles",
+  "pontos": "21000",
   "cabine": "Econômica",
-  "direcao": "ida",
-  "data": "jun/2025",
-  "taxas": "R$ 350",
-  "observacoes": "alguma obs relevante"
+  "tipoVoo": "internacional",
+  "direcao": "ida_volta",
+  "datasIda": "Jul/26: 01, 28\nAgo/26: 06, 07",
+  "datasVolta": "Jun/26: 09, 10, 15\nJul/26: 01, 03"
 }
 
-Se "direcao" não estiver explícito, infira pela rota (ex: se GRU→MIA provavelmente é ida, MIA→GRU é volta).
-Se NÃO houver NENHUMA informação de passagem aérea (rota, milhas, programa ou companhia), retorne: { "valido": false, "indice": ${i} }`
+O campo "programa" deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.
+O campo "direcao" pode ser: "ida", "volta" ou "ida_volta".
+Se NÃO houver NENHUMA informação de passagem aérea, retorne: { "valido": false, "indice": ${i} }`
     });
-
-    const resultado = await chamarClaude(system, content, 512);
+    const resultado = await chamarClaude(system, content, 768);
     resultados.push(resultado || { valido: false, indice: i });
+    console.log(`   Item ${i}: ${resultado?.valido ? 'válido — ' + resultado?.origemCodigo + '→' + resultado?.destinoCodigo : 'inválido'}`);
   }
-
   return resultados;
 }
 
@@ -132,20 +201,36 @@ async function agruparEFormatar(classificacoes) {
   const validas = classificacoes.filter(c => c?.valido);
   if (validas.length === 0) return [];
 
+  // Se só 1 item, formata direto sem chamar IA
+  if (validas.length === 1) {
+    const v = validas[0];
+    const dados = {
+      origem: v.origem || v.origemCodigo,
+      destino: v.destino || v.destinoCodigo,
+      pontos: v.pontos,
+      programa: v.programa,
+      cia: v.cia,
+      cabine: v.cabine || 'Econômica',
+      tipoVoo: v.tipoVoo || 'internacional',
+      datasIda: v.datasIda || '',
+      datasVolta: v.datasVolta || '',
+    };
+    return [{ indices: [v.indice], tipo: v.direcao || 'ida', ...dados, mensagem: formatarMensagemCDV(dados) }];
+  }
+
+  // Múltiplos itens: IA decide agrupamento
   const system = `Você é um especialista em passagens aéreas com milhas para o mercado brasileiro.
-Sua tarefa é agrupar trechos que compõem a mesma emissão e formatar mensagens para WhatsApp.
-Responda APENAS com JSON válido, sem markdown.`;
+Agrupe trechos que compõem a mesma emissão. Responda APENAS com JSON válido, sem markdown.`;
 
-  const prompt = `Analise estas ${validas.length} oferta(s) classificadas e agrupe as que pertencem à mesma emissão.
+  const prompt = `Agrupe estas ${validas.length} ofertas que pertencem à mesma emissão.
 
-Critérios para agrupar (TODOS devem ser verdadeiros):
+Critérios para agrupar:
 - Mesmo programa de fidelidade
 - Mesma quantidade de milhas (ou muito próxima)
 - Mesma companhia aérea
-- Rotas complementares (ex: GRU→MIA é ida, MIA→GRU é volta)
-- Datas compatíveis (se informadas)
+- Rotas complementares (ex: GIG→AEP é ida, AEP→GIG é volta)
 
-Ofertas classificadas:
+Ofertas:
 ${JSON.stringify(validas, null, 2)}
 
 Responda com este JSON:
@@ -154,39 +239,39 @@ Responda com este JSON:
     {
       "indices": [0, 1],
       "tipo": "ida_volta",
-      "origem": "GRU",
-      "destino": "MIA",
-      "companhia": "LATAM",
-      "programa": "LATAM Pass",
-      "milhas": "25.000",
+      "origem": "Rio de Janeiro",
+      "destino": "Buenos Aires",
+      "origemCodigo": "GIG",
+      "destinoCodigo": "AEP",
+      "cia": "GOL",
+      "programa": "Smiles",
+      "pontos": "21000",
       "cabine": "Econômica",
-      "taxas": "R$ 350",
-      "mensagem": "✈️ *GRU ⇄ MIA* — LATAM\\n\\n💺 Econômica | Ida e volta\\n🏆 *LATAM Pass* — 25.000 milhas\\n💰 Taxas: R$ 350\\n\\n🔗 Resgate pelo app ou site da LATAM"
-    },
-    {
-      "indices": [2],
-      "tipo": "ida",
-      "origem": "GRU",
-      "destino": "FCO",
-      "companhia": "Azul",
-      "programa": "TudoAzul",
-      "milhas": "30.000",
-      "cabine": "Econômica",
-      "taxas": "R$ 280",
-      "mensagem": "✈️ *GRU → FCO* — Azul\\n\\n💺 Econômica | Somente ida\\n🏆 *TudoAzul* — 30.000 milhas\\n💰 Taxas: R$ 280\\n\\n🔗 Resgate pelo app ou site da Azul"
+      "tipoVoo": "internacional",
+      "datasIda": "Jul/26: 01, 28",
+      "datasVolta": "Jun/26: 09, 10"
     }
   ]
-}
-
-Regras para a mensagem:
-- Ida e volta: use ⇄ e "Ida e volta"
-- Somente ida: use → e "Somente ida"  
-- Negrite com *asteriscos* as informações importantes
-- Use \\n para quebras de linha
-- Seja direto e objetivo`;
+}`;
 
   const resultado = await chamarClaude(system, [{ type: 'text', text: prompt }], 2048);
-  return resultado?.emissoes || [];
+  const emissoes  = resultado?.emissoes || [];
+
+  // Formata cada emissão no padrão CDV
+  return emissoes.map(e => ({
+    ...e,
+    mensagem: formatarMensagemCDV({
+      origem:     e.origem || e.origemCodigo,
+      destino:    e.destino || e.destinoCodigo,
+      pontos:     e.pontos,
+      programa:   e.programa,
+      cia:        e.cia,
+      cabine:     e.cabine || 'Econômica',
+      tipoVoo:    e.tipoVoo || 'internacional',
+      datasIda:   e.datasIda || '',
+      datasVolta: e.datasVolta || '',
+    })
+  }));
 }
 
 // ── PROCESSAR BUFFER APÓS JANELA ──────────────────────────────────────────────
