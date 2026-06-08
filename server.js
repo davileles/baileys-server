@@ -227,7 +227,7 @@ async function conectar() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) { qrAtual = await QRCode.toDataURL(qr); console.log('QR gerado - acesse /qr'); }
-    if (connection === 'open') { conectado=true; qrAtual=null; console.log('WhatsApp conectado!'); console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', ')); console.log('Listener messages.upsert ativo: '+(sock.ev.listenerCount('messages.upsert'))+' listeners'); }
+    if (connection === 'open') { conectado=true; qrAtual=null; console.log('WhatsApp conectado!'); console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', ')); }
     if (connection === 'close') {
       conectado = false;
       const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
