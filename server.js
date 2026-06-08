@@ -78,8 +78,8 @@ async function chamarClaude(system, userContent, maxTokens = 2048) {
 
 // ── PASSO 1: CLASSIFICAR CADA ITEM INDIVIDUALMENTE ───────────────────────────
 async function classificarItens(itens) {
-  const system = `Você é um especialista em passagens aéreas com milhas para o mercado brasileiro.
-Para cada item recebido, extraia as informações estruturadas da oferta de passagem.
+  const system = `Você é um especialista em passagens aéreas com milhas/pontos para o mercado brasileiro.
+Sua tarefa é extrair informações de ofertas de passagem. Seja GENEROSO na classificação — se o conteúdo mencionar qualquer combinação de: rota aérea (origem/destino), programa de milhas/pontos, quantidade de milhas/pontos ou companhia aérea, classifique como válido.
 Responda APENAS com JSON válido, sem markdown.`;
 
   const resultados = [];
@@ -113,7 +113,7 @@ Responda com este JSON:
 }
 
 Se "direcao" não estiver explícito, infira pela rota (ex: se GRU→MIA provavelmente é ida, MIA→GRU é volta).
-Se NÃO for uma oferta de passagem com milhas, retorne: { "valido": false, "indice": ${i} }`
+Se NÃO houver NENHUMA informação de passagem aérea (rota, milhas, programa ou companhia), retorne: { "valido": false, "indice": ${i} }`
     });
 
     const resultado = await chamarClaude(system, content, 512);
