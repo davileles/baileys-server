@@ -68,10 +68,14 @@ async function chamarClaude(system, userContent, maxTokens = 2048) {
     }),
   });
   const data = await response.json();
+  console.log(`🤖 API response status: ${response.status} | content blocks: ${data.content?.length}`);
+  if (data.error) console.log(`❌ API erro: ${JSON.stringify(data.error)}`);
   const raw  = data.content?.[0]?.text || '{}';
+  console.log(`📝 Raw resposta IA: ${raw.slice(0, 300)}`);
   try {
     return JSON.parse(raw.replace(/```json|```/g, '').trim());
   } catch {
+    console.log(`❌ JSON parse falhou para: ${raw.slice(0, 100)}`);
     return null;
   }
 }
