@@ -61,7 +61,7 @@ async function chamarClaude(system, userContent, maxTokens = 2048) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-5',
       max_tokens: maxTokens,
       system,
       messages: [{ role: 'user', content: userContent }],
