@@ -319,6 +319,7 @@ async function conectar() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log(`📩 messages.upsert disparado — type: ${type}, qtd: ${messages.length}`);
     if (type !== 'notify') return;
     for (const msg of messages) await processarMensagem(msg);
   });
