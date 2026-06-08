@@ -236,6 +236,7 @@ async function conectar() {
     }
   });
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log('upsert: type='+type+' qtd='+messages.length+' jids='+messages.map(m=>m.key.remoteJid).join(','));
     if (type !== 'notify') return;
     for (const msg of messages) await processarMensagem(msg);
   });
