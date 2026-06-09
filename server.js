@@ -270,8 +270,14 @@ async function processarMensagem(msg) {
       try {
         const buffer = await downloadMediaMessage(msg,'buffer',{},{ logger:pino({level:'silent'}), reuploadRequest:sock.updateMediaMessage });
         imagemB64 = buffer.toString('base64');
-      } catch(e) { console.error('Erro ao baixar imagem:', e.message); }
+        console.log('[IMG] Baixada: '+(imagemB64.length/1024).toFixed(0)+'KB, caption="'+texto+'"');
+      } catch(e) {
+        console.error('[IMG] Erro ao baixar imagem:', e.message);
+        // Se download falhou mas n\u00e3o h\u00e1 caption, usa placeholder para n\u00e3o descartar
+        if (!texto) texto = '[imagem sem legenda]';
+      }
     } else { return; }
+    // Descarta apenas se n\u00e3o houver nenhum conte\u00fado
     if (!texto && !imagemB64) return;
 
     // ignorar mensagens que já são alertas CDV formatados
@@ -491,6 +497,38 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   oferta.status = 'rejeitado';
   res.json({ ok:true });
+});
+
+// Mesclar duas ofertas pendentes em uma
+app.post('/painel/mesclar', (req, res) => {
+  const { id1, id2 } = req.body;
+  if (!id1 || !id2) return res.status(400).json({ ok:false, erro:'ids necessarios.' });
+  const o1 = filaPendentes.find(o => o.id===id1 && o.status==='pendente');
+  const o2 = filaPendentes.find(o => o.id===id2 && o.status==='pendente');
+  if (!o1 || !o2) return res.status(404).json({ ok:false, erro:'Uma ou ambas ofertas nao encontradas ou ja processadas.' });
+
+  // Combinar conteudo: texto + imagens de ambas
+  const textosMesclados  = [...(o1.conteudoOriginal||[]), ...(o2.conteudoOriginal||[])];
+  const imagensMescladas = [...(o1.imagens||[]), ...(o2.imagens||[])];
+
+  // Mensagem mesclada: unir as duas mensagens formatadas
+  const msg1 = (o1.mensagemFormatada||'').trim();
+  const msg2 = (o2.mensagemFormatada||'').trim();
+  const mensagemMesclada = msg1 + (msg1 && msg2 ? '
+
+' : '') + msg2;
+
+  // Atualizar o1 com dados mesclados
+  o1.conteudoOriginal  = textosMesclados;
+  o1.imagens           = imagensMescladas;
+  o1.mensagemFormatada = mensagemMesclada;
+  o1.tipoConteudo      = 'mesclado';
+  o1.timestamp         = new Date().toISOString();
+
+  // Marcar o2 como mesclado (removido)
+  o2.status = 'mesclado';
+
+  res.json({ ok:true, id: o1.id, mensagemMesclada });
 });
 
 app.post('/enviar', async (req, res) => {
