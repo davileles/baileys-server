@@ -9,7 +9,7 @@ import cors from 'cors';
 import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
-import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { readdir, unlink } from 'fs/promises';
 import QRCode from 'qrcode';
 
@@ -45,7 +45,27 @@ app.use(express.json({ limit: '50mb' }));
 let sock      = null;
 let conectado = false;
 let qrAtual   = null;
-const filaPendentes     = [];
+const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
+
+// Carregar fila persistida ao iniciar
+function carregarFila() {
+  try {
+    if (existsSync(FILA_PATH)) {
+      const dados = JSON.parse(readFileSync(FILA_PATH, 'utf-8'));
+      filaPendentes.push(...dados);
+      console.log('[FILA] Carregadas ' + dados.length + ' ofertas do disco.');
+    }
+  } catch(e) { console.log('[FILA] Erro ao carregar fila:', e.message); }
+}
+
+function salvarFila() {
+  try {
+    writeFileSync(FILA_PATH, JSON.stringify(filaPendentes.slice(0, 100)), 'utf-8');
+  } catch(e) { console.log('[FILA] Erro ao salvar fila:', e.message); }
+}
+
+const filaPendentes = [];
+carregarFila();
 let contadorId          = 1;
 const bufferAgrupamento = new Map();
 
@@ -267,6 +287,7 @@ async function processarBuffer(grupoId) {
       const oferta  = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:emissao.mensagem, dadosExtraidos:emissao, status:'pendente' };
       filaPendentes.unshift(oferta);
       if (filaPendentes.length > 100) filaPendentes.splice(100);
+      salvarFila();
       console.log('Oferta #'+oferta.id+' - '+emissao.tipo+' '+emissao.origem+'->'+emissao.destino+' ('+emissao.cabine+')');
     }
   } catch (err) { console.error('Erro ao processar buffer:', err.message); }
@@ -506,6 +527,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   try {
     await sock.sendMessage(GRUPOS[GRUPO_DESTINO_PASSAGENS], { text:mensagem });
     oferta.status = 'aprovado';
+    salvarFila();
     res.json({ ok:true });
   } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
 });
@@ -515,6 +537,7 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   const oferta = filaPendentes.find(o => o.id===id);
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   oferta.status = 'rejeitado';
+  salvarFila();
   res.json({ ok:true });
 });
 
@@ -544,7 +567,7 @@ app.post('/painel/mesclar', (req, res) => {
 
   // Marcar o2 como mesclado (removido)
   o2.status = 'mesclado';
-
+  salvarFila();
   res.json({ ok:true, id: o1.id, mensagemMesclada });
 });
 
