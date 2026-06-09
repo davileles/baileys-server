@@ -188,7 +188,10 @@ async function chamarClaude(system, userContent, maxTokens) {
   if (data.error) { console.log('API erro:', JSON.stringify(data.error)); return null; }
   const raw = data.content?.[0]?.text || '{}';
   try { return JSON.parse(raw.replace(/```json|```/g,'').trim()); }
-  catch { console.log('JSON parse falhou:', raw.slice(0,100)); return null; }
+  catch(e) {
+    console.log('JSON parse falhou ('+e.message+'). Tamanho raw: '+raw.length+' chars. Trecho final: '+raw.slice(-80));
+    return null;
+  }
 }
 
 // ── PASSO 1: CLASSIFICAR ──────────────────────────────────────────────────────
@@ -200,17 +203,18 @@ async function classificarItens(itens) {
     const content = [];
     if (item.imagemBase64) content.push({ type:'image', source:{ type:'base64', media_type:'image/jpeg', data:item.imagemBase64 } });
     content.push({ type:'text', text:
-      'Extraia informacoes de passagem(ns) aerea(s) deste item. Pode haver UMA ou MAIS ofertas no mesmo conteudo.\n'
+      'Extraia TODAS as ofertas de passagem aerea presentes neste conteudo. Pode haver UMA ou MAIS emissoes separadas - identifique cada uma individualmente.\n'
       +(item.texto ? 'Texto: '+item.texto+'\n' : '')
-      +'\nIMPORTANTE sobre datas: formatos como "Junho/26: 16, 19, 22" ou "Junho: 16, 19" ou "16, 19, 22 de Junho" sao todos validos. Junte todas as datas de ida em datasIda e todas as datas de volta em datasVolta, separadas por virgula. Normalize para o formato "Mês/Ano: dias".\n'
-      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago.\n'
-      +'\nResponda com este JSON contendo um array de resultados (mesmo que seja apenas 1 oferta):\n'
-      +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22, 23, 24, 26","datasVolta":"Jun/26: 22, 23"}]}\n'
+      +'\nSe houver multiplas emissoes (ex: separadas por "Oportunidade de resgate" ou rotas diferentes), retorne UMA entrada por emissao no array.\n'
+      +'\nIMPORTANTE sobre datas: normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22". Inclua TODAS as datas listadas.\n'
+      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte.\n'
+      +'\nResponda com este JSON (uma entrada por emissao encontrada):\n'
+      +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}\n'
       +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
       +'Cabine deve ser exatamente "Economica" ou "Executiva".\n'
       +'Se NAO houver nenhuma passagem aerea retorne: {"resultados":[{"valido":false,"indice":'+i+'}]}'
     });
-    const resultado = await chamarClaude(system, content, 1024);
+    const resultado = await chamarClaude(system, content, 4096);
     const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:i }]);
     for (const r of lista) {
       if (r?.valido) {
@@ -243,7 +247,7 @@ async function agruparEFormatar(classificacoes) {
     +'Ofertas:\n'+JSON.stringify(validas,null,2)+'\n\n'
     +'Responda:\n{"emissoes":[{"indices":[0,1],"tipo":"ida_volta","origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 
-  const resultado = await chamarClaude(system, [{ type:'text', text:prompt }], 2048);
+  const resultado = await chamarClaude(system, [{ type:'text', text:prompt }], 4096);
   const emissoes  = resultado?.emissoes || [];
 
   // Fallback: se a IA retornou 0 emissoes mas havia itens validos,
