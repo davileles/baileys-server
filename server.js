@@ -46,6 +46,40 @@ function resolverGrupo(chave) {
 }
 function gerarId() { return contadorId++; }
 
+// ── TABELA IATA → CIDADE ──────────────────────────────────────────────────────
+const IATA_CIDADES = {
+  'GRU':'São Paulo','CGH':'São Paulo','VCP':'Campinas',
+  'GIG':'Rio de Janeiro','SDU':'Rio de Janeiro',
+  'BSB':'Brasília','CNF':'Belo Horizonte','SSA':'Salvador',
+  'REC':'Recife','FOR':'Fortaleza','MAO':'Manaus','BEL':'Belém',
+  'CWB':'Curitiba','POA':'Porto Alegre','FLN':'Florianópolis',
+  'NAT':'Natal','MCZ':'Maceió','AJU':'Aracaju','THE':'Teresina',
+  'SLZ':'São Luís','JPA':'João Pessoa','PMW':'Palmas',
+  'MIA':'Miami','JFK':'Nova York','EWR':'Nova York','LGA':'Nova York',
+  'MCO':'Orlando','LAX':'Los Angeles','ORD':'Chicago','ATL':'Atlanta',
+  'IAH':'Houston','DFW':'Dallas','SFO':'São Francisco','BOS':'Boston',
+  'LIS':'Lisboa','MAD':'Madrid','CDG':'Paris','LHR':'Londres',
+  'FCO':'Roma','MXP':'Milão','AMS':'Amsterdã','FRA':'Frankfurt',
+  'BCN':'Barcelona','VIE':'Viena','ZRH':'Zurique','MUC':'Munique',
+  'CPH':'Copenhague','ARN':'Estocolmo','HEL':'Helsinki','OSL':'Oslo',
+  'EZE':'Buenos Aires','AEP':'Buenos Aires','SCL':'Santiago',
+  'BOG':'Bogotá','LIM':'Lima','MVD':'Montevidéu','ASU':'Assunção',
+  'CUN':'Cancún','MEX':'Cidade do México','PTY':'Cidade do Panamá',
+  'MBJ':'Montego Bay','HAV':'Havana','SDQ':'Santo Domingo',
+  'DXB':'Dubai','DOH':'Doha','AUH':'Abu Dhabi','RUH':'Riade',
+  'NRT':'Tóquio','HND':'Tóquio','ICN':'Seul','PEK':'Pequim',
+  'PVG':'Xangai','HKG':'Hong Kong','SIN':'Singapura',
+  'BKK':'Bangcoc','KUL':'Kuala Lumpur','CGK':'Jacarta',
+  'SYD':'Sydney','MEL':'Melbourne','AKL':'Auckland',
+  'JNB':'Joanesburgo','CPT':'Cidade do Cabo','CAI':'Cairo',
+  'CMN':'Casablanca','NBO':'Nairóbi',
+};
+
+function resolverCidade(codigo, nomeIA) {
+  if (codigo && IATA_CIDADES[codigo.toUpperCase()]) return IATA_CIDADES[codigo.toUpperCase()];
+  return nomeIA || codigo || '-';
+}
+
 // ── CONSTANTES CDV ────────────────────────────────────────────────────────────
 const PROGRAMAS_CPM = {
   'Smiles':18,'Azul Fidelidade':15,'Azul pelo Mundo':15,
@@ -126,16 +160,27 @@ async function classificarItens(itens) {
     const content = [];
     if (item.imagemBase64) content.push({ type:'image', source:{ type:'base64', media_type:'image/jpeg', data:item.imagemBase64 } });
     content.push({ type:'text', text:
-      'Extraia informacoes de passagem aerea deste item.\n'
+      'Extraia informacoes de passagem(ns) aerea(s) deste item. Pode haver UMA ou MAIS ofertas no mesmo conteudo.\n'
       +(item.texto ? 'Texto: '+item.texto+'\n' : '')
-      +'\nResponda com este JSON:\n'
-      +'{"valido":true,"indice":'+i+',"origem":"Rio de Janeiro","destino":"Buenos Aires","origemCodigo":"GIG","destinoCodigo":"AEP","cia":"GOL","programa":"Smiles","pontos":"21000","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jul/26: 01, 28","datasVolta":"Jun/26: 09, 10"}\n'
+      +'\nIMPORTANTE sobre datas: formatos como "Junho/26: 16, 19, 22" ou "Junho: 16, 19" ou "16, 19, 22 de Junho" sao todos validos. Junte todas as datas de ida em datasIda e todas as datas de volta em datasVolta, separadas por virgula. Normalize para o formato "Mês/Ano: dias".\n'
+      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago.\n'
+      +'\nResponda com este JSON contendo um array de resultados (mesmo que seja apenas 1 oferta):\n'
+      +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22, 23, 24, 26","datasVolta":"Jun/26: 22, 23"}]}\n'
       +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
-      +'Se NAO for passagem aerea retorne: {"valido":false,"indice":'+i+'}'
+      +'Cabine deve ser exatamente "Economica" ou "Executiva".\n'
+      +'Se NAO houver nenhuma passagem aerea retorne: {"resultados":[{"valido":false,"indice":'+i+'}]}'
     });
-    const resultado = await chamarClaude(system, content, 512);
-    resultados.push(resultado || { valido:false, indice:i });
-    console.log('   Item '+i+': '+(resultado?.valido ? 'valido '+resultado?.origemCodigo+'->'+resultado?.destinoCodigo : 'invalido'));
+    const resultado = await chamarClaude(system, content, 1024);
+    const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:i }]);
+    for (const r of lista) {
+      if (r?.valido) {
+        // resolver cidade via tabela local, sobrepondo o que a IA retornou
+        r.origem  = resolverCidade(r.origemCodigo,  r.origem);
+        r.destino = resolverCidade(r.destinoCodigo, r.destino);
+      }
+      resultados.push(r || { valido:false, indice:i });
+      console.log('   Item '+i+': '+(r?.valido ? 'valido '+r?.origemCodigo+'->'+r?.destinoCodigo+' ('+r?.cabine+')' : 'invalido'));
+    }
   }
   return resultados;
 }
@@ -147,15 +192,25 @@ async function agruparEFormatar(classificacoes) {
 
   if (validas.length === 1) {
     const v = validas[0];
-    const dados = { origem:v.origem||v.origemCodigo, destino:v.destino||v.destinoCodigo, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+    const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
     return [{ indices:[v.indice], tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) }];
   }
 
   const system = 'Voce e especialista em passagens aereas. Agrupe trechos da mesma emissao. Responda APENAS JSON sem markdown.';
-  const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao.\n\nCriterios: mesmo programa, mesmas milhas, mesma companhia, rotas complementares.\n\nOfertas:\n'+JSON.stringify(validas,null,2)+'\n\nResponda:\n{"emissoes":[{"indices":[0,1],"tipo":"ida_volta","origem":"Rio de Janeiro","destino":"Buenos Aires","origemCodigo":"GIG","destinoCodigo":"AEP","cia":"GOL","programa":"Smiles","pontos":"21000","cabine":"Economica","tipoVoo":"internacional","datasIda":"Jul/26: 01, 28","datasVolta":"Jun/26: 09, 10"}]}';
+  const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao.\n\n'
+    +'Criterios para pertencer ao MESMO grupo: mesmo programa, mesmas milhas, mesma companhia, mesma cabine, rotas complementares (ex: ida e volta da mesma viagem).\n\n'
+    +'IMPORTANTE: cabine Economica e cabine Executiva sao emissoes DIFERENTES e devem ser grupos SEPARADOS, mesmo que todos os outros dados sejam iguais.\n\n'
+    +'Ofertas:\n'+JSON.stringify(validas,null,2)+'\n\n'
+    +'Responda:\n{"emissoes":[{"indices":[0,1],"tipo":"ida_volta","origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
+
   const resultado = await chamarClaude(system, [{ type:'text', text:prompt }], 2048);
   const emissoes  = resultado?.emissoes || [];
-  return emissoes.map(e => ({ ...e, mensagem:formatarMensagemCDV({ origem:e.origem||e.origemCodigo, destino:e.destino||e.destinoCodigo, pontos:e.pontos, programa:e.programa, cia:e.cia, cabine:e.cabine||'Economica', tipoVoo:e.tipoVoo||'internacional', datasIda:e.datasIda||'', datasVolta:e.datasVolta||'' }) }));
+  return emissoes.map(e => {
+    const origem  = resolverCidade(e.origemCodigo,  e.origem);
+    const destino = resolverCidade(e.destinoCodigo, e.destino);
+    const dados   = { origem, destino, pontos:e.pontos, programa:e.programa, cia:e.cia, cabine:e.cabine||'Economica', tipoVoo:e.tipoVoo||'internacional', datasIda:e.datasIda||'', datasVolta:e.datasVolta||'' };
+    return { ...e, ...dados, mensagem:formatarMensagemCDV(dados) };
+  });
 }
 
 // ── PROCESSAR BUFFER ──────────────────────────────────────────────────────────
@@ -181,7 +236,7 @@ async function processarBuffer(grupoId) {
       const oferta  = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:emissao.mensagem, dadosExtraidos:emissao, status:'pendente' };
       filaPendentes.unshift(oferta);
       if (filaPendentes.length > 100) filaPendentes.splice(100);
-      console.log('Oferta #'+oferta.id+' - '+emissao.tipo+' '+emissao.origem+'->'+emissao.destino);
+      console.log('Oferta #'+oferta.id+' - '+emissao.tipo+' '+emissao.origem+'->'+emissao.destino+' ('+emissao.cabine+')');
     }
   } catch (err) { console.error('Erro ao processar buffer:', err.message); }
 }
@@ -206,6 +261,18 @@ async function processarMensagem(msg) {
       } catch(e) { console.error('Erro ao baixar imagem:', e.message); }
     } else { return; }
     if (!texto && !imagemB64) return;
+
+    // ignorar mensagens que já são alertas CDV formatados
+    if (texto && (
+      texto.includes('Dica de emissao encontrada por @davileles') ||
+      texto.includes('Dica de emissão encontrada por @davileles') ||
+      texto.includes('Faca parte do Balcao clicando aqui') ||
+      texto.includes('Faça parte do Balcão clicando aqui')
+    )) {
+      console.log('Mensagem CDV ignorada (ja formatada)');
+      return;
+    }
+
     console.log('Mensagem capturada de '+jid+' ('+tipo+')');
     if (!bufferAgrupamento.has(jid)) {
       const timer = setTimeout(() => processarBuffer(jid), JANELA_AGRUPAMENTO_MS);
@@ -249,7 +316,7 @@ async function conectar() {
 }
 
 // ── CSS DO PAINEL ─────────────────────────────────────────────────────────────
-const PAINEL_CSS = `*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#0d0d0d;color:#f0f0f0;min-height:100vh}header{background:#111;border-bottom:1px solid #222;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}header h1{font-size:18px;color:#ffa500}header .nav a{color:#aaa;text-decoration:none;margin-left:16px;font-size:14px}header .nav a:hover{color:#ffa500}.container{max-width:960px;margin:0 auto;padding:24px 16px}.badge{background:#ffa500;color:#000;font-size:11px;font-weight:700;padding:2px 7px;border-radius:10px;margin-left:6px}.empty{text-align:center;color:#555;padding:60px 0;font-size:15px}.card{background:#161616;border:1px solid #222;border-radius:12px;margin-bottom:16px;overflow:hidden}.card-header{padding:12px 16px;background:#1a1a1a;border-bottom:1px solid #222;display:flex;align-items:center;gap:8px;font-size:13px;color:#aaa;flex-wrap:wrap}.card-header .id{color:#ffa500;font-weight:700;font-size:14px}.tag{background:#252525;padding:2px 8px;border-radius:6px;font-size:11px}.tag-iv{background:#1a2e1a;color:#22c55e}.tag-ida{background:#1a1f2e;color:#60a5fa}.card-body{display:grid;grid-template-columns:1fr 1fr}.col{padding:16px}.col+.col{border-left:1px solid #222}.col-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#444;margin-bottom:10px}.imgs-grid{display:flex;flex-wrap:wrap;gap:8px}.imgs-grid img{width:calc(50% - 4px);min-width:120px;border-radius:8px;object-fit:cover}.imgs-grid img:only-child{width:100%}.texto-orig{font-size:13px;color:#888;white-space:pre-wrap;word-break:break-word;margin-top:8px}.edit-area{width:100%;background:#0d0d0d;color:#f0f0f0;border:1px solid #2a2a2a;border-radius:8px;padding:12px;font-size:13px;font-family:inherit;line-height:1.7;resize:vertical;min-height:200px}.edit-area:focus{outline:none;border-color:#444}.card-footer{padding:12px 16px;border-top:1px solid #1a1a1a;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{padding:8px 20px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}.btn:hover{opacity:.8}.btn-ap{background:#22c55e;color:#000}.btn-rej{background:#333;color:#aaa}.ok-ap{color:#22c55e;font-size:13px}.ok-rej{color:#555;font-size:13px}.buffer-bar{background:#1a1400;border:1px solid #3a2e00;border-radius:8px;padding:10px 16px;font-size:13px;color:#ffa500;margin-bottom:16px}.sep{color:#333;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:28px 0 12px}@media(max-width:600px){.card-body{grid-template-columns:1fr}.col+.col{border-left:none;border-top:1px solid #1a1a1a}.imgs-grid img{width:100%}}`;
+const PAINEL_CSS = `*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#0d0d0d;color:#f0f0f0;min-height:100vh}header{background:#111;border-bottom:1px solid #222;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}header h1{font-size:18px;color:#ffa500}header .nav a{color:#aaa;text-decoration:none;margin-left:16px;font-size:14px}header .nav a:hover{color:#ffa500}.container{max-width:960px;margin:0 auto;padding:24px 16px}.badge{background:#ffa500;color:#000;font-size:11px;font-weight:700;padding:2px 7px;border-radius:10px;margin-left:6px}.empty{text-align:center;color:#555;padding:60px 0;font-size:15px}.card{background:#161616;border:1px solid #222;border-radius:12px;margin-bottom:16px;overflow:hidden}.card-header{padding:12px 16px;background:#1a1a1a;border-bottom:1px solid #222;display:flex;align-items:center;gap:8px;font-size:13px;color:#aaa;flex-wrap:wrap}.card-header .id{color:#ffa500;font-weight:700;font-size:14px}.tag{background:#252525;padding:2px 8px;border-radius:6px;font-size:11px}.tag-iv{background:#1a2e1a;color:#22c55e}.tag-ida{background:#1a1f2e;color:#60a5fa}.tag-exec{background:#2e1a2e;color:#c084fc}.tag-eco{background:#1a2020;color:#67e8f9}.card-body{display:grid;grid-template-columns:1fr 1fr}.col{padding:16px}.col+.col{border-left:1px solid #222}.col-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#444;margin-bottom:10px}.imgs-grid{display:flex;flex-wrap:wrap;gap:8px}.imgs-grid img{width:calc(50% - 4px);min-width:120px;border-radius:8px;object-fit:cover}.imgs-grid img:only-child{width:100%}.texto-orig{font-size:13px;color:#888;white-space:pre-wrap;word-break:break-word;margin-top:8px}.edit-area{width:100%;background:#0d0d0d;color:#f0f0f0;border:1px solid #2a2a2a;border-radius:8px;padding:12px;font-size:13px;font-family:inherit;line-height:1.7;resize:vertical;min-height:200px}.edit-area:focus{outline:none;border-color:#444}.card-footer{padding:12px 16px;border-top:1px solid #1a1a1a;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{padding:8px 20px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}.btn:hover{opacity:.8}.btn-ap{background:#22c55e;color:#000}.btn-rej{background:#333;color:#aaa}.ok-ap{color:#22c55e;font-size:13px}.ok-rej{color:#555;font-size:13px}.buffer-bar{background:#1a1400;border:1px solid #3a2e00;border-radius:8px;padding:10px 16px;font-size:13px;color:#ffa500;margin-bottom:16px}.sep{color:#333;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:28px 0 12px}@media(max-width:600px){.card-body{grid-template-columns:1fr}.col+.col{border-left:none;border-top:1px solid #1a1a1a}.imgs-grid img{width:100%}}`;
 
 // ── ROTAS ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
@@ -277,14 +344,15 @@ app.get('/painel', (req, res) => {
   const renderCard = (o) => {
     const data = new Date(o.timestamp).toLocaleString('pt-BR');
     const d    = o.dadosExtraidos || {};
-    const tipoTag = d.tipo==='ida_volta'?'<span class="tag tag-iv">Ida e volta</span>':d.tipo==='ida'?'<span class="tag tag-ida">Somente ida</span>':'';
+    const tipoTag   = d.tipo==='ida_volta'?'<span class="tag tag-iv">Ida e volta</span>':d.tipo==='ida'?'<span class="tag tag-ida">Somente ida</span>':'';
+    const cabineTag = d.cabine==='Executiva'?'<span class="tag tag-exec">Executiva</span>':'<span class="tag tag-eco">Economica</span>';
     const rota = d.origem&&d.destino?'<span style="color:#f0f0f0;font-weight:600">'+d.origem+' - '+d.destino+'</span>':'';
     const prog = d.programa?'<span class="tag">'+d.programa+'</span>':'';
     const imgsHtml = (o.imagens||[]).length>0?'<div class="imgs-grid">'+(o.imagens.map(b=>'<img src="data:image/jpeg;base64,'+b+'" />')).join('')+'</div>':'';
     const textoHtml = o.conteudoOriginal?'<div class="texto-orig">'+o.conteudoOriginal+'</div>':'';
-    if (o.status==='aprovado') return '<div class="card"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+'<span style="margin-left:auto">'+data+'</span></div><div style="padding:12px 16px"><span class="ok-ap">Aprovado e enviado</span></div></div>';
-    if (o.status==='rejeitado') return '<div class="card"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+'<span style="margin-left:auto">'+data+'</span></div><div style="padding:12px 16px"><span class="ok-rej">Rejeitado</span></div></div>';
-    return '<div class="card" id="card-'+o.id+'"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+prog+'<span style="margin-left:auto;font-size:12px;color:#555">'+data+'</span></div><div class="card-body"><div class="col"><div class="col-title">Original ('+o.tipoConteudo+')</div>'+imgsHtml+textoHtml+'</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-'+o.id+'">'+o.mensagemFormatada+'</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar('+o.id+')">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar('+o.id+')">Rejeitar</button><span id="fb-'+o.id+'" style="font-size:13px;margin-left:auto"></span></div></div>';
+    if (o.status==='aprovado')  return '<div class="card"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+cabineTag+'<span style="margin-left:auto">'+data+'</span></div><div style="padding:12px 16px"><span class="ok-ap">Aprovado e enviado</span></div></div>';
+    if (o.status==='rejeitado') return '<div class="card"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+cabineTag+'<span style="margin-left:auto">'+data+'</span></div><div style="padding:12px 16px"><span class="ok-rej">Rejeitado</span></div></div>';
+    return '<div class="card" id="card-'+o.id+'"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+cabineTag+prog+'<span style="margin-left:auto;font-size:12px;color:#555">'+data+'</span></div><div class="card-body"><div class="col"><div class="col-title">Original ('+o.tipoConteudo+')</div>'+imgsHtml+textoHtml+'</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-'+o.id+'">'+o.mensagemFormatada+'</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar('+o.id+')">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar('+o.id+')">Rejeitar</button><span id="fb-'+o.id+'" style="font-size:13px;margin-left:auto"></span></div></div>';
   };
   res.send('<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Painel CDV</title><style>'+PAINEL_CSS+'</style></head><body><header><h1>Painel'+(pendentes.length>0?' <span class="badge">'+pendentes.length+'</span>':'')+'</h1><nav class="nav"><a href="/">Inicio</a><a href="/painel">Atualizar</a></nav></header><div class="container">'+(emBuffer>0?'<div class="buffer-bar">'+emBuffer+' item(ns) aguardando janela de '+JANELA_AGRUPAMENTO_MS/60000+' min...</div>':'')+(pendentes.length===0&&emBuffer===0?'<div class="empty">Nenhuma oferta pendente.</div>':pendentes.map(renderCard).join(''))+(processados.length>0?'<div class="sep">Processados recentemente</div>'+processados.slice(0,10).map(renderCard).join(''):'')+'</div><script>async function aprovar(id){const msg=document.getElementById("msg-"+id).value;const fb=document.getElementById("fb-"+id);fb.textContent="Enviando...";fb.style.color="#aaa";const r=await fetch("/painel/aprovar/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mensagem:msg})});const d=await r.json();if(d.ok){fb.style.color="#22c55e";fb.textContent="Enviado!";setTimeout(()=>{const c=document.getElementById("card-"+id);if(c)c.style.opacity=".35"},800)}else{fb.style.color="#ef4444";fb.textContent="Erro: "+d.erro}}async function rejeitar(id){const fb=document.getElementById("fb-"+id);const r=await fetch("/painel/rejeitar/"+id,{method:"POST"});const d=await r.json();if(d.ok){fb.style.color="#555";fb.textContent="Rejeitado";setTimeout(()=>{const c=document.getElementById("card-"+id);if(c)c.style.opacity=".35"},400)}}'+(emBuffer>0?'setTimeout(()=>location.reload(),30000);':'')+'</script></body></html>');
 });
