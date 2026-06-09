@@ -18,7 +18,7 @@ const GRUPOS = {
   cdv_ofertas: '120363423014138662@g.us',
   cdv_emissao: '120363172490263905@g.us',
 };
-const GRUPOS_MONITORADOS      = ['120363427512561555@g.us','120363409136599326@g.us'];
+const GRUPOS_MONITORADOS      = ['120363427512561555@g.us','120363409136599326@g.us','120363410708080270@g.us'];
 const GRUPO_DESTINO_PASSAGENS = 'cdv_emissao';
 const JANELA_AGRUPAMENTO_MS   = 3 * 60 * 1000;
 
@@ -298,33 +298,113 @@ async function processarMensagem(msg) {
 }
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
+
+// Health check: se ficar X minutos sem nenhum evento, força reconexão
+var HEALTH_CHECK_MS  = 8 * 60 * 1000; // 8 minutos sem nenhum upsert = suspeito
+var ultimoUpsert     = Date.now();
+var healthTimer      = null;
+
+function resetarHealthTimer() {
+  ultimoUpsert = Date.now();
+  if (healthTimer) clearTimeout(healthTimer);
+  healthTimer = setTimeout(() => {
+    var silencioMin = Math.round((Date.now() - ultimoUpsert) / 60000);
+    console.log('[HEALTH] '+silencioMin+' min sem eventos. Forçando reconexão...');
+    if (sock) {
+      try { sock.end(new Error('health-check-timeout')); } catch(e) {}
+      sock = null;
+    }
+    conectar();
+  }, HEALTH_CHECK_MS);
+}
+
+// Contador de erros de descriptografia (closed: -1 / bad_mac)
+var errosDescripto   = 0;
+var ERROS_DESCR_MAX  = 15; // após 15 erros, limpa sessão e reconecta
+
+async function limparSessaoEReconectar() {
+  console.log('[HEALTH] Muitos erros de descriptografia. Limpando sessão e reconectando...');
+  conectado = false;
+  if (sock) { try { sock.end(new Error('bad-session')); } catch(e) {} sock = null; }
+  // Remove apenas os arquivos de chave de sessão, mantendo as credenciais
+  const fs = await import('fs/promises');
+  try {
+    const arquivos = await fs.readdir(SESSAO_DIR);
+    for (const arq of arquivos) {
+      if (arq.startsWith('session-') || arq.includes('pre-key') || arq.includes('sender-key')) {
+        await fs.unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+      }
+    }
+    console.log('[HEALTH] Arquivos de sessão limpos.');
+  } catch(e) { console.log('[HEALTH] Erro ao limpar sessão:', e.message); }
+  errosDescripto = 0;
+  setTimeout(conectar, 3000);
+}
+
 async function conectar() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSAO_DIR);
   const { version }          = await fetchLatestBaileysVersion();
-  sock = makeWASocket({ version, auth:state, logger:pino({level:'silent'}), printQRInTerminal:true });
+  sock = makeWASocket({
+    version,
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: true,
+    // Ignora erros de descriptografia em vez de travar
+    getMessage: async () => undefined,
+  });
   sock.ev.on('creds.update', saveCreds);
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) { qrAtual = await QRCode.toDataURL(qr); console.log('QR gerado - acesse /qr'); }
-    if (connection === 'open') { conectado=true; qrAtual=null; console.log('WhatsApp conectado!'); console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', ')); }
+    if (connection === 'open') {
+      conectado = true;
+      qrAtual   = null;
+      errosDescripto = 0;
+      resetarHealthTimer();
+      console.log('WhatsApp conectado!');
+      console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', '));
+    }
     if (connection === 'close') {
       conectado = false;
+      if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
       const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log('Conexao encerrada, codigo: '+codigo+'. Reconectando em 5s...');
+      const motivo = lastDisconnect?.error?.message || '';
+      console.log('Conexão encerrada, codigo: '+codigo+' ('+motivo+'). Reconectando em 5s...');
       if (codigo !== DisconnectReason.loggedOut) {
         sock = null;
         setTimeout(conectar, 5000);
       } else {
         qrAtual = null;
-        console.log('Sessao expirada. Acesse /qr para reconectar.');
+        console.log('Sessão expirada. Acesse /qr para reconectar.');
       }
     }
   });
+
+  // Captura erros de descriptografia (closed: -1 / bad_mac)
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    // Resetar health timer a cada evento recebido
+    if (conectado) resetarHealthTimer();
+
     console.log('upsert: type='+type+' qtd='+messages.length+' jids='+messages.map(m=>m.key.remoteJid).join(','));
     if (type !== 'notify') return;
-    for (const msg of messages) await processarMensagem(msg);
+    for (const msg of messages) {
+      // Detectar mensagens que falharam na descriptografia
+      if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
+        errosDescripto++;
+        console.log('[HEALTH] Erro de descriptografia #'+errosDescripto+'/'+ERROS_DESCR_MAX);
+        if (errosDescripto >= ERROS_DESCR_MAX) {
+          await limparSessaoEReconectar();
+          return;
+        }
+        continue;
+      }
+      await processarMensagem(msg);
+    }
   });
+
+  // Iniciar health check
+  resetarHealthTimer();
 }
 
 // ── CSS DO PAINEL ─────────────────────────────────────────────────────────────
