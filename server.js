@@ -13,6 +13,9 @@ import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { readdir, unlink } from 'fs/promises';
 import QRCode from 'qrcode';
 
+// ── LOGGER CUSTOMIZADO (suprimir ruído do Baileys) ───────────────────────────
+const baileysLogger = pino({ level: 'silent' });
+
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
@@ -222,6 +225,17 @@ async function agruparEFormatar(classificacoes) {
 
   const resultado = await chamarClaude(system, [{ type:'text', text:prompt }], 2048);
   const emissoes  = resultado?.emissoes || [];
+
+  // Fallback: se a IA retornou 0 emissoes mas havia itens validos,
+  // criar uma emissao individual para cada item (rotas diferentes na mesma janela)
+  if (emissoes.length === 0) {
+    console.log('   Fallback: criando emissao individual para cada item valido');
+    return validas.map(v => {
+      const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+      return { indices:[v.indice], tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) };
+    });
+  }
+
   return emissoes.map(e => {
     const origem  = resolverCidade(e.origemCodigo,  e.origem);
     const destino = resolverCidade(e.destinoCodigo, e.destino);
@@ -357,9 +371,10 @@ async function conectar() {
   sock = makeWASocket({
     version,
     auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: true,
-    // Ignora erros de descriptografia em vez de travar
+    logger: baileysLogger,
+    printQRInTerminal: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
     getMessage: async () => undefined,
   });
   sock.ev.on('creds.update', saveCreds);
