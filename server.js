@@ -514,9 +514,7 @@ app.post('/painel/mesclar', (req, res) => {
   // Mensagem mesclada: unir as duas mensagens formatadas
   const msg1 = (o1.mensagemFormatada||'').trim();
   const msg2 = (o2.mensagemFormatada||'').trim();
-  const mensagemMesclada = msg1 + (msg1 && msg2 ? '
-
-' : '') + msg2;
+  const mensagemMesclada = msg1 + (msg1 && msg2 ? '\n\n' : '') + msg2;
 
   // Atualizar o1 com dados mesclados
   o1.conteudoOriginal  = textosMesclados;
