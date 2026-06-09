@@ -10,6 +10,7 @@ import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
 import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readdir, unlink } from 'fs/promises';
 import QRCode from 'qrcode';
 
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
@@ -333,12 +334,11 @@ async function limparSessaoEReconectar() {
   conectado = false;
   if (sock) { try { sock.end(new Error('bad-session')); } catch(e) {} sock = null; }
   // Remove apenas os arquivos de chave de sessão, mantendo as credenciais
-  const fs = await import('fs/promises');
   try {
-    const arquivos = await fs.readdir(SESSAO_DIR);
+    const arquivos = await readdir(SESSAO_DIR);
     for (const arq of arquivos) {
       if (arq.startsWith('session-') || arq.includes('pre-key') || arq.includes('sender-key')) {
-        await fs.unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+        await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
       }
     }
     console.log('[HEALTH] Arquivos de sessão limpos.');
