@@ -206,8 +206,8 @@ async function classificarItens(itens) {
       'Extraia TODAS as ofertas de passagem aerea presentes neste conteudo. Pode haver UMA ou MAIS emissoes separadas - identifique cada uma individualmente.\n'
       +(item.texto ? 'Texto: '+item.texto+'\n' : '')
       +'\nSe houver multiplas emissoes (ex: separadas por "Oportunidade de resgate" ou rotas diferentes), retorne UMA entrada por emissao no array.\n'
-      +'\nIMPORTANTE sobre datas: normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22". Inclua TODAS as datas listadas.\n'
-      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte.\n'
+      +'\nIMPORTANTE sobre datas: Leia as datas diretamente da IMAGEM se estiverem visíveis nela. Normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22". Inclua TODAS as datas listadas, tanto de ida quanto de volta. Nao deixe datasIda ou datasVolta vazios se as datas estiverem visiveis.\n'
+      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU/REC = Recife, GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte, MAD = Madrid, FOR = Fortaleza, SLZ = São Luís.\n'
       +'\nResponda com este JSON (uma entrada por emissao encontrada):\n'
       +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}\n'
       +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
@@ -546,6 +546,22 @@ app.post('/painel/rejeitar/:id', (req, res) => {
 });
 
 // Mesclar duas ofertas pendentes em uma
+// Injetar texto manualmente no pipeline (simula mensagem recebida)
+app.post('/injetar', async (req, res) => {
+  const { texto } = req.body;
+  if (!texto || !texto.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
+  // Usar um grupoId fictício para injeções manuais
+  const grupoFake = 'injecao_manual';
+  if (!bufferAgrupamento.has(grupoFake)) {
+    const timer = setTimeout(() => processarBuffer(grupoFake), JANELA_AGRUPAMENTO_MS);
+    bufferAgrupamento.set(grupoFake, { itens:[], timer });
+  }
+  const entrada = bufferAgrupamento.get(grupoFake);
+  entrada.itens.push({ texto: texto.trim(), imagemBase64: null, timestamp: Date.now() });
+  console.log('[INJECT] Texto injetado manualmente. Buffer: '+entrada.itens.length+' item(ns)');
+  res.json({ ok:true, bufferItens: entrada.itens.length });
+});
+
 app.post('/painel/mesclar', (req, res) => {
   const { id1, id2 } = req.body;
   if (!id1 || !id2) return res.status(400).json({ ok:false, erro:'ids necessarios.' });
