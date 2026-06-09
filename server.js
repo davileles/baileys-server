@@ -13,6 +13,10 @@ import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { readdir, unlink } from 'fs/promises';
 import QRCode from 'qrcode';
 
+// ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
+process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
+process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
+
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
 const GRUPOS = {
   tsp:         '120363424721106736@g.us',
