@@ -103,26 +103,38 @@ const PROGRAMAS_LINK = {
   'Aeroplan':'https://www.aircanada.com/home/ca/en/aco/flights'
 };
 
+// ── FORMATAR DATAS (quebra de linha por mês) ─────────────────────────────────
+function formatarDatas(str) {
+  if (!str || str === '-') return '-';
+  // Já vem formatado como "Mês/Ano: dias\nMês/Ano: dias" ou tudo numa linha
+  // Garante quebra antes de cada entrada de mês (ex: "Jun/26: 1, 2 Jul/26: 3")
+  var resultado = str
+    .replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1')
+    .replace(/^\n/, '')
+    .trim();
+  return resultado;
+}
+
 function formatarMensagemCDV(d) {
   var n = '\n';
-  var rodape = '`Dica de emissao encontrada por @davileles - Clube do Viajante`';
-  var balcao = '`Faca parte do Balcao clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
+  var rodape = '`Dica de emiss\u00e3o encontrada por @davileles - Clube do Viajante`';
+  var balcao = '`Fa\u00e7a parte do Balc\u00e3o clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
   var cpm = PROGRAMAS_CPM[d.programa] || 0;
   var num = parseInt(String(d.pontos||'0').replace(/[^0-9]/g,'')) || 0;
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
   var link = PROGRAMAS_LINK[d.programa] || '';
-  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Economica') : '';
+  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Econ\u00f4mica') : '';
   var pts = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
   var msg = '';
   msg += '*'+d.origem+' - '+d.destino+' por '+pts+' pontos OU '+valStr+trecho+'*'+n+n;
   msg += rodape+n+n;
-  msg += 'Voce pode comprar essa passagem no Balcao de Milhas CDV por aproximadamente '+valStr+' o trecho + taxa de embarque.'+n+n;
+  msg += 'Voc\u00ea pode comprar essa passagem no Balc\u00e3o de Milhas CDV por aproximadamente '+valStr+' o trecho + taxa de embarque.'+n+n;
   msg += balcao+n+n;
-  msg += '\uD83D\uDEEB *DATAS DE IDA*'+n+(d.datasIda||'-')+n+n;
-  msg += '\uD83D\uDEEC *DATAS DE VOLTA*'+n+(d.datasVolta||'-')+n+n;
+  msg += '\uD83D\uDEEB *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
+  msg += '\uD83D\uDEEC *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
   msg += '\uD83C\uDF9F\uFE0F *PROGRAMA* '+d.programa+n+n;
-  msg += '\u2708\uFE0F *CIA AEREA* '+d.cia+n+n;
+  msg += '\u2708\uFE0F *CIA A\u00c9REA* '+d.cia+n+n;
   msg += '\uD83D\uDD17 *LINK* '+link+n+n;
   msg += rodape;
   return msg;
