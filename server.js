@@ -545,6 +545,49 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   res.json({ ok:true });
 });
 
+// Reprocessar oferta existente com o pipeline atualizado
+app.post('/painel/reprocessar/:id', async (req, res) => {
+  const id = parseInt(req.params.id);
+  const oferta = filaPendentes.find(o => o.id === id && o.status === 'pendente');
+  if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta não encontrada.' });
+
+  try {
+    // Reconstruir itens como se tivessem acabado de chegar
+    const itens = [];
+    // Adicionar imagens como itens separados
+    for (const imgB64 of (oferta.imagens || [])) {
+      itens.push({ texto: oferta.conteudoOriginal || '', imagemBase64: imgB64, timestamp: Date.now() });
+    }
+    // Se não tinha imagem, usar só o texto
+    if (itens.length === 0 && oferta.conteudoOriginal) {
+      itens.push({ texto: oferta.conteudoOriginal, imagemBase64: null, timestamp: Date.now() });
+    }
+    if (itens.length === 0) return res.status(400).json({ ok:false, erro:'Sem conteúdo para reprocessar.' });
+
+    // Rodar o pipeline
+    console.log('[REPROCESS] Reprocessando oferta #'+id+' com '+itens.length+' item(ns)');
+    const classificacoes = await classificarItens(itens);
+    const validas = classificacoes.filter(c => c.valido);
+    if (validas.length === 0) {
+      return res.json({ ok:false, erro:'Nenhuma emissão válida encontrada após reprocessamento.' });
+    }
+    const emissoes = await agruparEFormatar(classificacoes);
+    if (emissoes.length === 0) {
+      return res.json({ ok:false, erro:'Agrupamento retornou 0 emissões.' });
+    }
+    // Atualizar a oferta com a mensagem reprocessada (usa a primeira emissão)
+    oferta.mensagemFormatada = emissoes[0].mensagem;
+    oferta.dadosExtraidos    = emissoes[0];
+    oferta.timestamp         = new Date().toISOString();
+    salvarFila();
+    console.log('[REPROCESS] Oferta #'+id+' reprocessada com sucesso.');
+    res.json({ ok:true, mensagemFormatada: oferta.mensagemFormatada });
+  } catch(e) {
+    console.error('[REPROCESS] Erro:', e.message);
+    res.status(500).json({ ok:false, erro: e.message });
+  }
+});
+
 // Mesclar duas ofertas pendentes em uma
 // Injetar texto manualmente no pipeline (simula mensagem recebida)
 app.post('/injetar', async (req, res) => {
