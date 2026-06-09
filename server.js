@@ -110,7 +110,7 @@ function resolverCidade(codigo, nomeIA) {
 
 // ── CONSTANTES CDV ────────────────────────────────────────────────────────────
 const PROGRAMAS_CPM = {
-  'Smiles':18,'Azul Fidelidade':15,'Azul pelo Mundo':15,
+  'Smiles':16,'Azul Fidelidade':15,'Azul pelo Mundo':15,
   'LATAM Pass':26,'Iberia Plus':58,'Privilege Club':58,
   'Executive Club':58,'TAP':43,'AAdvantage':100,'SUMA':80,
   'Flying Club':50,'Finnair Plus':58,'Aeroplan':50
@@ -148,7 +148,10 @@ function formatarMensagemCDV(d) {
   var rodape = '`Dica de emiss\u00e3o encontrada por @davileles - Clube do Viajante`';
   var balcao = '`Fa\u00e7a parte do Balc\u00e3o clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
   var cpm = PROGRAMAS_CPM[d.programa] || 0;
-  var num = parseInt(String(d.pontos||'0').replace(/[^0-9]/g,'')) || 0;
+  // Sanitizar pontos: remover separadores, garantir numero razoavel (< 5 milhoes)
+  var rawPontos = String(d.pontos||'0').replace(/[.,\s]/g,'');
+  var num = parseInt(rawPontos) || 0;
+  if (num > 5000000) { console.log('[WARN] Pontos suspeitos: '+d.pontos+' -> '+num+'. Ignorando.'); num = 0; }
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
   var link = PROGRAMAS_LINK[d.programa] || '';
