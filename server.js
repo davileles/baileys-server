@@ -98,34 +98,32 @@ const bufferAgrupamento = new Map();
 
 // ── FILA DE ENVIO (intervalo de 5 min entre mensagens) ───────────────────────
 const INTERVALO_ENVIO_MS = 5 * 60 * 1000;
-const filaEnvio = [];       // { ofertaId, mensagem, resolve, reject }
-let enviandoAgora = false;
-
-async function processarFilaEnvio() {
-  if (enviandoAgora || filaEnvio.length === 0) return;
-  enviandoAgora = true;
-  const item = filaEnvio.shift();
-  console.log('[ENVIO] Enviando oferta #'+item.ofertaId+' ('+filaEnvio.length+' na fila)');
-  try {
-    await sock.sendMessage(GRUPOS[GRUPO_DESTINO_PASSAGENS], { text: item.mensagem });
-    item.resolve();
-    console.log('[ENVIO] Oferta #'+item.ofertaId+' enviada. Próximo envio em '+INTERVALO_ENVIO_MS/60000+' min.');
-  } catch(e) {
-    item.reject(e);
-    console.error('[ENVIO] Erro ao enviar oferta #'+item.ofertaId+':', e.message);
-  }
-  if (filaEnvio.length > 0) {
-    setTimeout(() => { enviandoAgora = false; processarFilaEnvio(); }, INTERVALO_ENVIO_MS);
-  } else {
-    enviandoAgora = false;
-  }
-}
+const filaEnvio = [];   // { ofertaId, mensagem, resolve, reject }
+let promessaFila = Promise.resolve(); // cadeia sequencial garantida
 
 function enfileirarEnvio(ofertaId, mensagem) {
   return new Promise((resolve, reject) => {
+    const posicao = filaEnvio.length;
     filaEnvio.push({ ofertaId, mensagem, resolve, reject });
-    console.log('[ENVIO] Oferta #'+ofertaId+' enfileirada. Posição: '+filaEnvio.length+'. Enviando em breve...');
-    processarFilaEnvio();
+    console.log('[ENVIO] Oferta #'+ofertaId+' enfileirada. Posição: '+(posicao+1));
+
+    // Encadeia na promessa atual — garante execução sequencial com delay
+    promessaFila = promessaFila.then(() => new Promise(res => {
+      const item = filaEnvio.shift();
+      if (!item) { res(); return; }
+      console.log('[ENVIO] Enviando oferta #'+item.ofertaId+' ('+filaEnvio.length+' restantes na fila)');
+      sock.sendMessage(GRUPOS[GRUPO_DESTINO_PASSAGENS], { text: item.mensagem })
+        .then(() => {
+          item.resolve();
+          console.log('[ENVIO] Oferta #'+item.ofertaId+' enviada. Aguardando '+INTERVALO_ENVIO_MS/60000+' min...');
+          setTimeout(res, INTERVALO_ENVIO_MS);
+        })
+        .catch(e => {
+          item.reject(e);
+          console.error('[ENVIO] Erro ao enviar oferta #'+item.ofertaId+':', e.message);
+          setTimeout(res, INTERVALO_ENVIO_MS); // aguarda mesmo em erro
+        });
+    }));
   });
 }
 
@@ -277,6 +275,8 @@ async function classificarItens(itens) {
       +'1. Se houver multiplas emissoes no TEXTO (separadas por "Oportunidade de resgate" ou programas/rotas diferentes), retorne UMA entrada por emissao.\n'
       +'2. Se houver IMAGEM junto com texto: a imagem e um screenshot de confirmacao da PRIMEIRA emissao do texto. Use o texto como fonte principal dos dados (programa, milhas, datas). A imagem serve apenas para confirmar dados visuais nao presentes no texto.\n'
       +'3. Priorize SEMPRE os dados do texto sobre os dados da imagem quando houver conflito.\n'
+      +'4. DESCARTE imagens que sejam apenas screenshots de resultado de busca sem lista de datas explícita. Para uma imagem ser válida como emissão independente ela DEVE conter: origem, destino, programa/milhas E lista de datas. Se a imagem mostrar apenas o resultado de uma busca (ex: tela de seleção de voo sem datas listadas), descarte-a — ela é apenas uma confirmação visual de outra emissão.\n'
+      +'5. Textos válidos como emissão DEVEM conter: programa de fidelidade, origem, destino, cabine E lista de datas. Textos sem lista de datas não são emissões válidas.\n'
       +'\nIMPORTANTE sobre datas: Use as datas do TEXTO quando disponiveis. So leia datas da imagem se o texto nao tiver datas. Normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22".\n'
       +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte, MAD = Madrid, FOR = Fortaleza, SLZ = São Luís, JPA = João Pessoa, SSA = Salvador, NAT = Natal, MCZ = Maceió, REC = Recife, POA = Porto Alegre, CWB = Curitiba, BSB = Brasília.\n'
       +'CRITICO: use SEMPRE o codigo IATA do texto quando disponivel. Nunca substitua o codigo IATA correto por outro.\n'
@@ -656,7 +656,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   if (!oferta)             return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   const mensagem = req.body.mensagem || oferta.mensagemFormatada;
-  const posicao  = filaEnvio.length + (enviandoAgora ? 1 : 0);
+  const posicao  = filaEnvio.length;
   const tempoMin = posicao * (INTERVALO_ENVIO_MS / 60000);
   try {
     oferta.status = 'aprovado';
@@ -771,7 +771,7 @@ app.post('/enviar', async (req, res) => {
   // Se for envio para cdv_emissao, usar fila com intervalo de 5 min
   const isEmissao = grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
   if (isEmissao) {
-    const posicao = filaEnvio.length + (enviandoAgora ? 1 : 0);
+    const posicao = filaEnvio.length;
     const tempoMin = posicao * (INTERVALO_ENVIO_MS / 60000);
     try {
       res.json({ ok:true, posicao, tempoMin: tempoMin > 0 ? tempoMin : 0 });
