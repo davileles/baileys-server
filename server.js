@@ -278,7 +278,8 @@ async function classificarItens(itens) {
       +'2. Se houver IMAGEM junto com texto: a imagem e um screenshot de confirmacao da PRIMEIRA emissao do texto. Use o texto como fonte principal dos dados (programa, milhas, datas). A imagem serve apenas para confirmar dados visuais nao presentes no texto.\n'
       +'3. Priorize SEMPRE os dados do texto sobre os dados da imagem quando houver conflito.\n'
       +'\nIMPORTANTE sobre datas: Use as datas do TEXTO quando disponiveis. So leia datas da imagem se o texto nao tiver datas. Normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22".\n'
-      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte, MAD = Madrid, FOR = Fortaleza, SLZ = São Luís.\n'
+      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte, MAD = Madrid, FOR = Fortaleza, SLZ = São Luís, JPA = João Pessoa, SSA = Salvador, NAT = Natal, MCZ = Maceió, REC = Recife, POA = Porto Alegre, CWB = Curitiba, BSB = Brasília.\n'
+      +'CRITICO: use SEMPRE o codigo IATA do texto quando disponivel. Nunca substitua o codigo IATA correto por outro.\n'
       +'\nResponda com este JSON (uma entrada por emissao encontrada):\n'
       +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}\n'
       +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
@@ -672,10 +673,12 @@ app.post('/painel/reprocessar/:id', async (req, res) => {
 app.post('/painel/mesclar', (req, res) => {
   const { id1, id2 } = req.body;
   if (!id1 || !id2) return res.status(400).json({ ok:false, erro:'ids necessarios.' });
-  const o1 = filaPendentes.find(o => o.id===id1 && o.status==='pendente');
-  const o2 = filaPendentes.find(o => o.id===id2 && o.status==='pendente');
+  const o1 = filaPendentes.find(o => String(o.id)===String(id1) && o.status==='pendente');
+  const o2 = filaPendentes.find(o => String(o.id)===String(id2) && o.status==='pendente');
   if (!o1 || !o2) return res.status(404).json({ ok:false, erro:'Uma ou ambas ofertas nao encontradas ou ja processadas.' });
-  const textosMesclados  = [...(o1.conteudoOriginal||[]), ...(o2.conteudoOriginal||[])];
+  // conteudoOriginal pode ser string ou array — normalizar para array
+  const toArray = v => Array.isArray(v) ? v : (v ? [v] : []);
+  const textosMesclados  = [...toArray(o1.conteudoOriginal), ...toArray(o2.conteudoOriginal)];
   const imagensMescladas = [...(o1.imagens||[]), ...(o2.imagens||[])];
   const msg1 = (o1.mensagemFormatada||'').trim();
   const msg2 = (o2.mensagemFormatada||'').trim();
