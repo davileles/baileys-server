@@ -26,13 +26,32 @@ const GRUPOS = {
   cdv_ofertas: '120363423014138662@g.us',
   cdv_emissao: '120363172490263905@g.us',
 };
-const GRUPOS_MONITORADOS      = ['120363427512561555@g.us','120363409136599326@g.us','120363410708080270@g.us'];
+const GRUPOS_MONITORADOS      = [
+  '120363427512561555@g.us',
+  '120363409136599326@g.us',
+  '120363410708080270@g.us',
+  '120363229600818869@g.us',
+  '120363298361885116@g.us',
+  '120363301488379027@g.us',
+  '120363230402728347@g.us',
+  '120363229682219999@g.us',
+  '120363212151306916@g.us',
+  '120363318399199070@g.us',
+  '120363230586056001@g.us',
+];
 const GRUPO_DESTINO_PASSAGENS = 'cdv_emissao';
 const JANELA_AGRUPAMENTO_MS   = 3 * 60 * 1000;
 
 // Filtro de datas mínimas por grupo (grupos não listados = sem filtro)
 const GRUPOS_FILTRO_DATAS_MIN = {
-  // 'XXXX@g.us': 5,  // adicionar grupos com filtro aqui
+  '120363229600818869@g.us': 5,
+  '120363298361885116@g.us': 5,
+  '120363301488379027@g.us': 5,
+  '120363230402728347@g.us': 5,
+  '120363229682219999@g.us': 5,
+  '120363212151306916@g.us': 5,
+  '120363318399199070@g.us': 5,
+  '120363230586056001@g.us': 5,
 };
 
 const PORT          = process.env.PORT || 3001;
