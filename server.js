@@ -360,8 +360,7 @@ async function processarBuffer(grupoId) {
 async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
-    const fromMe = msg.key.fromMe;
-    if (fromMe) return;
+    // fromMe removido: mensagens enviadas pelo próprio número também são monitoradas
     if (!GRUPOS_MONITORADOS.includes(jid)) return;
     const m    = msg.message;
     const tipo = Object.keys(m || {})[0];
