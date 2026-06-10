@@ -91,7 +91,7 @@ const filaPendentes = [];
 carregarFila();
 // Iniciar contadorId após o maior ID já existente para evitar colisões
 let contadorId = filaPendentes.length > 0
-  ? Math.max(...filaPendentes.map(o => o.id || 0)) + 1
+  ? filaPendentes.reduce((max, o) => Math.max(max, parseInt(o.id)||0), 0) + 1
   : 1;
 console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
 const bufferAgrupamento = new Map();
@@ -605,8 +605,19 @@ app.post('/api/claude', async (req, res) => {
 });
 
 app.get('/painel-json', (req, res) => {
-  const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ ok:true, bufferAtivo:emBuffer, ofertas:filaPendentes.slice(0,50) });
+  try {
+    const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
+    // Sanitizar ofertas para evitar erros de serialização
+    const ofertas = filaPendentes.slice(0,50).map(o => ({
+      ...o,
+      conteudoOriginal: typeof o.conteudoOriginal === 'string' ? o.conteudoOriginal : (Array.isArray(o.conteudoOriginal) ? o.conteudoOriginal.join('\n') : ''),
+      imagens: Array.isArray(o.imagens) ? o.imagens : [],
+    }));
+    res.json({ ok:true, bufferAtivo:emBuffer, ofertas });
+  } catch(e) {
+    console.error('[PAINEL-JSON] Erro:', e.message);
+    res.status(500).json({ ok:false, erro: e.message });
+  }
 });
 
 app.post('/painel/aprovar/:id', async (req, res) => {
