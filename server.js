@@ -89,8 +89,45 @@ function salvarFila() {
 
 const filaPendentes = [];
 carregarFila();
-let contadorId          = 1;
+// Iniciar contadorId após o maior ID já existente para evitar colisões
+let contadorId = filaPendentes.length > 0
+  ? Math.max(...filaPendentes.map(o => o.id || 0)) + 1
+  : 1;
+console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
 const bufferAgrupamento = new Map();
+
+// ── FILA DE ENVIO (intervalo de 5 min entre mensagens) ───────────────────────
+const INTERVALO_ENVIO_MS = 5 * 60 * 1000;
+const filaEnvio = [];       // { ofertaId, mensagem, resolve, reject }
+let enviandoAgora = false;
+
+async function processarFilaEnvio() {
+  if (enviandoAgora || filaEnvio.length === 0) return;
+  enviandoAgora = true;
+  const item = filaEnvio.shift();
+  console.log('[ENVIO] Enviando oferta #'+item.ofertaId+' ('+filaEnvio.length+' na fila)');
+  try {
+    await sock.sendMessage(GRUPOS[GRUPO_DESTINO_PASSAGENS], { text: item.mensagem });
+    item.resolve();
+    console.log('[ENVIO] Oferta #'+item.ofertaId+' enviada. Próximo envio em '+INTERVALO_ENVIO_MS/60000+' min.');
+  } catch(e) {
+    item.reject(e);
+    console.error('[ENVIO] Erro ao enviar oferta #'+item.ofertaId+':', e.message);
+  }
+  if (filaEnvio.length > 0) {
+    setTimeout(() => { enviandoAgora = false; processarFilaEnvio(); }, INTERVALO_ENVIO_MS);
+  } else {
+    enviandoAgora = false;
+  }
+}
+
+function enfileirarEnvio(ofertaId, mensagem) {
+  return new Promise((resolve, reject) => {
+    filaEnvio.push({ ofertaId, mensagem, resolve, reject });
+    console.log('[ENVIO] Oferta #'+ofertaId+' enfileirada. Posição: '+filaEnvio.length+'. Enviando em breve...');
+    processarFilaEnvio();
+  });
+}
 
 function resolverGrupo(chave) {
   return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
@@ -577,12 +614,19 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   if (!oferta)             return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   const mensagem = req.body.mensagem || oferta.mensagemFormatada;
+  const posicao  = filaEnvio.length + (enviandoAgora ? 1 : 0);
+  const tempoMin = posicao * (INTERVALO_ENVIO_MS / 60000);
   try {
-    await sock.sendMessage(GRUPOS[GRUPO_DESTINO_PASSAGENS], { text:mensagem });
     oferta.status = 'aprovado';
+    oferta.mensagemFinal = mensagem;
     salvarFila();
-    res.json({ ok:true });
-  } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
+    // Retornar imediatamente com posição na fila
+    res.json({ ok:true, posicao, tempoMin: tempoMin > 0 ? tempoMin : 0 });
+    // Enfileirar o envio (assíncrono)
+    await enfileirarEnvio(oferta.id, mensagem);
+  } catch(err) {
+    console.error('[APROVAR] Erro no envio:', err.message);
+  }
 });
 
 app.post('/painel/rejeitar/:id', (req, res) => {
@@ -666,8 +710,20 @@ app.post('/enviar', async (req, res) => {
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
-  try { await sock.sendMessage(grupoId, { text:mensagem }); res.json({ ok:true }); }
-  catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
+
+  // Se for envio para cdv_emissao, usar fila com intervalo de 5 min
+  const isEmissao = grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
+  if (isEmissao) {
+    const posicao = filaEnvio.length + (enviandoAgora ? 1 : 0);
+    const tempoMin = posicao * (INTERVALO_ENVIO_MS / 60000);
+    try {
+      res.json({ ok:true, posicao, tempoMin: tempoMin > 0 ? tempoMin : 0 });
+      await enfileirarEnvio('manual', mensagem);
+    } catch(err) { console.error('[ENVIAR] Erro no envio:', err.message); }
+  } else {
+    try { await sock.sendMessage(grupoId, { text:mensagem }); res.json({ ok:true }); }
+    catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
+  }
 });
 
 app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
