@@ -236,12 +236,16 @@ async function classificarItens(itens) {
     content.push({ type:'text', text:
       'Extraia TODAS as ofertas de passagem aerea presentes neste conteudo. Pode haver UMA ou MAIS emissoes separadas - identifique cada uma individualmente.\n'
       +(item.texto ? 'Texto: '+item.texto+'\n' : '')
-      +'\nSe houver multiplas emissoes (ex: separadas por "Oportunidade de resgate" ou rotas diferentes), retorne UMA entrada por emissao no array.\n'
-      +'\nIMPORTANTE sobre datas: Leia as datas diretamente da IMAGEM se estiverem visíveis nela. Normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22". Inclua TODAS as datas listadas, tanto de ida quanto de volta. Nao deixe datasIda ou datasVolta vazios se as datas estiverem visiveis.\n'
-      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU/REC = Recife, GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte, MAD = Madrid, FOR = Fortaleza, SLZ = São Luís.\n'
+      +'\nREGRAS DE EXTRACAO:\n'
+      +'1. Se houver multiplas emissoes no TEXTO (separadas por "Oportunidade de resgate" ou programas/rotas diferentes), retorne UMA entrada por emissao.\n'
+      +'2. Se houver IMAGEM junto com texto: a imagem e um screenshot de confirmacao da PRIMEIRA emissao do texto. Use o texto como fonte principal dos dados (programa, milhas, datas). A imagem serve apenas para confirmar dados visuais nao presentes no texto.\n'
+      +'3. Priorize SEMPRE os dados do texto sobre os dados da imagem quando houver conflito.\n'
+      +'\nIMPORTANTE sobre datas: Use as datas do TEXTO quando disponiveis. So leia datas da imagem se o texto nao tiver datas. Normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22".\n'
+      +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA. Ex: GRU = São Paulo, GIG = Rio de Janeiro, CUN = Cancún, SCL = Santiago, LIM = Lima, CNF = Belo Horizonte, MAD = Madrid, FOR = Fortaleza, SLZ = São Luís.\n'
       +'\nResponda com este JSON (uma entrada por emissao encontrada):\n'
       +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}\n'
       +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
+      +'IMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade. Utilize sempre o nome exato da lista acima.\n'
       +'Cabine deve ser exatamente "Economica" ou "Executiva".\n'
       +'Se NAO houver nenhuma passagem aerea retorne: {"resultados":[{"valido":false,"indice":'+i+'}]}'
     });
@@ -272,8 +276,12 @@ async function agruparEFormatar(classificacoes) {
 
   const system = 'Voce e especialista em passagens aereas. Agrupe trechos da mesma emissao. Responda APENAS JSON sem markdown.';
   const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao.\n\n'
-    +'Criterios para pertencer ao MESMO grupo: mesmo programa, mesmas milhas, mesma companhia, mesma cabine, rotas complementares (ex: ida e volta da mesma viagem).\n\n'
-    +'IMPORTANTE: cabine Economica e cabine Executiva sao emissoes DIFERENTES e devem ser grupos SEPARADOS, mesmo que todos os outros dados sejam iguais.\n\n'
+    +'Criterios para pertencer ao MESMO grupo: mesmo programa, mesmas milhas (valores proximos), mesma companhia aerea, mesma cabine, rotas complementares (ex: ida e volta da mesma viagem).\n\n'
+    +'REGRAS DE SEPARACAO OBRIGATORIA — sempre crie grupos SEPARADOS quando:\n'
+    +'- Programas diferentes (ex: LATAM Pass e Smiles = SEPARADOS)\n'
+    +'- Companhias aereas diferentes\n'
+    +'- Cabines diferentes (Economica vs Executiva)\n'
+    +'- Rotas sem relacao de ida/volta (ex: CNF->SCL e GRU->MIA = SEPARADOS)\n\n'
     +'IMPORTANTE para pontos: use SEMPRE o MENOR valor numerico entre os trechos. Nunca concatene valores. Ex: se ida=72700 e volta=70300, pontos=70300.\n\n'
     +'Ofertas:\n'+JSON.stringify(validas,null,2)+'\n\n'
     +'Responda:\n{"emissoes":[{"indices":[0,1],"tipo":"ida_volta","origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":70300,"cabine":"Economica","tipoVoo":"internacional","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
@@ -390,6 +398,9 @@ async function processarMensagem(msg) {
       console.log('Janela de '+JANELA_AGRUPAMENTO_MS/60000+' min iniciada');
     }
     const entrada = bufferAgrupamento.get(jid);
+
+    // Cada mensagem entra como item independente no buffer.
+    // Imagens sem caption são emissões independentes (não anexar ao texto existente).
     entrada.itens.push({ texto, imagemBase64:imagemB64, timestamp:Date.now() });
     console.log('Buffer: '+entrada.itens.length+' item(ns)');
   } catch(err) { console.error('Erro ao processar mensagem:', err.message); }
