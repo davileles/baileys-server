@@ -30,6 +30,11 @@ const GRUPOS_MONITORADOS      = ['120363427512561555@g.us','120363409136599326@g
 const GRUPO_DESTINO_PASSAGENS = 'cdv_emissao';
 const JANELA_AGRUPAMENTO_MS   = 3 * 60 * 1000;
 
+// Filtro de datas mínimas por grupo (grupos não listados = sem filtro)
+const GRUPOS_FILTRO_DATAS_MIN = {
+  // 'XXXX@g.us': 5,  // adicionar grupos com filtro aqui
+};
+
 const PORT          = process.env.PORT || 3001;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const SESSAO_DIR    = './sessao';
@@ -47,7 +52,6 @@ let conectado = false;
 let qrAtual   = null;
 const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
 
-// Carregar fila persistida ao iniciar
 function carregarFila() {
   try {
     if (existsSync(FILA_PATH)) {
@@ -131,11 +135,17 @@ const PROGRAMAS_LINK = {
   'Aeroplan':'https://www.aircanada.com/home/ca/en/aco/flights'
 };
 
+// ── CONTAR DATAS TOTAIS ───────────────────────────────────────────────────────
+function contarDatas(datasStr) {
+  if (!datasStr || datasStr === '-') return 0;
+  // Conta números separados por vírgula/espaço nas datas
+  const matches = datasStr.match(/\b\d{1,2}\b/g);
+  return matches ? matches.length : 0;
+}
+
 // ── FORMATAR DATAS (quebra de linha por mês) ─────────────────────────────────
 function formatarDatas(str) {
   if (!str || str === '-') return '-';
-  // Já vem formatado como "Mês/Ano: dias\nMês/Ano: dias" ou tudo numa linha
-  // Garante quebra antes de cada entrada de mês (ex: "Jun/26: 1, 2 Jul/26: 3")
   var resultado = str
     .replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1')
     .replace(/^\n/, '')
@@ -148,7 +158,6 @@ function formatarMensagemCDV(d) {
   var rodape = '`Dica de emiss\u00e3o encontrada por @davileles - Clube do Viajante`';
   var balcao = '`Fa\u00e7a parte do Balc\u00e3o clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
   var cpm = PROGRAMAS_CPM[d.programa] || 0;
-  // Sanitizar pontos: remover separadores, garantir numero razoavel (< 5 milhoes)
   var rawPontos = String(d.pontos||'0').replace(/[.,\s]/g,'');
   var num = parseInt(rawPontos) || 0;
   if (num > 5000000) { console.log('[WARN] Pontos suspeitos: '+d.pontos+' -> '+num+'. Ignorando.'); num = 0; }
@@ -221,7 +230,6 @@ async function classificarItens(itens) {
     const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:i }]);
     for (const r of lista) {
       if (r?.valido) {
-        // resolver cidade via tabela local, sobrepondo o que a IA retornou
         r.origem  = resolverCidade(r.origemCodigo,  r.origem);
         r.destino = resolverCidade(r.destinoCodigo, r.destino);
       }
@@ -247,14 +255,13 @@ async function agruparEFormatar(classificacoes) {
   const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao.\n\n'
     +'Criterios para pertencer ao MESMO grupo: mesmo programa, mesmas milhas, mesma companhia, mesma cabine, rotas complementares (ex: ida e volta da mesma viagem).\n\n'
     +'IMPORTANTE: cabine Economica e cabine Executiva sao emissoes DIFERENTES e devem ser grupos SEPARADOS, mesmo que todos os outros dados sejam iguais.\n\n'
+    +'IMPORTANTE para pontos: use SEMPRE o MENOR valor numerico entre os trechos. Nunca concatene valores. Ex: se ida=72700 e volta=70300, pontos=70300.\n\n'
     +'Ofertas:\n'+JSON.stringify(validas,null,2)+'\n\n'
-    +'Responda:\n{"emissoes":[{"indices":[0,1],"tipo":"ida_volta","origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
+    +'Responda:\n{"emissoes":[{"indices":[0,1],"tipo":"ida_volta","origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":70300,"cabine":"Economica","tipoVoo":"internacional","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 
   const resultado = await chamarClaude(system, [{ type:'text', text:prompt }], 4096);
   const emissoes  = resultado?.emissoes || [];
 
-  // Fallback: se a IA retornou 0 emissoes mas havia itens validos,
-  // criar uma emissao individual para cada item (rotas diferentes na mesma janela)
   if (emissoes.length === 0) {
     console.log('   Fallback: criando emissao individual para cada item valido');
     return validas.map(v => {
@@ -284,6 +291,28 @@ async function processarBuffer(grupoId) {
     const validas = classificacoes.filter(c => c?.valido);
     console.log('   '+validas.length+'/'+itens.length+' validos');
     if (validas.length === 0) { console.log('Nenhuma oferta encontrada.'); return; }
+
+    // Aplicar filtro de datas mínimas se configurado para esse grupo
+    const minDatas = GRUPOS_FILTRO_DATAS_MIN[grupoId];
+    if (minDatas) {
+      const validasFiltradas = validas.filter(v => {
+        const total = contarDatas(v.datasIda) + contarDatas(v.datasVolta);
+        if (total <= minDatas) {
+          console.log('   [FILTRO] Emissão descartada por poucas datas ('+total+' <= '+minDatas+'): '+v.origemCodigo+'->'+v.destinoCodigo);
+          return false;
+        }
+        return true;
+      });
+      if (validasFiltradas.length === 0) {
+        console.log('   [FILTRO] Todas emissões descartadas por poucas datas.');
+        return;
+      }
+      // Substituir validas no array de classificacoes
+      classificacoes.forEach(c => {
+        if (c?.valido && !validasFiltradas.includes(c)) c.valido = false;
+      });
+    }
+
     console.log('Passo 2: agrupando...');
     const emissoes = await agruparEFormatar(classificacoes);
     console.log('   '+emissoes.length+' emissao(oes)');
@@ -320,14 +349,11 @@ async function processarMensagem(msg) {
         console.log('[IMG] Baixada: '+(imagemB64.length/1024).toFixed(0)+'KB, caption="'+texto+'"');
       } catch(e) {
         console.error('[IMG] Erro ao baixar imagem:', e.message);
-        // Se download falhou mas n\u00e3o h\u00e1 caption, usa placeholder para n\u00e3o descartar
         if (!texto) texto = '[imagem sem legenda]';
       }
     } else { return; }
-    // Descarta apenas se n\u00e3o houver nenhum conte\u00fado
     if (!texto && !imagemB64) return;
 
-    // ignorar mensagens que já são alertas CDV formatados
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
       texto.includes('Dica de emissão encontrada por @davileles') ||
@@ -351,9 +377,7 @@ async function processarMensagem(msg) {
 }
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
-
-// Health check: se ficar X minutos sem nenhum evento, força reconexão
-var HEALTH_CHECK_MS  = 8 * 60 * 1000; // 8 minutos sem nenhum upsert = suspeito
+var HEALTH_CHECK_MS  = 8 * 60 * 1000;
 var ultimoUpsert     = Date.now();
 var healthTimer      = null;
 
@@ -371,15 +395,13 @@ function resetarHealthTimer() {
   }, HEALTH_CHECK_MS);
 }
 
-// Contador de erros de descriptografia (closed: -1 / bad_mac)
 var errosDescripto   = 0;
-var ERROS_DESCR_MAX  = 15; // após 15 erros, limpa sessão e reconecta
+var ERROS_DESCR_MAX  = 15;
 
 async function limparSessaoEReconectar() {
   console.log('[HEALTH] Muitos erros de descriptografia. Limpando sessão e reconectando...');
   conectado = false;
   if (sock) { try { sock.end(new Error('bad-session')); } catch(e) {} sock = null; }
-  // Remove apenas os arquivos de chave de sessão, mantendo as credenciais
   try {
     const arquivos = await readdir(SESSAO_DIR);
     for (const arq of arquivos) {
@@ -434,15 +456,11 @@ async function conectar() {
     }
   });
 
-  // Captura erros de descriptografia (closed: -1 / bad_mac)
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    // Resetar health timer a cada evento recebido
     if (conectado) resetarHealthTimer();
-
     console.log('upsert: type='+type+' qtd='+messages.length+' jids='+messages.map(m=>m.key.remoteJid).join(','));
     if (type !== 'notify') return;
     for (const msg of messages) {
-      // Detectar mensagens que falharam na descriptografia
       if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
         errosDescripto++;
         console.log('[HEALTH] Erro de descriptografia #'+errosDescripto+'/'+ERROS_DESCR_MAX);
@@ -456,7 +474,6 @@ async function conectar() {
     }
   });
 
-  // Iniciar health check
   resetarHealthTimer();
 }
 
@@ -548,37 +565,25 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   res.json({ ok:true });
 });
 
-// Reprocessar oferta existente com o pipeline atualizado
 app.post('/painel/reprocessar/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => o.id === id && o.status === 'pendente');
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta não encontrada.' });
-
   try {
-    // Reconstruir itens como se tivessem acabado de chegar
     const itens = [];
-    // Adicionar imagens como itens separados
     for (const imgB64 of (oferta.imagens || [])) {
       itens.push({ texto: oferta.conteudoOriginal || '', imagemBase64: imgB64, timestamp: Date.now() });
     }
-    // Se não tinha imagem, usar só o texto
     if (itens.length === 0 && oferta.conteudoOriginal) {
       itens.push({ texto: oferta.conteudoOriginal, imagemBase64: null, timestamp: Date.now() });
     }
     if (itens.length === 0) return res.status(400).json({ ok:false, erro:'Sem conteúdo para reprocessar.' });
-
-    // Rodar o pipeline
     console.log('[REPROCESS] Reprocessando oferta #'+id+' com '+itens.length+' item(ns)');
     const classificacoes = await classificarItens(itens);
     const validas = classificacoes.filter(c => c.valido);
-    if (validas.length === 0) {
-      return res.json({ ok:false, erro:'Nenhuma emissão válida encontrada após reprocessamento.' });
-    }
+    if (validas.length === 0) return res.json({ ok:false, erro:'Nenhuma emissão válida encontrada.' });
     const emissoes = await agruparEFormatar(classificacoes);
-    if (emissoes.length === 0) {
-      return res.json({ ok:false, erro:'Agrupamento retornou 0 emissões.' });
-    }
-    // Atualizar a oferta com a mensagem reprocessada (usa a primeira emissão)
+    if (emissoes.length === 0) return res.json({ ok:false, erro:'Agrupamento retornou 0 emissões.' });
     oferta.mensagemFormatada = emissoes[0].mensagem;
     oferta.dadosExtraidos    = emissoes[0];
     oferta.timestamp         = new Date().toISOString();
@@ -591,12 +596,30 @@ app.post('/painel/reprocessar/:id', async (req, res) => {
   }
 });
 
-// Mesclar duas ofertas pendentes em uma
-// Injetar texto manualmente no pipeline (simula mensagem recebida)
+app.post('/painel/mesclar', (req, res) => {
+  const { id1, id2 } = req.body;
+  if (!id1 || !id2) return res.status(400).json({ ok:false, erro:'ids necessarios.' });
+  const o1 = filaPendentes.find(o => o.id===id1 && o.status==='pendente');
+  const o2 = filaPendentes.find(o => o.id===id2 && o.status==='pendente');
+  if (!o1 || !o2) return res.status(404).json({ ok:false, erro:'Uma ou ambas ofertas nao encontradas ou ja processadas.' });
+  const textosMesclados  = [...(o1.conteudoOriginal||[]), ...(o2.conteudoOriginal||[])];
+  const imagensMescladas = [...(o1.imagens||[]), ...(o2.imagens||[])];
+  const msg1 = (o1.mensagemFormatada||'').trim();
+  const msg2 = (o2.mensagemFormatada||'').trim();
+  const mensagemMesclada = msg1 + (msg1 && msg2 ? '\n\n' : '') + msg2;
+  o1.conteudoOriginal  = textosMesclados;
+  o1.imagens           = imagensMescladas;
+  o1.mensagemFormatada = mensagemMesclada;
+  o1.tipoConteudo      = 'mesclado';
+  o1.timestamp         = new Date().toISOString();
+  o2.status = 'mesclado';
+  salvarFila();
+  res.json({ ok:true, id: o1.id, mensagemMesclada });
+});
+
 app.post('/injetar', async (req, res) => {
   const { texto } = req.body;
   if (!texto || !texto.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
-  // Usar um grupoId fictício para injeções manuais
   const grupoFake = 'injecao_manual';
   if (!bufferAgrupamento.has(grupoFake)) {
     const timer = setTimeout(() => processarBuffer(grupoFake), JANELA_AGRUPAMENTO_MS);
@@ -606,35 +629,6 @@ app.post('/injetar', async (req, res) => {
   entrada.itens.push({ texto: texto.trim(), imagemBase64: null, timestamp: Date.now() });
   console.log('[INJECT] Texto injetado manualmente. Buffer: '+entrada.itens.length+' item(ns)');
   res.json({ ok:true, bufferItens: entrada.itens.length });
-});
-
-app.post('/painel/mesclar', (req, res) => {
-  const { id1, id2 } = req.body;
-  if (!id1 || !id2) return res.status(400).json({ ok:false, erro:'ids necessarios.' });
-  const o1 = filaPendentes.find(o => o.id===id1 && o.status==='pendente');
-  const o2 = filaPendentes.find(o => o.id===id2 && o.status==='pendente');
-  if (!o1 || !o2) return res.status(404).json({ ok:false, erro:'Uma ou ambas ofertas nao encontradas ou ja processadas.' });
-
-  // Combinar conteudo: texto + imagens de ambas
-  const textosMesclados  = [...(o1.conteudoOriginal||[]), ...(o2.conteudoOriginal||[])];
-  const imagensMescladas = [...(o1.imagens||[]), ...(o2.imagens||[])];
-
-  // Mensagem mesclada: unir as duas mensagens formatadas
-  const msg1 = (o1.mensagemFormatada||'').trim();
-  const msg2 = (o2.mensagemFormatada||'').trim();
-  const mensagemMesclada = msg1 + (msg1 && msg2 ? '\n\n' : '') + msg2;
-
-  // Atualizar o1 com dados mesclados
-  o1.conteudoOriginal  = textosMesclados;
-  o1.imagens           = imagensMescladas;
-  o1.mensagemFormatada = mensagemMesclada;
-  o1.tipoConteudo      = 'mesclado';
-  o1.timestamp         = new Date().toISOString();
-
-  // Marcar o2 como mesclado (removido)
-  o2.status = 'mesclado';
-  salvarFila();
-  res.json({ ok:true, id: o1.id, mensagemMesclada });
 });
 
 app.post('/enviar', async (req, res) => {
@@ -663,7 +657,7 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
 });
 
 app.get('/grupos', async (req, res) => {
-  if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  if (!sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   try {
     const chats  = await sock.groupFetchAllParticipating();
     const grupos = Object.values(chats).map(g => ({ id:g.id, nome:g.subject||'(sem nome)' })).sort((a,b) => a.nome.localeCompare(b.nome,'pt-BR'));
