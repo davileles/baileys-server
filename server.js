@@ -312,6 +312,34 @@ async function agruparEFormatar(classificacoes) {
     return [{ indices:[v.indice], tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) }];
   }
 
+  // Pré-agrupamento determinístico: separar por programa + cabine + par de cidades
+  // Evita que a IA agrupe rotas diferentes como "Múltiplos destinos"
+  const grupos = new Map();
+  for (const v of validas) {
+    const cidadeA = [v.origemCodigo||v.origem, v.destinoCodigo||v.destino].sort().join('-');
+    const cidadeB = [v.destinoCodigo||v.destino, v.origemCodigo||v.origem].sort().join('-');
+    const chave = (v.programa||'') + '|' + (v.cabine||'Economica') + '|' + cidadeA;
+    if (!grupos.has(chave)) grupos.set(chave, []);
+    grupos.get(chave).push(v);
+  }
+
+  // Se há rotas diferentes (múltiplas chaves), criar emissão individual por grupo
+  if (grupos.size > 1) {
+    console.log('   Pré-agrupamento: '+grupos.size+' grupos distintos detectados — criando emissões separadas');
+    const resultado = [];
+    for (const [chave, items] of grupos) {
+      // Para cada grupo, usar o item com mais datas (ou o primeiro)
+      const v = items.reduce((best, cur) => {
+        const dBest = contarDatas((best.datasIda||'') + ' ' + (best.datasVolta||''));
+        const dCur  = contarDatas((cur.datasIda||'') + ' ' + (cur.datasVolta||''));
+        return dCur > dBest ? cur : best;
+      }, items[0]);
+      const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+      resultado.push({ indices:items.map(i=>i.indice), tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) });
+    }
+    return resultado;
+  }
+
   const system = 'Voce e especialista em passagens aereas. Agrupe trechos da mesma emissao. Responda APENAS JSON sem markdown.';
   const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao.\n\n'
     +'Criterios para pertencer ao MESMO grupo: mesmo programa, mesmas milhas (valores proximos), mesma companhia aerea, mesma cabine, rotas complementares (ex: ida e volta da mesma viagem).\n\n'
@@ -430,16 +458,18 @@ async function processarMensagem(msg) {
 
     console.log('Mensagem capturada de '+jid+' ('+tipo+')');
     if (!bufferAgrupamento.has(jid)) {
-      const timer = setTimeout(() => processarBuffer(jid), JANELA_AGRUPAMENTO_MS);
-      bufferAgrupamento.set(jid, { itens:[], timer });
-      console.log('Janela de '+JANELA_AGRUPAMENTO_MS/60000+' min iniciada');
+      bufferAgrupamento.set(jid, { itens:[], timer:null });
+      console.log('Janela deslizante iniciada para '+jid);
     }
     const entrada = bufferAgrupamento.get(jid);
 
+    // Janela deslizante: cada nova mensagem reinicia o timer de 3 min
+    if (entrada.timer) clearTimeout(entrada.timer);
+    entrada.timer = setTimeout(() => processarBuffer(jid), JANELA_AGRUPAMENTO_MS);
+
     // Cada mensagem entra como item independente no buffer.
-    // Imagens sem caption são emissões independentes (não anexar ao texto existente).
     entrada.itens.push({ texto, imagemBase64:imagemB64, timestamp:Date.now() });
-    console.log('Buffer: '+entrada.itens.length+' item(ns)');
+    console.log('Buffer: '+entrada.itens.length+' item(ns) | timer reiniciado (+'+JANELA_AGRUPAMENTO_MS/60000+' min)');
   } catch(err) { console.error('Erro ao processar mensagem:', err.message); }
 }
 
@@ -702,6 +732,19 @@ app.post('/painel/mesclar', (req, res) => {
   o2.status = 'mesclado';
   salvarFila();
   res.json({ ok:true, id: o1.id, mensagemMesclada });
+});
+
+// Limpar fila — remove todas as ofertas pendentes presas
+app.post('/painel/limpar', (req, res) => {
+  const { confirmar } = req.body;
+  if (confirmar !== 'sim') return res.status(400).json({ ok:false, erro:'Envie { "confirmar": "sim" } para confirmar.' });
+  const antes = filaPendentes.length;
+  // Marcar todas as pendentes como rejeitadas
+  filaPendentes.forEach(o => { if (o.status === 'pendente') o.status = 'rejeitado'; });
+  salvarFila();
+  const depois = filaPendentes.filter(o => o.status === 'pendente').length;
+  console.log('[LIMPAR] '+antes+' ofertas, '+depois+' pendentes restantes.');
+  res.json({ ok:true, antes, depois });
 });
 
 app.post('/injetar', async (req, res) => {
