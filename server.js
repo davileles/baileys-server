@@ -610,7 +610,7 @@ app.get('/painel-json', (req, res) => {
 
 app.post('/painel/aprovar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
-  const oferta = filaPendentes.find(o => o.id===id);
+  const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta)             return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   const mensagem = req.body.mensagem || oferta.mensagemFormatada;
@@ -631,7 +631,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
 app.post('/painel/rejeitar/:id', (req, res) => {
   const id     = parseInt(req.params.id);
-  const oferta = filaPendentes.find(o => o.id===id);
+  const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   oferta.status = 'rejeitado';
   salvarFila();
@@ -640,7 +640,7 @@ app.post('/painel/rejeitar/:id', (req, res) => {
 
 app.post('/painel/reprocessar/:id', async (req, res) => {
   const id = parseInt(req.params.id);
-  const oferta = filaPendentes.find(o => o.id === id && o.status === 'pendente');
+  const oferta = filaPendentes.find(o => String(o.id) === String(id) && o.status === 'pendente');
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta não encontrada.' });
   try {
     const itens = [];
