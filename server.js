@@ -206,7 +206,6 @@ const PROGRAMAS_LINK = {
 // ── CONTAR DATAS TOTAIS ───────────────────────────────────────────────────────
 function contarDatas(datasStr) {
   if (!datasStr || datasStr === '-') return 0;
-  // Conta números separados por vírgula/espaço nas datas
   const matches = datasStr.match(/\b\d{1,2}\b/g);
   return matches ? matches.length : 0;
 }
@@ -223,8 +222,8 @@ function formatarDatas(str) {
 
 function formatarMensagemCDV(d) {
   var n = '\n';
-  var rodape = '`Dica de emiss\u00e3o encontrada por @davileles - Clube do Viajante`';
-  var balcao = '`Fa\u00e7a parte do Balc\u00e3o clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
+  var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
+  var balcao = '`Faça parte do Balcão clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
   var cpm = PROGRAMAS_CPM[d.programa] || 0;
   var rawPontos = String(d.pontos||'0').replace(/[.,\s]/g,'');
   var num = parseInt(rawPontos) || 0;
@@ -232,18 +231,18 @@ function formatarMensagemCDV(d) {
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
   var link = PROGRAMAS_LINK[d.programa] || '';
-  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Econ\u00f4mica') : '';
+  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Econômica') : '';
   var pts = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
   var msg = '';
   msg += '*'+d.origem+' - '+d.destino+' por '+pts+' pontos OU '+valStr+trecho+'*'+n+n;
   msg += rodape+n+n;
-  msg += 'Voc\u00ea pode comprar essa passagem no Balc\u00e3o de Milhas CDV por aproximadamente '+valStr+' o trecho + taxa de embarque.'+n+n;
+  msg += 'Você pode comprar essa passagem no Balcão de Milhas CDV por aproximadamente '+valStr+' o trecho + taxa de embarque.'+n+n;
   msg += balcao+n+n;
-  msg += '\uD83D\uDEEB *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
-  msg += '\uD83D\uDEEC *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
-  msg += '\uD83C\uDF9F\uFE0F *PROGRAMA* '+d.programa+n+n;
-  msg += '\u2708\uFE0F *CIA A\u00c9REA* '+d.cia+n+n;
-  msg += '\uD83D\uDD17 *LINK* '+link+n+n;
+  msg += '🛫 *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
+  msg += '🛬 *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
+  msg += '🎟️ *PROGRAMA* '+d.programa+n+n;
+  msg += '✈️ *CIA AÉREA* '+d.cia+n+n;
+  msg += '🔗 *LINK* '+link+n+n;
   msg += rodape;
   return msg;
 }
@@ -427,46 +426,36 @@ async function agruparEFormatar(classificacoes) {
     return [{ indices:[v.indice], tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) }];
   }
 
-  // Pré-agrupamento determinístico: separar por programa + cabine + par de cidades
-  // Evita que a IA agrupe rotas diferentes como "Múltiplos destinos"
   const grupos = new Map();
   for (const v of validas) {
     const cidadeA = [v.origemCodigo||v.origem, v.destinoCodigo||v.destino].sort().join('-');
-    const cidadeB = [v.destinoCodigo||v.destino, v.origemCodigo||v.origem].sort().join('-');
     const chave = (v.programa||'') + '|' + (v.cabine||'Economica') + '|' + cidadeA;
     if (!grupos.has(chave)) grupos.set(chave, []);
     grupos.get(chave).push(v);
   }
 
-  // Se há rotas diferentes (múltiplas chaves), criar emissão individual por grupo
   if (grupos.size > 1) {
     console.log('   Pré-agrupamento: '+grupos.size+' grupos distintos detectados — criando emissões separadas');
     const resultado = [];
     for (const [chave, items] of grupos) {
-      // Detectar se há itens de direções opostas (ida_volta)
       const origens = new Set(items.map(i => (i.origemCodigo||i.origem||'').toUpperCase()));
       const isIdaVolta = items.length >= 2 && origens.size > 1;
 
       let v, tipo, datasIda, datasVolta;
       if (isIdaVolta) {
-        // Separar item de ida e item de volta pelo par de cidades
-        // Usar o primeiro item como "ida" (origem → destino)
         const itemIda    = items[0];
         const itemVolta  = items.find(i => (i.origemCodigo||i.origem) !== (itemIda.origemCodigo||itemIda.origem)) || items[1];
         v         = itemIda;
         tipo      = 'ida_volta';
         datasIda  = itemIda.datasIda  || itemIda.datasVolta  || '';
         datasVolta= itemVolta.datasIda || itemVolta.datasVolta || '';
-        // Pontos: usar o maior valor entre ida e volta
         const pontosIda   = parseInt(String(itemIda.pontos).replace(/\D/g,''))||0;
         const pontosVolta = parseInt(String(itemVolta.pontos).replace(/\D/g,''))||0;
         v = { ...itemIda, pontos: Math.max(pontosIda, pontosVolta) };
       } else {
-        // Mesmo sentido: verificar se algum item tem "datasVolta" — pode ser ida_volta mal classificado
         const temVolta = items.some(i => i.datasVolta && i.datasVolta.trim().length > 0);
         const temIda   = items.some(i => i.datasIda   && i.datasIda.trim().length   > 0);
         if (temIda && temVolta && items.length >= 2) {
-          // Tratar como ida_volta: item com datasIda = ida, item com datasVolta = volta
           const itemIda   = items.find(i => i.datasIda   && i.datasIda.trim().length   > 0) || items[0];
           const itemVolta = items.find(i => i.datasVolta && i.datasVolta.trim().length > 0) || items[1];
           v         = itemIda;
@@ -477,7 +466,6 @@ async function agruparEFormatar(classificacoes) {
           const pontosVolta = parseInt(String(itemVolta.pontos).replace(/\D/g,''))||0;
           v = { ...itemIda, pontos: Math.max(pontosIda, pontosVolta) };
         } else {
-          // Mesmo sentido: usar item com mais datas
           v = items.reduce((best, cur) => {
             const dBest = contarDatas((best.datasIda||'') + ' ' + (best.datasVolta||''));
             const dCur  = contarDatas((cur.datasIda||'') + ' ' + (cur.datasVolta||''));
@@ -540,7 +528,6 @@ async function processarBuffer(grupoId) {
     console.log('   '+validas.length+'/'+itens.length+' validos');
     if (validas.length === 0) { console.log('Nenhuma oferta encontrada.'); return; }
 
-    // Aplicar filtro de datas mínimas se configurado para esse grupo
     const minDatas = GRUPOS_FILTRO_DATAS_MIN[grupoId];
     if (minDatas) {
       const validasFiltradas = validas.filter(v => {
@@ -555,7 +542,6 @@ async function processarBuffer(grupoId) {
         console.log('   [FILTRO] Todas emissões descartadas por poucas datas.');
         return;
       }
-      // Substituir validas no array de classificacoes
       classificacoes.forEach(c => {
         if (c?.valido && !validasFiltradas.includes(c)) c.valido = false;
       });
@@ -581,7 +567,6 @@ async function processarBuffer(grupoId) {
 async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
-    // fromMe removido: mensagens enviadas pelo próprio número também são monitoradas
     if (!GRUPOS_MONITORADOS.includes(jid)) return;
     const m    = msg.message;
     const tipo = Object.keys(m || {})[0];
@@ -618,11 +603,9 @@ async function processarMensagem(msg) {
     }
     const entrada = bufferAgrupamento.get(jid);
 
-    // Janela deslizante: cada nova mensagem reinicia o timer de 3 min
     if (entrada.timer) clearTimeout(entrada.timer);
     entrada.timer = setTimeout(() => processarBuffer(jid), JANELA_AGRUPAMENTO_MS);
 
-    // Cada mensagem entra como item independente no buffer.
     entrada.itens.push({ texto, imagemBase64:imagemB64, timestamp:Date.now() });
     console.log('Buffer: '+entrada.itens.length+' item(ns) | timer reiniciado (+'+JANELA_AGRUPAMENTO_MS/60000+' min)');
   } catch(err) { console.error('Erro ao processar mensagem:', err.message); }
@@ -808,7 +791,6 @@ app.post('/api/claude', async (req, res) => {
 app.get('/painel-json', (req, res) => {
   try {
     const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-    // Sanitizar ofertas para evitar erros de serialização
     const ofertas = filaPendentes.slice(0,50).map(o => ({
       ...o,
       conteudoOriginal: typeof o.conteudoOriginal === 'string' ? o.conteudoOriginal : (Array.isArray(o.conteudoOriginal) ? o.conteudoOriginal.join('\n') : ''),
@@ -836,9 +818,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     oferta.status = 'aprovado';
     oferta.mensagemFinal = mensagem;
     salvarFila();
-    // Retornar imediatamente com posição na fila
     res.json({ ok:true, posicao, tempoMin: tempoMin > 0 ? tempoMin : 0 });
-    // Enfileirar o envio (assíncrono)
     await enfileirarEnvio(oferta.id, mensagem);
   } catch(err) {
     console.error('[APROVAR] Erro no envio:', err.message);
@@ -891,7 +871,6 @@ app.post('/painel/mesclar', (req, res) => {
   const o1 = filaPendentes.find(o => String(o.id)===String(id1) && o.status==='pendente');
   const o2 = filaPendentes.find(o => String(o.id)===String(id2) && o.status==='pendente');
   if (!o1 || !o2) return res.status(404).json({ ok:false, erro:'Uma ou ambas ofertas nao encontradas ou ja processadas.' });
-  // conteudoOriginal pode ser string ou array — normalizar para array
   const toArray = v => Array.isArray(v) ? v : (v ? [v] : []);
   const textosMesclados  = [...toArray(o1.conteudoOriginal), ...toArray(o2.conteudoOriginal)];
   const imagensMescladas = [...(o1.imagens||[]), ...(o2.imagens||[])];
@@ -908,12 +887,10 @@ app.post('/painel/mesclar', (req, res) => {
   res.json({ ok:true, id: o1.id, mensagemMesclada });
 });
 
-// Limpar fila — remove todas as ofertas pendentes presas
 app.post('/painel/limpar', (req, res) => {
   const { confirmar } = req.body;
   if (confirmar !== 'sim') return res.status(400).json({ ok:false, erro:'Envie { "confirmar": "sim" } para confirmar.' });
   const antes = filaPendentes.length;
-  // Marcar todas as pendentes como rejeitadas
   filaPendentes.forEach(o => { if (o.status === 'pendente') o.status = 'rejeitado'; });
   salvarFila();
   const depois = filaPendentes.filter(o => o.status === 'pendente').length;
@@ -945,7 +922,6 @@ app.post('/enviar', async (req, res) => {
   if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
 
-  // Se for envio para cdv_emissao, usar fila com intervalo de 5 min
   const isEmissao = grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
   if (isEmissao) {
     const posicao = filaEnvio.length;
@@ -988,6 +964,116 @@ app.get('/grupos', async (req, res) => {
   } catch(err) { res.status(500).json({ ok:false, erro:'groupFetchAllParticipating falhou: '+err.message }); }
 });
 
+// ── HUBLA WEBHOOK ─────────────────────────────────────────────────────────────
+
+const MENSAGEM_BOAS_VINDAS = (nome) => `Olá, ${nome}! Seja muito bem-vindo ao Clube do Viajante Premium! ✈️
+
+Estou muito feliz em ter você com a gente. A partir de agora, você terá acesso aos nossos conteúdos, grupos e oportunidades para aprender a acumular e usar melhor seus pontos e milhas.
+
+Para começar da melhor forma, minha orientação é que o *seu primeiro passo* seja acessar a área de membros e *assistir*, pelo menos, ao *módulo de boas-vindas*.
+
+Nele eu explico algumas instruções importantes sobre como aproveitar os conteúdos, como funcionam os grupos, onde encontrar cada informação e quais são os próximos passos para você tirar o máximo proveito da sua assinatura.
+
+Além disso, *você já está participando do desafio 100 em 3*: quem assistir a todas as aulas em até 3 meses ganha um kit de viagens personalizado. Todos os detalhes sobre o desafio também estão explicados no módulo de boas-vindas.
+
+Mais uma vez, que bom ter você aqui! Tenho certeza de que esse será um passo muito importante para você viajar melhor, economizar mais e aproveitar muito mais o mundo dos pontos e milhas. 🚀
+
+Acesse a área de membros aqui: https://app.hub.la/m/5aPVHUjfhTa79XR2bWqC
+
+Davi Leles`;
+
+function formatarNumero(telefone) {
+  const apenasDigitos = telefone.replace(/\D/g, '');
+  const comDDI = apenasDigitos.startsWith('55') ? apenasDigitos : `55${apenasDigitos}`;
+  return `${comDDI}@s.whatsapp.net`;
+}
+
+function extrairTelefone(payload) {
+  const ev = payload.event;
+  if (!ev) return null;
+  return (
+    ev.member?.phone ||
+    ev.member?.user?.phone ||
+    ev.subscriber?.phone ||
+    ev.customer?.phone ||
+    ev.user?.phone ||
+    null
+  );
+}
+
+function extrairNome(payload) {
+  const ev = payload.event;
+  if (!ev) return 'novo membro';
+  const nomeCompleto =
+    ev.member?.fullName ||
+    ev.member?.name ||
+    ev.member?.user?.name ||
+    ev.subscriber?.name ||
+    ev.customer?.name ||
+    ev.user?.name ||
+    null;
+  if (!nomeCompleto) return 'novo membro';
+  return nomeCompleto.split(' ')[0];
+}
+
+app.post('/webhook/hubla', async (req, res) => {
+  try {
+    const tokenRecebido = req.headers['x-hubla-token'];
+    const tokenEsperado = process.env.HUBLA_TOKEN;
+
+    if (!tokenEsperado) {
+      console.error('[Hubla] HUBLA_TOKEN não configurado nas variáveis de ambiente');
+      return res.status(500).json({ error: 'Configuração interna ausente' });
+    }
+
+    if (!tokenRecebido || tokenRecebido !== tokenEsperado) {
+      console.warn('[Hubla] Token inválido ou ausente');
+      return res.status(401).json({ error: 'Token inválido' });
+    }
+
+    const payload = req.body;
+    const tipo = payload?.type;
+
+    console.log(`[Hubla] Evento recebido: ${tipo}`);
+
+    if (tipo !== 'customer.member_added') {
+      console.log(`[Hubla] Evento ignorado: ${tipo}`);
+      return res.status(200).json({ status: 'ignorado', tipo });
+    }
+
+    const telefone = extrairTelefone(payload);
+    const nome = extrairNome(payload);
+
+    if (!telefone) {
+      console.warn('[Hubla] Telefone não encontrado. Payload completo:', JSON.stringify(payload, null, 2));
+      return res.status(200).json({ status: 'sem_telefone', tipo });
+    }
+
+    const numeroFormatado = formatarNumero(telefone);
+    const mensagem = MENSAGEM_BOAS_VINDAS(nome);
+
+    console.log(`[Hubla] Enviando boas-vindas para ${nome} (${numeroFormatado})`);
+
+    if (!conectado || !sock) {
+      const ok = await aguardarSock();
+      if (!ok) {
+        console.error('[Hubla] WhatsApp não conectado ao tentar enviar boas-vindas');
+        return res.status(503).json({ error: 'WhatsApp não conectado' });
+      }
+    }
+
+    await sock.sendMessage(numeroFormatado, { text: mensagem });
+
+    console.log(`[Hubla] ✅ Boas-vindas enviadas com sucesso para ${nome}`);
+    return res.status(200).json({ status: 'enviado', para: nome });
+
+  } catch (err) {
+    console.error('[Hubla] Erro ao processar webhook:', err);
+    return res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// ── INICIAR ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
   console.log('Monitorando: '+GRUPOS_MONITORADOS.join(', '));
