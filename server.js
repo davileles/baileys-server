@@ -381,7 +381,7 @@ async function classificarItens(itens) {
       'Extraia TODAS as ofertas de passagem aerea presentes neste conteudo. Pode haver UMA ou MAIS emissoes separadas - identifique cada uma individualmente.\n'
       +(item.texto ? 'Texto: '+item.texto+'\n' : '')
       +'\nREGRAS DE EXTRACAO:\n'
-      +'1. Se houver multiplas emissoes no TEXTO (separadas por "Oportunidade de resgate" ou programas/rotas diferentes), retorne UMA entrada por emissao.\n'
+      +'1. Se houver multiplas emissoes no TEXTO (separadas por "Oportunidade de resgate", programas diferentes, rotas diferentes ou cidades diferentes), retorne UMA entrada por emissao. NUNCA agrupe emissões diferentes em uma única entrada mesmo que compartilhem uma cidade de origem ou destino. Ex: GRU→MIA e CGH→RAO são DUAS emissões distintas e devem gerar DUAS entradas separadas.\n'
       +'2. Se houver IMAGEM junto com texto: a imagem e um screenshot de confirmacao da PRIMEIRA emissao do texto. Use o texto como fonte principal dos dados (programa, milhas, datas). A imagem serve apenas para confirmar dados visuais nao presentes no texto.\n'
       +'3. Priorize SEMPRE os dados do texto sobre os dados da imagem quando houver conflito.\n'
       +'4. REGRA OBRIGATÓRIA DE DATAS: Qualquer item (imagem ou texto) SÓ é válido se contiver uma lista de datas de disponibilidade explícita (ex: "Junho/26: 11, 12" ou "Datas de ida: ..."). SEM lista de datas = INVÁLIDO, independente de ter origem, destino ou milhas.\n'
@@ -396,6 +396,9 @@ async function classificarItens(itens) {
       +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}\n'
       +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
       +'IMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade. Utilize sempre o nome exato da lista acima.\n'
+      +'REGRA CIA AÉREA DOMÉSTICA BRASIL: Para voos domésticos no Brasil, a companhia aérea operadora é SEMPRE determinada pelo programa: Smiles = GOL, LATAM Pass = LATAM, Azul Fidelidade = AZUL, Azul pelo Mundo = AZUL. Não use outra cia para voos domésticos nesses programas.\n'
+      +'REGRA IMAGEM SEM TEXTO: Imagens enviadas SOZINHAS (sem texto/caption) de sites de busca de passagens (Azul, LATAM, Smiles, GOL, etc.) mostrando apenas resultado de busca, confirmação de reserva ou tela de seleção de tarifa são INVÁLIDAS — retorne valido:false. Uma imagem isolada só é válida se contiver: origem, destino, programa, pontos E lista de datas explícita.\n'
+      +'REGRA IMAGEM COM TEXTO: Quando uma imagem é enviada junto com um texto, o texto é a fonte principal. Se o texto tiver as datas, USE as datas do texto. A imagem serve apenas para confirmar dados visuais ausentes no texto. Se a imagem for de uma rota DIFERENTE do texto (ex: texto é POA→CNF e imagem mostra POA→RIO), a imagem é de outra emissão — IGNORE a imagem e processe apenas o texto.\n'
       +'Cabine deve ser exatamente "Economica" ou "Executiva".\n'
       +'Se NAO houver nenhuma passagem aerea retorne: {"resultados":[{"valido":false,"indice":'+i+'}]}'
     });
@@ -493,7 +496,7 @@ async function agruparEFormatar(classificacoes) {
   }
 
   const system = 'Voce e especialista em passagens aereas. Agrupe trechos da mesma emissao. Responda APENAS JSON sem markdown.';
-  const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao.\n\n'
+  const prompt = 'Agrupe estas '+validas.length+' ofertas que pertencem a mesma emissao. IMPORTANTE: ofertas com rotas distintas (ex: GRU→MIA e CGH→RAO) NAO pertencem à mesma emissao — crie grupos separados para elas.\n\n'
     +'Criterios para pertencer ao MESMO grupo: mesmo programa, mesmas milhas (valores proximos), mesma companhia aerea, mesma cabine, rotas complementares (ex: ida e volta da mesma viagem).\n\n'
     +'REGRAS DE SEPARACAO OBRIGATORIA — sempre crie grupos SEPARADOS quando:\n'
     +'- Programas diferentes (ex: LATAM Pass e Smiles = SEPARADOS)\n'
