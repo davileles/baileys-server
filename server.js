@@ -142,7 +142,7 @@ function enfileirarEnvio(ofertaId, mensagem) {
 }
 
 function resolverGrupo(chave) {
-  return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
+  return GRUPOS[chave] ?? (chave?.includes('@g.us') || chave?.includes('@s.whatsapp.net') ? chave : null);
 }
 function gerarId() { return contadorId++; }
 
