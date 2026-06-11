@@ -73,6 +73,15 @@ app.use(express.json({ limit: '50mb' }));
 
 let sock      = null;
 let conectado = false;
+
+// Aguarda sock estar disponível (até 8s)
+async function aguardarSock(ms = 8000) {
+  const inicio = Date.now();
+  while ((!sock || !conectado) && Date.now() - inicio < ms) {
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return !!sock && conectado;
+}
 let qrAtual   = null;
 const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
 
@@ -813,7 +822,10 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta)             return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
-  if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  if (!conectado || !sock) {
+    const ok = await aguardarSock();
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
   const mensagem = req.body.mensagem || oferta.mensagemFormatada;
   const posicao  = filaEnvio.length;
   const tempoMin = posicao * (INTERVALO_ENVIO_MS / 60000);
@@ -922,7 +934,10 @@ app.post('/injetar', async (req, res) => {
 
 app.post('/enviar', async (req, res) => {
   const { grupo, mensagem } = req.body;
-  if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  if (!conectado || !sock) {
+    const ok = await aguardarSock();
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
@@ -945,7 +960,10 @@ app.post('/enviar', async (req, res) => {
 app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
   const { grupo, legenda } = req.body;
   const file = req.file;
-  if (!conectado || !sock) { if(file) unlinkSync(file.path); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
+  if (!conectado || !sock) {
+    const ok = await aguardarSock();
+    if (!ok) { if(file) unlinkSync(file.path); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
+  }
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) { if(file) unlinkSync(file.path); return res.status(400).json({ ok:false, erro:'Grupo invalido.' }); }
   if (!file) return res.status(400).json({ ok:false, erro:'Imagem obrigatoria.' });
