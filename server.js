@@ -265,7 +265,7 @@ async function chamarClaude(system, userContent, maxTokens) {
   }
 }
 
-// ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
+// ── LINKS AFILIADOS TSP ────────────────────────────────────────────────────────
 const LINKS_TSP = {
   'Amazon':        'https://amzn.to/4dFRSzy',
   'Mercado Livre': 'https://meli.la/2xystLt',
@@ -273,7 +273,7 @@ const LINKS_TSP = {
   'Shopee_com':    'https://s.shopee.com.br/30kdYeLY0W',
 };
 
-// ── FORMATAR CUPOM TSP ────────────────────────────────────────────────────────
+// ── FORMATAR CUPOM TSP ──────────────────────────────────────────────────
 function formatarCupomTSP(dados) {
   const loja   = dados.loja   || '';
   const tipo   = dados.tipo   || 'reais';
@@ -286,30 +286,20 @@ function formatarCupomTSP(dados) {
   const validade = (isPct && limite)
     ? `Válido em compras acima de R$ ${minimo} com limite de R$ ${limite} de desconto.`
     : `Válido em compras acima de R$ ${minimo}.`;
-  let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*
-
-`;
+  let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*\n\n`;
   msg += validade + '\n\n';
   msg += `🛒 *LOJA* ${loja.toUpperCase()}`;
-  if (codigo) msg += `
-
-🏷️ *CUPOM* ${codigo.toUpperCase()}`;
+  if (codigo) msg += `\n\n🏷️ *CUPOM* ${codigo.toUpperCase()}`;
   if (isPct && limite) {
     const ideal = Math.ceil(100 * Number(limite) / Number(valor));
-    msg += `
-
-⚠️ *IMPORTANTE* Ideal para compras de até R$ ${ideal}.
-
-`;
+    msg += `\n\n⚠️ *IMPORTANTE* Ideal para compras de até R$ ${ideal}.\n\n`;
   } else { msg += '\n\n'; }
   let url = '';
   if (loja === 'Amazon')             url = LINKS_TSP['Amazon'];
   else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
   else if (loja === 'Shopee')        url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
   if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
-  msg += '
-
-`Convide seus amigos para entrar aqui no grupo: https://chat.whatsapp.com/HK7NL13BdPXKJPAGtvTKKg`';
+  msg += '\n\n`Convide seus amigos para entrar aqui no grupo: https://chat.whatsapp.com/HK7NL13BdPXKJPAGtvTKKg`';
   return msg;
 }
 
