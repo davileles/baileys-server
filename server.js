@@ -842,12 +842,13 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
 });
 
 app.get('/grupos', async (req, res) => {
-  if (!sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  if (!sock) return res.status(503).json({ ok:false, erro:'sock null — aguarde reconexao.' });
+  if (!conectado) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado (conectado=false).' });
   try {
     const chats  = await sock.groupFetchAllParticipating();
     const grupos = Object.values(chats).map(g => ({ id:g.id, nome:g.subject||'(sem nome)' })).sort((a,b) => a.nome.localeCompare(b.nome,'pt-BR'));
     res.json({ ok:true, total:grupos.length, grupos });
-  } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
+  } catch(err) { res.status(500).json({ ok:false, erro:'groupFetchAllParticipating falhou: '+err.message }); }
 });
 
 app.listen(PORT, () => {
