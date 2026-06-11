@@ -289,9 +289,7 @@ function formatarCupomTSP(dados) {
   let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*
 
 `;
-  msg += validade + '
-
-';
+  msg += validade + '\n\n';
   msg += `🛒 *LOJA* ${loja.toUpperCase()}`;
   if (codigo) msg += `
 
@@ -303,9 +301,7 @@ function formatarCupomTSP(dados) {
 ⚠️ *IMPORTANTE* Ideal para compras de até R$ ${ideal}.
 
 `;
-  } else { msg += '
-
-'; }
+  } else { msg += '\n\n'; }
   let url = '';
   if (loja === 'Amazon')             url = LINKS_TSP['Amazon'];
   else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
