@@ -13,6 +13,11 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from '
 import { readdir, unlink } from 'fs/promises';
 import QRCode from 'qrcode';
 
+// ── TELEGRAM ──────────────────────────────────────────────────────────────────
+import { TelegramClient } from 'telegram';
+import { StringSession } from 'telegram/sessions/index.js';
+import { NewMessage } from 'telegram/events/index.js';
+
 // ── LOGGER CUSTOMIZADO (suprimir ruído do Baileys) ───────────────────────────
 const baileysLogger = pino({ level: 'silent' });
 
@@ -259,6 +264,115 @@ async function chamarClaude(system, userContent, maxTokens) {
     return null;
   }
 }
+
+// ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
+const LINKS_TSP = {
+  'Amazon':        'https://amzn.to/4dFRSzy',
+  'Mercado Livre': 'https://meli.la/2xystLt',
+  'Shopee_sem':    'https://s.shopee.com.br/9fHPmP3QZF',
+  'Shopee_com':    'https://s.shopee.com.br/30kdYeLY0W',
+};
+
+// ── FORMATAR CUPOM TSP ────────────────────────────────────────────────────────
+function formatarCupomTSP(dados) {
+  const loja   = dados.loja   || '';
+  const tipo   = dados.tipo   || 'reais';
+  const valor  = dados.valor  || 0;
+  const minimo = dados.minimo || 0;
+  const limite = dados.limite || null;
+  const codigo = dados.codigo || null;
+  const isPct  = tipo === 'pct';
+  const tipoStr = isPct ? '%' : ' reais';
+  const validade = (isPct && limite)
+    ? `Válido em compras acima de R$ ${minimo} com limite de R$ ${limite} de desconto.`
+    : `Válido em compras acima de R$ ${minimo}.`;
+  let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*
+
+`;
+  msg += validade + '
+
+';
+  msg += `🛒 *LOJA* ${loja.toUpperCase()}`;
+  if (codigo) msg += `
+
+🏷️ *CUPOM* ${codigo.toUpperCase()}`;
+  if (isPct && limite) {
+    const ideal = Math.ceil(100 * Number(limite) / Number(valor));
+    msg += `
+
+⚠️ *IMPORTANTE* Ideal para compras de até R$ ${ideal}.
+
+`;
+  } else { msg += '
+
+'; }
+  let url = '';
+  if (loja === 'Amazon')             url = LINKS_TSP['Amazon'];
+  else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
+  else if (loja === 'Shopee')        url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
+  if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
+  msg += '
+
+`Convide seus amigos para entrar aqui no grupo: https://chat.whatsapp.com/HK7NL13BdPXKJPAGtvTKKg`';
+  return msg;
+}
+
+// ── TELEGRAM CLIENT ───────────────────────────────────────────────────────────
+const TG_API_ID   = parseInt(process.env.TG_API_ID   || '0');
+const TG_API_HASH = process.env.TG_API_HASH || '';
+const TG_SESSION_PATH = SESSAO_DIR + '/telegram_session.txt';
+const TG_GRUPO_MONITORADO = process.env.TG_GRUPO || '@juaocupons';
+
+let tgClient = null;
+let tgConectado = false;
+let tgAuthState = null;
+let tgAuthResolve = null;
+let tgAuthReject  = null;
+
+async function extrairCupomTelegram(texto) {
+  const system = 'Você é um extrator de dados de cupons de desconto para o mercado brasileiro. Analise a mensagem e retorne SOMENTE JSON válido, sem texto extra, sem markdown. Campos: {"eh_cupom": true/false, "loja": "Amazon" | "Mercado Livre" | "Shopee" | "Outro: nome", "tipo": "pct" | "reais", "valor": número, "minimo": número, "limite": número | null, "codigo": "CUPOM" | null, "multiplos": [{valor,minimo,codigo}] | null, "observacao": "texto" | null}. Se não for cupom retorne {"eh_cupom": false}.';
+  return await chamarClaude(system, [{ type:'text', text: texto }], 500);
+}
+
+async function processarMensagemTelegram(texto) {
+  if (!texto?.trim()) return;
+  console.log('[TG] Nova mensagem:', texto.slice(0, 80));
+  try {
+    const campos = await extrairCupomTelegram(texto);
+    if (!campos || !campos.eh_cupom) { console.log('[TG] Não é cupom, ignorado.'); return; }
+    console.log(`[TG] Cupom: ${campos.loja} | ${campos.valor}${campos.tipo === 'pct' ? '%' : ' R$'}`);
+    const lista = campos.multiplos?.length
+      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo, codigo: m.codigo ?? campos.codigo, multiplos: null }))
+      : [campos];
+    for (const c of lista) {
+      const oferta = { id: gerarId(), timestamp: new Date().toISOString(), grupoOrigem: 'telegram:@juaocupons', tipoConteudo: 'cupom_tsp', conteudoOriginal: texto, imagens: [], mensagemFormatada: formatarCupomTSP(c), dadosExtraidos: c, status: 'pendente' };
+      filaPendentes.unshift(oferta);
+      if (filaPendentes.length > 100) filaPendentes.splice(100);
+      salvarFila();
+      console.log(`[TG] Cupom #${oferta.id} adicionado — ${c.loja}`);
+    }
+  } catch(err) { console.error('[TG] Erro:', err.message); }
+}
+
+async function iniciarTelegram() {
+  if (!TG_API_ID || !TG_API_HASH) { console.log('[TG] Desativado (sem TG_API_ID/HASH).'); return; }
+  const sessionStr = existsSync(TG_SESSION_PATH) ? readFileSync(TG_SESSION_PATH, 'utf-8').trim() : '';
+  tgClient = new TelegramClient(new StringSession(sessionStr), TG_API_ID, TG_API_HASH, { connectionRetries: 5 });
+  await tgClient.start({
+    phoneNumber: () => new Promise((res, rej) => { tgAuthState = 'aguardando_telefone'; tgAuthResolve = res; tgAuthReject = rej; }),
+    password:    () => new Promise((res, rej) => { tgAuthState = 'aguardando_senha';    tgAuthResolve = res; tgAuthReject = rej; }),
+    phoneCode:   () => new Promise((res, rej) => { tgAuthState = 'aguardando_codigo';  tgAuthResolve = res; tgAuthReject = rej; }),
+    onError: (err) => { console.error('[TG] Erro auth:', err.message); tgAuthState = 'erro'; },
+  });
+  writeFileSync(TG_SESSION_PATH, tgClient.session.save(), 'utf-8');
+  tgConectado = true; tgAuthState = 'ok';
+  console.log(`[TG] Conectado! Monitorando ${TG_GRUPO_MONITORADO}`);
+  tgClient.addEventHandler(async (event) => {
+    await processarMensagemTelegram(event.message?.message || '');
+  }, new NewMessage({ chats: [TG_GRUPO_MONITORADO] }));
+}
+
+iniciarTelegram().catch(err => { console.error('[TG] Falha:', err.message); tgAuthState = 'erro'; });
 
 // ── PASSO 1: CLASSIFICAR ──────────────────────────────────────────────────────
 async function classificarItens(itens) {
@@ -636,7 +750,7 @@ app.get('/qr', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, qrDisponivel:!!qrAtual, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, janelaMin:JANELA_AGRUPAMENTO_MS/60000, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
+  res.json({ conectado, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, janelaMin:JANELA_AGRUPAMENTO_MS/60000, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
 });
 
 app.get('/painel', (req, res) => {
@@ -657,6 +771,22 @@ app.get('/painel', (req, res) => {
     return '<div class="card" id="card-'+o.id+'"><div class="card-header"><span class="id">#'+o.id+'</span>'+rota+tipoTag+cabineTag+prog+'<span style="margin-left:auto;font-size:12px;color:#555">'+data+'</span></div><div class="card-body"><div class="col"><div class="col-title">Original ('+o.tipoConteudo+')</div>'+imgsHtml+textoHtml+'</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-'+o.id+'">'+o.mensagemFormatada+'</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar('+o.id+')">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar('+o.id+')">Rejeitar</button><span id="fb-'+o.id+'" style="font-size:13px;margin-left:auto"></span></div></div>';
   };
   res.send('<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Painel CDV</title><style>'+PAINEL_CSS+'</style></head><body><header><h1>Painel'+(pendentes.length>0?' <span class="badge">'+pendentes.length+'</span>':'')+'</h1><nav class="nav"><a href="/">Inicio</a><a href="/painel">Atualizar</a></nav></header><div class="container">'+(emBuffer>0?'<div class="buffer-bar">'+emBuffer+' item(ns) aguardando janela de '+JANELA_AGRUPAMENTO_MS/60000+' min...</div>':'')+(pendentes.length===0&&emBuffer===0?'<div class="empty">Nenhuma oferta pendente.</div>':pendentes.map(renderCard).join(''))+(processados.length>0?'<div class="sep">Processados recentemente</div>'+processados.slice(0,10).map(renderCard).join(''):'')+'</div><script>async function aprovar(id){const msg=document.getElementById("msg-"+id).value;const fb=document.getElementById("fb-"+id);fb.textContent="Enviando...";fb.style.color="#aaa";const r=await fetch("/painel/aprovar/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mensagem:msg})});const d=await r.json();if(d.ok){fb.style.color="#22c55e";fb.textContent="Enviado!";setTimeout(()=>{const c=document.getElementById("card-"+id);if(c)c.style.opacity=".35"},800)}else{fb.style.color="#ef4444";fb.textContent="Erro: "+d.erro}}async function rejeitar(id){const fb=document.getElementById("fb-"+id);const r=await fetch("/painel/rejeitar/"+id,{method:"POST"});const d=await r.json();if(d.ok){fb.style.color="#555";fb.textContent="Rejeitado";setTimeout(()=>{const c=document.getElementById("card-"+id);if(c)c.style.opacity=".35"},400)}}'+(emBuffer>0?'setTimeout(()=>location.reload(),30000);':'')+'</script></body></html>');
+});
+
+app.get('/tg-auth', (req, res) => {
+  if (tgConectado) return res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>TG Auth</title></head><body style="background:#0d0d0d;color:#22c55e;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px"><h2>✅ Telegram conectado!</h2><p style="color:#aaa">Monitorando ' + TG_GRUPO_MONITORADO + '</p><a href="/painel" style="color:#ffa500">Ir para o painel</a></body></html>');
+  const labels = { 'aguardando_telefone': { titulo: 'Digite seu número do Telegram', placeholder: '+5511999999999', campo: 'telefone' }, 'aguardando_codigo': { titulo: 'Digite o código de verificação', placeholder: '12345', campo: 'codigo' }, 'aguardando_senha': { titulo: 'Digite sua senha 2FA', placeholder: 'sua senha', campo: 'senha' } };
+  const info = labels[tgAuthState] || { titulo: 'Aguardando inicialização...', placeholder: '', campo: '' };
+  res.send('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>TG Auth</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:20px;padding:24px}h2{color:#ffa500}input{background:#1a1a1a;border:1px solid #333;border-radius:8px;color:#f0f0f0;font-size:16px;padding:12px 16px;width:280px;outline:none}button{background:#ffa500;color:#000;border:none;border-radius:8px;font-size:15px;font-weight:700;padding:12px 32px;cursor:pointer}p{color:#888;font-size:14px}</style></head><body><h2>🔐 Autenticação Telegram</h2><p>' + info.titulo + '</p>' + (info.campo ? '<input type="text" id="val" placeholder="' + info.placeholder + '" autocomplete="off"/><button onclick="enviar()">Confirmar</button><p id="msg"></p><script>async function enviar(){const v=document.getElementById("val").value.trim();if(!v)return;const r=await fetch("/tg-auth/submit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({valor:v})});const d=await r.json();document.getElementById("msg").textContent=d.ok?"✓ Enviado! Aguardando...":"Erro: "+d.erro;if(d.ok)setTimeout(()=>location.reload(),2000);}document.getElementById("val").addEventListener("keydown",e=>{if(e.key==="Enter")enviar();});<\/script>' : '<script>setTimeout(()=>location.reload(),3000)<\/script>') + '</body></html>');
+});
+
+app.post('/tg-auth/submit', (req, res) => {
+  const { valor } = req.body;
+  if (!valor?.trim()) return res.status(400).json({ ok:false, erro:'Valor vazio.' });
+  if (!tgAuthResolve) return res.status(400).json({ ok:false, erro:'Nenhuma autenticação em andamento.' });
+  tgAuthResolve(valor.trim());
+  tgAuthResolve = null; tgAuthReject = null;
+  res.json({ ok:true });
 });
 
 app.post('/api/claude', async (req, res) => {
