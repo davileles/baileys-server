@@ -16,7 +16,8 @@ import QRCode from 'qrcode';
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
-import { NewMessage } from 'telegram/events/index.js';
+import { Raw } from 'telegram/events/index.js';
+import { Api } from 'telegram';
 
 // ── LOGGER CUSTOMIZADO (suprimir ruído do Baileys) ───────────────────────────
 const baileysLogger = pino({ level: 'silent' });
@@ -545,12 +546,24 @@ async function iniciarTelegram() {
   tgAuthState = 'ok';
   console.log(`[TG] Conectado! Monitorando ${TG_GRUPO_MONITORADO}`);
 
-  // Listener de novas mensagens
-  tgClient.addEventHandler(async (event) => {
-    const msg = event.message;
-    const texto = msg?.message || '';
-    await processarMensagemTelegram(texto);
-  }, new NewMessage({ chats: [TG_GRUPO_MONITORADO] }));
+  // Listener de novas mensagens de canal (UpdateNewChannelMessage)
+  tgClient.addEventHandler(async (update) => {
+    try {
+      const msg = update.message;
+      if (!msg?.message) return;
+
+      // Verificar se veio do canal monitorado
+      const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
+      const username = entity?.username || '';
+      if (username.toLowerCase() !== TG_GRUPO_MONITORADO.replace('@', '').toLowerCase()) return;
+
+      const texto = msg.message;
+      console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
+      await processarMensagemTelegram(texto);
+    } catch (err) {
+      console.error('[TG] Erro no handler de canal:', err.message);
+    }
+  }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
 }
 
 // Iniciar Telegram em background (sem bloquear o servidor)
