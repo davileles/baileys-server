@@ -446,10 +446,138 @@ iniciarTelegram().catch(err => {
   tgAuthState = 'erro';
 });
 
+// ── GRUPOS COM REGRAS ESPECIAIS DE EXTRAÇÃO ───────────────────────────────────
+// Grupo que usa APENAS imagem como fonte principal (ignorar texto)
+const GRUPO_APENAS_IMAGEM = '120363427512561555@g.us';
+// Grupo executiva: ignorar imagens, sempre Executiva, usar só 1º programa
+const GRUPO_EXECUTIVA     = '120363410708080270@g.us';
+// Grupos texto estruturado: ignorar imagens, padrão "Oportunidade de resgate"
+const GRUPOS_TEXTO_ESTRUTURADO = new Set([
+  '120363229600818869@g.us',
+  '120363298361885116@g.us',
+  '120363301488379027@g.us',
+  '120363230402728347@g.us',
+  '120363229682219999@g.us',
+  '120363212151306916@g.us',
+  '120363318399199070@g.us',
+  '120363230586056001@g.us',
+]);
+
+const SYSTEM_CDV = 'Voce e especialista em passagens aereas com milhas para o mercado brasileiro. Seja GENEROSO: qualquer mencao a rota aerea, milhas/pontos, programa de fidelidade ou companhia aerea deve ser valido. Responda APENAS JSON sem markdown.';
+const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\nIMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade. LatamPass = LATAM Pass.\nCabine deve ser exatamente "Economica" ou "Executiva".';
+const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
+const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
+
 // ── PASSO 1: CLASSIFICAR (CDV) ────────────────────────────────────────────────
-async function classificarItens(itens) {
-  const system = 'Voce e especialista em passagens aereas com milhas para o mercado brasileiro. Seja GENEROSO: qualquer mencao a rota aerea, milhas/pontos, programa de fidelidade ou companhia aerea deve ser valido. Responda APENAS JSON sem markdown.';
+async function classificarItens(itens, grupoId) {
   const resultados = [];
+
+  // ── Grupo 120363427512561555: extração APENAS da imagem ───────────────────
+  if (grupoId === GRUPO_APENAS_IMAGEM) {
+    // Agrupa itens com imagem; itens sem imagem são descartados
+    const itensComImagem = itens.filter(item => item.imagemBase64);
+    if (itensComImagem.length === 0) { console.log('[GRUPO-IMG] Nenhuma imagem encontrada, descartando.'); return []; }
+
+    for (let i = 0; i < itensComImagem.length; i++) {
+      const item = itensComImagem[i];
+      const indiceOriginal = itens.indexOf(item);
+      const content = [
+        { type:'image', source:{ type:'base64', media_type:'image/jpeg', data:item.imagemBase64 } },
+        { type:'text', text:
+          'Esta imagem é de um grupo de alertas de passagens aéreas com milhas. Extraia os dados diretamente da imagem — IGNORE qualquer texto que acompanhe.\n\n'
+          +'Leia da imagem:\n'
+          +'- Programa de fidelidade (ex: LATAM Pass, Smiles, Azul Fidelidade)\n'
+          +'- Origem e destino com código IATA\n'
+          +'- Quantidade de milhas/pontos\n'
+          +'- Classe (Econômica ou Executiva)\n'
+          +'- Datas de ida\n'
+          +'- Datas de volta (pode estar em imagem separada)\n\n'
+          +'Se a imagem mostrar APENAS datas de ida (sem datas de volta) ou APENAS datas de volta, preencha somente o campo correspondente e deixe o outro vazio.\n'
+          +'Normalize as datas para o formato "Mês/Ano: dias". Ex: "Jun/26: 11, 13, 15".\n'
+          +'IMPORTANTE sobre cidades: use o nome completo da cidade, não o código IATA.\n\n'
+          +PROGRAMAS_VALIDOS+'\n\n'
+          +'Responda com este JSON:\n'+JSON_EXEMPLO(indiceOriginal)+'\n'
+          +'Se não houver passagem aérea na imagem retorne: '+JSON_INVALIDO(indiceOriginal)
+        }
+      ];
+      const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
+      const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
+      for (const r of lista) {
+        if (r?.valido) { r.origem = resolverCidade(r.origemCodigo, r.origem); r.destino = resolverCidade(r.destinoCodigo, r.destino); }
+        resultados.push(r || { valido:false, indice:indiceOriginal });
+      }
+    }
+    return resultados;
+  }
+
+  // ── Grupo 120363410708080270: executiva, ignorar imagens, 1º programa ─────
+  if (grupoId === GRUPO_EXECUTIVA) {
+    const itensTexto = itens.filter(item => item.texto?.trim());
+    if (itensTexto.length === 0) { console.log('[GRUPO-EXEC] Sem texto, descartando.'); return []; }
+
+    for (let i = 0; i < itensTexto.length; i++) {
+      const item = itensTexto[i];
+      const indiceOriginal = itens.indexOf(item);
+      const content = [{ type:'text', text:
+        'Este texto é de um grupo especializado em passagens de CLASSE EXECUTIVA com milhas.\n\n'
+        +'REGRAS CRÍTICAS:\n'
+        +'1. Cabine é SEMPRE "Executiva" independente do que estiver no texto.\n'
+        +'2. Se houver múltiplos programas de fidelidade listados (ex: Smiles, Azul, Aegean), use APENAS O PRIMEIRO programa e suas respectivas milhas. Ignore os demais.\n'
+        +'3. Ignore COMPLETAMENTE imagens — extraia dados somente do texto.\n'
+        +'4. Nas datas, remova números entre parênteses (quantidade de assentos). Ex: "JUL/26: 13(2), 19(1)" → "Jul/26: 13, 19".\n'
+        +'5. Normalize datas para "Mês/Ano: dias". Ex: "JUL/26: 13, 19" → "Jul/26: 13, 19".\n'
+        +'6. Pode haver uma mensagem somente com datas de ida (rota A→B) e outra somente com datas de volta (rota B→A). Nesse caso, indique "direcao":"ida" ou "direcao":"volta" conforme aplicável.\n\n'
+        +'Texto:\n'+item.texto+'\n\n'
+        +PROGRAMAS_VALIDOS+'\n\n'
+        +'Responda com este JSON:\n'+JSON_EXEMPLO(indiceOriginal)+'\n'
+        +'Se NAO houver passagem aerea retorne: '+JSON_INVALIDO(indiceOriginal)
+      }];
+      const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
+      const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
+      for (const r of lista) {
+        if (r?.valido) {
+          r.cabine  = 'Executiva';
+          r.origem  = resolverCidade(r.origemCodigo, r.origem);
+          r.destino = resolverCidade(r.destinoCodigo, r.destino);
+        }
+        resultados.push(r || { valido:false, indice:indiceOriginal });
+      }
+    }
+    return resultados;
+  }
+
+  // ── 8 grupos texto estruturado: ignorar imagens, padrão "Oportunidade" ────
+  if (GRUPOS_TEXTO_ESTRUTURADO.has(grupoId)) {
+    const itensTexto = itens.filter(item => item.texto?.trim());
+    if (itensTexto.length === 0) { console.log('[GRUPO-TEXTO] Sem texto, descartando.'); return []; }
+
+    for (let i = 0; i < itensTexto.length; i++) {
+      const item = itensTexto[i];
+      const indiceOriginal = itens.indexOf(item);
+      const content = [{ type:'text', text:
+        'Este texto é de um grupo de alertas de passagens aéreas com milhas. Extraia os dados — IGNORE imagens completamente.\n\n'
+        +'REGRAS:\n'
+        +'1. O texto pode conter UMA ou MAIS emissões separadas por "Oportunidade de resgate" ou por rotas/programas diferentes. Retorne uma entrada por emissão.\n'
+        +'2. Ignore tudo após as datas de volta: propagandas, valores em dinheiro, links de agência.\n'
+        +'3. Milhas podem vir como "X mil milhas" — converta para número. Ex: "101.9 mil" = 101900, "39,5 mil" = 39500.\n'
+        +'4. Datas podem vir em formato longo. Normalize para "Mês/Ano: dias". Ex: "Junho/26: 13, 14, 15" → "Jun/26: 13, 14, 15". "Agosto: 4 a 31" → "Ago/26: 4, 5, 6, ..., 31" (liste todos os dias).\n'
+        +'5. Textos válidos DEVEM conter: programa, origem, destino, milhas e lista de datas. Se faltar lista de datas, retorne inválido.\n\n'
+        +'Texto:\n'+item.texto+'\n\n'
+        +PROGRAMAS_VALIDOS+'\n\n'
+        +'Responda com este JSON (uma entrada por emissão):\n'+JSON_EXEMPLO(indiceOriginal)+'\n'
+        +'Se NAO houver passagem aerea retorne: '+JSON_INVALIDO(indiceOriginal)
+      }];
+      const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
+      const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
+      for (const r of lista) {
+        if (r?.valido) { r.origem = resolverCidade(r.origemCodigo, r.origem); r.destino = resolverCidade(r.destinoCodigo, r.destino); }
+        resultados.push(r || { valido:false, indice:indiceOriginal });
+      }
+    }
+    return resultados;
+  }
+
+  // ── Comportamento padrão (demais grupos) ──────────────────────────────────
   for (let i = 0; i < itens.length; i++) {
     const item = itens[i];
     const content = [];
@@ -467,19 +595,14 @@ async function classificarItens(itens) {
       +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA.\n'
       +'CRITICO: use SEMPRE o codigo IATA do texto quando disponivel. Nunca substitua o codigo IATA correto por outro.\n'
       +'\nResponda com este JSON (uma entrada por emissao encontrada):\n'
-      +'{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}\n'
-      +'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\n'
-      +'IMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade.\n'
-      +'Cabine deve ser exatamente "Economica" ou "Executiva".\n'
-      +'Se NAO houver nenhuma passagem aerea retorne: {"resultados":[{"valido":false,"indice":'+i+'}]}'
+      +JSON_EXEMPLO(i)+'\n'
+      +PROGRAMAS_VALIDOS+'\n'
+      +'Se NAO houver nenhuma passagem aerea retorne: '+JSON_INVALIDO(i)
     });
-    const resultado = await chamarClaude(system, content, 4096);
+    const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
     const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:i }]);
     for (const r of lista) {
-      if (r?.valido) {
-        r.origem  = resolverCidade(r.origemCodigo,  r.origem);
-        r.destino = resolverCidade(r.destinoCodigo, r.destino);
-      }
+      if (r?.valido) { r.origem = resolverCidade(r.origemCodigo, r.origem); r.destino = resolverCidade(r.destinoCodigo, r.destino); }
       resultados.push(r || { valido:false, indice:i });
     }
   }
@@ -545,6 +668,49 @@ async function agruparEFormatar(classificacoes) {
   });
 }
 
+// ── MESCLAR PARES IDA/VOLTA (grupos com trecho separado) ─────────────────────
+// Para grupos onde ida e volta chegam como mensagens separadas com rotas invertidas,
+// mescla os pares: A→B (só datasIda) + B→A (só datasIda) → uma emissão ida_volta.
+function mesclarParesIdaVolta(validas) {
+  const usadas = new Set();
+  const resultado = [];
+
+  for (let i = 0; i < validas.length; i++) {
+    if (usadas.has(i)) continue;
+    const v = validas[i];
+    // Procura par complementar: mesmo programa, cabine, e rota invertida
+    let parIdx = -1;
+    for (let j = i + 1; j < validas.length; j++) {
+      if (usadas.has(j)) continue;
+      const w = validas[j];
+      const mesmoPrograma = (v.programa||'') === (w.programa||'');
+      const mesmaCabine   = (v.cabine||'Economica') === (w.cabine||'Economica');
+      const rotaInvertida = (v.origemCodigo||v.origem) === (w.destinoCodigo||w.destino)
+                         && (v.destinoCodigo||v.destino) === (w.origemCodigo||w.origem);
+      if (mesmoPrograma && mesmaCabine && rotaInvertida) { parIdx = j; break; }
+    }
+
+    if (parIdx !== -1) {
+      const w = validas[parIdx];
+      usadas.add(i); usadas.add(parIdx);
+      // v é ida (A→B), w é volta (B→A → suas datasIda viram datasVolta)
+      const merged = {
+        ...v,
+        direcao:    'ida_volta',
+        datasIda:   v.datasIda   || v.datasVolta || '',
+        datasVolta: w.datasIda   || w.datasVolta || '',
+        indices:    [...(v.indices||[v.indice]), ...(w.indices||[w.indice])],
+      };
+      console.log('[MERGE] Par ida/volta mesclado: '+v.origemCodigo+'→'+v.destinoCodigo);
+      resultado.push(merged);
+    } else {
+      usadas.add(i);
+      resultado.push({ ...v, indices: v.indices||[v.indice] });
+    }
+  }
+  return resultado;
+}
+
 // ── PROCESSAR BUFFER (CDV) ────────────────────────────────────────────────────
 async function processarBuffer(grupoId) {
   const entrada = bufferAgrupamento.get(grupoId);
@@ -553,9 +719,15 @@ async function processarBuffer(grupoId) {
   const { itens } = entrada;
   console.log('Janela encerrada - '+itens.length+' item(ns)');
   try {
-    const classificacoes = await classificarItens(itens);
-    const validas = classificacoes.filter(c => c?.valido);
+    const classificacoes = await classificarItens(itens, grupoId);
+    let validas = classificacoes.filter(c => c?.valido);
     if (validas.length === 0) { console.log('Nenhuma oferta encontrada.'); return; }
+
+    // Mesclar pares ida/volta para grupos que enviam trechos separados
+    const gruposMesclagem = new Set([GRUPO_APENAS_IMAGEM, GRUPO_EXECUTIVA]);
+    if (gruposMesclagem.has(grupoId)) {
+      validas = mesclarParesIdaVolta(validas);
+    }
 
     const minDatas = GRUPOS_FILTRO_DATAS_MIN[grupoId];
     if (minDatas) {
@@ -565,10 +737,12 @@ async function processarBuffer(grupoId) {
         return true;
       });
       if (validasFiltradas.length === 0) { console.log('   [FILTRO] Todas descartadas.'); return; }
-      classificacoes.forEach(c => { if (c?.valido && !validasFiltradas.includes(c)) c.valido = false; });
+      validas = validasFiltradas;
     }
 
-    const emissoes = await agruparEFormatar(classificacoes);
+    // Reconstruir classificacoes só com as validas restantes para agruparEFormatar
+    const classificacoesFinais = validas.map(v => ({ ...v, valido:true }));
+    const emissoes = await agruparEFormatar(classificacoesFinais);
     for (const emissao of emissoes) {
       const indices = emissao.indices || [];
       const imagens = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
@@ -864,7 +1038,7 @@ app.post('/painel/reprocessar/:id', async (req, res) => {
     for (const imgB64 of (oferta.imagens||[])) itens.push({ texto:oferta.conteudoOriginal||'', imagemBase64:imgB64, timestamp:Date.now() });
     if (itens.length===0 && oferta.conteudoOriginal) itens.push({ texto:oferta.conteudoOriginal, imagemBase64:null, timestamp:Date.now() });
     if (itens.length===0) return res.status(400).json({ ok:false, erro:'Sem conteúdo para reprocessar.' });
-    const classificacoes = await classificarItens(itens);
+    const classificacoes = await classificarItens(itens, oferta.grupoOrigem||'');
     const validas = classificacoes.filter(c => c.valido);
     if (validas.length===0) return res.json({ ok:false, erro:'Nenhuma emissão válida encontrada.' });
     const emissoes = await agruparEFormatar(classificacoes);
