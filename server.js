@@ -1242,15 +1242,17 @@ app.post('/reset-sessao', async (req, res) => {
       conectado = false;
     }
     // Apagar arquivos de sessão Baileys (preserva fila e agendamentos)
-    const { readdir: readdirP, unlink: unlinkP } = await import('fs/promises');
+    const { readdir: readdirP, unlink: unlinkP, stat: statP } = await import('fs/promises');
     const arquivos = await readdirP(SESSAO_DIR);
     const preservar = new Set(['fila_pendentes.json', 'agendamentos.json', 'telegram_session.txt']);
     let deletados = [];
     for (const arq of arquivos) {
-      if (!preservar.has(arq)) {
-        await unlinkP(SESSAO_DIR + '/' + arq);
-        deletados.push(arq);
-      }
+      if (preservar.has(arq)) continue;
+      const caminho = SESSAO_DIR + '/' + arq;
+      const info = await statP(caminho);
+      if (info.isDirectory()) continue; // pula pastas (ex: lost+found)
+      await unlinkP(caminho);
+      deletados.push(arq);
     }
     console.log('[RESET] Sessão apagada. Arquivos removidos:', deletados.join(', '));
     res.json({ ok:true, deletados, msg: 'Sessão resetada. Reinicie o servidor e escaneie o QR.' });
