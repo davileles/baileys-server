@@ -76,10 +76,19 @@ let conectado = false;
 let qrAtual   = null;
 
 // Aguarda sock estar disponível (até 8s)
-async function aguardarSock(ms = 8000) {
+// Aguarda sock conectado E estável (sem reconexões recentes)
+let ultimaConexao = 0; // timestamp da última vez que conectado ficou true
+async function aguardarSock(ms = 15000) {
   const inicio = Date.now();
+  // Fase 1: espera estar conectado
   while ((!sock || !conectado) && Date.now() - inicio < ms) {
     await new Promise(r => setTimeout(r, 300));
+  }
+  if (!sock || !conectado) return false;
+  // Fase 2: espera 2s de estabilidade após a última conexão
+  const estabilidade = 2000;
+  while (Date.now() - ultimaConexao < estabilidade && Date.now() - inicio < ms) {
+    await new Promise(r => setTimeout(r, 200));
   }
   return !!sock && conectado;
 }
@@ -311,38 +320,9 @@ function contarDatas(datasStr) {
   return matches ? matches.length : 0;
 }
 
-function comprimirDias(diasStr) {
-  // Remove cabeçalho de mês/ano antes de extrair os números (evita capturar o '26' de 'Ago/26:')
-  const semCabecalho = diasStr.replace(/[A-Za-záàãâéêíóôõúüç]+\/\d{2}:\s*/g, '');
-  const dias = [...new Set(semCabecalho.match(/\b\d{1,2}\b/g) || [])].map(Number).sort((a,b)=>a-b);
-  if (dias.length === 0) return '';
-  const grupos = [];
-  let inicio = dias[0], fim = dias[0];
-  for (let i = 1; i < dias.length; i++) {
-    if (dias[i] === fim + 1) { fim = dias[i]; }
-    else {
-      grupos.push(inicio === fim ? String(inicio) : inicio + '-' + fim);
-      inicio = fim = dias[i];
-    }
-  }
-  grupos.push(inicio === fim ? String(inicio) : inicio + '-' + fim);
-  return grupos.join(', ');
-}
-
 function formatarDatas(str) {
   if (!str || str === '-') return '-';
-  // Divide por mês e comprime cada bloco de dias consecutivos
-  return str
-    .replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1')
-    .replace(/^\n/, '')
-    .trim()
-    .split('\n')
-    .map(linha => {
-      const match = linha.match(/^([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)\s*(.*)$/);
-      if (!match) return linha;
-      return match[1] + ' ' + comprimirDias(match[2]);
-    })
-    .join('\n');
+  return str.replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1').replace(/^\n/, '').trim();
 }
 
 function formatarMensagemCDV(d) {
@@ -986,7 +966,7 @@ async function conectar() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) { qrAtual = await QRCode.toDataURL(qr); }
-    if (connection === 'open') { conectado = true; qrAtual = null; errosDescripto = 0; resetarHealthTimer(); console.log('WhatsApp conectado!'); }
+    if (connection === 'open') { conectado = true; ultimaConexao = Date.now(); qrAtual = null; errosDescripto = 0; resetarHealthTimer(); console.log('WhatsApp conectado!'); }
     if (connection === 'close') {
       conectado = false;
       if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
@@ -1143,10 +1123,9 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
-  if (!conectado || !sock) {
-    const ok = await aguardarSock();
-    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
-  }
+  // Sempre aguarda estabilidade antes de enviar (evita Connection Closed em loop de reconexão)
+  const sockOk = await aguardarSock(15000);
+  if (!sockOk) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado ou instável.' });
   const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
   const agendarEm = req.body.agendarEm || null;
 
@@ -1250,6 +1229,37 @@ app.post('/painel/limpar', (req, res) => {
   res.json({ ok:true });
 });
 
+// ── RESET DE SESSÃO BAILEYS ──────────────────────────────────────────────────
+app.post('/reset-sessao', async (req, res) => {
+  const { confirmar } = req.body;
+  if (confirmar !== 'sim') return res.status(400).json({ ok:false, erro:'Envie { "confirmar": "sim" } para confirmar.' });
+  try {
+    // Desconectar sock atual se existir
+    if (sock) {
+      try { await sock.logout(); } catch(e) {}
+      try { sock.end(); } catch(e) {}
+      sock = null;
+      conectado = false;
+    }
+    // Apagar arquivos de sessão Baileys (preserva fila e agendamentos)
+    const { readdir: readdirP, unlink: unlinkP } = await import('fs/promises');
+    const arquivos = await readdirP(SESSAO_DIR);
+    const preservar = new Set(['fila_pendentes.json', 'agendamentos.json', 'telegram_session.txt']);
+    let deletados = [];
+    for (const arq of arquivos) {
+      if (!preservar.has(arq)) {
+        await unlinkP(SESSAO_DIR + '/' + arq);
+        deletados.push(arq);
+      }
+    }
+    console.log('[RESET] Sessão apagada. Arquivos removidos:', deletados.join(', '));
+    res.json({ ok:true, deletados, msg: 'Sessão resetada. Reinicie o servidor e escaneie o QR.' });
+  } catch(err) {
+    res.status(500).json({ ok:false, erro: err.message });
+  }
+});
+
+// ── RESET DE SESSÃO BAILEYS ──────────────────────────────────────────────────
 app.post('/injetar', async (req, res) => {
   const { texto } = req.body;
   if (!texto?.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
