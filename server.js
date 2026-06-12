@@ -108,26 +108,139 @@ let contadorId = filaPendentes.length > 0
 console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
 const bufferAgrupamento = new Map();
 
-// ── FILA DE ENVIO CDV (intervalo de 5 min entre mensagens) ───────────────────
-const INTERVALO_ENVIO_MS = 5 * 60 * 1000;
+// ── FILA DE ENVIO CDV (intervalo de 5 min, janela 07h–21h, fuso SP) ──────────
+const INTERVALO_ENVIO_MS  = 5 * 60 * 1000;
+const HORA_INICIO_ENVIO   = 7;   // 07:00 SP
+const HORA_FIM_ENVIO      = 21;  // 21:00 SP (exclusive: não envia após 21:00)
+const TZ_SP               = 'America/Sao_Paulo';
 const filaEnvio = [];
 let promessaFila = Promise.resolve();
 
-function enfileirarEnvio(ofertaId, mensagem) {
+// Retorna a hora atual em SP (0-23)
+function horaSP() {
+  return parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone:TZ_SP, hour:'numeric', hour12:false }).format(new Date()), 10);
+}
+
+// Retorna quantos ms faltam até a próxima janela permitida (07h SP) se fora dela
+function msAteJanela() {
+  const agora = new Date();
+  const hora  = horaSP();
+  if (hora >= HORA_INICIO_ENVIO && hora < HORA_FIM_ENVIO) return 0;
+  // Calcula quantos ms até 07:00 SP do próximo dia (ou hoje se ainda não chegou)
+  const partes = new Intl.DateTimeFormat('pt-BR', {
+    timeZone:TZ_SP, year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
+  }).formatToParts(agora);
+  const get = (t) => parseInt(partes.find(p => p.type===t).value, 10);
+  let ano=get('year'),mes=get('month')-1,dia=get('day'),h=get('hour'),min=get('minute'),seg=get('second');
+  // Próximo 07:00 SP: se ainda é antes de 07:00 hoje, usa hoje; senão usa amanhã
+  let alvo;
+  if (h < HORA_INICIO_ENVIO) {
+    alvo = new Date(agora.getTime() - ((h*3600+min*60+seg)*1000) + HORA_INICIO_ENVIO*3600*1000);
+  } else {
+    // após 21:00 → próximo dia 07:00
+    alvo = new Date(agora.getTime() - ((h*3600+min*60+seg)*1000) + (24+HORA_INICIO_ENVIO)*3600*1000);
+  }
+  return Math.max(0, alvo.getTime() - agora.getTime());
+}
+
+// Calcula o tempo de envio estimado para um item na posição `posicao` da fila (0-based)
+// levando em conta a janela horária. Retorna { posicao, tempoMin, horario }
+function calcularPosicaoFila(posicaoNaFila) {
+  const agora = Date.now();
+  const espera = msAteJanela();
+  // Base: quando o primeiro item poderá ser enviado
+  let baseMs = agora + espera;
+  // Cada posição adiciona INTERVALO_ENVIO_MS, mas se o slot cair fora da janela, pula para 07h do próximo dia
+  let tempoMs = baseMs;
+  for (let i = 0; i < posicaoNaFila; i++) {
+    tempoMs += INTERVALO_ENVIO_MS;
+    // Verificar se caiu fora da janela
+    const h = parseInt(new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,hour:'numeric',hour12:false}).format(new Date(tempoMs)),10);
+    if (h >= HORA_FIM_ENVIO || h < HORA_INICIO_ENVIO) {
+      // Avança para 07:00 do próximo dia
+      const diff = tempoMs - agora;
+      const msAte = msAteJanela.call({ _t: tempoMs }) || (() => {
+        // recalcular baseado em tempoMs
+        const hh = h;
+        if (hh < HORA_INICIO_ENVIO) return (HORA_INICIO_ENVIO - hh) * 3600000;
+        return (24 + HORA_INICIO_ENVIO - hh) * 3600000;
+      })();
+      tempoMs += msAte;
+    }
+  }
+  const tempoMin = Math.round((tempoMs - agora) / 60000);
+  const horario  = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,hour:'2-digit',minute:'2-digit'}).format(new Date(tempoMs));
+  return { posicao: posicaoNaFila, tempoMin, horario };
+}
+
+function enfileirarEnvio(ofertaId, mensagem, grupoAlvo) {
+  const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
   return new Promise((resolve, reject) => {
     const posicao = filaEnvio.length;
-    filaEnvio.push({ ofertaId, mensagem, resolve, reject });
+    filaEnvio.push({ ofertaId, mensagem, destino, resolve, reject });
     console.log('[ENVIO] Oferta #'+ofertaId+' enfileirada. Posição: '+(posicao+1));
     promessaFila = promessaFila.then(() => new Promise(res => {
       const item = filaEnvio.shift();
       if (!item) { res(); return; }
-      console.log('[ENVIO] Enviando oferta #'+item.ofertaId+' ('+filaEnvio.length+' restantes na fila)');
-      sock.sendMessage(GRUPOS[GRUPO_DESTINO_PASSAGENS], { text: item.mensagem })
-        .then(() => { item.resolve(); setTimeout(res, INTERVALO_ENVIO_MS); })
-        .catch(e => { item.reject(e); setTimeout(res, INTERVALO_ENVIO_MS); });
+      // Aguardar janela horária se necessário
+      const espera = msAteJanela();
+      const despachar = () => {
+        console.log('[ENVIO] Enviando oferta #'+item.ofertaId+' ('+filaEnvio.length+' restantes na fila)');
+        sock.sendMessage(item.destino, { text: item.mensagem })
+          .then(() => { item.resolve(); setTimeout(res, INTERVALO_ENVIO_MS); })
+          .catch(e  => { item.reject(e);  setTimeout(res, INTERVALO_ENVIO_MS); });
+      };
+      if (espera > 0) {
+        console.log('[ENVIO] Fora da janela horária. Aguardando '+Math.round(espera/60000)+' min para retomar.');
+        setTimeout(despachar, espera);
+      } else {
+        despachar();
+      }
     }));
   });
 }
+
+// ── AGENDAMENTOS ──────────────────────────────────────────────────────────────
+const AGEND_PATH = SESSAO_DIR + '/agendamentos.json';
+let agendamentos = [];
+
+function carregarAgendamentos() {
+  try {
+    if (existsSync(AGEND_PATH)) {
+      agendamentos = JSON.parse(readFileSync(AGEND_PATH, 'utf-8'));
+      console.log('[AGEND] Carregados ' + agendamentos.length + ' agendamentos.');
+    }
+  } catch(e) { console.log('[AGEND] Erro ao carregar:', e.message); }
+}
+
+function salvarAgendamentos() {
+  try { writeFileSync(AGEND_PATH, JSON.stringify(agendamentos), 'utf-8'); } catch(e) {}
+}
+
+carregarAgendamentos();
+
+// Verifica a cada 30s se há agendamentos a disparar
+setInterval(() => {
+  const agora = Date.now();
+  const prontos = agendamentos.filter(a => a.status === 'aguardando' && a.dispararEm <= agora);
+  for (const ag of prontos) {
+    ag.status = 'despachado';
+    salvarAgendamentos();
+    const grupoId = resolverGrupo(ag.grupo);
+    if (!grupoId) { ag.status = 'erro'; salvarAgendamentos(); continue; }
+    const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
+    if (isEmissao) {
+      enfileirarEnvio('ag-'+ag.id, ag.mensagem, grupoId).catch(e => console.error('[AGEND] Erro envio:', e.message));
+    } else {
+      if (!sock || !conectado) { ag.status = 'erro'; salvarAgendamentos(); continue; }
+      sock.sendMessage(grupoId, { text: ag.mensagem })
+        .then(() => { ag.status = 'enviado'; salvarAgendamentos(); })
+        .catch(e  => { ag.status = 'erro';   salvarAgendamentos(); console.error('[AGEND] Erro envio:', e.message); });
+    }
+    console.log('[AGEND] Disparando agendamento #'+ag.id+' para grupo '+ag.grupo);
+  }
+}, 30 * 1000);
 
 function resolverGrupo(chave) {
   return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
@@ -992,32 +1105,51 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     const ok = await aguardarSock();
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
-  const mensagem = req.body.mensagem || oferta.mensagemFormatada;
+  const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
+  const agendarEm = req.body.agendarEm || null;
+
+  // Agendamento futuro explícito
+  if (agendarEm) {
+    const dispararEm = new Date(agendarEm).getTime();
+    if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
+    const agId = gerarId();
+    agendamentos.push({ id:agId, grupo:'cdv_emissao', mensagem, dispararEm, status:'aguardando', criadoEm:new Date().toISOString() });
+    salvarAgendamentos();
+    oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
+    const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
+    return res.json({ ok:true, agendado:true, horario });
+  }
 
   // Cupons TSP: enviar direto para o grupo tsp (sem fila de intervalo)
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
       await sock.sendMessage(GRUPOS['tsp'], { text: mensagem });
-      oferta.status = 'aprovado';
-      oferta.mensagemFinal = mensagem;
-      salvarFila();
+      oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
       res.json({ ok:true });
-    } catch(err) {
-      res.status(500).json({ ok:false, erro: err.message });
-    }
+    } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
     return;
   }
 
-  // CDV: fila com intervalo de 5min
-  const posicao  = filaEnvio.length;
-  const tempoMin = posicao * (INTERVALO_ENVIO_MS / 60000);
+  // CDV: fila com intervalo de 5min + restrição de janela horária
+  const info = calcularPosicaoFila(filaEnvio.length);
   try {
-    oferta.status = 'aprovado';
-    oferta.mensagemFinal = mensagem;
-    salvarFila();
-    res.json({ ok:true, posicao, tempoMin: tempoMin > 0 ? tempoMin : 0 });
-    await enfileirarEnvio(oferta.id, mensagem);
+    oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
+    res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
+    await enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS]);
   } catch(err) { console.error('[APROVAR] Erro:', err.message); }
+});
+
+app.get('/agendamentos', (req, res) => {
+  res.json({ ok:true, agendamentos: agendamentos.filter(a => a.status === 'aguardando') });
+});
+
+app.delete('/agendamentos/:id', (req, res) => {
+  const id = parseInt(req.params.id);
+  const idx = agendamentos.findIndex(a => a.id === id);
+  if (idx === -1) return res.status(404).json({ ok:false, erro:'Agendamento não encontrado.' });
+  agendamentos[idx].status = 'cancelado';
+  salvarAgendamentos();
+  res.json({ ok:true });
 });
 
 app.post('/painel/rejeitar/:id', (req, res) => {
@@ -1090,16 +1222,30 @@ app.post('/injetar', async (req, res) => {
 });
 
 app.post('/enviar', async (req, res) => {
-  const { grupo, mensagem } = req.body;
+  const { grupo, mensagem, agendarEm } = req.body;
   if (!conectado||!sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
+
+  // Agendamento futuro
+  if (agendarEm) {
+    const dispararEm = new Date(agendarEm).getTime();
+    if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
+    const id = gerarId();
+    agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', criadoEm: new Date().toISOString() });
+    salvarAgendamentos();
+    const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
+    return res.json({ ok:true, agendado:true, id, horario });
+  }
+
   const isEmissao = grupo==='cdv_emissao'||grupoId===GRUPOS['cdv_emissao'];
   if (isEmissao) {
-    const posicao=filaEnvio.length, tempoMin=posicao*(INTERVALO_ENVIO_MS/60000);
-    try { res.json({ ok:true, posicao, tempoMin:tempoMin>0?tempoMin:0 }); await enfileirarEnvio('manual', mensagem); }
-    catch(err) { console.error('[ENVIAR] Erro:', err.message); }
+    const info = calcularPosicaoFila(filaEnvio.length);
+    try {
+      res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
+      await enfileirarEnvio('manual', mensagem, grupoId);
+    } catch(err) { console.error('[ENVIAR] Erro:', err.message); }
   } else {
     try { await sock.sendMessage(grupoId, { text:mensagem }); res.json({ ok:true }); }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
