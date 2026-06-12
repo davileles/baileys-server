@@ -76,19 +76,10 @@ let conectado = false;
 let qrAtual   = null;
 
 // Aguarda sock estar disponível (até 8s)
-// Aguarda sock conectado E estável (sem reconexões recentes)
-let ultimaConexao = 0; // timestamp da última vez que conectado ficou true
-async function aguardarSock(ms = 15000) {
+async function aguardarSock(ms = 8000) {
   const inicio = Date.now();
-  // Fase 1: espera estar conectado
   while ((!sock || !conectado) && Date.now() - inicio < ms) {
     await new Promise(r => setTimeout(r, 300));
-  }
-  if (!sock || !conectado) return false;
-  // Fase 2: espera 2s de estabilidade após a última conexão
-  const estabilidade = 2000;
-  while (Date.now() - ultimaConexao < estabilidade && Date.now() - inicio < ms) {
-    await new Promise(r => setTimeout(r, 200));
   }
   return !!sock && conectado;
 }
@@ -104,9 +95,35 @@ function carregarFila() {
   } catch(e) { console.log('[FILA] Erro ao carregar fila:', e.message); }
 }
 
+function limparFila() {
+  const agora = Date.now();
+  const LIMITE_24H = 24 * 60 * 60 * 1000;
+  const LIMITE_PROCESSADAS = 20;
+
+  // 1. Remove qualquer oferta (pendente ou não) com mais de 24h
+  for (let i = filaPendentes.length - 1; i >= 0; i--) {
+    const ts = new Date(filaPendentes[i].timestamp).getTime();
+    if (agora - ts > LIMITE_24H) filaPendentes.splice(i, 1);
+  }
+
+  // 2. Garante no máximo 20 aprovadas/rejeitadas (remove as mais antigas)
+  const processadas = filaPendentes
+    .map((o, i) => ({ o, i }))
+    .filter(({ o }) => o.status !== 'pendente')
+    .sort((a, b) => new Date(a.o.timestamp) - new Date(b.o.timestamp)); // mais antigas primeiro
+  const excesso = processadas.length - LIMITE_PROCESSADAS;
+  if (excesso > 0) {
+    const idxRemover = new Set(processadas.slice(0, excesso).map(({ i }) => i));
+    for (let i = filaPendentes.length - 1; i >= 0; i--) {
+      if (idxRemover.has(i)) filaPendentes.splice(i, 1);
+    }
+  }
+}
+
 function salvarFila() {
   try {
-    writeFileSync(FILA_PATH, JSON.stringify(filaPendentes.slice(0, 100)), 'utf-8');
+    limparFila();
+    writeFileSync(FILA_PATH, JSON.stringify(filaPendentes), 'utf-8');
   } catch(e) { console.log('[FILA] Erro ao salvar fila:', e.message); }
 }
 
@@ -482,7 +499,6 @@ async function processarMensagemTelegram(texto) {
         status: 'pendente',
       };
       filaPendentes.unshift(oferta);
-      if (filaPendentes.length > 100) filaPendentes.splice(100);
       salvarFila();
       console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}`);
     }
@@ -884,7 +900,6 @@ async function processarBuffer(grupoId) {
       const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
       const oferta  = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:emissao.mensagem, dadosExtraidos:emissao, status:'pendente' };
       filaPendentes.unshift(oferta);
-      if (filaPendentes.length > 100) filaPendentes.splice(100);
       salvarFila();
     }
   } catch (err) { console.error('Erro ao processar buffer:', err.message); }
@@ -936,7 +951,16 @@ function resetarHealthTimer() {
     console.log('[HEALTH] Forçando reconexão...');
     conectado = false;
     if (sock) { try { sock.end(new Error('health-check-timeout')); } catch(e) {} sock = null; }
-    conectar();
+    // Limpeza automática da fila a cada hora
+setInterval(() => {
+  const antes = filaPendentes.length;
+  limparFila();
+  salvarFila();
+  const depois = filaPendentes.length;
+  if (antes !== depois) console.log('[FILA] Limpeza automática: ' + (antes - depois) + ' oferta(s) removida(s).');
+}, 60 * 60 * 1000);
+
+conectar();
   }, HEALTH_CHECK_MS);
 }
 
@@ -966,7 +990,7 @@ async function conectar() {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) { qrAtual = await QRCode.toDataURL(qr); }
-    if (connection === 'open') { conectado = true; ultimaConexao = Date.now(); qrAtual = null; errosDescripto = 0; resetarHealthTimer(); console.log('WhatsApp conectado!'); }
+    if (connection === 'open') { conectado = true; qrAtual = null; errosDescripto = 0; resetarHealthTimer(); console.log('WhatsApp conectado!'); }
     if (connection === 'close') {
       conectado = false;
       if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
@@ -1123,9 +1147,10 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
-  // Sempre aguarda estabilidade antes de enviar (evita Connection Closed em loop de reconexão)
-  const sockOk = await aguardarSock(15000);
-  if (!sockOk) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado ou instável.' });
+  if (!conectado || !sock) {
+    const ok = await aguardarSock();
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
   const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
   const agendarEm = req.body.agendarEm || null;
 
@@ -1229,39 +1254,6 @@ app.post('/painel/limpar', (req, res) => {
   res.json({ ok:true });
 });
 
-// ── RESET DE SESSÃO BAILEYS ──────────────────────────────────────────────────
-app.post('/reset-sessao', async (req, res) => {
-  const { confirmar } = req.body;
-  if (confirmar !== 'sim') return res.status(400).json({ ok:false, erro:'Envie { "confirmar": "sim" } para confirmar.' });
-  try {
-    // Desconectar sock atual se existir
-    if (sock) {
-      try { await sock.logout(); } catch(e) {}
-      try { sock.end(); } catch(e) {}
-      sock = null;
-      conectado = false;
-    }
-    // Apagar arquivos de sessão Baileys (preserva fila e agendamentos)
-    const { readdir: readdirP, unlink: unlinkP, stat: statP } = await import('fs/promises');
-    const arquivos = await readdirP(SESSAO_DIR);
-    const preservar = new Set(['fila_pendentes.json', 'agendamentos.json', 'telegram_session.txt']);
-    let deletados = [];
-    for (const arq of arquivos) {
-      if (preservar.has(arq)) continue;
-      const caminho = SESSAO_DIR + '/' + arq;
-      const info = await statP(caminho);
-      if (info.isDirectory()) continue; // pula pastas (ex: lost+found)
-      await unlinkP(caminho);
-      deletados.push(arq);
-    }
-    console.log('[RESET] Sessão apagada. Arquivos removidos:', deletados.join(', '));
-    res.json({ ok:true, deletados, msg: 'Sessão resetada. Reinicie o servidor e escaneie o QR.' });
-  } catch(err) {
-    res.status(500).json({ ok:false, erro: err.message });
-  }
-});
-
-// ── RESET DE SESSÃO BAILEYS ──────────────────────────────────────────────────
 app.post('/injetar', async (req, res) => {
   const { texto } = req.body;
   if (!texto?.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
@@ -1391,5 +1383,6 @@ app.post('/webhook/hubla', async (req, res) => {
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
+
 
 conectar();
