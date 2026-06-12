@@ -942,8 +942,7 @@ async function processarBuffer(grupoId) {
       for (const v of validas) {
         const indices = v.indices || [v.indice];
         const imagens = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
-        const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('
-');
+        const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
         const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
         const mensagem = formatarMensagemCDV(dados);
         const oferta   = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:mensagem, dadosExtraidos:{ ...dados, indices }, status:'pendente' };
@@ -960,8 +959,7 @@ async function processarBuffer(grupoId) {
     for (const emissao of emissoes) {
       const indices = emissao.indices || [];
       const imagens = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
-      const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('
-');
+      const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
       const oferta  = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:emissao.mensagem, dadosExtraidos:emissao, status:'pendente' };
       filaPendentes.unshift(oferta);
       salvarFila();
