@@ -879,11 +879,23 @@ function mesclarParesIdaVolta(validas) {
     return mesmoPrograma && mesmaCabine && rotaInvertida;
   }
 
-  while (i < validas.length) {
-    const v = validas[i];
-    const w = validas[i + 1];
+  const usados = new Set();
 
-    if (w && ehParInvertido(v, w)) {
+  while (i < validas.length) {
+    if (usados.has(i)) { i++; continue; }
+    const v = validas[i];
+
+    // Busca par em até 2 posições à frente
+    let parIdx = -1;
+    for (let j = i + 1; j <= Math.min(i + 2, validas.length - 1); j++) {
+      if (!usados.has(j) && ehParInvertido(v, validas[j])) {
+        parIdx = j;
+        break;
+      }
+    }
+
+    if (parIdx !== -1) {
+      const w = validas[parIdx];
       const merged = {
         ...v,
         direcao:    'ida_volta',
@@ -893,13 +905,15 @@ function mesclarParesIdaVolta(validas) {
       };
       merged.origem  = resolverCidade(merged.origemCodigo,  merged.origem);
       merged.destino = resolverCidade(merged.destinoCodigo, merged.destino);
-      console.log('[MERGE] Par ida/volta mesclado: '+(v.origemCodigo||v.origem)+'->'+(v.destinoCodigo||v.destino));
+      console.log('[MERGE] Par ida/volta mesclado (pos '+i+'+'+parIdx+'): '+(v.origemCodigo||v.origem)+'->'+(v.destinoCodigo||v.destino));
       resultado.push(merged);
-      i += 2;
+      usados.add(i);
+      usados.add(parIdx);
     } else {
       resultado.push({ ...v, indices: v.indices||[v.indice] });
-      i += 1;
+      usados.add(i);
     }
+    i++;
   }
   return resultado;
 }
