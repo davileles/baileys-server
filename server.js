@@ -625,6 +625,7 @@ function resetarHealthTimer() {
   if (healthTimer) clearTimeout(healthTimer);
   healthTimer = setTimeout(() => {
     console.log('[HEALTH] Forçando reconexão...');
+    conectado = false;
     if (sock) { try { sock.end(new Error('health-check-timeout')); } catch(e) {} sock = null; }
     conectar();
   }, HEALTH_CHECK_MS);
@@ -751,7 +752,7 @@ app.get('/qr', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
 });
 
 app.get('/painel', (req, res) => {
@@ -947,7 +948,7 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
 });
 
 app.get('/grupos', async (req, res) => {
-  if (!sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  if (!sock || !conectado) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   try {
     const chats  = await sock.groupFetchAllParticipating();
     const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
