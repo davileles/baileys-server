@@ -311,9 +311,38 @@ function contarDatas(datasStr) {
   return matches ? matches.length : 0;
 }
 
+function comprimirDias(diasStr) {
+  // Remove cabeçalho de mês/ano antes de extrair os números (evita capturar o '26' de 'Ago/26:')
+  const semCabecalho = diasStr.replace(/[A-Za-záàãâéêíóôõúüç]+\/\d{2}:\s*/g, '');
+  const dias = [...new Set(semCabecalho.match(/\b\d{1,2}\b/g) || [])].map(Number).sort((a,b)=>a-b);
+  if (dias.length === 0) return '';
+  const grupos = [];
+  let inicio = dias[0], fim = dias[0];
+  for (let i = 1; i < dias.length; i++) {
+    if (dias[i] === fim + 1) { fim = dias[i]; }
+    else {
+      grupos.push(inicio === fim ? String(inicio) : inicio + '-' + fim);
+      inicio = fim = dias[i];
+    }
+  }
+  grupos.push(inicio === fim ? String(inicio) : inicio + '-' + fim);
+  return grupos.join(', ');
+}
+
 function formatarDatas(str) {
   if (!str || str === '-') return '-';
-  return str.replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1').replace(/^\n/, '').trim();
+  // Divide por mês e comprime cada bloco de dias consecutivos
+  return str
+    .replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1')
+    .replace(/^\n/, '')
+    .trim()
+    .split('\n')
+    .map(linha => {
+      const match = linha.match(/^([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)\s*(.*)$/);
+      if (!match) return linha;
+      return match[1] + ' ' + comprimirDias(match[2]);
+    })
+    .join('\n');
 }
 
 function formatarMensagemCDV(d) {
