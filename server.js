@@ -619,9 +619,7 @@ async function iniciarTelegram() {
       const texto = msg.message;
       console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
       await processarMensagemTelegram(texto);
-    } catch (err) {
-      console.error('[TG] Erro no handler de canal:', err.message);
-    }
+    } catch (err) { console.error('[TG] Erro no handler de canal:', err.message); }
   }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
 }
 
@@ -964,10 +962,7 @@ async function processarBuffer(grupoId) {
       filaPendentes.unshift(oferta);
       salvarFila();
     }
-  } catch (err) {
-      console.error('[TG] Erro no handler de canal:', err.message);
-    }
-  }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
+  } catch (err) { console.error('Erro ao processar buffer:', err.message); }
 }
 
 // Iniciar Telegram em background (sem bloquear o servidor)
