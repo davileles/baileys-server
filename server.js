@@ -965,12 +965,6 @@ async function processarBuffer(grupoId) {
   } catch (err) { console.error('Erro ao processar buffer:', err.message); }
 }
 
-// Iniciar Telegram em background (sem bloquear o servidor)
-iniciarTelegram().catch(err => {
-  console.error('[TG] Falha ao iniciar:', err.message);
-  tgAuthState = 'erro';
-});
-
 // ── LISTENER WHATSAPP ─────────────────────────────────────────────────────────
 async function processarMensagem(msg) {
   try {
