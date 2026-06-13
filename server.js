@@ -1247,6 +1247,28 @@ app.delete('/fila-envio', (req, res) => {
   res.json({ ok: true, removidos: total });
 });
 
+// Marca uma oferta como 'enviado' no filaPendentes para não voltar no próximo restart
+// POST /fila-envio/marcar-enviado/:ofertaId
+app.post('/fila-envio/marcar-enviado/:ofertaId', (req, res) => {
+  const id = req.params.ofertaId;
+  const oferta = filaPendentes.find(o => String(o.id) === String(id));
+  if (!oferta) return res.status(404).json({ ok: false, erro: 'Oferta #' + id + ' não encontrada' });
+  oferta.status = 'enviado';
+  salvarFila();
+  console.log('[FILA] Oferta #' + id + ' marcada como enviado manualmente.');
+  res.json({ ok: true, id, statusAnterior: oferta.status });
+});
+
+// Marca TODAS as ofertas com status 'aprovado' como 'enviado' de uma vez
+// POST /fila-envio/marcar-todas-enviado
+app.post('/fila-envio/marcar-todas-enviado', (req, res) => {
+  const aprovadas = filaPendentes.filter(o => o.status === 'aprovado');
+  aprovadas.forEach(o => { o.status = 'enviado'; });
+  salvarFila();
+  console.log('[FILA] ' + aprovadas.length + ' oferta(s) marcada(s) como enviado manualmente.');
+  res.json({ ok: true, marcadas: aprovadas.length, ids: aprovadas.map(o => o.id) });
+});
+
 app.get('/painel', (req, res) => {
   const pendentes   = filaPendentes.filter(o => o.status==='pendente');
   const processados = filaPendentes.filter(o => o.status!=='pendente');
