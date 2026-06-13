@@ -135,96 +135,124 @@ let contadorId = filaPendentes.length > 0
 console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
 const bufferAgrupamento = new Map();
 
-// ── FILA DE ENVIO CDV (intervalo de 5 min, janela 07h–21h, fuso SP) ──────────
-const INTERVALO_ENVIO_MS  = 5 * 60 * 1000;
-const HORA_INICIO_ENVIO   = 7;   // 07:00 SP
-const HORA_FIM_ENVIO      = 21;  // 21:00 SP (exclusive: não envia após 21:00)
-const TZ_SP               = 'America/Sao_Paulo';
+// ── FILA DE ENVIO CDV (intervalo de 5 min, janela 08h–21h, fuso SP) ──────────
+const INTERVALO_ENVIO_MS = 10 * 60 * 1000;
+const HORA_INICIO_ENVIO  = 8;   // 08:00 SP
+const HORA_FIM_ENVIO     = 21;  // 21:00 SP (exclusive)
+const TZ_SP              = 'America/Sao_Paulo';
+
+// Estrutura da fila: array de objetos { ofertaId, mensagem, destino }
+// Callbacks removidos — o worker loop controla tudo
 const filaEnvio = [];
-let promessaFila = Promise.resolve();
+let workerRodando = false;
 
 // Retorna a hora atual em SP (0-23)
 function horaSP() {
-  return parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone:TZ_SP, hour:'numeric', hour12:false }).format(new Date()), 10);
+  return parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: 'numeric', hour12: false }).format(new Date()), 10);
 }
 
-// Retorna quantos ms faltam até a próxima janela permitida (07h SP) se fora dela
+// Retorna ms até a próxima abertura da janela (0 se já dentro)
 function msAteJanela() {
-  const agora = new Date();
-  const hora  = horaSP();
+  const hora = horaSP();
   if (hora >= HORA_INICIO_ENVIO && hora < HORA_FIM_ENVIO) return 0;
-  // Calcula quantos ms até 07:00 SP do próximo dia (ou hoje se ainda não chegou)
+  // Calcula ms até 08:00 SP
+  const agora = Date.now();
   const partes = new Intl.DateTimeFormat('pt-BR', {
-    timeZone:TZ_SP, year:'numeric', month:'2-digit', day:'2-digit',
-    hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false
-  }).formatToParts(agora);
-  const get = (t) => parseInt(partes.find(p => p.type===t).value, 10);
-  let ano=get('year'),mes=get('month')-1,dia=get('day'),h=get('hour'),min=get('minute'),seg=get('second');
-  // Próximo 07:00 SP: se ainda é antes de 07:00 hoje, usa hoje; senão usa amanhã
-  let alvo;
+    timeZone: TZ_SP, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  }).formatToParts(new Date(agora));
+  const get = t => parseInt(partes.find(p => p.type === t).value, 10);
+  const h = get('hour'), m = get('minute'), s = get('second');
+  const segundosPassados = h * 3600 + m * 60 + s;
+  const segundosAte08   = HORA_INICIO_ENVIO * 3600;
+  let diffMs;
   if (h < HORA_INICIO_ENVIO) {
-    alvo = new Date(agora.getTime() - ((h*3600+min*60+seg)*1000) + HORA_INICIO_ENVIO*3600*1000);
+    diffMs = (segundosAte08 - segundosPassados) * 1000;
   } else {
-    // após 21:00 → próximo dia 07:00
-    alvo = new Date(agora.getTime() - ((h*3600+min*60+seg)*1000) + (24+HORA_INICIO_ENVIO)*3600*1000);
+    diffMs = (86400 - segundosPassados + segundosAte08) * 1000;
   }
-  return Math.max(0, alvo.getTime() - agora.getTime());
+  return Math.max(0, diffMs);
 }
 
-// Calcula o tempo de envio estimado para um item na posição `posicao` da fila (0-based)
-// levando em conta a janela horária. Retorna { posicao, tempoMin, horario }
+// Calcula posição estimada na fila para exibição no painel
 function calcularPosicaoFila(posicaoNaFila) {
-  const agora = Date.now();
-  const espera = msAteJanela();
-  // Base: quando o primeiro item poderá ser enviado
-  let baseMs = agora + espera;
-  // Cada posição adiciona INTERVALO_ENVIO_MS, mas se o slot cair fora da janela, pula para 07h do próximo dia
-  let tempoMs = baseMs;
+  const agora   = Date.now();
+  let tempoMs   = agora + msAteJanela();
   for (let i = 0; i < posicaoNaFila; i++) {
     tempoMs += INTERVALO_ENVIO_MS;
-    // Verificar se caiu fora da janela
-    const h = parseInt(new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,hour:'numeric',hour12:false}).format(new Date(tempoMs)),10);
+    const h = parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: 'numeric', hour12: false }).format(new Date(tempoMs)), 10);
     if (h >= HORA_FIM_ENVIO || h < HORA_INICIO_ENVIO) {
-      // Avança para 07:00 do próximo dia
-      const diff = tempoMs - agora;
-      const msAte = msAteJanela.call({ _t: tempoMs }) || (() => {
-        // recalcular baseado em tempoMs
-        const hh = h;
-        if (hh < HORA_INICIO_ENVIO) return (HORA_INICIO_ENVIO - hh) * 3600000;
-        return (24 + HORA_INICIO_ENVIO - hh) * 3600000;
-      })();
-      tempoMs += msAte;
+      // Pula para 08:00 do próximo dia
+      const diffMs = msAteJanela.call(null); // recalcular na posição tempoMs não é trivial; usamos estimativa conservadora
+      tempoMs += (24 + HORA_INICIO_ENVIO - h) * 3600000;
     }
   }
   const tempoMin = Math.round((tempoMs - agora) / 60000);
-  const horario  = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,hour:'2-digit',minute:'2-digit'}).format(new Date(tempoMs));
+  const horario  = new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: '2-digit', minute: '2-digit' }).format(new Date(tempoMs));
   return { posicao: posicaoNaFila, tempoMin, horario };
 }
 
+// Aguarda até sock estar conectado (polling com timeout de 3min)
+async function aguardarConectado(timeoutMs = 180000) {
+  const inicio = Date.now();
+  while (!conectado || !sock) {
+    if (Date.now() - inicio > timeoutMs) throw new Error('Timeout aguardando conexão WhatsApp');
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+// Worker loop: processa a fila item a item, respeitando janela e intervalo
+async function workerFila() {
+  if (workerRodando) return;
+  workerRodando = true;
+  console.log('[FILA] Worker iniciado.');
+  while (filaEnvio.length > 0) {
+    // 1. Aguardar janela horária
+    const espera = msAteJanela();
+    if (espera > 0) {
+      console.log('[FILA] Fora da janela (hora SP:' + horaSP() + '). Aguardando ' + Math.round(espera / 60000) + ' min...');
+      await new Promise(r => setTimeout(r, espera));
+    }
+    // 2. Aguardar conexão WhatsApp
+    try {
+      await aguardarConectado();
+    } catch(e) {
+      console.error('[FILA] ' + e.message + '. Recolocando item na fila e aguardando 60s.');
+      await new Promise(r => setTimeout(r, 60000));
+      continue;
+    }
+    // 3. Pegar próximo item
+    const item = filaEnvio[0];
+    if (!item) break;
+    // 4. Enviar
+    try {
+      console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
+      await sock.sendMessage(item.destino, { text: item.mensagem });
+      filaEnvio.shift(); // remove só após sucesso
+      console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada. Aguardando ' + (INTERVALO_ENVIO_MS / 60000) + ' min para próxima.');
+    } catch(e) {
+      console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId + ':', e.message);
+      // Não remove da fila — tenta de novo após aguardar reconexão
+      await new Promise(r => setTimeout(r, 10000));
+      continue;
+    }
+    // 5. Aguardar intervalo antes do próximo (só se ainda há itens)
+    if (filaEnvio.length > 0) {
+      await new Promise(r => setTimeout(r, INTERVALO_ENVIO_MS));
+    }
+  }
+  workerRodando = false;
+  console.log('[FILA] Worker encerrado (fila vazia).');
+}
+
+// Enfileira e garante que o worker está rodando
 function enfileirarEnvio(ofertaId, mensagem, grupoAlvo) {
   const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
-  return new Promise((resolve, reject) => {
-    const posicao = filaEnvio.length;
-    filaEnvio.push({ ofertaId, mensagem, destino, resolve, reject });
-    console.log('[ENVIO] Oferta #'+ofertaId+' enfileirada. Posição: '+(posicao+1));
-    promessaFila = promessaFila.then(() => new Promise(res => {
-      const item = filaEnvio.shift();
-      if (!item) { res(); return; }
-      // Aguardar janela horária se necessário
-      const espera = msAteJanela();
-      const despachar = () => {
-        console.log('[ENVIO] Enviando oferta #'+item.ofertaId+' ('+filaEnvio.length+' restantes na fila)');
-        sock.sendMessage(item.destino, { text: item.mensagem })
-          .then(() => { item.resolve(); setTimeout(res, INTERVALO_ENVIO_MS); })
-          .catch(e  => { item.reject(e);  setTimeout(res, INTERVALO_ENVIO_MS); });
-      };
-      if (espera > 0) {
-        console.log('[ENVIO] Fora da janela horária. Aguardando '+Math.round(espera/60000)+' min para retomar.');
-        setTimeout(despachar, espera);
-      } else {
-        despachar();
-      }
-    }));
+  const posicao = filaEnvio.length;
+  filaEnvio.push({ ofertaId, mensagem, destino });
+  console.log('[FILA] Oferta #' + ofertaId + ' enfileirada na posição ' + (posicao + 1));
+  workerFila().catch(e => {
+    console.error('[FILA] Worker encerrou com erro:', e.message);
+    workerRodando = false;
   });
 }
 
@@ -258,7 +286,7 @@ setInterval(() => {
     if (!grupoId) { ag.status = 'erro'; salvarAgendamentos(); continue; }
     const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
     if (isEmissao) {
-      enfileirarEnvio('ag-'+ag.id, ag.mensagem, grupoId).catch(e => console.error('[AGEND] Erro envio:', e.message));
+      enfileirarEnvio('ag-'+ag.id, ag.mensagem, grupoId);
     } else {
       if (!sock || !conectado) { ag.status = 'erro'; salvarAgendamentos(); continue; }
       sock.sendMessage(grupoId, { text: ag.mensagem })
@@ -1252,11 +1280,9 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   // CDV: fila com intervalo de 5min + restrição de janela horária
   const info = calcularPosicaoFila(filaEnvio.length);
-  try {
-    oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
-    res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
-    await enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS]);
-  } catch(err) { console.error('[APROVAR] Erro:', err.message); }
+  oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
+  enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS]);
+  res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
 });
 
 app.get('/agendamentos', (req, res) => {
@@ -1362,10 +1388,8 @@ app.post('/enviar', async (req, res) => {
   const isEmissao = grupo==='cdv_emissao'||grupoId===GRUPOS['cdv_emissao'];
   if (isEmissao) {
     const info = calcularPosicaoFila(filaEnvio.length);
-    try {
-      res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
-      await enfileirarEnvio('manual', mensagem, grupoId);
-    } catch(err) { console.error('[ENVIAR] Erro:', err.message); }
+    enfileirarEnvio('manual', mensagem, grupoId);
+    res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
   } else {
     try { await sock.sendMessage(grupoId, { text:mensagem }); res.json({ ok:true }); }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
