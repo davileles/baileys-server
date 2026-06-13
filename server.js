@@ -1226,6 +1226,27 @@ app.get('/fila-envio', (req, res) => {
   });
 });
 
+// Remove um item específico da fila de envio por ofertaId
+// DELETE /fila-envio/:ofertaId
+app.delete('/fila-envio/:ofertaId', (req, res) => {
+  const id = req.params.ofertaId;
+  const antes = filaEnvio.length;
+  const idx = filaEnvio.findIndex(i => String(i.ofertaId) === String(id));
+  if (idx === -1) return res.status(404).json({ ok: false, erro: 'Item não encontrado na fila' });
+  filaEnvio.splice(idx, 1);
+  console.log('[FILA] Item #' + id + ' removido manualmente da fila. Restam ' + filaEnvio.length);
+  res.json({ ok: true, removido: id, total: filaEnvio.length });
+});
+
+// Remove todos os itens da fila de envio de uma vez
+// DELETE /fila-envio
+app.delete('/fila-envio', (req, res) => {
+  const total = filaEnvio.length;
+  filaEnvio.splice(0, filaEnvio.length);
+  console.log('[FILA] Fila de envio limpa manualmente. ' + total + ' itens removidos.');
+  res.json({ ok: true, removidos: total });
+});
+
 app.get('/painel', (req, res) => {
   const pendentes   = filaPendentes.filter(o => o.status==='pendente');
   const processados = filaPendentes.filter(o => o.status!=='pendente');
