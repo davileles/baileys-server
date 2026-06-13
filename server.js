@@ -133,6 +133,18 @@ let contadorId = filaPendentes.length > 0
   ? filaPendentes.reduce((max, o) => Math.max(max, parseInt(o.id)||0), 0) + 1
   : 1;
 console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
+
+// Recolocar na fila de envio ofertas que foram aprovadas mas não enviadas (survives restart)
+function requeueAprovadas() {
+  const aprovadas = filaPendentes.filter(o => o.status === 'aprovado' && o.mensagemFinal);
+  if (aprovadas.length === 0) return;
+  console.log('[FILA] Reenfileirando ' + aprovadas.length + ' oferta(s) aprovada(s) após restart...');
+  for (const o of aprovadas) {
+    filaEnvio.push({ ofertaId: o.id, mensagem: o.mensagemFinal, destino: GRUPOS[GRUPO_DESTINO_PASSAGENS] });
+    console.log('[FILA] Reenfileirada oferta #' + o.id);
+  }
+  workerFila().catch(e => { console.error('[FILA] Worker erro:', e.message); workerRodando = false; });
+}
 const bufferAgrupamento = new Map();
 
 // ── FILA DE ENVIO CDV (intervalo de 5 min, janela 08h–21h, fuso SP) ──────────
@@ -255,6 +267,9 @@ function enfileirarEnvio(ofertaId, mensagem, grupoAlvo) {
     workerRodando = false;
   });
 }
+
+// Chamar após definição do worker — recoloca aprovadas pendentes de envio
+requeueAprovadas();
 
 // ── AGENDAMENTOS ──────────────────────────────────────────────────────────────
 const AGEND_PATH = SESSAO_DIR + '/agendamentos.json';
@@ -1188,6 +1203,27 @@ app.get('/qr', (req, res) => {
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
   res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
+});
+
+app.get('/fila-envio', (req, res) => {
+  const itens = filaEnvio.map((item, idx) => ({
+    posicao:  idx + 1,
+    ofertaId: item.ofertaId,
+    destino:  item.destino,
+    preview:  item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
+  }));
+  const espera = msAteJanela();
+  const horaSP_ = horaSP();
+  res.json({
+    total:         filaEnvio.length,
+    workerAtivo:   workerRodando,
+    dentroJanela:  espera === 0,
+    horaSP:        horaSP_,
+    janelaEnvio:   `${HORA_INICIO_ENVIO}h–${HORA_FIM_ENVIO}h SP`,
+    msAteJanela:   espera,
+    intervaloMinutos: INTERVALO_ENVIO_MS / 60000,
+    itens,
+  });
 });
 
 app.get('/painel', (req, res) => {
