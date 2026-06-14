@@ -110,7 +110,7 @@ function limparFila() {
   const processadas = filaPendentes
     .map((o, i) => ({ o, i }))
     .filter(({ o }) => o.status !== 'pendente')
-    .sort((a, b) => new Date(a.o.timestamp) - new Date(b.o.timestamp)); // mais antigas primeiro
+    .sort((a, b) => new Date(a.o.timestamp) - new Date(b.o.timestamp));
   const excesso = processadas.length - LIMITE_PROCESSADAS;
   if (excesso > 0) {
     const idxRemover = new Set(processadas.slice(0, excesso).map(({ i }) => i));
@@ -149,25 +149,20 @@ const bufferAgrupamento = new Map();
 
 // ── FILA DE ENVIO CDV (intervalo de 5 min, janela 08h–21h, fuso SP) ──────────
 const INTERVALO_ENVIO_MS = 10 * 60 * 1000;
-const HORA_INICIO_ENVIO  = 8;   // 08:00 SP
-const HORA_FIM_ENVIO     = 21;  // 21:00 SP (exclusive)
+const HORA_INICIO_ENVIO  = 8;
+const HORA_FIM_ENVIO     = 21;
 const TZ_SP              = 'America/Sao_Paulo';
 
-// Estrutura da fila: array de objetos { ofertaId, mensagem, destino }
-// Callbacks removidos — o worker loop controla tudo
 const filaEnvio = [];
 let workerRodando = false;
 
-// Retorna a hora atual em SP (0-23)
 function horaSP() {
   return parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: 'numeric', hour12: false }).format(new Date()), 10);
 }
 
-// Retorna ms até a próxima abertura da janela (0 se já dentro)
 function msAteJanela() {
   const hora = horaSP();
   if (hora >= HORA_INICIO_ENVIO && hora < HORA_FIM_ENVIO) return 0;
-  // Calcula ms até 08:00 SP
   const agora = Date.now();
   const partes = new Intl.DateTimeFormat('pt-BR', {
     timeZone: TZ_SP, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
@@ -185,7 +180,6 @@ function msAteJanela() {
   return Math.max(0, diffMs);
 }
 
-// Calcula posição estimada na fila para exibição no painel
 function calcularPosicaoFila(posicaoNaFila) {
   const agora   = Date.now();
   let tempoMs   = agora + msAteJanela();
@@ -193,8 +187,6 @@ function calcularPosicaoFila(posicaoNaFila) {
     tempoMs += INTERVALO_ENVIO_MS;
     const h = parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: 'numeric', hour12: false }).format(new Date(tempoMs)), 10);
     if (h >= HORA_FIM_ENVIO || h < HORA_INICIO_ENVIO) {
-      // Pula para 08:00 do próximo dia
-      const diffMs = msAteJanela.call(null); // recalcular na posição tempoMs não é trivial; usamos estimativa conservadora
       tempoMs += (24 + HORA_INICIO_ENVIO - h) * 3600000;
     }
   }
@@ -203,7 +195,6 @@ function calcularPosicaoFila(posicaoNaFila) {
   return { posicao: posicaoNaFila, tempoMin, horario };
 }
 
-// Aguarda até sock estar conectado (polling com timeout de 3min)
 async function aguardarConectado(timeoutMs = 180000) {
   const inicio = Date.now();
   while (!conectado || !sock) {
@@ -212,19 +203,16 @@ async function aguardarConectado(timeoutMs = 180000) {
   }
 }
 
-// Worker loop: processa a fila item a item, respeitando janela e intervalo
 async function workerFila() {
   if (workerRodando) return;
   workerRodando = true;
   console.log('[FILA] Worker iniciado.');
   while (filaEnvio.length > 0) {
-    // 1. Aguardar janela horária
     const espera = msAteJanela();
     if (espera > 0) {
       console.log('[FILA] Fora da janela (hora SP:' + horaSP() + '). Aguardando ' + Math.round(espera / 60000) + ' min...');
       await new Promise(r => setTimeout(r, espera));
     }
-    // 2. Aguardar conexão WhatsApp
     try {
       await aguardarConectado();
     } catch(e) {
@@ -232,22 +220,18 @@ async function workerFila() {
       await new Promise(r => setTimeout(r, 60000));
       continue;
     }
-    // 3. Pegar próximo item
     const item = filaEnvio[0];
     if (!item) break;
-    // 4. Enviar
     try {
       console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
       await sock.sendMessage(item.destino, { text: item.mensagem });
-      filaEnvio.shift(); // remove só após sucesso
+      filaEnvio.shift();
       console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada. Aguardando ' + (INTERVALO_ENVIO_MS / 60000) + ' min para próxima.');
     } catch(e) {
       console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId + ':', e.message);
-      // Não remove da fila — tenta de novo após aguardar reconexão
       await new Promise(r => setTimeout(r, 10000));
       continue;
     }
-    // 5. Aguardar intervalo antes do próximo (só se ainda há itens)
     if (filaEnvio.length > 0) {
       await new Promise(r => setTimeout(r, INTERVALO_ENVIO_MS));
     }
@@ -256,7 +240,6 @@ async function workerFila() {
   console.log('[FILA] Worker encerrado (fila vazia).');
 }
 
-// Enfileira e garante que o worker está rodando
 function enfileirarEnvio(ofertaId, mensagem, grupoAlvo) {
   const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
   const posicao = filaEnvio.length;
@@ -268,7 +251,6 @@ function enfileirarEnvio(ofertaId, mensagem, grupoAlvo) {
   });
 }
 
-// Chamar após definição do worker — recoloca aprovadas pendentes de envio
 requeueAprovadas();
 
 // ── AGENDAMENTOS ──────────────────────────────────────────────────────────────
@@ -290,7 +272,6 @@ function salvarAgendamentos() {
 
 carregarAgendamentos();
 
-// Verifica a cada 30s se há agendamentos a disparar
 setInterval(() => {
   const agora = Date.now();
   const prontos = agendamentos.filter(a => a.status === 'aguardando' && a.dispararEm <= agora);
@@ -311,6 +292,15 @@ setInterval(() => {
     console.log('[AGEND] Disparando agendamento #'+ag.id+' para grupo '+ag.grupo);
   }
 }, 30 * 1000);
+
+// ── Limpeza automática da fila (1x/hora) — nível do módulo ──────────────────
+setInterval(() => {
+  const antes = filaPendentes.length;
+  limparFila();
+  salvarFila();
+  const depois = filaPendentes.length;
+  if (antes !== depois) console.log('[FILA] Limpeza automática: ' + (antes - depois) + ' oferta(s) removida(s).');
+}, 60 * 60 * 1000);
 
 function resolverGrupo(chave) {
   return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
@@ -380,7 +370,6 @@ function contarDatas(datasStr) {
   return matches ? matches.length : 0;
 }
 
-// Comprime sequências numéricas contíguas: [1,2,3,4,7,8] → "1-4, 7-8"
 function comprimirSequencia(nums) {
   if (!nums || nums.length === 0) return '';
   const sorted = [...new Set(nums)].sort((a, b) => a - b);
@@ -400,19 +389,17 @@ function comprimirSequencia(nums) {
 
 function formatarDatas(str) {
   if (!str || str === '-') return '-';
-  // Quebra por mês, comprime dias sequenciais em cada trecho
   return str
     .replace(/([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)/g, '\n$1')
     .replace(/^\n/, '')
     .trim()
     .split('\n')
     .map(linha => {
-      // Linha esperada: "Jun/26: 1, 2, 3, 4, 7, 8"
       const match = linha.match(/^([A-Za-záàãâéêíóôõúüç]+\/\d{2}:)\s*(.+)$/);
       if (!match) return linha;
       const prefixo = match[1];
       const dias = match[2].match(/\d+/g);
-      if (!dias || dias.length <= 2) return linha; // não vale comprimir 1 ou 2 dias
+      if (!dias || dias.length <= 2) return linha;
       const nums = dias.map(Number);
       return `${prefixo} ${comprimirSequencia(nums)}`;
     })
@@ -454,7 +441,6 @@ const LINKS_TSP = {
   'Shopee_com':    'https://s.shopee.com.br/30kdYeLY0W',
 };
 
-// ── FORMATAR CUPOM TSP (replicando gerarCupom() do HTML) ─────────────────────
 function formatarCupomTSP(dados) {
   const loja   = dados.loja   || '';
   const tipo   = dados.tipo   || 'reais';
@@ -557,7 +543,6 @@ async function processarMensagemTelegram(texto) {
 
     console.log(`[TG] Cupom identificado: ${campos.loja} | ${campos.valor}${campos.tipo === 'pct' ? '%' : ' R$'}`);
 
-    // Múltiplos cupons na mesma mensagem
     const lista = campos.multiplos?.length
       ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo, codigo: m.codigo ?? campos.codigo, multiplos: null }))
       : [campos];
@@ -593,8 +578,7 @@ const TG_GRUPO_MONITORADO = process.env.TG_GRUPO || '@juaocupons';
 let tgClient = null;
 let tgConectado = false;
 
-// Estado da autenticação interativa via web
-let tgAuthState = null; // null | 'aguardando_telefone' | 'aguardando_codigo' | 'aguardando_senha' | 'ok' | 'erro'
+let tgAuthState = null;
 let tgAuthResolve = null;
 let tgAuthReject  = null;
 let tgAuthValor   = null;
@@ -615,7 +599,6 @@ async function iniciarTelegram() {
     connectionRetries: 5,
   });
 
-  // Callbacks de autenticação interativa via web
   await tgClient.start({
     phoneNumber: () => new Promise((resolve, reject) => {
       console.log('[TG] Aguardando número de telefone via /tg-auth...');
@@ -641,20 +624,17 @@ async function iniciarTelegram() {
     },
   });
 
-  // Salvar sessão para próximos deploys
   const sessionSalva = tgClient.session.save();
   writeFileSync(TG_SESSION_PATH, sessionSalva, 'utf-8');
   tgConectado = true;
   tgAuthState = 'ok';
   console.log(`[TG] Conectado! Monitorando ${TG_GRUPO_MONITORADO}`);
 
-  // Listener de novas mensagens de canal (UpdateNewChannelMessage)
   tgClient.addEventHandler(async (update) => {
     try {
       const msg = update.message;
       if (!msg?.message) return;
 
-      // Verificar se veio do canal monitorado
       const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
       const username = entity?.username || '';
       if (username.toLowerCase() !== TG_GRUPO_MONITORADO.replace('@', '').toLowerCase()) return;
@@ -666,18 +646,14 @@ async function iniciarTelegram() {
   }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
 }
 
-// Iniciar Telegram em background (sem bloquear o servidor)
 iniciarTelegram().catch(err => {
   console.error('[TG] Falha ao iniciar:', err.message);
   tgAuthState = 'erro';
 });
 
 // ── GRUPOS COM REGRAS ESPECIAIS DE EXTRAÇÃO ───────────────────────────────────
-// Grupo que usa APENAS imagem como fonte principal (ignorar texto)
 const GRUPO_APENAS_IMAGEM = '120363427512561555@g.us';
-// Grupo executiva: ignorar imagens, sempre Executiva, usar só 1º programa
 const GRUPO_EXECUTIVA     = '120363410708080270@g.us';
-// Grupos texto estruturado: ignorar imagens, padrão "Oportunidade de resgate"
 const GRUPOS_TEXTO_ESTRUTURADO = new Set([
   '120363229600818869@g.us',
   '120363298361885116@g.us',
@@ -698,9 +674,7 @@ const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
 async function classificarItens(itens, grupoId) {
   const resultados = [];
 
-  // ── Grupo 120363427512561555: extração APENAS da imagem ───────────────────
   if (grupoId === GRUPO_APENAS_IMAGEM) {
-    // Agrupa itens com imagem; itens sem imagem são descartados
     const itensComImagem = itens.filter(item => item.imagemBase64);
     if (itensComImagem.length === 0) { console.log('[GRUPO-IMG] Nenhuma imagem encontrada, descartando.'); return []; }
 
@@ -741,7 +715,6 @@ async function classificarItens(itens, grupoId) {
     return resultados;
   }
 
-  // ── Grupo 120363410708080270: executiva, ignorar imagens, 1º programa ─────
   if (grupoId === GRUPO_EXECUTIVA) {
     const itensTexto = itens.filter(item => item.texto?.trim());
     if (itensTexto.length === 0) { console.log('[GRUPO-EXEC] Sem texto, descartando.'); return []; }
@@ -777,7 +750,6 @@ async function classificarItens(itens, grupoId) {
     return resultados;
   }
 
-  // ── 8 grupos texto estruturado: ignorar imagens, padrão "Oportunidade" ────
   if (GRUPOS_TEXTO_ESTRUTURADO.has(grupoId)) {
     const itensTexto = itens.filter(item => item.texto?.trim());
     if (itensTexto.length === 0) { console.log('[GRUPO-TEXTO] Sem texto, descartando.'); return []; }
@@ -808,7 +780,6 @@ async function classificarItens(itens, grupoId) {
     return resultados;
   }
 
-  // ── Comportamento padrão (demais grupos) ──────────────────────────────────
   for (let i = 0; i < itens.length; i++) {
     const item = itens[i];
     const content = [];
@@ -899,10 +870,7 @@ async function agruparEFormatar(classificacoes) {
   });
 }
 
-// ── MESCLAR PARES IDA/VOLTA (grupos com trecho separado) ─────────────────────
-// Regra de proximidade: uma emissão só pode ser mergeada com a VIZINHA IMEDIATA
-// (i com i+1). Reflete a lógica real de envio: imagens consecutivas no grupo
-// pertencem à mesma emissão. Nunca busca par além do vizinho imediato.
+// ── MESCLAR PARES IDA/VOLTA ───────────────────────────────────────────────────
 function mesclarParesIdaVolta(validas) {
   const resultado = [];
   let i = 0;
@@ -928,7 +896,6 @@ function mesclarParesIdaVolta(validas) {
     if (usados.has(i)) { i++; continue; }
     const v = validas[i];
 
-    // Busca par em até 2 posições à frente
     let parIdx = -1;
     for (let j = i + 1; j <= Math.min(i + 2, validas.length - 1); j++) {
       if (!usados.has(j) && ehParInvertido(v, validas[j])) {
@@ -973,7 +940,6 @@ async function processarBuffer(grupoId) {
     let validas = classificacoes.filter(c => c?.valido);
     if (validas.length === 0) { console.log('Nenhuma oferta encontrada.'); return; }
 
-    // Mesclar pares ida/volta para grupos que enviam trechos separados
     const gruposMesclagem = new Set([GRUPO_APENAS_IMAGEM, GRUPO_EXECUTIVA, ...GRUPOS_TEXTO_ESTRUTURADO]);
     if (gruposMesclagem.has(grupoId)) {
       validas = mesclarParesIdaVolta(validas);
@@ -990,8 +956,6 @@ async function processarBuffer(grupoId) {
       validas = validasFiltradas;
     }
 
-    // Grupos de imagem/executiva: cada emissão já está individualizada após o merge —
-    // NÃO passar pelo agruparEFormatar (Claude do passo 2 confunde emissões díspares).
     const gruposBypass = new Set([GRUPO_APENAS_IMAGEM, GRUPO_EXECUTIVA]);
     if (gruposBypass.has(grupoId)) {
       for (const v of validas) {
@@ -1008,7 +972,6 @@ async function processarBuffer(grupoId) {
       return;
     }
 
-    // Demais grupos: agruparEFormatar via Claude
     const classificacoesFinais = validas.map(v => ({ ...v, valido:true }));
     const emissoes = await agruparEFormatar(classificacoesFinais);
     for (const emissao of emissoes) {
@@ -1067,17 +1030,10 @@ function resetarHealthTimer() {
   healthTimer = setTimeout(() => {
     console.log('[HEALTH] Forçando reconexão...');
     conectado = false;
-    if (sock) { try { sock.end(new Error('health-check-timeout')); } catch(e) {} sock = null; }
-    // Limpeza automática da fila a cada hora
-setInterval(() => {
-  const antes = filaPendentes.length;
-  limparFila();
-  salvarFila();
-  const depois = filaPendentes.length;
-  if (antes !== depois) console.log('[FILA] Limpeza automática: ' + (antes - depois) + ' oferta(s) removida(s).');
-}, 60 * 60 * 1000);
-
-conectar();
+    const sockRef = sock;
+    sock = null;
+    if (sockRef) { try { sockRef.end(new Error('health-check-timeout')); } catch(e) {} }
+    conectar();
   }, HEALTH_CHECK_MS);
 }
 
@@ -1086,7 +1042,9 @@ var ERROS_DESCR_MAX = 15;
 
 async function limparSessaoEReconectar() {
   conectado = false;
-  if (sock) { try { sock.end(new Error('bad-session')); } catch(e) {} sock = null; }
+  const sockRef = sock;
+  sock = null;
+  if (sockRef) { try { sockRef.end(new Error('bad-session')); } catch(e) {} }
   try {
     const arquivos = await readdir(SESSAO_DIR);
     for (const arq of arquivos) {
@@ -1135,7 +1093,6 @@ const PAINEL_CSS = `*{box-sizing:border-box;margin:0;padding:0}body{font-family:
 
 // ── ROTAS ─────────────────────────────────────────────────────────────────────
 
-// Rota de autenticação Telegram via web
 app.get('/tg-auth', (req, res) => {
   const estado = tgAuthState;
   const conectadoTg = tgConectado;
@@ -1226,11 +1183,8 @@ app.get('/fila-envio', (req, res) => {
   });
 });
 
-// Remove um item específico da fila de envio por ofertaId
-// DELETE /fila-envio/:ofertaId
 app.delete('/fila-envio/:ofertaId', (req, res) => {
   const id = req.params.ofertaId;
-  const antes = filaEnvio.length;
   const idx = filaEnvio.findIndex(i => String(i.ofertaId) === String(id));
   if (idx === -1) return res.status(404).json({ ok: false, erro: 'Item não encontrado na fila' });
   filaEnvio.splice(idx, 1);
@@ -1238,8 +1192,6 @@ app.delete('/fila-envio/:ofertaId', (req, res) => {
   res.json({ ok: true, removido: id, total: filaEnvio.length });
 });
 
-// Remove todos os itens da fila de envio de uma vez
-// DELETE /fila-envio
 app.delete('/fila-envio', (req, res) => {
   const total = filaEnvio.length;
   filaEnvio.splice(0, filaEnvio.length);
@@ -1247,8 +1199,6 @@ app.delete('/fila-envio', (req, res) => {
   res.json({ ok: true, removidos: total });
 });
 
-// Marca uma oferta como 'enviado' no filaPendentes para não voltar no próximo restart
-// POST /fila-envio/marcar-enviado/:ofertaId
 app.post('/fila-envio/marcar-enviado/:ofertaId', (req, res) => {
   const id = req.params.ofertaId;
   const oferta = filaPendentes.find(o => String(o.id) === String(id));
@@ -1259,8 +1209,6 @@ app.post('/fila-envio/marcar-enviado/:ofertaId', (req, res) => {
   res.json({ ok: true, id, statusAnterior: oferta.status });
 });
 
-// Marca TODAS as ofertas com status 'aprovado' como 'enviado' de uma vez
-// POST /fila-envio/marcar-todas-enviado
 app.post('/fila-envio/marcar-todas-enviado', (req, res) => {
   const aprovadas = filaPendentes.filter(o => o.status === 'aprovado');
   aprovadas.forEach(o => { o.status = 'enviado'; });
@@ -1283,7 +1231,6 @@ app.get('/painel', (req, res) => {
     const isTSP = o.tipoConteudo === 'cupom_tsp';
 
     if (isTSP) {
-      // Card especial para cupons TSP
       const loja  = d.loja || '';
       const valor = d.valor || '';
       const tipo  = d.tipo === 'pct' ? '%' : ' R$';
@@ -1294,7 +1241,6 @@ app.get('/painel', (req, res) => {
       return `<div class="card" id="card-${o.id}"><div class="card-header"><span class="id">#${o.id}</span><span class="tag tag-tsp">📦 Cupom TSP</span><span style="color:#f0f0f0;font-weight:600">${loja} ${valor}${tipo}</span>${cod}<span style="font-size:12px;color:#555;margin-left:auto">${data}</span></div><div class="card-body"><div class="col"><div class="col-title">Original (Telegram)</div>${textoHtml}</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-${o.id}">${o.mensagemFormatada}</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar(${o.id})">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar(${o.id})">Rejeitar</button><span id="fb-${o.id}" style="font-size:13px;margin-left:auto"></span></div></div>`;
     }
 
-    // Card CDV (original)
     const tipoTag   = d.tipo==='ida_volta'?'<span class="tag tag-iv">Ida e volta</span>':d.tipo==='ida'?'<span class="tag tag-ida">Somente ida</span>':'';
     const cabineTag = d.cabine==='Executiva'?'<span class="tag tag-exec">Executiva</span>':'<span class="tag tag-eco">Economica</span>';
     const rota = d.origem&&d.destino?`<span style="color:#f0f0f0;font-weight:600">${d.origem} - ${d.destino}</span>`:'';
@@ -1335,7 +1281,6 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
   const agendarEm = req.body.agendarEm || null;
 
-  // Agendamento futuro explícito
   if (agendarEm) {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
@@ -1347,7 +1292,6 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     return res.json({ ok:true, agendado:true, horario });
   }
 
-  // Cupons TSP: enviar direto para o grupo tsp (sem fila de intervalo)
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
       await sock.sendMessage(GRUPOS['tsp'], { text: mensagem });
@@ -1357,7 +1301,6 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     return;
   }
 
-  // CDV: fila com intervalo de 5min + restrição de janela horária
   const info = calcularPosicaoFila(filaEnvio.length);
   oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
   enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS]);
@@ -1453,7 +1396,6 @@ app.post('/enviar', async (req, res) => {
   if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
 
-  // Agendamento futuro
   if (agendarEm) {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
@@ -1560,6 +1502,5 @@ app.post('/webhook/hubla', async (req, res) => {
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
-
 
 conectar();
