@@ -203,16 +203,30 @@ async function aguardarConectado(timeoutMs = 180000) {
   }
 }
 
+// Timestamp do último envio — persiste entre execuções do worker
+let ultimoEnvioMs = 0;
+
 async function workerFila() {
   if (workerRodando) return;
   workerRodando = true;
   console.log('[FILA] Worker iniciado.');
   while (filaEnvio.length > 0) {
+    // 1. Aguardar janela de horário (8h–21h SP)
     const espera = msAteJanela();
     if (espera > 0) {
       console.log('[FILA] Fora da janela (hora SP:' + horaSP() + '). Aguardando ' + Math.round(espera / 60000) + ' min...');
       await new Promise(r => setTimeout(r, espera));
     }
+
+    // 2. Respeitar intervalo desde o último envio (mesmo que worker tenha encerrado antes)
+    const msDesdoUltimo = Date.now() - ultimoEnvioMs;
+    if (ultimoEnvioMs > 0 && msDesdoUltimo < INTERVALO_ENVIO_MS) {
+      const aguardar = INTERVALO_ENVIO_MS - msDesdoUltimo;
+      console.log('[FILA] Intervalo entre envios: aguardando ' + Math.round(aguardar / 60000) + ' min (último envio há ' + Math.round(msDesdoUltimo / 60000) + ' min).');
+      await new Promise(r => setTimeout(r, aguardar));
+    }
+
+    // 3. Verificar conexão
     try {
       await aguardarConectado();
     } catch(e) {
@@ -220,20 +234,19 @@ async function workerFila() {
       await new Promise(r => setTimeout(r, 60000));
       continue;
     }
+
     const item = filaEnvio[0];
     if (!item) break;
     try {
       console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
       await sock.sendMessage(item.destino, { text: item.mensagem });
       filaEnvio.shift();
-      console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada. Aguardando ' + (INTERVALO_ENVIO_MS / 60000) + ' min para próxima.');
+      ultimoEnvioMs = Date.now(); // registra timestamp do envio
+      console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada.');
     } catch(e) {
       console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId + ':', e.message);
       await new Promise(r => setTimeout(r, 10000));
       continue;
-    }
-    if (filaEnvio.length > 0) {
-      await new Promise(r => setTimeout(r, INTERVALO_ENVIO_MS));
     }
   }
   workerRodando = false;
@@ -667,6 +680,34 @@ const GRUPOS_TEXTO_ESTRUTURADO = new Set([
 
 const SYSTEM_CDV = 'Voce e especialista em passagens aereas com milhas para o mercado brasileiro. Seja GENEROSO: qualquer mencao a rota aerea, milhas/pontos, programa de fidelidade ou companhia aerea deve ser valido. Responda APENAS JSON sem markdown.';
 const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\nIMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade. LatamPass = LATAM Pass.\nCabine deve ser exatamente "Economica" ou "Executiva".';
+
+// ── DE-PARA: programa → CIA operadora (para voos nacionais BR e fallback) ─────
+const CIA_POR_PROGRAMA = {
+  'Smiles':           'GOL',
+  'Azul Fidelidade':  'Azul',
+  'LATAM Pass':       'LATAM',
+};
+
+function corrigirCia(cia, programa, origemCodigo, destinoCodigo) {
+  // Verifica se é voo doméstico brasileiro (ambos os aeroportos no BR ou código desconhecido)
+  const IATAS_BR = new Set([
+    'GRU','CGH','VCP','GIG','SDU','BSB','CNF','SSA','REC','FOR','MAO','BEL',
+    'CWB','POA','FLN','NAT','MCZ','AJU','THE','SLZ','JPA','PMW','VIX','CLV',
+    'RAO','CGB','CWB','IGU','MGF','LDB','UDI','BPS','PPB','JOI','NVT','XAP',
+    'CFB','CFC','CCM','PFB','URG','BVB','STM','IMP','PIN','CAF','TFF','MCP',
+  ]);
+  const oriIsBR  = !origemCodigo  || IATAS_BR.has(origemCodigo.toUpperCase());
+  const destIsBR = !destinoCodigo || IATAS_BR.has(destinoCodigo.toUpperCase());
+  const isDomestico = oriIsBR && destIsBR;
+
+  // Smiles nunca é CIA — sempre corrigir independente do tipo de voo
+  // Para outros programas, aplicar de-para só em domésticos
+  if (programa === 'Smiles' || (isDomestico && CIA_POR_PROGRAMA[programa])) {
+    return CIA_POR_PROGRAMA[programa] || cia;
+  }
+  // Azul pelo Mundo: CIA é sempre a parceira estrangeira, não Azul — não sobrescrever
+  return cia;
+}
 const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
 
@@ -693,6 +734,11 @@ async function classificarItens(itens, grupoId) {
           +'- Companhia aérea operadora do voo (campo "cia")\n'
           +'- Datas de ida\n'
           +'- Datas de volta (pode estar em imagem separada)\n\n'
+          +'CRÍTICO sobre códigos IATA (origemCodigo e destinoCodigo):\n'
+          +'- Leia o código IATA EXATAMENTE como aparece na imagem. Ex: se a imagem mostra "VIX → RAO", origemCodigo="VIX" e destinoCodigo="RAO".\n'
+          +'- NUNCA substitua, corrija ou invente um código IATA diferente do que está na imagem.\n'
+          +'- Para o campo "origem" use o nome da cidade do IATA de origem. Para "destino" use o nome da cidade do IATA de destino. Ex: VIX=Vitória, RAO=Ribeirão Preto, CLV=Caldas Novas, CTG=Cartagena, CGB=Cuiabá, SSA=Salvador.\n'
+          +'- Se não souber o nome da cidade, use o próprio código IATA como nome — nunca invente.\n\n'
           +'CRÍTICO sobre companhia aérea (campo "cia"):\n'
           +'- "cia" é a companhia que OPERA o voo, não o programa de fidelidade.\n'
           +'- Quando o programa for "Azul pelo Mundo", a CIA é sempre uma parceira estrangeira mencionada na imagem (ex: COPA, United, TAP, Air France, KLM). NUNCA coloque "Azul" como CIA nesse programa.\n'
@@ -708,7 +754,11 @@ async function classificarItens(itens, grupoId) {
       const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
-        if (r?.valido) { r.origem = resolverCidade(r.origemCodigo, r.origem); r.destino = resolverCidade(r.destinoCodigo, r.destino); }
+        if (r?.valido) {
+          r.origem  = resolverCidade(r.origemCodigo, r.origem);
+          r.destino = resolverCidade(r.destinoCodigo, r.destino);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+        }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
     }
@@ -743,6 +793,7 @@ async function classificarItens(itens, grupoId) {
           r.cabine  = 'Executiva';
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -773,7 +824,11 @@ async function classificarItens(itens, grupoId) {
       const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
-        if (r?.valido) { r.origem = resolverCidade(r.origemCodigo, r.origem); r.destino = resolverCidade(r.destinoCodigo, r.destino); }
+        if (r?.valido) {
+          r.origem  = resolverCidade(r.origemCodigo, r.origem);
+          r.destino = resolverCidade(r.destinoCodigo, r.destino);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+        }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
     }
@@ -804,7 +859,11 @@ async function classificarItens(itens, grupoId) {
     const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
     const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:i }]);
     for (const r of lista) {
-      if (r?.valido) { r.origem = resolverCidade(r.origemCodigo, r.origem); r.destino = resolverCidade(r.destinoCodigo, r.destino); }
+      if (r?.valido) {
+        r.origem  = resolverCidade(r.origemCodigo, r.origem);
+        r.destino = resolverCidade(r.destinoCodigo, r.destino);
+        r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+      }
       resultados.push(r || { valido:false, indice:i });
     }
   }
@@ -974,11 +1033,37 @@ async function processarBuffer(grupoId) {
 
     const classificacoesFinais = validas.map(v => ({ ...v, valido:true }));
     const emissoes = await agruparEFormatar(classificacoesFinais);
+
+    // Monta mapa indice→item para associação correta de imagens/textos
+    // (os índices nas emissões vêm do passo 1 e podem não ser posicionais)
+    const indiceMapa = new Map();
+    itens.forEach((item, idx) => indiceMapa.set(idx, item));
+
     for (const emissao of emissoes) {
       const indices = emissao.indices || [];
-      const imagens = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
-      const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
-      const oferta  = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:emissao.mensagem, dadosExtraidos:emissao, status:'pendente' };
+
+      // Pega imagens e textos dos itens originais usando os índices do passo 1
+      const imagensEmissao = indices.map(i => indiceMapa.get(i)?.imagemBase64).filter(Boolean);
+      const textosEmissao  = indices.map(i => indiceMapa.get(i)?.texto).filter(Boolean).join('\n');
+
+      // Fallback: se índices não bateram com nada, usa textos de todos os itens válidos
+      const imagensFinal = imagensEmissao.length > 0
+        ? imagensEmissao
+        : validas.filter(v => indices.includes(v.indice)).map(v => itens[v.indice]?.imagemBase64).filter(Boolean);
+      const textosFinal = textosEmissao
+        || validas.filter(v => indices.includes(v.indice)).map(v => itens[v.indice]?.texto).filter(Boolean).join('\n');
+
+      const oferta = {
+        id: gerarId(),
+        timestamp: new Date().toISOString(),
+        grupoOrigem: grupoId,
+        tipoConteudo: imagensFinal.length > 1 ? imagensFinal.length+' imagens' : imagensFinal.length === 1 ? 'imagem' : 'texto',
+        conteudoOriginal: textosFinal,
+        imagens: imagensFinal,
+        mensagemFormatada: emissao.mensagem,
+        dadosExtraidos: emissao,
+        status: 'pendente'
+      };
       filaPendentes.unshift(oferta);
       salvarFila();
     }
