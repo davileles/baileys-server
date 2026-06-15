@@ -1028,8 +1028,8 @@ function resetarHealthTimer() {
   ultimoUpsert = Date.now();
   if (healthTimer) clearTimeout(healthTimer);
   healthTimer = setTimeout(() => {
-    console.log('[HEALTH] Forçando reconexão...');
-    conectado = false;
+    console.log('[HEALTH] Sem mensagens por ' + (HEALTH_CHECK_MS/60000) + ' min. Forçando reconexão...');
+    conectado = false; // garante que requisiçoes nao passem enquanto reconecta
     const sockRef = sock;
     sock = null;
     if (sockRef) { try { sockRef.end(new Error('health-check-timeout')); } catch(e) {} }
@@ -1068,9 +1068,12 @@ async function conectar() {
     if (connection === 'open') { conectado = true; qrAtual = null; errosDescripto = 0; resetarHealthTimer(); console.log('WhatsApp conectado!'); }
     if (connection === 'close') {
       conectado = false;
+      sock = null; // garante que sockAtivo reflita a realidade imediatamente
       if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
       const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (codigo !== DisconnectReason.loggedOut) { sock = null; setTimeout(conectar, 5000); }
+      console.log('[WA] Conexão fechada. Código:', codigo);
+      if (codigo !== DisconnectReason.loggedOut) { setTimeout(conectar, 5000); }
+      else { console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr'); }
     }
   });
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -1155,6 +1158,17 @@ app.get('/qr', (req, res) => {
   if (conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px"><h2>WhatsApp ja conectado!</h2><a href="/" style="color:#ffa500">Voltar</a></body></html>');
   if (!qrAtual)  return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR...</h2></body></html>');
   res.send('<html><head><title>QR</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Escanear QR Code</h2><img src="'+qrAtual+'" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+});
+
+app.post('/reconectar', async (req, res) => {
+  console.log('[MANUAL] Reconexão forçada via /reconectar');
+  conectado = false;
+  const sockRef = sock;
+  sock = null;
+  if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+  if (sockRef) { try { sockRef.end(new Error('manual-reconnect')); } catch(e) {} }
+  setTimeout(conectar, 1000);
+  res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
 });
 
 app.get('/status', (req, res) => {
@@ -1391,7 +1405,12 @@ app.post('/injetar', async (req, res) => {
 
 app.post('/enviar', async (req, res) => {
   const { grupo, mensagem, agendarEm } = req.body;
-  if (!conectado||!sock) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+
+  // Se sock nulo mas server está tentando reconectar, aguarda até 15s
+  if (!conectado || !sock) {
+    const ok = await aguardarSock(15000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado. Acesse /qr para reconectar.' });
+  }
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
