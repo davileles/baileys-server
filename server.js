@@ -242,6 +242,11 @@ async function workerFila() {
       await sock.sendMessage(item.destino, { text: item.mensagem });
       filaEnvio.shift();
       ultimoEnvioMs = Date.now(); // registra timestamp do envio
+
+      // Marca como 'enviado' na filaPendentes para não reentrar na fila após restart
+      const ofertaEnviada = filaPendentes.find(o => String(o.id) === String(item.ofertaId));
+      if (ofertaEnviada) { ofertaEnviada.status = 'enviado'; salvarFila(); }
+
       console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada.');
     } catch(e) {
       console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId + ':', e.message);
@@ -1335,7 +1340,8 @@ app.get('/painel', (req, res) => {
       const tipo  = d.tipo === 'pct' ? '%' : ' R$';
       const cod   = d.codigo ? `<span class="tag">${d.codigo}</span>` : '';
       const textoHtml = o.conteudoOriginal ? `<div class="texto-orig">${o.conteudoOriginal}</div>` : '';
-      if (o.status==='aprovado')  return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span><span class="tag tag-tsp">📦 Cupom TSP</span><span style="color:#f0f0f0;font-weight:600">${loja} ${valor}${tipo}</span>${cod}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-ap">Aprovado e enviado</span></div></div>`;
+      if (o.status==='aprovado'||o.status==='enviado')  return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span><span class="tag tag-tsp">📦 Cupom TSP</span><span style="color:#f0f0f0;font-weight:600">${loja} ${valor}${tipo}</span>${cod}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-ap">${o.status==='enviado'?'✓ Enviado':'Aprovado e enviado'}</span></div></div>`;
+      if (o.status==='agendado') return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span><span class="tag tag-tsp">📦 Cupom TSP</span><span style="color:#f0f0f0;font-weight:600">${loja} ${valor}${tipo}</span>${cod}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-ap">📅 Agendado</span></div></div>`;
       if (o.status==='rejeitado') return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span><span class="tag tag-tsp">📦 Cupom TSP</span><span style="color:#f0f0f0;font-weight:600">${loja} ${valor}${tipo}</span>${cod}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-rej">Rejeitado</span></div></div>`;
       return `<div class="card" id="card-${o.id}"><div class="card-header"><span class="id">#${o.id}</span><span class="tag tag-tsp">📦 Cupom TSP</span><span style="color:#f0f0f0;font-weight:600">${loja} ${valor}${tipo}</span>${cod}<span style="font-size:12px;color:#555;margin-left:auto">${data}</span></div><div class="card-body"><div class="col"><div class="col-title">Original (Telegram)</div>${textoHtml}</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-${o.id}">${o.mensagemFormatada}</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar(${o.id})">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar(${o.id})">Rejeitar</button><span id="fb-${o.id}" style="font-size:13px;margin-left:auto"></span></div></div>`;
     }
@@ -1346,7 +1352,8 @@ app.get('/painel', (req, res) => {
     const prog = d.programa?`<span class="tag">${d.programa}</span>`:'';
     const imgsHtml = (o.imagens||[]).length>0?'<div class="imgs-grid">'+(o.imagens.map(b=>'<img src="data:image/jpeg;base64,'+b+'" />')).join('')+'</div>':'';
     const textoHtml = o.conteudoOriginal?`<div class="texto-orig">${typeof o.conteudoOriginal === 'string' ? o.conteudoOriginal : o.conteudoOriginal.join?.('\n') || ''}</div>`:'';
-    if (o.status==='aprovado')  return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span>${rota}${tipoTag}${cabineTag}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-ap">Aprovado e enviado</span></div></div>`;
+    if (o.status==='aprovado'||o.status==='enviado')  return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span>${rota}${tipoTag}${cabineTag}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-ap">${o.status==='enviado'?'✓ Enviado':'Aprovado — na fila de envio'}</span></div></div>`;
+    if (o.status==='agendado')  return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span>${rota}${tipoTag}${cabineTag}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-ap">📅 Agendado</span></div></div>`;
     if (o.status==='rejeitado') return `<div class="card"><div class="card-header"><span class="id">#${o.id}</span>${rota}${tipoTag}${cabineTag}<span style="margin-left:auto">${data}</span></div><div style="padding:12px 16px"><span class="ok-rej">Rejeitado</span></div></div>`;
     return `<div class="card" id="card-${o.id}"><div class="card-header"><span class="id">#${o.id}</span>${rota}${tipoTag}${cabineTag}${prog}<span style="margin-left:auto;font-size:12px;color:#555">${data}</span></div><div class="card-body"><div class="col"><div class="col-title">Original (${o.tipoConteudo})</div>${imgsHtml}${textoHtml}</div><div class="col"><div class="col-title">Mensagem formatada</div><textarea class="edit-area" id="msg-${o.id}">${o.mensagemFormatada}</textarea></div></div><div class="card-footer"><button class="btn btn-ap" onclick="aprovar(${o.id})">Aprovar e enviar</button><button class="btn btn-rej" onclick="rejeitar(${o.id})">Rejeitar</button><span id="fb-${o.id}" style="font-size:13px;margin-left:auto"></span></div></div>`;
   };
@@ -1386,7 +1393,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     const agId = gerarId();
     agendamentos.push({ id:agId, grupo:'cdv_emissao', mensagem, dispararEm, status:'aguardando', criadoEm:new Date().toISOString() });
     salvarAgendamentos();
-    oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
+    oferta.status = 'agendado'; oferta.mensagemFinal = mensagem; salvarFila();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
     return res.json({ ok:true, agendado:true, horario });
   }
@@ -1394,7 +1401,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
       await sock.sendMessage(GRUPOS['tsp'], { text: mensagem });
-      oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
+      oferta.status = 'enviado'; oferta.mensagemFinal = mensagem; salvarFila();
       res.json({ ok:true });
     } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
     return;
