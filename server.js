@@ -1634,6 +1634,26 @@ app.post('/reset-sessao', async (req, res) => {
   await limparSessaoEReconectar();
 });
 
+app.post('/reset-sessao-completo', async (req, res) => {
+  console.log('[RESET] Reset COMPLETO de sessão solicitado via endpoint.');
+  res.json({ ok:true, mensagem:'Apagando toda a sessão e reconectando...' });
+  conectado = false;
+  const sockRef = sock;
+  sock = null;
+  if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+  if (sockRef) { try { sockRef.end(new Error('reset-completo')); } catch(e) {} }
+  try {
+    const arquivos = await readdir(SESSAO_DIR);
+    for (const arq of arquivos) {
+      if (arq === 'fila_pendentes.json' || arq === 'agendamentos.json') continue; // preserva fila e agendamentos
+      await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+    }
+    console.log('[RESET] Sessão apagada completamente. Aguardando novo QR...');
+  } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
+  errosDescripto = 0;
+  setTimeout(conectar, 2000);
+});
+
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
