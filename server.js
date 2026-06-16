@@ -1555,7 +1555,19 @@ app.get('/grupos', async (req, res) => {
     const chats  = await sock.groupFetchAllParticipating();
     const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
     res.json({ ok:true, total:grupos.length, grupos });
-  } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
+  } catch(err) {
+    if (err.message?.includes('Connection Closed') || err.message?.includes('Connection Terminated')) {
+      console.warn('[GRUPOS] Conexão caiu durante fetch, aguardando reconexão...');
+      const ok = await aguardarSock(20000);
+      if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp reconectando, tente novamente.' });
+      try {
+        const chats  = await sock.groupFetchAllParticipating();
+        const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
+        return res.json({ ok:true, total:grupos.length, grupos });
+      } catch(err2) { return res.status(500).json({ ok:false, erro:err2.message }); }
+    }
+    res.status(500).json({ ok:false, erro:err.message });
+  }
 });
 
 // ── HUBLA WEBHOOK ─────────────────────────────────────────────────────────────
@@ -1615,6 +1627,12 @@ app.post('/webhook/hubla', async (req, res) => {
   } catch (err) { console.error('[Hubla] Erro:', err); return res.status(500).json({ error: 'Erro interno' }); }
 });
 
+
+app.post('/reset-sessao', async (req, res) => {
+  console.log('[RESET] Reset de sessão solicitado via endpoint.');
+  res.json({ ok:true, mensagem:'Limpando sessão e reconectando...' });
+  await limparSessaoEReconectar();
+});
 
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
