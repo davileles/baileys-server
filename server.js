@@ -1531,7 +1531,10 @@ app.post('/enviar', async (req, res) => {
 app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
   const { grupo, legenda } = req.body;
   const file = req.file;
-  if (!conectado||!sock) { if(file) unlinkSync(file.path); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
+  if (!conectado || !sock) {
+    const ok = await aguardarSock(15000);
+    if (!ok) { if(file) unlinkSync(file.path); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
+  }
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) { if(file) unlinkSync(file.path); return res.status(400).json({ ok:false, erro:'Grupo invalido.' }); }
   if (!file) return res.status(400).json({ ok:false, erro:'Imagem obrigatoria.' });
@@ -1544,7 +1547,10 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
 });
 
 app.get('/grupos', async (req, res) => {
-  if (!sock || !conectado) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  if (!sock || !conectado) {
+    const ok = await aguardarSock(15000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
   try {
     const chats  = await sock.groupFetchAllParticipating();
     const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
