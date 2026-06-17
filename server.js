@@ -1149,38 +1149,71 @@ async function limparSessaoEReconectar() {
   setTimeout(conectar, 3000);
 }
 
+// ── WHATSAPP ──────────────────────────────────────────────────────────────────
+var HEALTH_CHECK_MS  = 8 * 60 * 1000;
+var ultimoUpsert     = Date.now();
+var healthTimer      = null;
+var isConnecting     = false; // NOVO: evita instâncias duplas
+
+// ... (resetarHealthTimer e limparSessaoEReconectar permanecem iguais) ...
+
 async function conectar() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSAO_DIR);
-  const { version }          = await fetchLatestBaileysVersion();
-  sock = makeWASocket({ version, auth: state, logger: baileysLogger, printQRInTerminal: false, syncFullHistory: false, markOnlineOnConnect: true, getMessage: async () => undefined });
-  sock.ev.on('creds.update', saveCreds);
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-    if (qr) { qrAtual = await QRCode.toDataURL(qr); }
-    if (connection === 'open') { conectado = true; qrAtual = null; errosDescripto = 0; resetarHealthTimer(); console.log('WhatsApp conectado!'); }
-    if (connection === 'close') {
-      conectado = false;
-      sock = null; // garante que sockAtivo reflita a realidade imediatamente
-      if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
-      const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log('[WA] Conexão fechada. Código:', codigo);
-      if (codigo !== DisconnectReason.loggedOut) { setTimeout(conectar, 5000); }
-      else { console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr'); }
-    }
-  });
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (conectado) resetarHealthTimer();
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
-        errosDescripto++;
-        if (errosDescripto >= ERROS_DESCR_MAX) { await limparSessaoEReconectar(); return; }
-        continue;
+  if (isConnecting) {
+    console.log('[WA] Já existe uma tentativa de conexão em andamento, ignorando.');
+    return;
+  }
+  isConnecting = true;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(SESSAO_DIR);
+    const { version }          = await fetchLatestBaileysVersion();
+    sock = makeWASocket({ version, auth: state, logger: baileysLogger, printQRInTerminal: false, syncFullHistory: false, markOnlineOnConnect: true, getMessage: async () => undefined });
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+      if (qr) { qrAtual = await QRCode.toDataURL(qr); }
+      if (connection === 'open') {
+        conectado = true; qrAtual = null; errosDescripto = 0;
+        isConnecting = false; // liberou — conexão estabelecida
+        resetarHealthTimer();
+        console.log('WhatsApp conectado!');
       }
-      await processarMensagem(msg);
-    }
-  });
-  resetarHealthTimer();
+      if (connection === 'close') {
+        conectado = false;
+        isConnecting = false; // liberou — para poder reconectar
+        sock = null;
+        if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+        const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
+        console.log('[WA] Conexão fechada. Código:', codigo);
+        if (codigo === DisconnectReason.loggedOut) {
+          console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr');
+        } else if (codigo === 440) {
+          // Connection Replaced: outra instância abriu a mesma sessão.
+          // Aguarda mais tempo para evitar loop de reconexões rápidas.
+          console.log('[WA] Connection Replaced (440). Aguardando 15s antes de reconectar...');
+          setTimeout(conectar, 15000);
+        } else {
+          setTimeout(conectar, 5000);
+        }
+      }
+    });
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (conectado) resetarHealthTimer();
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
+          errosDescripto++;
+          if (errosDescripto >= ERROS_DESCR_MAX) { await limparSessaoEReconectar(); return; }
+          continue;
+        }
+        await processarMensagem(msg);
+      }
+    });
+    resetarHealthTimer();
+  } catch (err) {
+    console.error('[WA] Erro ao conectar:', err.message);
+    isConnecting = false;
+    setTimeout(conectar, 5000);
+  }
 }
 
 // ── CSS DO PAINEL ─────────────────────────────────────────────────────────────
