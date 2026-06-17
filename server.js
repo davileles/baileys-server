@@ -29,7 +29,7 @@ process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledReject
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
 const GRUPOS = {
   tsp:         '120363424721106736@g.us',
-  cdv_ofertas: '120363423014138662@g.us',
+  cdv_ofertas: '120363170138704529@g.us',
   cdv_emissao: '120363172490263905@g.us',
 };
 const GRUPOS_MONITORADOS      = [
