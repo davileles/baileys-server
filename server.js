@@ -77,12 +77,16 @@ let sock      = null;
 let conectado = false;
 let qrAtual   = null;
 
-// Aguarda sock estar disponível (até 8s)
-async function aguardarSock(ms = 8000) {
+// Aguarda sock estar disponível — agora dispara conexão sob demanda se necessário
+async function aguardarSock(ms = 20000) {
+  if (conectado && sock) { resetarInactivityTimer(); return true; }
+  console.log('[WA] aguardarSock: conectando sob demanda...');
+  conectar();
   const inicio = Date.now();
   while ((!sock || !conectado) && Date.now() - inicio < ms) {
     await new Promise(r => setTimeout(r, 300));
   }
+  if (conectado && sock) resetarInactivityTimer();
   return !!sock && conectado;
 }
 const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
@@ -198,11 +202,17 @@ function calcularPosicaoFila(posicaoNaFila) {
 }
 
 async function aguardarConectado(timeoutMs = 180000) {
+  // Dispara conexão sob demanda se worker precisar enviar
+  if (!conectado || !sock) {
+    console.log("[WORKER] Desconectado. Conectando sob demanda para envio...");
+    conectar();
+  }
   const inicio = Date.now();
   while (!conectado || !sock) {
-    if (Date.now() - inicio > timeoutMs) throw new Error('Timeout aguardando conexão WhatsApp');
+    if (Date.now() - inicio > timeoutMs) throw new Error("Timeout aguardando conexão WhatsApp");
     await new Promise(r => setTimeout(r, 2000));
   }
+  resetarInactivityTimer();
 }
 
 // Timestamp do último envio — persiste entre execuções do worker
@@ -1150,12 +1160,43 @@ async function limparSessaoEReconectar() {
 }
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
-var HEALTH_CHECK_MS  = 8 * 60 * 1000;
-var ultimoUpsert     = Date.now();
-var healthTimer      = null;
-var isConnecting     = false; // NOVO: evita instâncias duplas
+var isConnecting = false; // evita instâncias duplas de conexão
 
-// ... (resetarHealthTimer e limparSessaoEReconectar permanecem iguais) ...
+// ── LAZY CONNECTION: timer de inatividade ────────────────────────────────────
+// O servidor NÃO mantém conexão permanente. Conecta sob demanda e desconecta
+// após INACTIVITY_TIMEOUT ms sem uso, eliminando o loop 440.
+const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 min sem uso → desconecta
+let inactivityTimer = null;
+
+function resetarInactivityTimer() {
+  clearTimeout(inactivityTimer);
+  inactivityTimer = setTimeout(async () => {
+    if (!conectado || !sock) return;
+    console.log('[WA] Inatividade detectada. Desconectando voluntariamente...');
+    conectado = false;
+    const sockRef = sock;
+    sock = null;
+    if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+    try { sockRef.end(undefined); } catch(e) {}
+    console.log('[WA] Desconectado por inatividade. Próxima conexão sob demanda.');
+  }, INACTIVITY_TIMEOUT_MS);
+}
+
+// Garante que sock está pronto; conecta se necessário. Usado nas rotas de envio.
+async function conectarSeNecessario() {
+  if (conectado && sock) {
+    resetarInactivityTimer(); // renova o timer de inatividade
+    return true;
+  }
+  console.log('[WA] Conectando sob demanda...');
+  conectar();
+  // Aguarda até 20s pela conexão
+  const inicio = Date.now();
+  while ((!conectado || !sock) && Date.now() - inicio < 20000) {
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return conectado && !!sock;
+}
 
 async function conectar() {
   if (isConnecting) {
@@ -1173,26 +1214,32 @@ async function conectar() {
       if (qr) { qrAtual = await QRCode.toDataURL(qr); }
       if (connection === 'open') {
         conectado = true; qrAtual = null; errosDescripto = 0;
-        isConnecting = false; // liberou — conexão estabelecida
+        isConnecting = false;
         resetarHealthTimer();
+        resetarInactivityTimer(); // inicia contagem de inatividade
         console.log('WhatsApp conectado!');
       }
       if (connection === 'close') {
         conectado = false;
-        isConnecting = false; // liberou — para poder reconectar
+        isConnecting = false;
         sock = null;
+        clearTimeout(inactivityTimer);
         if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log('[WA] Conexão fechada. Código:', codigo);
         if (codigo === DisconnectReason.loggedOut) {
           console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr');
+          // NÃO reconecta automaticamente — aguarda o usuário escanear o QR
         } else if (codigo === 440) {
-          // Connection Replaced: outra instância abriu a mesma sessão.
-          // Aguarda mais tempo para evitar loop de reconexões rápidas.
-          console.log('[WA] Connection Replaced (440). Aguardando 15s antes de reconectar...');
-          setTimeout(conectar, 15000);
+          // Connection Replaced: OUTRA instância do mesmo servidor conectou.
+          // Com lazy connection isso só acontece em race condition de deploy.
+          // NÃO reconecta automaticamente — aguarda próxima demanda.
+          console.log('[WA] Connection Replaced (440). Aguardando próxima demanda para reconectar.');
         } else {
-          setTimeout(conectar, 5000);
+          // Erros inesperados (ex: 408, 503): reconecta uma vez após 10s.
+          // Se ocorrer novamente, aguarda demanda.
+          console.log('[WA] Erro inesperado (código ' + codigo + '). Reconectando em 10s...');
+          setTimeout(conectar, 10000);
         }
       }
     });
@@ -1281,6 +1328,8 @@ app.get('/', (req, res) => {
 
 app.get('/qr', (req, res) => {
   if (conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px"><h2>WhatsApp ja conectado!</h2><a href="/" style="color:#ffa500">Voltar</a></body></html>');
+  // Dispara conexão se ainda não estiver conectando (modo lazy)
+  if (!isConnecting && !sock) conectar();
   if (!qrAtual)  return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR...</h2></body></html>');
   res.send('<html><head><title>QR</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Escanear QR Code</h2><img src="'+qrAtual+'" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
 });
@@ -1581,6 +1630,45 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
   finally { if(existsSync(file.path)) unlinkSync(file.path); }
 });
 
+// ── ENVIAR ÁUDIO / VOICEMAIL ──────────────────────────────────────────────────
+// Aceita upload de arquivo de áudio (ogg, mp4, m4a, mp3, etc) via multipart
+// e envia como mensagem de voz (PTT = push-to-talk) no grupo indicado.
+app.post('/enviar-audio', upload.single('audio'), async (req, res) => {
+  const { grupo } = req.body;
+  const file = req.file;
+  if (!file) return res.status(400).json({ ok:false, erro:'Arquivo de áudio obrigatório (campo: audio).' });
+
+  // Conecta sob demanda antes de tentar enviar
+  const ok = await aguardarSock(20000);
+  if (!ok) {
+    if (existsSync(file.path)) unlinkSync(file.path);
+    return res.status(503).json({ ok:false, erro:'WhatsApp não conectado. Tente novamente em instantes.' });
+  }
+
+  const grupoId = resolverGrupo(grupo || 'cdv_ofertas');
+  if (!grupoId) {
+    if (existsSync(file.path)) unlinkSync(file.path);
+    return res.status(400).json({ ok:false, erro:'Grupo inválido: ' + grupo });
+  }
+
+  try {
+    const buffer   = readFileSync(file.path);
+    const mimetype = file.mimetype || 'audio/ogg; codecs=opus';
+    await sock.sendMessage(grupoId, {
+      audio:    buffer,
+      mimetype: mimetype,
+      ptt:      true,  // true = aparece como mensagem de voz (voicemail)
+    });
+    console.log('[AUDIO] Áudio enviado para ' + grupoId + ' (' + buffer.length + ' bytes)');
+    res.json({ ok:true });
+  } catch(err) {
+    console.error('[AUDIO] Erro ao enviar áudio:', err.message);
+    res.status(500).json({ ok:false, erro:err.message });
+  } finally {
+    if (existsSync(file.path)) unlinkSync(file.path);
+  }
+});
+
 app.get('/grupos', async (req, res) => {
   if (!sock || !conectado) {
     const ok = await aguardarSock(15000);
@@ -1693,4 +1781,7 @@ app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
 
-conectar();
+// Conexão lazy: NÃO conecta no startup.
+// O servidor conecta automaticamente quando chega a primeira requisição de envio.
+// Para conectar manualmente, acesse /qr ou faça qualquer chamada a /enviar, /enviar-audio, etc.
+console.log("[SERVER] Modo lazy connection ativo. Aguardando primeira demanda para conectar ao WhatsApp.");
