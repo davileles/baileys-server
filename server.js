@@ -1336,6 +1336,16 @@ app.post('/reconectar', async (req, res) => {
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
 });
 
+app.get('/debug-fila', (req, res) => {
+  try {
+    const raw = readFileSync(FILA_PATH, 'utf-8');
+    const dados = JSON.parse(raw);
+    res.json({ total: dados.length, itens: dados });
+  } catch(e) {
+    res.json({ erro: e.message });
+  }
+});
+
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
   res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
