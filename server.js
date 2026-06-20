@@ -1162,24 +1162,15 @@ async function limparSessaoEReconectar() {
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
 var isConnecting = false; // evita instâncias duplas de conexão
 
-// ── LAZY CONNECTION: timer de inatividade ────────────────────────────────────
-// O servidor NÃO mantém conexão permanente. Conecta sob demanda e desconecta
-// após INACTIVITY_TIMEOUT ms sem uso, eliminando o loop 440.
-const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 min sem uso → desconecta
-let inactivityTimer = null;
+// ── CONEXÃO PERMANENTE ───────────────────────────────────────────────────────
+// O servidor mantém conexão ativa para monitorar mensagens dos grupos.
+// O health timer cuida de reconexão em caso de queda real.
+// O inactivity timer foi removido — ele desconectava o sock a cada 5 min e
+// fazia o servidor perder todas as mensagens dos grupos monitorados.
+let inactivityTimer = null; // mantido por compatibilidade (não usado)
 
 function resetarInactivityTimer() {
-  clearTimeout(inactivityTimer);
-  inactivityTimer = setTimeout(async () => {
-    if (!conectado || !sock) return;
-    console.log('[WA] Inatividade detectada. Desconectando voluntariamente...');
-    conectado = false;
-    const sockRef = sock;
-    sock = null;
-    if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
-    try { sockRef.end(undefined); } catch(e) {}
-    console.log('[WA] Desconectado por inatividade. Próxima conexão sob demanda.');
-  }, INACTIVITY_TIMEOUT_MS);
+  // Conexão permanente — não desconecta por inatividade.
 }
 
 // Garante que sock está pronto; conecta se necessário. Usado nas rotas de envio.
@@ -1231,10 +1222,10 @@ async function conectar() {
           console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr');
           // NÃO reconecta automaticamente — aguarda o usuário escanear o QR
         } else if (codigo === 440) {
-          // Connection Replaced: OUTRA instância do mesmo servidor conectou.
-          // Com lazy connection isso só acontece em race condition de deploy.
-          // NÃO reconecta automaticamente — aguarda próxima demanda.
-          console.log('[WA] Connection Replaced (440). Aguardando próxima demanda para reconectar.');
+          // Connection Replaced: outra instância conectou (race condition de deploy).
+          // Aguarda 15s antes de reconectar para evitar loop entre instâncias.
+          console.log('[WA] Connection Replaced (440). Reconectando em 15s...');
+          setTimeout(conectar, 15000);
         } else {
           // Erros inesperados (ex: 408, 503): reconecta uma vez após 10s.
           // Se ocorrer novamente, aguarda demanda.
