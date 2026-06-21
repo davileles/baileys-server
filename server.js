@@ -73,21 +73,61 @@ const upload = multer({ dest: UPLOAD_DIR });
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-let sock      = null;
-let conectado = false;
-let qrAtual   = null;
+let sock         = null;
+let conectado    = false;
+let qrAtual      = null;
 
-// Aguarda sock estar disponível — agora dispara conexão sob demanda se necessário
+// ── GERENCIADOR DE CONEXÃO ────────────────────────────────────────────────────
+// Mantém uma única Promise de conexão em andamento para evitar instâncias duplas.
+// Qualquer chamada a aguardarSock() aguarda essa Promise em vez de disparar
+// um novo conectar(), eliminando o loop 440 causado por race conditions.
+let _conexaoPromise = null; // Promise ativa de conexão (null quando conectado)
+
+// Inicia conexão uma única vez e retorna a Promise compartilhada.
+// Chamadas simultâneas recebem a mesma Promise.
+function iniciarConexao() {
+  if (conectado && sock) return Promise.resolve(true);
+  if (_conexaoPromise) return _conexaoPromise;
+  _conexaoPromise = new Promise((resolve) => {
+    const onOpen = () => { cleanup(); resolve(true); };
+    const onFail = () => { cleanup(); resolve(false); };
+    const _conectar = async () => {
+      // Guarda referência para remover listeners mesmo se sock mudar
+      const sockAntes = sock;
+      if (sockAntes) {
+        sockAntes.ev.off('connection.update', checkUpdate);
+      }
+      await conectar();
+    };
+    const checkUpdate = (update) => {
+      if (update.connection === 'open')   onOpen();
+      if (update.connection === 'close')  onFail();
+    };
+    // Aguarda evento de conexão no sock atual (pode já estar conectando)
+    const attachListener = () => {
+      if (sock) sock.ev.on('connection.update', checkUpdate);
+    };
+    attachListener();
+    if (!isConnecting && !sock) iniciarConexao();
+    else if (!sock) setTimeout(attachListener, 200);
+    function cleanup() {
+      _conexaoPromise = null;
+      if (sock) sock.ev.off('connection.update', checkUpdate);
+    }
+  });
+  return _conexaoPromise;
+}
+
+// Aguarda sock disponível. NÃO dispara conectar() diretamente —
+// usa iniciarConexao() para garantir uma única instância ativa.
 async function aguardarSock(ms = 20000) {
-  if (conectado && sock) { resetarInactivityTimer(); return true; }
-  console.log('[WA] aguardarSock: conectando sob demanda...');
-  conectar();
-  const inicio = Date.now();
-  while ((!sock || !conectado) && Date.now() - inicio < ms) {
-    await new Promise(r => setTimeout(r, 300));
-  }
-  if (conectado && sock) resetarInactivityTimer();
-  return !!sock && conectado;
+  if (conectado && sock) return true;
+  console.log('[WA] aguardarSock: aguardando conexão...');
+  const resultado = await Promise.race([
+    iniciarConexao(),
+    new Promise(r => setTimeout(() => r(false), ms)),
+  ]);
+  return resultado && conectado && !!sock;
 }
 const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
 
@@ -215,6 +255,32 @@ async function aguardarConectado(timeoutMs = 180000) {
   resetarInactivityTimer();
 }
 
+// Envia mensagem com retry automático (1 tentativa extra) caso a conexão caia no momento do envio.
+// Isso resolve o erro que você vê na página TSP na primeira tentativa de envio.
+async function enviarMensagem(destino, conteudo, tentativa = 0) {
+  if (!conectado || !sock) {
+    const ok = await aguardarSock(20000);
+    if (!ok) throw new Error('WhatsApp não conectado após aguardar reconexão.');
+  }
+  try {
+    return await sock.sendMessage(destino, conteudo);
+  } catch (err) {
+    const retryable = err.message?.includes('Connection Closed') ||
+                      err.message?.includes('Connection Terminated') ||
+                      err.message?.includes('timed out') ||
+                      err.message?.includes('Bad MAC') ||
+                      err.output?.statusCode === 428;
+    if (retryable && tentativa < 2) {
+      console.warn('[WA] Falha ao enviar (tentativa ' + (tentativa+1) + '):', err.message, '— aguardando reconexão...');
+      await new Promise(r => setTimeout(r, 2000));
+      const ok = await aguardarSock(20000);
+      if (!ok) throw new Error('WhatsApp não reconectou a tempo para reenvio.');
+      return enviarMensagem(destino, conteudo, tentativa + 1);
+    }
+    throw err;
+  }
+}
+
 // Timestamp do último envio — persiste entre execuções do worker
 let ultimoEnvioMs = 0;
 
@@ -251,7 +317,7 @@ async function workerFila() {
     if (!item) break;
     try {
       console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
-      await sock.sendMessage(item.destino, { text: item.mensagem });
+      await enviarMensagem(item.destino, { text: item.mensagem });
       filaEnvio.shift();
       ultimoEnvioMs = Date.now(); // registra timestamp do envio
 
@@ -314,8 +380,7 @@ setInterval(() => {
     if (isEmissao) {
       enfileirarEnvio('ag-'+ag.id, ag.mensagem, grupoId);
     } else {
-      if (!sock || !conectado) { ag.status = 'erro'; salvarAgendamentos(); continue; }
-      sock.sendMessage(grupoId, { text: ag.mensagem })
+      enviarMensagem(grupoId, { text: ag.mensagem })
         .then(() => { ag.status = 'enviado'; salvarAgendamentos(); })
         .catch(e  => { ag.status = 'erro';   salvarAgendamentos(); console.error('[AGEND] Erro envio:', e.message); });
     }
@@ -1173,64 +1238,86 @@ function resetarInactivityTimer() {
   // Conexão permanente — não desconecta por inatividade.
 }
 
-// Garante que sock está pronto; conecta se necessário. Usado nas rotas de envio.
+// Garante que sock está pronto; usa iniciarConexao() para evitar instâncias duplas.
 async function conectarSeNecessario() {
-  if (conectado && sock) {
-    resetarInactivityTimer(); // renova o timer de inatividade
-    return true;
+  if (conectado && sock) return true;
+  return await aguardarSock(20000);
+}
+
+// Backoff exponencial para reconexões: evita hammering no WhatsApp
+let _reconectarTentativas = 0;
+function _delayReconexao(codigo) {
+  // 440 = Connection Replaced: backoff maior para dar tempo à instância ganhadora estabilizar
+  // Outros erros: backoff crescente até 60s
+  if (codigo === 440) {
+    _reconectarTentativas++;
+    const delay = Math.min(15000 * _reconectarTentativas, 60000);
+    console.log('[WA] Connection Replaced (440). Reconectando em ' + (delay/1000) + 's (tentativa ' + _reconectarTentativas + ')...');
+    return delay;
   }
-  console.log('[WA] Conectando sob demanda...');
-  conectar();
-  // Aguarda até 20s pela conexão
-  const inicio = Date.now();
-  while ((!conectado || !sock) && Date.now() - inicio < 20000) {
-    await new Promise(r => setTimeout(r, 300));
-  }
-  return conectado && !!sock;
+  _reconectarTentativas++;
+  const delay = Math.min(5000 * Math.pow(2, _reconectarTentativas - 1), 60000);
+  console.log('[WA] Erro (código ' + codigo + '). Reconectando em ' + (delay/1000) + 's...');
+  return delay;
 }
 
 async function conectar() {
   if (isConnecting) {
-    console.log('[WA] Já existe uma tentativa de conexão em andamento, ignorando.');
+    console.log('[WA] Conexão já em andamento, ignorando chamada duplicada.');
     return;
   }
   isConnecting = true;
+  _conexaoPromise = _conexaoPromise || new Promise(() => {}); // sinaliza que há conexão em curso
   try {
     const { state, saveCreds } = await useMultiFileAuthState(SESSAO_DIR);
     const { version }          = await fetchLatestBaileysVersion();
-    sock = makeWASocket({ version, auth: state, logger: baileysLogger, printQRInTerminal: false, syncFullHistory: false, markOnlineOnConnect: true, getMessage: async () => undefined });
+    const novaSock = makeWASocket({
+      version,
+      auth: state,
+      logger: baileysLogger,
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+      getMessage: async () => undefined,
+      // Keepalive agressivo para detectar quedas mais rápido
+      keepAliveIntervalMs: 30000,
+    });
+    sock = novaSock;
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       if (qr) { qrAtual = await QRCode.toDataURL(qr); }
       if (connection === 'open') {
-        conectado = true; qrAtual = null; errosDescripto = 0;
+        conectado = true;
+        qrAtual = null;
+        errosDescripto = 0;
         isConnecting = false;
+        _reconectarTentativas = 0; // reseta backoff após conexão bem-sucedida
+        _conexaoPromise = null;    // libera a Promise de conexão
         resetarHealthTimer();
-        resetarInactivityTimer(); // inicia contagem de inatividade
-        console.log('WhatsApp conectado!');
+        console.log('[WA] ✓ WhatsApp conectado!');
       }
       if (connection === 'close') {
+        // Ignora eventos de sock antigo (pode acontecer durante troca de instância)
+        if (novaSock !== sock && sock !== null) {
+          console.log('[WA] Evento de fechamento de sock antigo ignorado.');
+          return;
+        }
         conectado = false;
         isConnecting = false;
         sock = null;
+        _conexaoPromise = null;
         clearTimeout(inactivityTimer);
         if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log('[WA] Conexão fechada. Código:', codigo);
         if (codigo === DisconnectReason.loggedOut) {
           console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr');
-          // NÃO reconecta automaticamente — aguarda o usuário escanear o QR
-        } else if (codigo === 440) {
-          // Connection Replaced: outra instância conectou (race condition de deploy).
-          // Aguarda 15s antes de reconectar para evitar loop entre instâncias.
-          console.log('[WA] Connection Replaced (440). Reconectando em 15s...');
-          setTimeout(conectar, 15000);
+          _reconectarTentativas = 0;
+          // NÃO reconecta automaticamente
         } else {
-          // Erros inesperados (ex: 408, 503): reconecta uma vez após 10s.
-          // Se ocorrer novamente, aguarda demanda.
-          console.log('[WA] Erro inesperado (código ' + codigo + '). Reconectando em 10s...');
-          setTimeout(conectar, 10000);
+          const delay = _delayReconexao(codigo);
+          setTimeout(conectar, delay);
         }
       }
     });
@@ -1248,9 +1335,11 @@ async function conectar() {
     });
     resetarHealthTimer();
   } catch (err) {
-    console.error('[WA] Erro ao conectar:', err.message);
+    console.error('[WA] Erro ao inicializar socket:', err.message);
     isConnecting = false;
-    setTimeout(conectar, 5000);
+    _conexaoPromise = null;
+    const delay = _delayReconexao(null);
+    setTimeout(conectar, delay);
   }
 }
 
@@ -1320,7 +1409,7 @@ app.get('/', (req, res) => {
 app.get('/qr', (req, res) => {
   if (conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px"><h2>WhatsApp ja conectado!</h2><a href="/" style="color:#ffa500">Voltar</a></body></html>');
   // Dispara conexão se ainda não estiver conectando (modo lazy)
-  if (!isConnecting && !sock) conectar();
+  if (!isConnecting && !sock) iniciarConexao();
   if (!qrAtual)  return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR...</h2></body></html>');
   res.send('<html><head><title>QR</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Escanear QR Code</h2><img src="'+qrAtual+'" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
 });
@@ -1328,6 +1417,9 @@ app.get('/qr', (req, res) => {
 app.post('/reconectar', async (req, res) => {
   console.log('[MANUAL] Reconexão forçada via /reconectar');
   conectado = false;
+  isConnecting = false;
+  _reconectarTentativas = 0;
+  _conexaoPromise = null;
   const sockRef = sock;
   sock = null;
   if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
@@ -1348,7 +1440,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -1485,7 +1577,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
-      await sock.sendMessage(GRUPOS['tsp'], { text: mensagem });
+      await enviarMensagem(GRUPOS['tsp'], { text: mensagem });
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem; salvarFila();
       res.json({ ok:true });
     } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
@@ -1608,7 +1700,7 @@ app.post('/enviar', async (req, res) => {
     enfileirarEnvio('manual', mensagem, grupoId);
     res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
   } else {
-    try { await sock.sendMessage(grupoId, { text:mensagem }); res.json({ ok:true }); }
+    try { await enviarMensagem(grupoId, { text:mensagem }); res.json({ ok:true }); }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
   }
 });
@@ -1625,7 +1717,7 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
   if (!file) return res.status(400).json({ ok:false, erro:'Imagem obrigatoria.' });
   try {
     const buffer = readFileSync(file.path);
-    await sock.sendMessage(grupoId, { image:buffer, caption:legenda||'' });
+    await enviarMensagem(grupoId, { image:buffer, caption:legenda||'' });
     res.json({ ok:true });
   } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
   finally { if(existsSync(file.path)) unlinkSync(file.path); }
@@ -1655,10 +1747,10 @@ app.post('/enviar-audio', upload.single('audio'), async (req, res) => {
   try {
     const buffer   = readFileSync(file.path);
     const mimetype = file.mimetype || 'audio/ogg; codecs=opus';
-    await sock.sendMessage(grupoId, {
+    await enviarMensagem(grupoId, {
       audio:    buffer,
       mimetype: mimetype,
-      ptt:      true,  // true = aparece como mensagem de voz (voicemail)
+      ptt:      true,
     });
     console.log('[AUDIO] Áudio enviado para ' + grupoId + ' (' + buffer.length + ' bytes)');
     res.json({ ok:true });
@@ -1745,7 +1837,7 @@ app.post('/webhook/hubla', async (req, res) => {
     const numeroFormatado = formatarNumero(telefone);
     console.log(`[Hubla] Enviando boas-vindas para ${nome} (${numeroFormatado})`);
     if (!conectado || !sock) { const ok = await aguardarSock(); if (!ok) return res.status(503).json({ error: 'WhatsApp não conectado' }); }
-    await sock.sendMessage(numeroFormatado, { text: MENSAGEM_BOAS_VINDAS(nome) });
+    await enviarMensagem(numeroFormatado, { text: MENSAGEM_BOAS_VINDAS(nome) });
     console.log(`[Hubla] ✅ Enviado para ${nome}`);
     return res.status(200).json({ status: 'enviado', para: nome });
   } catch (err) { console.error('[Hubla] Erro:', err); return res.status(500).json({ error: 'Erro interno' }); }
@@ -1775,6 +1867,8 @@ app.post('/reset-sessao-completo', async (req, res) => {
     console.log('[RESET] Sessão apagada completamente. Aguardando novo QR...');
   } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
   errosDescripto = 0;
+  _reconectarTentativas = 0;
+  _conexaoPromise = null;
   setTimeout(conectar, 2000);
 });
 
