@@ -78,56 +78,26 @@ let conectado    = false;
 let qrAtual      = null;
 
 // ── GERENCIADOR DE CONEXÃO ────────────────────────────────────────────────────
-// Mantém uma única Promise de conexão em andamento para evitar instâncias duplas.
-// Qualquer chamada a aguardarSock() aguarda essa Promise em vez de disparar
-// um novo conectar(), eliminando o loop 440 causado por race conditions.
-let _conexaoPromise = null; // Promise ativa de conexão (null quando conectado)
+// Flag que indica se já existe um processo de conexão ativo.
+// Evita instâncias duplas de sock sem complexidade de Promises aninhadas.
+let _conexaoPromise = null; // apenas para expor no /status
 
-// Inicia conexão uma única vez e retorna a Promise compartilhada.
-// Chamadas simultâneas recebem a mesma Promise.
-function iniciarConexao() {
-  if (conectado && sock) return Promise.resolve(true);
-  if (_conexaoPromise) return _conexaoPromise;
-  _conexaoPromise = new Promise((resolve) => {
-    const onOpen = () => { cleanup(); resolve(true); };
-    const onFail = () => { cleanup(); resolve(false); };
-    const _conectar = async () => {
-      // Guarda referência para remover listeners mesmo se sock mudar
-      const sockAntes = sock;
-      if (sockAntes) {
-        sockAntes.ev.off('connection.update', checkUpdate);
-      }
-      await conectar();
-    };
-    const checkUpdate = (update) => {
-      if (update.connection === 'open')   onOpen();
-      if (update.connection === 'close')  onFail();
-    };
-    // Aguarda evento de conexão no sock atual (pode já estar conectando)
-    const attachListener = () => {
-      if (sock) sock.ev.on('connection.update', checkUpdate);
-    };
-    attachListener();
-    if (!isConnecting && !sock) iniciarConexao();
-    else if (!sock) setTimeout(attachListener, 200);
-    function cleanup() {
-      _conexaoPromise = null;
-      if (sock) sock.ev.off('connection.update', checkUpdate);
-    }
-  });
-  return _conexaoPromise;
-}
-
-// Aguarda sock disponível. NÃO dispara conectar() diretamente —
-// usa iniciarConexao() para garantir uma única instância ativa.
+// Aguarda sock disponível com polling leve.
+// Dispara conectar() uma única vez se não estiver conectando.
 async function aguardarSock(ms = 20000) {
   if (conectado && sock) return true;
   console.log('[WA] aguardarSock: aguardando conexão...');
-  const resultado = await Promise.race([
-    iniciarConexao(),
-    new Promise(r => setTimeout(() => r(false), ms)),
-  ]);
-  return resultado && conectado && !!sock;
+  if (!isConnecting && !sock) conectar();
+  const inicio = Date.now();
+  while ((!conectado || !sock) && Date.now() - inicio < ms) {
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return conectado && !!sock;
+}
+
+// Alias mantido para compatibilidade com /qr route
+function iniciarConexao() {
+  if (!isConnecting && !sock) conectar();
 }
 const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
 
@@ -1267,7 +1237,7 @@ async function conectar() {
     return;
   }
   isConnecting = true;
-  _conexaoPromise = _conexaoPromise || new Promise(() => {}); // sinaliza que há conexão em curso
+
   try {
     const { state, saveCreds } = await useMultiFileAuthState(SESSAO_DIR);
     const { version }          = await fetchLatestBaileysVersion();
@@ -1293,7 +1263,7 @@ async function conectar() {
         errosDescripto = 0;
         isConnecting = false;
         _reconectarTentativas = 0; // reseta backoff após conexão bem-sucedida
-        _conexaoPromise = null;    // libera a Promise de conexão
+
         resetarHealthTimer();
         console.log('[WA] ✓ WhatsApp conectado!');
       }
@@ -1306,7 +1276,7 @@ async function conectar() {
         conectado = false;
         isConnecting = false;
         sock = null;
-        _conexaoPromise = null;
+
         clearTimeout(inactivityTimer);
         if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
@@ -1337,7 +1307,7 @@ async function conectar() {
   } catch (err) {
     console.error('[WA] Erro ao inicializar socket:', err.message);
     isConnecting = false;
-    _conexaoPromise = null;
+
     const delay = _delayReconexao(null);
     setTimeout(conectar, delay);
   }
@@ -1419,7 +1389,7 @@ app.post('/reconectar', async (req, res) => {
   conectado = false;
   isConnecting = false;
   _reconectarTentativas = 0;
-  _conexaoPromise = null;
+
   const sockRef = sock;
   sock = null;
   if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
@@ -1868,7 +1838,7 @@ app.post('/reset-sessao-completo', async (req, res) => {
   } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
   errosDescripto = 0;
   _reconectarTentativas = 0;
-  _conexaoPromise = null;
+
   setTimeout(conectar, 2000);
 });
 
