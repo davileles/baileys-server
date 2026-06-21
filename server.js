@@ -1123,6 +1123,24 @@ async function processarBuffer(grupoId) {
 }
 
 // ── LISTENER WHATSAPP ─────────────────────────────────────────────────────────
+// ── FILA SERIAL POR GRUPO ─────────────────────────────────────────────────────
+// Garante que mensagens do mesmo grupo são processadas uma por vez, em ordem.
+// Grupos diferentes processam em paralelo entre si.
+const _filaGrupo = new Map(); // jid → Promise (última tarefa na fila)
+
+function enfileirarPorGrupo(jid, fn) {
+  const anterior = _filaGrupo.get(jid) || Promise.resolve();
+  const proxima  = anterior.then(() => fn()).catch(err => {
+    console.error('[FILA-GRUPO] Erro ao processar mensagem do grupo', jid, ':', err.message);
+  });
+  _filaGrupo.set(jid, proxima);
+  // Limpa o Map após processar para não vazar memória
+  proxima.finally(() => {
+    if (_filaGrupo.get(jid) === proxima) _filaGrupo.delete(jid);
+  });
+  return proxima;
+}
+
 async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
@@ -1300,7 +1318,13 @@ async function conectar() {
           if (errosDescripto >= ERROS_DESCR_MAX) { await limparSessaoEReconectar(); return; }
           continue;
         }
-        await processarMensagem(msg);
+        // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos = paralelo
+        const jid = msg.key?.remoteJid;
+        if (jid) {
+          enfileirarPorGrupo(jid, () => processarMensagem(msg));
+        } else {
+          await processarMensagem(msg);
+        }
       }
     });
     resetarHealthTimer();
