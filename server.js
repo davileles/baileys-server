@@ -993,12 +993,23 @@ function mesclarParesIdaVolta(validas) {
   function ehParInvertido(v, w) {
     const mesmoPrograma = (v.programa||'') === (w.programa||'');
     const mesmaCabine   = (v.cabine||'Economica') === (w.cabine||'Economica');
+
+    // Mesma CIA (companhia operadora) — evita mesclar Finnair com Iberia, etc.
+    const mesmaCia = !v.cia || !w.cia || (v.cia||'').toLowerCase().trim() === (w.cia||'').toLowerCase().trim();
+
+    // Milhas similares (±15%) — evita mesclar 50.500 Avios com 77.250 Avios
+    const pV = Number(v.pontos) || 0;
+    const pW = Number(w.pontos) || 0;
+    const milhasSimilares = pV === 0 || pW === 0 || Math.abs(pV - pW) / Math.max(pV, pW) <= 0.15;
+
+    // Rota estritamente invertida: A→B com B→A usando código IATA
     const vOri = normalizar(v.origemCodigo,  v.origem);
     const vDes = normalizar(v.destinoCodigo, v.destino);
     const wOri = normalizar(w.origemCodigo,  w.origem);
     const wDes = normalizar(w.destinoCodigo, w.destino);
     const rotaInvertida = vOri && vDes && wOri && wDes && vOri === wDes && vDes === wOri;
-    return mesmoPrograma && mesmaCabine && rotaInvertida;
+
+    return mesmoPrograma && mesmaCabine && mesmaCia && milhasSimilares && rotaInvertida;
   }
 
   const usados = new Set();
@@ -1008,6 +1019,9 @@ function mesclarParesIdaVolta(validas) {
     const v = validas[i];
 
     let parIdx = -1;
+    // Busca par ida/volta nas próximas 2 posições.
+    // Se msg 1 não é par de msg 2, verifica se msg 2 é par de msg 3, etc.
+    // O Set "usados" garante que nenhuma mensagem é reutilizada.
     for (let j = i + 1; j <= Math.min(i + 2, validas.length - 1); j++) {
       if (!usados.has(j) && ehParInvertido(v, validas[j])) {
         parIdx = j;
@@ -1094,16 +1108,12 @@ async function processarBuffer(grupoId) {
     for (const emissao of emissoes) {
       const indices = emissao.indices || [];
 
-      // Pega imagens e textos dos itens originais usando os índices do passo 1
+      // Pega imagens e textos EXATAMENTE dos índices que geraram esta emissão.
+      // Sem fallback genérico — evita associar texto de uma oferta com dados de outra.
       const imagensEmissao = indices.map(i => indiceMapa.get(i)?.imagemBase64).filter(Boolean);
       const textosEmissao  = indices.map(i => indiceMapa.get(i)?.texto).filter(Boolean).join('\n');
-
-      // Fallback: se índices não bateram com nada, usa textos de todos os itens válidos
-      const imagensFinal = imagensEmissao.length > 0
-        ? imagensEmissao
-        : validas.filter(v => indices.includes(v.indice)).map(v => itens[v.indice]?.imagemBase64).filter(Boolean);
-      const textosFinal = textosEmissao
-        || validas.filter(v => indices.includes(v.indice)).map(v => itens[v.indice]?.texto).filter(Boolean).join('\n');
+      const imagensFinal   = imagensEmissao;
+      const textosFinal    = textosEmissao;
 
       const oferta = {
         id: gerarId(),
