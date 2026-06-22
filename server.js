@@ -32,6 +32,10 @@ const BAILEYS_NOISE = [
   'remoteIdentityKey', 'registrationId', 'previousCounter', 'lastRemoteEphemeralKey',
   'pubKey', '<Buffer', '_chains', 'chainKey', 'chainType', 'messageKeys',
   'indexInfo', 'baseKey', 'signedKeyId', 'preKeyId', 'created:', 'closed:',
+  'Closing open session', 'Closing session', 'in favor of incoming',
+  'Failed to decrypt message', 'Session error', 'Bad MAC',
+  'decryptWithSessions', 'doDecryptWhisperMessage', 'verifyMAC',
+  '_asyncQueueExecutor', 'session_cipher', 'libsignal',
 ];
 function isBaileysNoise(args) {
   const str = args.map(a => (typeof a === 'string' ? a : (typeof a === 'object' ? JSON.stringify(a) : String(a)))).join(' ');
@@ -1975,7 +1979,7 @@ app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
 
-// Conexão lazy: NÃO conecta no startup.
-// O servidor conecta automaticamente quando chega a primeira requisição de envio.
-// Para conectar manualmente, acesse /qr ou faça qualquer chamada a /enviar, /enviar-audio, etc.
-console.log("[SERVER] Modo lazy connection ativo. Aguardando primeira demanda para conectar ao WhatsApp.");
+// Conecta ao WhatsApp imediatamente no startup.
+// Garante que mensagens dos grupos monitorados não sejam perdidas após deploy.
+console.log("[SERVER] Iniciando conexão com WhatsApp...");
+conectar();
