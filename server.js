@@ -24,37 +24,7 @@ const baileysLogger = pino({ level: 'silent' });
 
 // Intercepta console.log/warn para suprimir dumps de criptografia do Baileys
 // que causam rate limit de 500 logs/s no Railway e derrubam o processo.
-const _consoleLog  = console.log.bind(console);
-const _consoleWarn = console.warn.bind(console);
-// Filtra ruído de criptografia do Baileys que causa rate limit no Railway.
-// Usa apenas strings que NÃO aparecem em logs legítimos do servidor.
-const BAILEYS_NOISE_EXACT = [
-  'Removing old closed session',
-  'Closing open session in favor of incoming prekey bundle',
-  'Failed to decrypt message with any known session',
-  'Session error:Error: Bad MAC',
-];
-const BAILEYS_NOISE_CONTAINS = [
-  'SessionEntry {', 'currentRatchet:', 'ephemeralKeyPair:',
-  'privKey: <Buffer', 'pubKey: <Buffer', 'rootKey: <Buffer',
-  'lastRemoteEphemeralKey: <Buffer', 'remoteIdentityKey: <Buffer',
-  '_chains: {', 'chainKey: [Object]', 'messageKeys: {',
-  'registrationId:', 'baseKeyType:', 'pendingPreKey:',
-  'decryptWithSessions', 'doDecryptWhisperMessage', 'verifyMAC',
-  '_asyncQueueExecutor', 'session_cipher.js', 'libsignal/src',
-];
-function isBaileysNoise(args) {
-  // Só serializa se o primeiro argumento for string (evita serializar objetos legítimos)
-  const first = args[0];
-  if (typeof first !== 'string') return false;
-  if (BAILEYS_NOISE_EXACT.some(kw => first === kw)) return true;
-  if (BAILEYS_NOISE_CONTAINS.some(kw => first.includes(kw))) return true;
-  // Verifica args adicionais apenas para stacks de erro
-  const rest = args.slice(1).map(a => typeof a === 'string' ? a : '').join(' ');
-  return BAILEYS_NOISE_CONTAINS.some(kw => rest.includes(kw));
-}
-console.log  = (...args) => { if (!isBaileysNoise(args)) _consoleLog(...args); };
-console.warn = (...args) => { if (!isBaileysNoise(args)) _consoleWarn(...args); };
+// Filtro de noise removido temporariamente para diagnóstico.
 
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
