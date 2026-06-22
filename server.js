@@ -757,13 +757,15 @@ function corrigirCia(cia, programa, origemCodigo, destinoCodigo) {
   const destIsBR = !destinoCodigo || IATAS_BR.has(destinoCodigo.toUpperCase());
   const isDomestico = oriIsBR && destIsBR;
 
-  // Smiles nunca é CIA — sempre corrigir independente do tipo de voo
-  // Para outros programas, aplicar de-para só em domésticos
-  if (programa === 'Smiles' || (isDomestico && CIA_POR_PROGRAMA[programa])) {
-    return CIA_POR_PROGRAMA[programa] || cia;
+  // Smiles: para voos domésticos = GOL. Para internacionais, usa CIA extraída da imagem/texto.
+  // Para outros programas, aplicar de-para só em domésticos.
+  if (isDomestico && CIA_POR_PROGRAMA[programa]) {
+    return CIA_POR_PROGRAMA[programa];
   }
-  // Azul pelo Mundo: CIA é sempre a parceira estrangeira, não Azul — não sobrescrever
-  return cia;
+  // Internacional com CIA explícita na fonte (ex: Air France, Turkish) — respeita
+  if (cia && cia !== programa) return cia;
+  // Fallback para doméstico sem CIA identificada
+  return CIA_POR_PROGRAMA[programa] || cia;
 }
 const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
@@ -1162,10 +1164,11 @@ async function processarBuffer(grupoId) {
     if (gruposBypass.has(grupoId)) {
       for (const v of validas) {
         const indices = v.indices || [v.indice];
-        const imagens = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
         const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
         const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
         const mensagem = formatarMensagemCDV(dados);
+        // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
+        const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
         const oferta   = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:mensagem, dadosExtraidos:{ ...dados, indices }, status:'pendente' };
         filaPendentes.unshift(oferta);
         salvarFila();
