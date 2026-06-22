@@ -1250,6 +1250,8 @@ async function processarMensagem(msg) {
     } else { return; }
     if (!texto && !imagemB64) return;
 
+    console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo, texto ? '| texto: '+texto.slice(0,60) : '| imagem');
+
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
       texto.includes('Dica de emissão encontrada por @davileles') ||
@@ -1275,7 +1277,8 @@ function resetarHealthTimer() {
   if (healthTimer) clearTimeout(healthTimer);
   healthTimer = setTimeout(() => {
     console.log('[HEALTH] Sem mensagens por ' + (HEALTH_CHECK_MS/60000) + ' min. Forçando reconexão...');
-    conectado = false; // garante que requisiçoes nao passem enquanto reconecta
+    conectado = false;
+    isConnecting = false; // garante que conectar() não seja ignorado por flag travada
     const sockRef = sock;
     sock = null;
     if (sockRef) { try { sockRef.end(new Error('health-check-timeout')); } catch(e) {} }
@@ -1781,8 +1784,20 @@ app.post('/enviar', async (req, res) => {
 
   const isEmissao = grupo==='cdv_emissao'||grupoId===GRUPOS['cdv_emissao'];
   if (isEmissao) {
+    // Comprime datas consecutivas antes de enfileirar (ex: 1, 2, 3, 4 → 1-4)
+    const mensagemComprimida = mensagem
+      .split('\n')
+      .map(linha => {
+        const m = linha.match(/^([A-Za-záàãâéêíóôõúüçÁÀÃÂÉÊÍÓÔÕÚÜÇ]+\/\d{2}:)\s*(.+)$/);
+        if (!m) return linha;
+        const dias = m[2].match(/\d+/g);
+        if (!dias || dias.length <= 2) return linha;
+        const nums = dias.map(Number);
+        return m[1] + ' ' + comprimirSequencia(nums);
+      })
+      .join('\n');
     const info = calcularPosicaoFila(filaEnvio.length);
-    enfileirarEnvio('manual', mensagem, grupoId);
+    enfileirarEnvio('manual', mensagemComprimida, grupoId);
     res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
   } else {
     try { await enviarMensagem(grupoId, { text:mensagem }); res.json({ ok:true }); }
