@@ -26,20 +26,32 @@ const baileysLogger = pino({ level: 'silent' });
 // que causam rate limit de 500 logs/s no Railway e derrubam o processo.
 const _consoleLog  = console.log.bind(console);
 const _consoleWarn = console.warn.bind(console);
-const BAILEYS_NOISE = [
-  'Removing old closed session', 'SessionEntry', 'currentRatchet',
-  'ephemeralKeyPair', 'privKey', 'rootKey', 'baseKeyType', 'pendingPreKey',
-  'remoteIdentityKey', 'registrationId', 'previousCounter', 'lastRemoteEphemeralKey',
-  'pubKey', '<Buffer', '_chains', 'chainKey', 'chainType', 'messageKeys',
-  'indexInfo', 'baseKey', 'signedKeyId', 'preKeyId', 'created:', 'closed:',
-  'Closing open session', 'Closing session', 'in favor of incoming',
-  'Failed to decrypt message', 'Session error', 'Bad MAC',
+// Filtra ruído de criptografia do Baileys que causa rate limit no Railway.
+// Usa apenas strings que NÃO aparecem em logs legítimos do servidor.
+const BAILEYS_NOISE_EXACT = [
+  'Removing old closed session',
+  'Closing open session in favor of incoming prekey bundle',
+  'Failed to decrypt message with any known session',
+  'Session error:Error: Bad MAC',
+];
+const BAILEYS_NOISE_CONTAINS = [
+  'SessionEntry {', 'currentRatchet:', 'ephemeralKeyPair:',
+  'privKey: <Buffer', 'pubKey: <Buffer', 'rootKey: <Buffer',
+  'lastRemoteEphemeralKey: <Buffer', 'remoteIdentityKey: <Buffer',
+  '_chains: {', 'chainKey: [Object]', 'messageKeys: {',
+  'registrationId:', 'baseKeyType:', 'pendingPreKey:',
   'decryptWithSessions', 'doDecryptWhisperMessage', 'verifyMAC',
-  '_asyncQueueExecutor', 'session_cipher', 'libsignal',
+  '_asyncQueueExecutor', 'session_cipher.js', 'libsignal/src',
 ];
 function isBaileysNoise(args) {
-  const str = args.map(a => (typeof a === 'string' ? a : (typeof a === 'object' ? JSON.stringify(a) : String(a)))).join(' ');
-  return BAILEYS_NOISE.some(kw => str.includes(kw));
+  // Só serializa se o primeiro argumento for string (evita serializar objetos legítimos)
+  const first = args[0];
+  if (typeof first !== 'string') return false;
+  if (BAILEYS_NOISE_EXACT.some(kw => first === kw)) return true;
+  if (BAILEYS_NOISE_CONTAINS.some(kw => first.includes(kw))) return true;
+  // Verifica args adicionais apenas para stacks de erro
+  const rest = args.slice(1).map(a => typeof a === 'string' ? a : '').join(' ');
+  return BAILEYS_NOISE_CONTAINS.some(kw => rest.includes(kw));
 }
 console.log  = (...args) => { if (!isBaileysNoise(args)) _consoleLog(...args); };
 console.warn = (...args) => { if (!isBaileysNoise(args)) _consoleWarn(...args); };
