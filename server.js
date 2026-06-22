@@ -1268,23 +1268,10 @@ async function processarMensagem(msg) {
 }
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
-var HEALTH_CHECK_MS  = 8 * 60 * 1000;
-var ultimoUpsert     = Date.now();
-var healthTimer      = null;
-
-function resetarHealthTimer() {
-  ultimoUpsert = Date.now();
-  if (healthTimer) clearTimeout(healthTimer);
-  healthTimer = setTimeout(() => {
-    console.log('[HEALTH] Sem mensagens por ' + (HEALTH_CHECK_MS/60000) + ' min. Forçando reconexão...');
-    conectado = false;
-    isConnecting = false; // garante que conectar() não seja ignorado por flag travada
-    const sockRef = sock;
-    sock = null;
-    if (sockRef) { try { sockRef.end(new Error('health-check-timeout')); } catch(e) {} }
-    conectar();
-  }, HEALTH_CHECK_MS);
-}
+// Health check removido — o keepAliveIntervalMs do Baileys (30s) detecta quedas
+// sem forçar reconexões desnecessárias que corrompem a sessão (Bad MAC).
+var healthTimer = null;
+function resetarHealthTimer() { /* desativado */ }
 
 var errosDescripto  = 0;
 var ERROS_DESCR_MAX = 15;
@@ -1374,9 +1361,7 @@ async function conectar() {
         qrAtual = null;
         errosDescripto = 0;
         isConnecting = false;
-        _reconectarTentativas = 0; // reseta backoff após conexão bem-sucedida
-
-        resetarHealthTimer();
+        _reconectarTentativas = 0;
         console.log('[WA] ✓ WhatsApp conectado!');
       }
       if (connection === 'close') {
@@ -1403,8 +1388,26 @@ async function conectar() {
         }
       }
     });
+    // Intercepta stderr para detectar Bad MAC e resetar sessão automaticamente
+    let _badMacCount = 0;
+    const _stderrWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = function(chunk, encoding, cb) {
+      const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (str.includes('Bad MAC') || str.includes('Key used already or never filled')) {
+        _badMacCount++;
+        if (_badMacCount >= 10) {
+          _badMacCount = 0;
+          console.log('[BAD-MAC] Detectados 10+ erros de descriptografia. Resetando sessão...');
+          process.stderr.write = _stderrWrite; // restaura antes de resetar
+          limparSessaoEReconectar();
+        }
+        if (typeof cb === 'function') cb();
+        return true;
+      }
+      return _stderrWrite(chunk, encoding, cb);
+    };
+
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (conectado) resetarHealthTimer();
       if (type !== 'notify') return;
       for (const msg of messages) {
         if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
