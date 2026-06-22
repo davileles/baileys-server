@@ -22,6 +22,24 @@ import { Api } from 'telegram';
 // ── LOGGER CUSTOMIZADO (suprimir ruído do Baileys) ───────────────────────────
 const baileysLogger = pino({ level: 'silent' });
 
+// Intercepta console.log/warn para suprimir dumps de criptografia do Baileys
+// que causam rate limit de 500 logs/s no Railway e derrubam o processo.
+const _consoleLog  = console.log.bind(console);
+const _consoleWarn = console.warn.bind(console);
+const BAILEYS_NOISE = [
+  'Removing old closed session', 'SessionEntry', 'currentRatchet',
+  'ephemeralKeyPair', 'privKey', 'rootKey', 'baseKeyType', 'pendingPreKey',
+  'remoteIdentityKey', 'registrationId', 'previousCounter', 'lastRemoteEphemeralKey',
+  'pubKey', '<Buffer', '_chains', 'chainKey', 'chainType', 'messageKeys',
+  'indexInfo', 'baseKey', 'signedKeyId', 'preKeyId', 'created:', 'closed:',
+];
+function isBaileysNoise(args) {
+  const str = args.map(a => (typeof a === 'string' ? a : (typeof a === 'object' ? JSON.stringify(a) : String(a)))).join(' ');
+  return BAILEYS_NOISE.some(kw => str.includes(kw));
+}
+console.log  = (...args) => { if (!isBaileysNoise(args)) _consoleLog(...args); };
+console.warn = (...args) => { if (!isBaileysNoise(args)) _consoleWarn(...args); };
+
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
@@ -728,6 +746,7 @@ const GRUPOS_TEXTO_ESTRUTURADO = new Set([
   '120363212151306916@g.us',
   '120363318399199070@g.us',
   '120363230586056001@g.us',
+  '120363211235070904@g.us',
 ]);
 
 const SYSTEM_CDV = 'Voce e especialista em passagens aereas com milhas para o mercado brasileiro. Seja GENEROSO: qualquer mencao a rota aerea, milhas/pontos, programa de fidelidade ou companhia aerea deve ser valido. Responda APENAS JSON sem markdown.';
@@ -977,7 +996,10 @@ async function agruparEFormatar(classificacoes) {
     const origem  = resolverCidade(e.origemCodigo,  e.origem);
     const destino = resolverCidade(e.destinoCodigo, e.destino);
     const dados   = { origem, destino, pontos:e.pontos, programa:e.programa, cia:e.cia, cabine:e.cabine||'Economica', tipoVoo:e.tipoVoo||'internacional', datasIda:e.datasIda||'', datasVolta:e.datasVolta||'' };
-    return { ...e, ...dados, mensagem:formatarMensagemCDV(dados) };
+    // A Claude AI retorna índices como posições em `validas` (0,1,2...).
+    // Remapeia para os índices reais de `itens` (v.indice) antes de retornar.
+    const indicesReais = (e.indices||[]).map(pos => validas[pos]?.indice ?? pos);
+    return { ...e, ...dados, indices: indicesReais, mensagem:formatarMensagemCDV(dados) };
   });
 }
 
@@ -1054,6 +1076,75 @@ function mesclarParesIdaVolta(validas) {
 }
 
 // ── PROCESSAR BUFFER (CDV) ────────────────────────────────────────────────────
+// ── FILA DE ESPERA POR PAR IDA/VOLTA ENTRE BUFFERS ───────────────────────────
+// Quando uma oferta somente-ida chega, aguarda até 5 minutos por sua volta.
+// Se a volta chegar, mescla e libera. Se não chegar, libera como somente-ida.
+const _esperandoPar = new Map(); // chave → { oferta, timer, grupoId }
+
+function chaveParOuInverso(oferta) {
+  const ori = (oferta.dadosExtraidos?.origemCodigo || '').toUpperCase();
+  const des = (oferta.dadosExtraidos?.destinoCodigo || '').toUpperCase();
+  const prog = (oferta.dadosExtraidos?.programa || '').toLowerCase();
+  const cab  = (oferta.dadosExtraidos?.cabine || 'Economica').toLowerCase();
+  if (!ori || !des) return null;
+  return prog + '|' + cab + '|' + [ori, des].sort().join('-');
+}
+
+function aguardarParIdaVolta(oferta, grupoId) {
+  // Só aplica em ofertas somente-ida com rota identificada
+  const tipo = oferta.dadosExtraidos?.tipo;
+  if (tipo === 'ida_volta') return false; // já completa, libera direto
+
+  const chave = chaveParOuInverso(oferta);
+  if (!chave) return false;
+
+  const esperando = _esperandoPar.get(chave);
+  if (esperando) {
+    // Par encontrado — mescla e libera
+    clearTimeout(esperando.timer);
+    _esperandoPar.delete(chave);
+    const o1 = esperando.oferta;
+    const o2 = oferta;
+    // Determina qual é ida e qual é volta pela rota
+    const o1Ori = (o1.dadosExtraidos?.origemCodigo || '').toUpperCase();
+    const o2Ori = (o2.dadosExtraidos?.origemCodigo || '').toUpperCase();
+    const base  = o1Ori <= o2Ori ? o1 : o2;
+    const volta = o1Ori <= o2Ori ? o2 : o1;
+    const mesclada = {
+      ...base,
+      id: gerarId(),
+      dadosExtraidos: {
+        ...base.dadosExtraidos,
+        tipo: 'ida_volta',
+        datasIda:   base.dadosExtraidos?.datasIda  || volta.dadosExtraidos?.datasIda  || '',
+        datasVolta: volta.dadosExtraidos?.datasIda || base.dadosExtraidos?.datasVolta || '',
+      },
+      conteudoOriginal: [base.conteudoOriginal, volta.conteudoOriginal].filter(Boolean).join('\n'),
+      imagens: [...(base.imagens||[]), ...(volta.imagens||[])],
+    };
+    mesclada.mensagemFormatada = formatarMensagemCDV({ ...mesclada.dadosExtraidos });
+    mesclada.tipoConteudo = mesclada.imagens.length > 1 ? mesclada.imagens.length+' imagens' : mesclada.imagens.length === 1 ? 'imagem' : 'texto';
+    filaPendentes.unshift(mesclada);
+    salvarFila();
+    console.log('[PAR-BUFFER] Mesclado ida/volta entre buffers: ' + (mesclada.dadosExtraidos?.origemCodigo) + '↔' + (mesclada.dadosExtraidos?.destinoCodigo));
+    return true; // consumido
+  }
+
+  // Sem par ainda — coloca na espera por 5 minutos
+  const timer = setTimeout(() => {
+    if (_esperandoPar.get(chave)?.oferta === oferta) {
+      _esperandoPar.delete(chave);
+      filaPendentes.unshift(oferta);
+      salvarFila();
+      console.log('[PAR-BUFFER] Timeout — liberando somente-ida: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
+    }
+  }, 5 * 60 * 1000);
+
+  _esperandoPar.set(chave, { oferta, timer, grupoId });
+  console.log('[PAR-BUFFER] Aguardando par para: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
+  return true; // segurado
+}
+
 async function processarBuffer(grupoId) {
   const entrada = bufferAgrupamento.get(grupoId);
   if (!entrada) return;
@@ -1126,8 +1217,12 @@ async function processarBuffer(grupoId) {
         dadosExtraidos: emissao,
         status: 'pendente'
       };
-      filaPendentes.unshift(oferta);
-      salvarFila();
+      // Aguarda par ida/volta de buffer diferente (até 5 min)
+      const parEsperando = aguardarParIdaVolta(oferta, grupoId);
+      if (!parEsperando) {
+        filaPendentes.unshift(oferta);
+        salvarFila();
+      }
     }
   } catch (err) { console.error('Erro ao processar buffer:', err.message); }
 }
