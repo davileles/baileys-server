@@ -1255,6 +1255,13 @@ async function processarMensagem(msg) {
 
     console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo, texto ? '| texto: '+texto.slice(0,60) : '| imagem');
 
+    // Primeira mensagem válida confirmada: sessão saudável, zera contadores de erro
+    if (_sessaoRecemLimpa || errosDescripto > 0) {
+      console.log('[SESSION] Primeira mensagem válida após limpeza/instabilidade — sessão confirmada.');
+      errosDescripto = 0;
+      _sessaoRecemLimpa = false;
+    }
+
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
       texto.includes('Dica de emissão encontrada por @davileles') ||
@@ -1289,8 +1296,9 @@ function resetarHealthTimer() {
   }, HEALTH_CHECK_MS);
 }
 
-var errosDescripto  = 0;
-var ERROS_DESCR_MAX = 15;
+var errosDescripto      = 0;
+var ERROS_DESCR_MAX     = 15;
+var _sessaoRecemLimpa   = false; // evita reset de errosDescripto ao reconectar após limpeza de sessão
 
 async function limparSessaoEReconectar() {
   conectado = false;
@@ -1305,7 +1313,9 @@ async function limparSessaoEReconectar() {
       }
     }
   } catch(e) {}
-  errosDescripto = 0;
+  _sessaoRecemLimpa = true;
+  // Não zera errosDescripto aqui — será zerado só após a primeira mensagem válida,
+  // para evitar loop de Bad MAC → limpar → reconectar → Bad MAC infinito.
   setTimeout(conectar, 3000);
 }
 
@@ -1389,12 +1399,15 @@ async function conectar() {
       if (connection === 'open') {
         conectado = true;
         qrAtual = null;
-        errosDescripto = 0;
+        // Só zera errosDescripto em reconexões normais.
+        // Se a sessão foi recém-limpa, mantém o contador até a primeira mensagem válida
+        // para evitar loop: Bad MAC → limpar → reconectar → Bad MAC → limpar infinito.
+        if (!_sessaoRecemLimpa) errosDescripto = 0;
         isConnecting = false;
         _reconectarTentativas = 0;
         _erros500Consecutivos = 0;
         resetarHealthTimer();
-        console.log('[WA] ✓ WhatsApp conectado!');
+        console.log('[WA] ✓ WhatsApp conectado!' + (_sessaoRecemLimpa ? ' (aguardando 1ª mensagem válida para confirmar sessão)' : ''));
       }
       if (connection === 'close') {
         // Ignora eventos de sock antigo (pode acontecer durante troca de instância)
@@ -1984,6 +1997,7 @@ app.post('/reset-sessao-completo', async (req, res) => {
     console.log('[RESET] Sessão apagada completamente. Aguardando novo QR...');
   } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
   errosDescripto = 0;
+  _sessaoRecemLimpa = false; // reset-completo via endpoint = sessão nova, não precisa aguardar mensagem válida
   _reconectarTentativas = 0;
 
   setTimeout(conectar, 2000);
