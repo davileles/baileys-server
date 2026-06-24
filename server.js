@@ -814,6 +814,7 @@ async function classificarItens(itens, grupoId) {
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
         if (r?.valido) {
+          r.indice  = indiceOriginal; // força índice correto
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
@@ -850,6 +851,7 @@ async function classificarItens(itens, grupoId) {
       for (const r of lista) {
         if (r?.valido) {
           r.cabine  = 'Executiva';
+          r.indice  = indiceOriginal; // força índice correto
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
@@ -884,6 +886,7 @@ async function classificarItens(itens, grupoId) {
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
         if (r?.valido) {
+          r.indice  = indiceOriginal; // força índice correto
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
@@ -1029,10 +1032,9 @@ function mesclarParesIdaVolta(validas) {
     const v = validas[i];
 
     let parIdx = -1;
-    // Busca par ida/volta nas próximas 2 posições.
-    // Se msg 1 não é par de msg 2, verifica se msg 2 é par de msg 3, etc.
+    // Busca par ida/volta em TODOS os itens restantes (não só os próximos 2).
     // O Set "usados" garante que nenhuma mensagem é reutilizada.
-    for (let j = i + 1; j <= Math.min(i + 2, validas.length - 1); j++) {
+    for (let j = i + 1; j < validas.length; j++) {
       if (!usados.has(j) && ehParInvertido(v, validas[j])) {
         parIdx = j;
         break;
@@ -1170,8 +1172,12 @@ async function processarBuffer(grupoId) {
         // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
         const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
         const oferta   = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:mensagem, dadosExtraidos:{ ...dados, indices }, status:'pendente' };
-        filaPendentes.unshift(oferta);
-        salvarFila();
+        // Para o grupo de imagem, usa aguardarParIdaVolta para capturar par de buffers diferentes
+        const segurado = grupoId === GRUPO_APENAS_IMAGEM ? aguardarParIdaVolta(oferta, grupoId) : false;
+        if (!segurado) {
+          filaPendentes.unshift(oferta);
+          salvarFila();
+        }
         console.log('[BYPASS] Oferta criada direto: '+v.origemCodigo+'->'+v.destinoCodigo+' ('+v.programa+')');
       }
       return;
@@ -1239,7 +1245,12 @@ async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
     if (!GRUPOS_MONITORADOS.includes(jid)) return;
-    const m    = msg.message;
+    // Desembrulha mensagens encaminhadas/efêmeras que chegam com wrapper externo
+    const WRAPPERS = ['ephemeralMessage','viewOnceMessage','viewOnceMessageV2','documentWithCaptionMessage','editedMessage'];
+    let m = msg.message;
+    for (const w of WRAPPERS) {
+      if (m?.[w]?.message) { m = m[w].message; break; }
+    }
     const tipo = Object.keys(m || {})[0];
     let texto = '', imagemB64 = null;
     if (tipo === 'conversation') { texto = m.conversation; }
