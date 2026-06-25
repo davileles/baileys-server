@@ -814,7 +814,6 @@ async function classificarItens(itens, grupoId) {
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
         if (r?.valido) {
-          r.indice  = indiceOriginal; // força índice correto
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
@@ -851,7 +850,6 @@ async function classificarItens(itens, grupoId) {
       for (const r of lista) {
         if (r?.valido) {
           r.cabine  = 'Executiva';
-          r.indice  = indiceOriginal; // força índice correto
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
@@ -886,7 +884,6 @@ async function classificarItens(itens, grupoId) {
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
         if (r?.valido) {
-          r.indice  = indiceOriginal; // força índice correto
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
@@ -1032,9 +1029,10 @@ function mesclarParesIdaVolta(validas) {
     const v = validas[i];
 
     let parIdx = -1;
-    // Busca par ida/volta em TODOS os itens restantes (não só os próximos 2).
+    // Busca par ida/volta nas próximas 2 posições.
+    // Se msg 1 não é par de msg 2, verifica se msg 2 é par de msg 3, etc.
     // O Set "usados" garante que nenhuma mensagem é reutilizada.
-    for (let j = i + 1; j < validas.length; j++) {
+    for (let j = i + 1; j <= Math.min(i + 2, validas.length - 1); j++) {
       if (!usados.has(j) && ehParInvertido(v, validas[j])) {
         parIdx = j;
         break;
@@ -1172,12 +1170,8 @@ async function processarBuffer(grupoId) {
         // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
         const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
         const oferta   = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:mensagem, dadosExtraidos:{ ...dados, indices }, status:'pendente' };
-        // Para o grupo de imagem, usa aguardarParIdaVolta para capturar par de buffers diferentes
-        const segurado = grupoId === GRUPO_APENAS_IMAGEM ? aguardarParIdaVolta(oferta, grupoId) : false;
-        if (!segurado) {
-          filaPendentes.unshift(oferta);
-          salvarFila();
-        }
+        filaPendentes.unshift(oferta);
+        salvarFila();
         console.log('[BYPASS] Oferta criada direto: '+v.origemCodigo+'->'+v.destinoCodigo+' ('+v.programa+')');
       }
       return;
@@ -1245,12 +1239,7 @@ async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
     if (!GRUPOS_MONITORADOS.includes(jid)) return;
-    // Desembrulha mensagens encaminhadas/efêmeras que chegam com wrapper externo
-    const WRAPPERS = ['ephemeralMessage','viewOnceMessage','viewOnceMessageV2','documentWithCaptionMessage','editedMessage'];
-    let m = msg.message;
-    for (const w of WRAPPERS) {
-      if (m?.[w]?.message) { m = m[w].message; break; }
-    }
+    const m    = msg.message;
     const tipo = Object.keys(m || {})[0];
     let texto = '', imagemB64 = null;
     if (tipo === 'conversation') { texto = m.conversation; }
@@ -1282,22 +1271,52 @@ async function processarMensagem(msg) {
 }
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
-var HEALTH_CHECK_MS  = 8 * 60 * 1000;
+var HEALTH_PING_MS   = 60 * 1000;   // ping leve a cada 60s (backstop p/ morte silenciosa)
+var PING_TIMEOUT_MS  = 15 * 1000;   // sem resposta em 15s = falha
+var PING_FALHAS_MAX  = 2;           // só reconecta após N pings falhos seguidos
 var ultimoUpsert     = Date.now();
 var healthTimer      = null;
+var pingFalhas       = 0;
 
+function _reconectarPorHealth(motivo) {
+  console.log('[HEALTH] ' + motivo + ' Forçando reconexão...');
+  conectado = false;
+  isConnecting = false; // evita que reconexão seja ignorada por flag travada
+  const sockRef = sock;
+  sock = null;
+  if (sockRef) { try { sockRef.end(new Error('health-ping-falhou')); } catch(e) {} }
+  conectar();
+}
+
+// A detecção PRINCIPAL de queda continua sendo por eventos: o keepAliveIntervalMs
+// do socket + o handler 'connection.update' (close) reconectam na hora.
+// Aqui rodamos só um PING LEVE periódico como backstop para "morte silenciosa"
+// (TCP meio-aberto: o socket parece vivo, mas está morto e nenhum evento de close
+// dispara). Diferença crucial em relação ao antigo health-check: o ping NÃO derruba
+// conexões saudáveis nem reage a canal quieto — só reconecta após PING_FALHAS_MAX
+// pings sem resposta seguidos. Por ser leve, pode rodar a cada 60s sem causar churn,
+// deixando a janela cega em ~60s em vez de minutos.
 function resetarHealthTimer() {
   ultimoUpsert = Date.now();
-  if (healthTimer) clearTimeout(healthTimer);
-  healthTimer = setTimeout(() => {
-    console.log('[HEALTH] Sem mensagens por ' + (HEALTH_CHECK_MS/60000) + ' min. Forçando reconexão...');
-    conectado = false;
-    isConnecting = false; // evita que reconexão seja ignorada por flag travada
-    const sockRef = sock;
-    sock = null;
-    if (sockRef) { try { sockRef.end(new Error('health-check-timeout')); } catch(e) {} }
-    conectar();
-  }, HEALTH_CHECK_MS);
+  pingFalhas = 0;
+  if (healthTimer) clearInterval(healthTimer);
+  healthTimer = setInterval(async () => {
+    if (!conectado || !sock) return;  // queda real já é tratada por connection.update
+    try {
+      await Promise.race([
+        sock.sendPresenceUpdate('available'),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), PING_TIMEOUT_MS)),
+      ]);
+      pingFalhas = 0;                 // respondeu → conexão viva, não faz nada
+    } catch (e) {
+      pingFalhas++;
+      console.log('[HEALTH] Ping leve falhou (' + pingFalhas + '/' + PING_FALHAS_MAX + '): ' + e.message);
+      if (pingFalhas >= PING_FALHAS_MAX) {
+        pingFalhas = 0;
+        _reconectarPorHealth('Ping leve sem resposta.');
+      }
+    }
+  }, HEALTH_PING_MS);
 }
 
 var errosDescripto  = 0;
@@ -1418,7 +1437,7 @@ async function conectar() {
         sock = null;
 
         clearTimeout(inactivityTimer);
-        if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+        if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log('[WA] Conexão fechada. Código:', codigo);
         if (codigo === DisconnectReason.loggedOut) {
@@ -1538,7 +1557,7 @@ app.post('/reconectar', async (req, res) => {
 
   const sockRef = sock;
   sock = null;
-  if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
   if (sockRef) { try { sockRef.end(new Error('manual-reconnect')); } catch(e) {} }
   setTimeout(conectar, 1000);
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
@@ -1778,14 +1797,17 @@ app.post('/painel/limpar', (req, res) => {
 app.post('/injetar', async (req, res) => {
   const { texto } = req.body;
   if (!texto?.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
-  const grupoFake = 'injecao_manual';
-  if (!bufferAgrupamento.has(grupoFake)) {
-    const timer = setTimeout(() => processarBuffer(grupoFake), JANELA_AGRUPAMENTO_MS);
-    bufferAgrupamento.set(grupoFake, { itens:[], timer });
-  }
-  const entrada = bufferAgrupamento.get(grupoFake);
-  entrada.itens.push({ texto:texto.trim(), imagemBase64:null, timestamp:Date.now() });
-  res.json({ ok:true, bufferItens:entrada.itens.length });
+  // Cada injeção manual recebe seu PRÓPRIO grupo (id único) e é processada
+  // isoladamente. Assim 1 injeção = 1 oferta: não há janela de 3 min
+  // compartilhada (que quebrava as injeções em lotes conforme o tempo) nem
+  // risco de o agrupamento por IA fundir rotas diferentes enviadas em sequência.
+  const grupoFake = 'injecao_manual_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  const entrada = { itens: [], timer: null };
+  bufferAgrupamento.set(grupoFake, entrada);
+  entrada.itens.push({ texto: texto.trim(), imagemBase64: null, timestamp: Date.now() });
+  // Pequeno atraso só para a resposta HTTP retornar antes do processamento.
+  entrada.timer = setTimeout(() => processarBuffer(grupoFake), 1500);
+  res.json({ ok: true, grupo: grupoFake, bufferItens: entrada.itens.length });
 });
 
 app.post('/enviar', async (req, res) => {
@@ -1984,7 +2006,7 @@ app.post('/reset-sessao-completo', async (req, res) => {
   conectado = false;
   const sockRef = sock;
   sock = null;
-  if (healthTimer) { clearTimeout(healthTimer); healthTimer = null; }
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
   if (sockRef) { try { sockRef.end(new Error('reset-completo')); } catch(e) {} }
   try {
     const arquivos = await readdir(SESSAO_DIR);
