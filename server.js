@@ -480,9 +480,14 @@ function formatarMensagemCDV(d) {
   var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
   var balcao = '`Faça parte do Balcão clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
   var cpm = PROGRAMAS_CPM[d.programa] || 0;
-  var rawPontos = String(d.pontos||'0').replace(/[.,\s]/g,'');
-  var num = parseInt(rawPontos) || 0;
-  if (num > 5000000) { num = 0; }
+  // Título usa SEMPRE o MENOR valor entre os trechos. d.pontos pode vir como
+  // um número só ("458600"), com separador ("102.000") ou com os dois trechos
+  // ("102000 (ida) / 86600 (volta)"). Extrai todos os números e pega o mínimo.
+  var pontosTokens = String(d.pontos||'').replace(/\([^)]*\)/g, ' ').match(/\d[\d.,]*/g);
+  var pontosNums = (pontosTokens || [])
+    .map(function (s) { return parseInt(s.replace(/[.,]/g, ''), 10) || 0; })
+    .filter(function (x) { return x > 0 && x <= 5000000; });
+  var num = pontosNums.length ? Math.min.apply(null, pontosNums) : 0;
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
   var link = PROGRAMAS_LINK[d.programa] || '';
