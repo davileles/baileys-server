@@ -992,7 +992,10 @@ async function agruparEFormatar(classificacoes) {
     // A Claude AI retorna índices como posições em `validas` (0,1,2...).
     // Remapeia para os índices reais de `itens` (v.indice) antes de retornar.
     const indicesReais = (e.indices||[]).map(pos => validas[pos]?.indice ?? pos);
-    return { ...e, ...dados, indices: indicesReais, mensagem:formatarMensagemCDV(dados) };
+    // Também preserva o indice da classificação que melhor corresponde à emissão
+    // (usado como fallback na associação de imagens no processarBuffer)
+    const indiceClassif = indicesReais.length > 0 ? indicesReais[0] : undefined;
+    return { ...e, ...dados, indices: indicesReais, indice: indiceClassif, mensagem:formatarMensagemCDV(dados) };
   });
 }
 
@@ -1193,12 +1196,22 @@ async function processarBuffer(grupoId) {
     for (const emissao of emissoes) {
       const indices = emissao.indices || [];
 
-      // Pega imagens e textos EXATAMENTE dos índices que geraram esta emissão.
-      // Sem fallback genérico — evita associar texto de uma oferta com dados de outra.
-      const imagensEmissao = indices.map(i => indiceMapa.get(i)?.imagemBase64).filter(Boolean);
-      const textosEmissao  = indices.map(i => indiceMapa.get(i)?.texto).filter(Boolean).join('\n');
-      const imagensFinal   = imagensEmissao;
-      const textosFinal    = textosEmissao;
+      // Usa os índices reais da emissão (já remapeados de validas para itens no agruparEFormatar).
+      // Para emissões com múltiplos programas/rotas no mesmo item (ex: texto com várias emissões),
+      // a Claude AI pode retornar o mesmo índice para emissões diferentes — neste caso,
+      // usamos o dadosExtraidos para identificar qual item é o original correto.
+      // Estratégia: busca o item cujo texto/imagem melhor corresponde à emissão.
+      let imagensFinal = indices.map(i => indiceMapa.get(i)?.imagemBase64).filter(Boolean);
+      let textosFinal  = indices.map(i => indiceMapa.get(i)?.texto).filter(Boolean).join('\n');
+
+      // Se não encontrou imagens pelos índices (bug de remapeamento), usa o índice da
+      // classificação original que gerou esta emissão via dadosExtraidos.indice
+      if (imagensFinal.length === 0 && emissao.indice !== undefined) {
+        const img = indiceMapa.get(emissao.indice)?.imagemBase64;
+        if (img) imagensFinal = [img];
+        const txt = indiceMapa.get(emissao.indice)?.texto;
+        if (txt && !textosFinal) textosFinal = txt;
+      }
 
       const oferta = {
         id: gerarId(),
@@ -1326,32 +1339,6 @@ function resetarHealthTimer() {
 
 var errosDescripto  = 0;
 var ERROS_DESCR_MAX = 15;
-
-// ── DETECTOR DE BAD MAC VIA STDERR ───────────────────────────────────────────
-// O Baileys emite Bad MAC direto no stderr, fora do contador errosDescripto.
-// Interceptamos e disparamos reset automático após 20 erros em 60 segundos.
-let _badMacCount  = 0;
-let _badMacTimer  = null;
-let _resetEmCurso = false;
-
-const _stderrOriginal = process.stderr.write.bind(process.stderr);
-process.stderr.write = function(chunk, encoding, cb) {
-  const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-  if (str.includes('Bad MAC') || str.includes('Key used already or never filled')) {
-    _badMacCount++;
-    if (!_badMacTimer) {
-      _badMacTimer = setTimeout(() => { _badMacCount = 0; _badMacTimer = null; }, 60000);
-    }
-    if (_badMacCount >= 20 && !_resetEmCurso) {
-      _resetEmCurso = true;
-      _badMacCount  = 0;
-      clearTimeout(_badMacTimer); _badMacTimer = null;
-      console.log('[BAD-MAC] 20+ erros de descriptografia em 60s — limpando sessão...');
-      limparSessaoEReconectar().finally(() => { _resetEmCurso = false; });
-    }
-  }
-  return _stderrOriginal(chunk, encoding, cb);
-};
 
 async function limparSessaoEReconectar() {
   conectado = false;
