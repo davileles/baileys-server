@@ -1327,6 +1327,32 @@ function resetarHealthTimer() {
 var errosDescripto  = 0;
 var ERROS_DESCR_MAX = 15;
 
+// ── DETECTOR DE BAD MAC VIA STDERR ───────────────────────────────────────────
+// O Baileys emite Bad MAC direto no stderr, fora do contador errosDescripto.
+// Interceptamos e disparamos reset automático após 20 erros em 60 segundos.
+let _badMacCount  = 0;
+let _badMacTimer  = null;
+let _resetEmCurso = false;
+
+const _stderrOriginal = process.stderr.write.bind(process.stderr);
+process.stderr.write = function(chunk, encoding, cb) {
+  const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+  if (str.includes('Bad MAC') || str.includes('Key used already or never filled')) {
+    _badMacCount++;
+    if (!_badMacTimer) {
+      _badMacTimer = setTimeout(() => { _badMacCount = 0; _badMacTimer = null; }, 60000);
+    }
+    if (_badMacCount >= 20 && !_resetEmCurso) {
+      _resetEmCurso = true;
+      _badMacCount  = 0;
+      clearTimeout(_badMacTimer); _badMacTimer = null;
+      console.log('[BAD-MAC] 20+ erros de descriptografia em 60s — limpando sessão...');
+      limparSessaoEReconectar().finally(() => { _resetEmCurso = false; });
+    }
+  }
+  return _stderrOriginal(chunk, encoding, cb);
+};
+
 async function limparSessaoEReconectar() {
   conectado = false;
   const sockRef = sock;
