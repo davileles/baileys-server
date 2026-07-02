@@ -37,7 +37,7 @@ const GRUPOS = {
   cdv_emissao: '120363172490263905@g.us',
 };
 const GRUPOS_MONITORADOS      = [
-  '120363427512561555@g.us',
+  '120363153036688838@g.us',
   '120363409136599326@g.us',
   '120363410708080270@g.us',
   '120363229600818869@g.us',
@@ -731,7 +731,7 @@ iniciarTelegram().catch(err => {
 });
 
 // ── GRUPOS COM REGRAS ESPECIAIS DE EXTRAÇÃO ───────────────────────────────────
-const GRUPO_APENAS_IMAGEM = '120363427512561555@g.us';
+const GRUPO_APENAS_IMAGEM = '120363153036688838@g.us';
 const GRUPO_EXECUTIVA     = '120363410708080270@g.us';
 const GRUPOS_TEXTO_ESTRUTURADO = new Set([
   '120363229600818869@g.us',
