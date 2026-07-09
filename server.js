@@ -517,6 +517,51 @@ function formatarMensagemCDV(d) {
   return msg;
 }
 
+// ── REGISTRO DE PASSAGEM NO PROXY + HISTÓRICO 180 DIAS ───────────────────────
+const CDV_PROXY_URL = 'https://cdv-proxy-production.up.railway.app';
+
+async function registrarPassagemProxy(dados) {
+  // Chama /passagens/registrar e retorna hist180 stats ({ minPts, mediaPts, count, isMin })
+  // ou null em caso de falha (fire-and-register, não bloqueia o fluxo).
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch(CDV_PROXY_URL + '/passagens/registrar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(dados),
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    const json = await r.json();
+    return json.ok ? (json.hist180 || null) : null;
+  } catch (e) {
+    console.warn('[CDV-HIST] Falha ao registrar passagem no proxy:', e.message);
+    return null;
+  }
+}
+
+function appendHistoricoMensagem(msg, hist180) {
+  // Appenda bloco de histórico ao final da mensagem WhatsApp (antes do último rodapé).
+  // Só inclui se hist180 tiver ao menos 1 entrada prévia (count >= 1).
+  if (!hist180 || hist180.count < 1) return msg;
+  const min   = hist180.minPts.toLocaleString('pt-BR');
+  const media = hist180.mediaPts.toLocaleString('pt-BR');
+  const minLabel = hist180.isMin ? '🏆 *Mín. 180d (novo mínimo!)*' : '🏆 *Mín. 180d*';
+  const bloco = `
+
+📊 *HISTÓRICO 180 DIAS* (${hist180.count + 1} registros)
+${minLabel}: ${min} pts
+📈 *Média 180d*: ${media} pts`;
+  // Insere antes do último rodapé (última ocorrência do marcador de rodapé)
+  const rodapeMarker = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
+  const lastIdx = msg.lastIndexOf(rodapeMarker);
+  if (lastIdx === -1) return msg + bloco;
+  return msg.slice(0, lastIdx) + bloco + '
+
+' + msg.slice(lastIdx);
+}
+
 // ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
 const LINKS_TSP = {
   'Amazon':        'https://amzn.to/4dFRSzy',
@@ -1096,7 +1141,7 @@ function chaveParOuInverso(oferta) {
   return prog + '|' + cab + '|' + [ori, des].sort().join('-');
 }
 
-function aguardarParIdaVolta(oferta, grupoId) {
+async function aguardarParIdaVolta(oferta, grupoId) {
   // Só aplica em ofertas somente-ida com rota identificada
   const tipo = oferta.dadosExtraidos?.tipo;
   if (tipo === 'ida_volta') return false; // já completa, libera direto
@@ -1128,7 +1173,8 @@ function aguardarParIdaVolta(oferta, grupoId) {
       conteudoOriginal: [base.conteudoOriginal, volta.conteudoOriginal].filter(Boolean).join('\n'),
       imagens: [...(base.imagens||[]), ...(volta.imagens||[])],
     };
-    mesclada.mensagemFormatada = formatarMensagemCDV({ ...mesclada.dadosExtraidos });
+    const hist180Par = await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta' });
+    mesclada.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV({ ...mesclada.dadosExtraidos }), hist180Par);
     mesclada.tipoConteudo = mesclada.imagens.length > 1 ? mesclada.imagens.length+' imagens' : mesclada.imagens.length === 1 ? 'imagem' : 'texto';
     filaPendentes.unshift(mesclada);
     salvarFila();
@@ -1140,8 +1186,14 @@ function aguardarParIdaVolta(oferta, grupoId) {
   const timer = setTimeout(() => {
     if (_esperandoPar.get(chave)?.oferta === oferta) {
       _esperandoPar.delete(chave);
-      filaPendentes.unshift(oferta);
-      salvarFila();
+      // Registra no proxy e appenda histórico (fire-and-update antes de entrar na fila)
+      registrarPassagemProxy({ origem:oferta.dadosExtraidos?.origem||'', destino:oferta.dadosExtraidos?.destino||'', cia:oferta.dadosExtraidos?.cia||'', programa:oferta.dadosExtraidos?.programa||'', pontos:Number(oferta.dadosExtraidos?.pontos)||0, cabine:oferta.dadosExtraidos?.cabine||'Economica', datas_ida:oferta.dadosExtraidos?.datasIda||'', datas_volta:oferta.dadosExtraidos?.datasVolta||'', fonte:'alerta' })
+        .then(hist180 => {
+          if (hist180) oferta.mensagemFormatada = appendHistoricoMensagem(oferta.mensagemFormatada, hist180);
+          filaPendentes.unshift(oferta);
+          salvarFila();
+        })
+        .catch(() => { filaPendentes.unshift(oferta); salvarFila(); });
       console.log('[PAR-BUFFER] Timeout — liberando somente-ida: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
     }
   }, 5 * 60 * 1000);
@@ -1184,7 +1236,8 @@ async function processarBuffer(grupoId) {
         const indices = v.indices || [v.indice];
         const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
         const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
-        const mensagem = formatarMensagemCDV(dados);
+        const hist180Bypass = await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta' });
+        const mensagem = appendHistoricoMensagem(formatarMensagemCDV(dados), hist180Bypass);
         // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
         const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
         const oferta   = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:mensagem, dadosExtraidos:{ ...dados, indices }, status:'pendente' };
@@ -1223,6 +1276,8 @@ async function processarBuffer(grupoId) {
         if (txt && !textosFinal) textosFinal = txt;
       }
 
+      const hist180Normal = await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta' });
+      const mensagemComHist = appendHistoricoMensagem(emissao.mensagem, hist180Normal);
       const oferta = {
         id: gerarId(),
         timestamp: new Date().toISOString(),
@@ -1230,12 +1285,12 @@ async function processarBuffer(grupoId) {
         tipoConteudo: imagensFinal.length > 1 ? imagensFinal.length+' imagens' : imagensFinal.length === 1 ? 'imagem' : 'texto',
         conteudoOriginal: textosFinal,
         imagens: imagensFinal,
-        mensagemFormatada: emissao.mensagem,
+        mensagemFormatada: mensagemComHist,
         dadosExtraidos: emissao,
         status: 'pendente'
       };
       // Aguarda par ida/volta de buffer diferente (até 5 min)
-      const parEsperando = aguardarParIdaVolta(oferta, grupoId);
+      const parEsperando = await aguardarParIdaVolta(oferta, grupoId);
       if (!parEsperando) {
         filaPendentes.unshift(oferta);
         salvarFila();
