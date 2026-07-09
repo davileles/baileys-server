@@ -542,24 +542,20 @@ async function registrarPassagemProxy(dados) {
 }
 
 function appendHistoricoMensagem(msg, hist180) {
-  // Appenda bloco de histórico ao final da mensagem WhatsApp (antes do último rodapé).
+  // Insere bloco de histórico ANTES do 🔗 *LINK* na mensagem WhatsApp.
   // Só inclui se hist180 tiver ao menos 1 entrada prévia (count >= 1).
   if (!hist180 || hist180.count < 1) return msg;
   const min   = hist180.minPts.toLocaleString('pt-BR');
   const media = hist180.mediaPts.toLocaleString('pt-BR');
-  const minLabel = hist180.isMin ? '🏆 *Mín. 180d (novo mínimo!)*' : '🏆 *Mín. 180d*';
-  const bloco = `
-
-📊 *HISTÓRICO 180 DIAS* (${hist180.count + 1} registros)
-${minLabel}: ${min} pts
-📈 *Média 180d*: ${media} pts`;
-  // Insere antes do último rodapé (última ocorrência do marcador de rodapé)
-  const rodapeMarker = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
-  const lastIdx = msg.lastIndexOf(rodapeMarker);
-  if (lastIdx === -1) return msg + bloco;
-  return msg.slice(0, lastIdx) + bloco + '
-
-' + msg.slice(lastIdx);
+  const minLinha = hist180.isMin
+    ? `🏆 *MÍN. 180 DIAS*: ${min} pts ➤ 🔥 Menor valor histórico`
+    : `🏆 *MÍN. 180 DIAS*: ${min} pts`;
+  const bloco = `${minLinha}\n\n📈 *MÉDIA 180 DIAS*: ${media} pts\n\n`;
+  // Insere antes do marcador do LINK
+  const linkMarker = '🔗 *LINK*';
+  const linkIdx = msg.indexOf(linkMarker);
+  if (linkIdx === -1) return msg + '\n\n' + bloco.trim();
+  return msg.slice(0, linkIdx) + bloco + msg.slice(linkIdx);
 }
 
 // ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
