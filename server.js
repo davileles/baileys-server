@@ -774,7 +774,7 @@ async function iniciarTelegram() {
       let imagemBase64 = null;
       if (msg.media) {
         try {
-          const buffer = await tgClient.downloadMedia(msg, { outputFile: Buffer });
+          const buffer = await tgClient.downloadMedia(msg, {});
           if (buffer) imagemBase64 = buffer.toString('base64');
           console.log('[TG] Mídia capturada:', buffer?.length, 'bytes');
         } catch(e) { console.warn('[TG] Falha ao baixar mídia:', e.message); }
