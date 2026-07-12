@@ -765,6 +765,11 @@ async function iniciarTelegram() {
   tgConectado = true;
   tgAuthState = 'ok';
   tgConta = await tgClient.getMe().then(u => ({ id: u.id?.toString(), username: u.username || null, phone: u.phone || null, nome: ((u.firstName||'')+' '+(u.lastName||'')).trim() })).catch(() => null);
+  // Sincronizar diálogos para garantir recebimento de updates de todos os canais seguidos
+  try {
+    const dialogs = await tgClient.getDialogs({ limit: 100 });
+    console.log(`[TG] ${dialogs.length} diálogos sincronizados`);
+  } catch(e) { console.warn('[TG] Falha ao sincronizar diálogos:', e.message); }
   console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}`);
 
   tgClient.addEventHandler(async (update) => {
