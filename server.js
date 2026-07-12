@@ -672,7 +672,7 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido') 
     console.log(`[TG] Cupom identificado: ${campos.loja} | ${campos.valor}${campos.tipo === 'pct' ? '%' : ' R$'}`);
 
     const lista = campos.multiplos?.length
-      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo, codigo: m.codigo ?? campos.codigo, multiplos: null }))
+      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo ?? 0, codigo: m.codigo ?? campos.codigo, tipo: m.tipo ?? campos.tipo, limite: m.limite ?? campos.limite ?? null, multiplos: null }))
       : [campos];
 
     for (const c of lista) {
