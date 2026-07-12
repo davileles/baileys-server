@@ -714,6 +714,7 @@ let tgClient = null;
 let tgConectado = false;
 
 let tgAuthState = null;
+let tgConta = null;
 let tgAuthResolve = null;
 let tgAuthReject  = null;
 let tgAuthValor   = null;
@@ -763,6 +764,7 @@ async function iniciarTelegram() {
   writeFileSync(TG_SESSION_PATH, sessionSalva, 'utf-8');
   tgConectado = true;
   tgAuthState = 'ok';
+  tgConta = await tgClient.getMe().then(u => ({ id: u.id?.toString(), username: u.username || null, phone: u.phone || null, nome: ((u.firstName||'')+' '+(u.lastName||'')).trim() })).catch(() => null);
   console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}`);
 
   tgClient.addEventHandler(async (update) => {
@@ -1679,7 +1681,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise });
 });
 
 app.get('/fila-envio', (req, res) => {
