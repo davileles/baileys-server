@@ -772,29 +772,18 @@ async function iniciarTelegram() {
   } catch(e) { console.warn('[TG] Falha ao sincronizar diálogos:', e.message); }
   console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}`);
 
-  // Handler diagnóstico — loga tipo de TODOS os updates recebidos
   tgClient.addEventHandler(async (update) => {
     try {
       const msg = update.message;
       if (!msg) return;
-      const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
-      const uname = (entity?.username || '').toLowerCase();
-      const ttl = (entity?.title || '');
-      if (uname) console.log(`[TG-DEBUG] update tipo=${update.className} username="${uname}" title="${ttl}" temTexto=${!!msg.message} temMidia=${!!msg.media}`);
-    } catch(e) {}
-  }, new Raw({}));
-
-  tgClient.addEventHandler(async (update) => {
-    try {
-      const msg = update.message;
-      if (!msg?.message && !msg?.media) return;
 
       const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
       const username = (entity?.username || '').toLowerCase();
       const title    = (entity?.title    || '').toLowerCase();
       const matches  = TG_CANAIS_MONITORADOS.some(c => username === c || title.includes(c));
-      console.log(`[TG] Mensagem de username="${username}" title="${title}" — ${matches ? 'ACEITA' : 'ignorada'}`);
       if (!matches) return;
+
+      console.log(`[TG] Mensagem ACEITA de username="${username}" title="${title}" tipo=${update.className}`);
 
       const texto = msg.message || '';
       if (!texto.trim()) return; // sem texto, ignora (só imagem sem legenda)
@@ -812,7 +801,7 @@ async function iniciarTelegram() {
       console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
       await processarMensagemTelegram(texto, username, imagemBase64);
     } catch (err) { console.error('[TG] Erro no handler de canal:', err.message); }
-  }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
+  }, new Raw({}));
 }
 
 iniciarTelegram().catch(err => {
