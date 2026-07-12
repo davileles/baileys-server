@@ -638,18 +638,21 @@ Campos:
   "loja": "Amazon" | "Mercado Livre" | "Shopee" | "Outro: nome",
   "tipo": "pct" | "reais",
   "valor": número (ex: 10, 30, 15),
-  "minimo": número (valor mínimo de compra),
+  "minimo": número (valor mínimo de compra, 0 se não informado),
   "limite": número | null (limite máximo de desconto em R$, só para tipo "pct"),
   "codigo": "CUPOM123" | null,
-  "multiplos": [ {valor, minimo, codigo} ] | null (quando há múltiplos cupons na mesma mensagem),
+  "multiplos": [ {valor, minimo, codigo, tipo} ] | null (quando há múltiplos cupons na mesma mensagem),
   "observacao": "texto livre" | null
 }
 
 Regras:
 - Se não for cupom de desconto, retorne {"eh_cupom": false}
 - Shopee sem código = "codigo": null
-- Para múltiplos cupons (ex: R$30 em R$299 + R$90 em R$899), use "multiplos"
-- Valores devem ser números puros sem símbolo`;
+- "tipo": use "pct" quando o desconto for em porcentagem (ex: 20% OFF, 15% de desconto). Use "reais" quando for valor fixo em R$ (ex: R$30 OFF, R$10 de desconto)
+- Em "multiplos", cada item DEVE ter seu próprio campo "tipo" ("pct" ou "reais") — não herde o tipo do cupom principal
+- Para múltiplos cupons na mesma mensagem (ex: 20% OFF em TVs + 15% OFF em Celulares), use "multiplos" com um item por cupom
+- Valores devem ser números puros sem símbolo (ex: 20 para 20%, 30 para R$30)
+- "minimo": 0 se não houver valor mínimo informado`;
 
   return await chamarClaude(system, [{ type:'text', text: texto }], 500);
 }
