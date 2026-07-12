@@ -1857,6 +1857,15 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   res.json({ ok:true });
 });
 
+app.post('/painel/remover-imagem/:id', (req, res) => {
+  const id     = parseInt(req.params.id);
+  const oferta = filaPendentes.find(o => String(o.id)===String(id));
+  if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  oferta.imagens = [];
+  salvarFila();
+  res.json({ ok:true });
+});
+
 app.post('/painel/reprocessar/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id) && o.status==='pendente');
