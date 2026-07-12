@@ -658,7 +658,7 @@ Regras:
 }
 
 // ── PROCESSAR MENSAGEM DO TELEGRAM ────────────────────────────────────────────
-async function processarMensagemTelegram(texto, canalUsername = 'desconhecido') {
+async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null) {
   if (!texto?.trim()) return;
   console.log('[TG] Nova mensagem recebida:', texto.slice(0, 80));
 
@@ -683,7 +683,7 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido') 
         grupoOrigem: `telegram:@${canalUsername}`,
         tipoConteudo: 'cupom_tsp',
         conteudoOriginal: texto,
-        imagens: [],
+        imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
         mensagemFormatada,
         dadosExtraidos: c,
         status: 'pendente',
@@ -761,15 +761,27 @@ async function iniciarTelegram() {
   tgClient.addEventHandler(async (update) => {
     try {
       const msg = update.message;
-      if (!msg?.message) return;
+      if (!msg?.message && !msg?.media) return;
 
       const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
       const username = entity?.username || '';
       if (!TG_CANAIS_MONITORADOS.includes(username.toLowerCase())) return;
 
-      const texto = msg.message;
+      const texto = msg.message || '';
+      if (!texto.trim()) return; // sem texto, ignora (só imagem sem legenda)
+
+      // Tentar baixar mídia (foto/documento) se existir
+      let imagemBase64 = null;
+      if (msg.media) {
+        try {
+          const buffer = await tgClient.downloadMedia(msg, { outputFile: Buffer });
+          if (buffer) imagemBase64 = buffer.toString('base64');
+          console.log('[TG] Mídia capturada:', buffer?.length, 'bytes');
+        } catch(e) { console.warn('[TG] Falha ao baixar mídia:', e.message); }
+      }
+
       console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
-      await processarMensagemTelegram(texto, username);
+      await processarMensagemTelegram(texto, username, imagemBase64);
     } catch (err) { console.error('[TG] Erro no handler de canal:', err.message); }
   }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
 }
@@ -1794,7 +1806,16 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
-      await enviarMensagem(GRUPOS['tsp'], { text: mensagem });
+      const imagem = oferta.imagens?.[0];
+      if (imagem?.imagemBase64) {
+        await enviarMensagem(GRUPOS['tsp'], {
+          image: Buffer.from(imagem.imagemBase64, 'base64'),
+          caption: mensagem,
+          mimetype: imagem.mime || 'image/jpeg',
+        });
+      } else {
+        await enviarMensagem(GRUPOS['tsp'], { text: mensagem });
+      }
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem; salvarFila();
       res.json({ ok:true });
     } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
