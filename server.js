@@ -655,7 +655,7 @@ Regras:
 }
 
 // ── PROCESSAR MENSAGEM DO TELEGRAM ────────────────────────────────────────────
-async function processarMensagemTelegram(texto) {
+async function processarMensagemTelegram(texto, canalUsername = 'desconhecido') {
   if (!texto?.trim()) return;
   console.log('[TG] Nova mensagem recebida:', texto.slice(0, 80));
 
@@ -677,7 +677,7 @@ async function processarMensagemTelegram(texto) {
       const oferta = {
         id: gerarId(),
         timestamp: new Date().toISOString(),
-        grupoOrigem: `telegram:@${username}`,
+        grupoOrigem: `telegram:@${canalUsername}`,
         tipoConteudo: 'cupom_tsp',
         conteudoOriginal: texto,
         imagens: [],
@@ -766,7 +766,7 @@ async function iniciarTelegram() {
 
       const texto = msg.message;
       console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
-      await processarMensagemTelegram(texto);
+      await processarMensagemTelegram(texto, username);
     } catch (err) { console.error('[TG] Erro no handler de canal:', err.message); }
   }, new Raw({ types: [Api.UpdateNewChannelMessage] }));
 }
