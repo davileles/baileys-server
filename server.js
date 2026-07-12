@@ -691,6 +691,13 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', 
       filaPendentes.unshift(oferta);
       salvarFila();
       console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}`);
+
+      // Alerta de novo cupom no grupo do operador
+      try {
+        await enviarMensagem('120363409136599326@g.us', {
+          text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+        });
+      } catch(e) { console.warn('[TG] Falha ao enviar alerta de cupom:', e.message); }
     }
   } catch(err) {
     console.error('[TG] Erro ao processar cupom:', err.message);
