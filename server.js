@@ -772,6 +772,18 @@ async function iniciarTelegram() {
   } catch(e) { console.warn('[TG] Falha ao sincronizar diálogos:', e.message); }
   console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}`);
 
+  // Handler diagnóstico — loga tipo de TODOS os updates recebidos
+  tgClient.addEventHandler(async (update) => {
+    try {
+      const msg = update.message;
+      if (!msg) return;
+      const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
+      const uname = (entity?.username || '').toLowerCase();
+      const ttl = (entity?.title || '');
+      if (uname) console.log(`[TG-DEBUG] update tipo=${update.className} username="${uname}" title="${ttl}" temTexto=${!!msg.message} temMidia=${!!msg.media}`);
+    } catch(e) {}
+  }, new Raw({}));
+
   tgClient.addEventHandler(async (update) => {
     try {
       const msg = update.message;
