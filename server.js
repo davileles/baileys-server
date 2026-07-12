@@ -771,8 +771,11 @@ async function iniciarTelegram() {
       if (!msg?.message && !msg?.media) return;
 
       const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
-      const username = entity?.username || '';
-      if (!TG_CANAIS_MONITORADOS.includes(username.toLowerCase())) return;
+      const username = (entity?.username || '').toLowerCase();
+      const title    = (entity?.title    || '').toLowerCase();
+      const matches  = TG_CANAIS_MONITORADOS.some(c => username === c || title.includes(c));
+      console.log(`[TG] Mensagem de username="${username}" title="${title}" — ${matches ? 'ACEITA' : 'ignorada'}`);
+      if (!matches) return;
 
       const texto = msg.message || '';
       if (!texto.trim()) return; // sem texto, ignora (só imagem sem legenda)
