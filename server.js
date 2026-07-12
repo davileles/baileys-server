@@ -677,7 +677,7 @@ async function processarMensagemTelegram(texto) {
       const oferta = {
         id: gerarId(),
         timestamp: new Date().toISOString(),
-        grupoOrigem: 'telegram:@juaocupons',
+        grupoOrigem: `telegram:@${username}`,
         tipoConteudo: 'cupom_tsp',
         conteudoOriginal: texto,
         imagens: [],
@@ -698,7 +698,7 @@ async function processarMensagemTelegram(texto) {
 const TG_API_ID   = parseInt(process.env.TG_API_ID   || '0');
 const TG_API_HASH = process.env.TG_API_HASH || '';
 const TG_SESSION_PATH = SESSAO_DIR + '/telegram_session.txt';
-const TG_GRUPO_MONITORADO = process.env.TG_GRUPO || '@juaocupons';
+const TG_CANAIS_MONITORADOS = (process.env.TG_GRUPO || '@juaocupons,@canaldetestetsp').split(',').map(s => s.trim().replace('@','').toLowerCase());
 
 let tgClient = null;
 let tgConectado = false;
@@ -753,7 +753,7 @@ async function iniciarTelegram() {
   writeFileSync(TG_SESSION_PATH, sessionSalva, 'utf-8');
   tgConectado = true;
   tgAuthState = 'ok';
-  console.log(`[TG] Conectado! Monitorando ${TG_GRUPO_MONITORADO}`);
+  console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}`);
 
   tgClient.addEventHandler(async (update) => {
     try {
@@ -762,7 +762,7 @@ async function iniciarTelegram() {
 
       const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
       const username = entity?.username || '';
-      if (username.toLowerCase() !== TG_GRUPO_MONITORADO.replace('@', '').toLowerCase()) return;
+      if (!TG_CANAIS_MONITORADOS.includes(username.toLowerCase())) return;
 
       const texto = msg.message;
       console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
@@ -1567,7 +1567,7 @@ app.get('/tg-auth', (req, res) => {
   const conectadoTg = tgConectado;
 
   if (conectadoTg) {
-    return res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Telegram Auth</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px}h2{color:#22c55e}a{color:#ffa500}</style></head><body><h2>✅ Telegram conectado!</h2><p>Monitorando ${TG_GRUPO_MONITORADO}</p><a href="/painel">Ir para o painel</a></body></html>`);
+    return res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Telegram Auth</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px}h2{color:#22c55e}a{color:#ffa500}</style></head><body><h2>✅ Telegram conectado!</h2><p>Monitorando ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}</p><a href="/painel">Ir para o painel</a></body></html>`);
   }
 
   const labels = {
@@ -1654,7 +1654,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupo:TG_GRUPO_MONITORADO, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -1718,7 +1718,7 @@ app.get('/painel', (req, res) => {
   const emBuffer    = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
 
   const tgStatusDot = tgConectado ? 'tg-dot-on' : (tgAuthState && tgAuthState !== 'ok' && tgAuthState !== 'erro' ? 'tg-dot-wait' : 'tg-dot-off');
-  const tgStatusTxt = tgConectado ? `Telegram conectado — monitorando ${TG_GRUPO_MONITORADO}` : (tgAuthState === 'aguardando_telefone' || tgAuthState === 'aguardando_codigo' || tgAuthState === 'aguardando_senha' ? `Telegram aguardando autenticação — <a href="/tg-auth" style="color:#ffa500">clique aqui para autenticar</a>` : `Telegram desconectado — <a href="/tg-auth" style="color:#ffa500">conectar</a>`);
+  const tgStatusTxt = tgConectado ? `Telegram conectado — monitorando ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}` : (tgAuthState === 'aguardando_telefone' || tgAuthState === 'aguardando_codigo' || tgAuthState === 'aguardando_senha' ? `Telegram aguardando autenticação — <a href="/tg-auth" style="color:#ffa500">clique aqui para autenticar</a>` : `Telegram desconectado — <a href="/tg-auth" style="color:#ffa500">conectar</a>`);
 
   const renderCard = (o) => {
     const data = new Date(o.timestamp).toLocaleString('pt-BR');
