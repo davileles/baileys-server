@@ -709,6 +709,8 @@ const TG_API_ID   = parseInt(process.env.TG_API_ID   || '0');
 const TG_API_HASH = process.env.TG_API_HASH || '';
 const TG_SESSION_PATH = SESSAO_DIR + '/telegram_session.txt';
 const TG_CANAIS_MONITORADOS = (process.env.TG_GRUPO || '@juaocupons,@canaldetestetsp').split(',').map(s => s.trim().replace('@','').toLowerCase());
+// Blacklist: channelIds numéricos ou substrings de title/username a ignorar (separados por vírgula)
+const TG_CANAIS_IGNORADOS_RAW = (process.env.TG_CANAIS_IGNORADOS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 
 let tgClient = null;
 let tgConectado = false;
@@ -771,44 +773,35 @@ async function iniciarTelegram() {
     console.log(`[TG] ${dialogs.length} diálogos sincronizados`);
   } catch(e) { console.warn('[TG] Falha ao sincronizar diálogos:', e.message); }
 
-  // Resolver usernames para channelIds numéricos — mais confiável que comparar username no update
-  const _canaisIds = new Set();
-  for (const canal of TG_CANAIS_MONITORADOS) {
+  // Resolver blacklist para channelIds numéricos
+  const _ignoradosIds = new Set();
+  for (const termo of TG_CANAIS_IGNORADOS_RAW) {
+    if (/^\d+$/.test(termo)) { _ignoradosIds.add(termo); continue; } // já é um ID
     try {
-      const ent = await tgClient.getInputEntity(canal);
-      const cid = (ent.channelId ?? ent.chatId ?? ent.userId)?.toString();
-      if (cid) { _canaisIds.add(cid); console.log(`[TG] Resolvido @${canal} → channelId=${cid}`); }
-      else { console.warn(`[TG] Não foi possível obter channelId para @${canal}`); }
-    } catch(e) { console.warn(`[TG] Erro ao resolver @${canal}: ${e.message}`); }
+      const ent = await tgClient.getInputEntity(termo).catch(() => null);
+      const cid = ent && (ent.channelId ?? ent.chatId ?? ent.userId)?.toString();
+      if (cid) { _ignoradosIds.add(cid); console.log(`[TG] Blacklist resolvido "${termo}" → channelId=${cid}`); }
+    } catch(e) { /* termo será comparado por título em runtime */ }
   }
-  console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')} (ids: ${[..._canaisIds].join(', ')})`);
+  console.log(`[TG] Conectado! Modo: captura geral | Blacklist: ${TG_CANAIS_IGNORADOS_RAW.join(', ') || 'nenhum'}`);
 
   tgClient.addEventHandler(async (update) => {
     try {
       const msg = update.message;
       if (!msg) return;
 
-      // Extrair channelId do peerId (campo confiável, sempre presente)
+      // Resolver identidade do canal remetente
       const peerId = msg.peerId;
       const peerChannelId = (peerId?.channelId ?? peerId?.chatId ?? peerId?.userId)?.toString();
+      const entity = await tgClient.getEntity(peerId).catch(() => null);
+      const username = (entity?.username || '').toLowerCase();
+      const title    = (entity?.title    || '').toLowerCase();
 
-      // Match primário: por channelId numérico resolvido na inicialização
-      const matchById = peerChannelId && _canaisIds.has(peerChannelId);
-
-      // Match secundário (fallback): por username/title via getEntity
-      let username = '', title = '';
-      if (!matchById) {
-        const entity = await tgClient.getEntity(peerId).catch(() => null);
-        username = (entity?.username || '').toLowerCase();
-        title    = (entity?.title    || '').toLowerCase();
-      }
-      const matchByName = TG_CANAIS_MONITORADOS.some(c => username === c || title.includes(c));
-
-      const matches = matchById || matchByName;
-      if (!matches) {
-        if (username || title) {
-          console.log(`[TG] Mensagem IGNORADA de username="${username}" title="${title}" channelId=${peerChannelId} — não está em TG_CANAIS_MONITORADOS`);
-        }
+      // Verificar blacklist: por channelId numérico OU substring de title/username
+      const bloqueadoPorId   = peerChannelId && _ignoradosIds.has(peerChannelId);
+      const bloqueadoPorNome = TG_CANAIS_IGNORADOS_RAW.some(t => username.includes(t) || title.includes(t));
+      if (bloqueadoPorId || bloqueadoPorNome) {
+        console.log(`[TG] BLOQUEADO (blacklist) channelId=${peerChannelId} username="${username}" title="${title}"`);
         return;
       }
 
