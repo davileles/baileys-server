@@ -787,10 +787,19 @@ async function iniciarTelegram() {
   }
   console.log(`[TG] Conectado! Modo: captura geral | Blacklist: ${TG_CANAIS_IGNORADOS_RAW.join(', ') || 'nenhum'}`);
 
+  // Cache de deduplicação: evita processar mesma mensagem duas vezes (New + Edit ou canal espelhado)
+  const _msgProcessadas = new Map(); // chave: "channelId:msgId" → timestamp
+  const MSG_DEDUP_TTL = 60 * 1000; // 60 segundos
+
   tgClient.addEventHandler(async (update) => {
     try {
       const msg = update.message;
       if (!msg) return;
+
+      // Ignorar edições — evita duplicação por UpdateEditChannelMessage
+      if (update.className === 'UpdateEditChannelMessage' || update.className === 'UpdateEditMessage') {
+        return;
+      }
 
       // Resolver identidade do canal remetente
       const peerId = msg.peerId;
@@ -806,6 +815,17 @@ async function iniciarTelegram() {
         console.log(`[TG] BLOQUEADO (blacklist) channelId=${peerChannelId} username="${username}" title="${title}"`);
         return;
       }
+
+      // Deduplicação por messageId — evita processar mesma msg de canais espelhados
+      const dedupKey = `${peerChannelId}:${msg.id}`;
+      const agora = Date.now();
+      // Limpar entradas expiradas
+      for (const [k, ts] of _msgProcessadas) { if (agora - ts > MSG_DEDUP_TTL) _msgProcessadas.delete(k); }
+      if (_msgProcessadas.has(dedupKey)) {
+        console.log(`[TG] DUPLICATA ignorada channelId=${peerChannelId} msgId=${msg.id}`);
+        return;
+      }
+      _msgProcessadas.set(dedupKey, agora);
 
       console.log(`[TG] Mensagem ACEITA channelId=${peerChannelId} username="${username}" title="${title}" tipo=${update.className}`);
 
