@@ -775,6 +775,16 @@ async function iniciarTelegram() {
     console.log(`[TG] ${dialogs.length} diálogos sincronizados`);
   } catch(e) { console.warn('[TG] Falha ao sincronizar diálogos:', e.message); }
 
+  // Forçar acesso explícito aos canais monitorados — garante que estejam no cache do gramjs
+  // independente da posição nos diálogos (evita updates perdidos de canais pouco ativos)
+  for (const canal of TG_CANAIS_MONITORADOS) {
+    try {
+      const ent = await tgClient.getInputEntity(canal);
+      const cid = (ent?.channelId ?? ent?.chatId ?? ent?.userId)?.toString();
+      console.log(`[TG] Canal monitorado resolvido: @${canal} → channelId=${cid}`);
+    } catch(e) { console.warn(`[TG] Falha ao resolver canal monitorado @${canal}: ${e.message}`); }
+  }
+
   // Resolver blacklist para channelIds numéricos
   const _ignoradosIds = new Set();
   for (const termo of TG_CANAIS_IGNORADOS_RAW) {
