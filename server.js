@@ -803,11 +803,34 @@ async function iniciarTelegram() {
 
   tgClient.addEventHandler(async (update) => {
     try {
-      const msg = update.message;
-      if (!msg) return;
-
-      // Ignorar edições — evita duplicação por UpdateEditChannelMessage
+      // Ignorar edições — evita duplicação
       if (update.className === 'UpdateEditChannelMessage' || update.className === 'UpdateEditMessage') {
+        return;
+      }
+
+      // Extrair mensagem — o campo varia conforme o tipo de update MTProto
+      let msg = update.message;
+
+      // UpdateShortMessage / UpdateShortChatMessage: mensagem está no próprio update
+      if (!msg && update.className === 'UpdateShortMessage') {
+        msg = update; // peerId precisa ser montado a partir de userId
+      }
+
+      // Updates / UpdatesCombined: mensagem está dentro de update.updates[]
+      if (!msg && Array.isArray(update.updates)) {
+        for (const u of update.updates) {
+          if (u.message) { msg = u.message; break; }
+        }
+      }
+
+      if (!msg) {
+        // Log de debug para tipos desconhecidos — ajuda a identificar updates perdidos
+        if (update.className && !['UpdateReadChannelInbox','UpdateReadHistoryInbox','UpdateReadHistoryOutbox',
+            'UpdateUserStatus','UpdateChannelUserTyping','UpdateChatUserTyping','UpdateReadChannelOutbox',
+            'UpdatePinnedChannelMessages','UpdateChannelAvailableMessages','UpdateDeleteChannelMessages',
+            'UpdateWebPage','UpdateChannelWebPage','UpdateServiceNotification'].includes(update.className)) {
+          console.log(`[TG] Update sem msg descartado: ${update.className}`);
+        }
         return;
       }
 
