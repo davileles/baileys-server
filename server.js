@@ -16,7 +16,7 @@ import QRCode from 'qrcode';
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
-import { Raw } from 'telegram/events/index.js';
+import { Raw, NewMessage } from 'telegram/events/index.js';
 import { Api } from 'telegram';
 
 // ── LOGGER CUSTOMIZADO (suprimir ruído do Baileys) ───────────────────────────
@@ -805,38 +805,11 @@ async function iniciarTelegram() {
   const _msgProcessadas = new Map(); // chave: "channelId:msgId" → timestamp
   const MSG_DEDUP_TTL = 60 * 1000; // 60 segundos
 
-  tgClient.addEventHandler(async (update) => {
+  // Handler principal: NewMessage captura UpdateNewMessage + UpdateNewChannelMessage de forma normalizada
+  tgClient.addEventHandler(async (event) => {
     try {
-      // Ignorar edições — evita duplicação
-      if (update.className === 'UpdateEditChannelMessage' || update.className === 'UpdateEditMessage') {
-        return;
-      }
-
-      // Extrair mensagem — o campo varia conforme o tipo de update MTProto
-      let msg = update.message;
-
-      // UpdateShortMessage / UpdateShortChatMessage: mensagem está no próprio update
-      if (!msg && update.className === 'UpdateShortMessage') {
-        msg = update; // peerId precisa ser montado a partir de userId
-      }
-
-      // Updates / UpdatesCombined: mensagem está dentro de update.updates[]
-      if (!msg && Array.isArray(update.updates)) {
-        for (const u of update.updates) {
-          if (u.message) { msg = u.message; break; }
-        }
-      }
-
-      if (!msg) {
-        // Log de debug para tipos desconhecidos — ajuda a identificar updates perdidos
-        if (update.className && !['UpdateReadChannelInbox','UpdateReadHistoryInbox','UpdateReadHistoryOutbox',
-            'UpdateUserStatus','UpdateChannelUserTyping','UpdateChatUserTyping','UpdateReadChannelOutbox',
-            'UpdatePinnedChannelMessages','UpdateChannelAvailableMessages','UpdateDeleteChannelMessages',
-            'UpdateWebPage','UpdateChannelWebPage','UpdateServiceNotification'].includes(update.className)) {
-          console.log(`[TG] Update sem msg descartado: ${update.className}`);
-        }
-        return;
-      }
+      const msg = event.message;
+      if (!msg) return;
 
       // Resolver identidade do canal remetente
       const peerId = msg.peerId;
@@ -856,7 +829,6 @@ async function iniciarTelegram() {
       // Deduplicação por messageId — evita processar mesma msg de canais espelhados
       const dedupKey = `${peerChannelId}:${msg.id}`;
       const agora = Date.now();
-      // Limpar entradas expiradas
       for (const [k, ts] of _msgProcessadas) { if (agora - ts > MSG_DEDUP_TTL) _msgProcessadas.delete(k); }
       if (_msgProcessadas.has(dedupKey)) {
         console.log(`[TG] DUPLICATA ignorada channelId=${peerChannelId} msgId=${msg.id}`);
@@ -864,12 +836,12 @@ async function iniciarTelegram() {
       }
       _msgProcessadas.set(dedupKey, agora);
 
-      console.log(`[TG] Mensagem ACEITA channelId=${peerChannelId} username="${username}" title="${title}" tipo=${update.className}`);
+      console.log(`[TG] Mensagem ACEITA channelId=${peerChannelId} username="${username}" title="${title}"`);
 
       const texto = msg.message || '';
-      if (!texto.trim()) return; // sem texto, ignora (só imagem sem legenda)
+      if (!texto.trim()) return;
 
-      // Tentar baixar mídia (foto/documento) se existir
+      // Tentar baixar mídia se existir
       let imagemBase64 = null;
       if (msg.media) {
         try {
@@ -879,10 +851,10 @@ async function iniciarTelegram() {
         } catch(e) { console.warn('[TG] Falha ao baixar mídia:', e.message); }
       }
 
-      console.log('[TG] Nova mensagem do canal:', texto.slice(0, 80));
+      console.log('[TG] Nova mensagem:', texto.slice(0, 80));
       await processarMensagemTelegram(texto, username, imagemBase64);
-    } catch (err) { console.error('[TG] Erro no handler de canal:', err.message); }
-  }, new Raw({}));
+    } catch (err) { console.error('[TG] Erro no handler NewMessage:', err.message); }
+  }, new NewMessage({}));
 }
 
 iniciarTelegram().catch(err => {
