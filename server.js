@@ -737,6 +737,8 @@ async function iniciarTelegram() {
 
   tgClient = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
     connectionRetries: 5,
+    receiveUpdates: true,
+    floodSleepThreshold: 60,
   });
 
   await tgClient.start({
