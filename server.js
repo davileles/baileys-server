@@ -646,7 +646,9 @@ Campos:
 }
 
 Regras:
-- Se não for cupom de desconto, retorne {"eh_cupom": false}
+- Se não for cupom de desconto com código de DESCONTO aplicável em compras, retorne {"eh_cupom": false}
+- NÃO é cupom: ofertas de milhas, pontos, cashback em programas de fidelidade (Azul Fidelidade, Smiles, TudoAzul, Livelo, etc), bônus de cadastro, promoções de acúmulo de pontos, sorteios, gifts, reembolso, indique-e-ganhe — mesmo que tenham um código
+- É cupom: código de desconto (%) ou valor fixo (R$) aplicável em compras em lojas como Amazon, Mercado Livre, Shopee, iFood, Uber Eats, Rappi, Magazine Luiza, etc
 - Shopee sem código = "codigo": null
 - "tipo": use "pct" quando o desconto for em porcentagem (ex: 20% OFF, 15% de desconto). Use "reais" quando for valor fixo em R$ (ex: R$30 OFF, R$10 de desconto)
 - Em "multiplos", cada item DEVE ter seu próprio campo "tipo" ("pct" ou "reais") — não herde o tipo do cupom principal
