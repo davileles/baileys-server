@@ -767,7 +767,7 @@ async function iniciarTelegram() {
   tgConta = await tgClient.getMe().then(u => ({ id: u.id?.toString(), username: u.username || null, phone: u.phone || null, nome: ((u.firstName||'')+' '+(u.lastName||'')).trim() })).catch(() => null);
   // Sincronizar diálogos para garantir recebimento de updates de todos os canais seguidos
   try {
-    const dialogs = await tgClient.getDialogs({ limit: 100 });
+    const dialogs = await tgClient.getDialogs({ limit: 500 });
     console.log(`[TG] ${dialogs.length} diálogos sincronizados`);
   } catch(e) { console.warn('[TG] Falha ao sincronizar diálogos:', e.message); }
   console.log(`[TG] Conectado! Monitorando: ${TG_CANAIS_MONITORADOS.map(c=>'@'+c).join(', ')}`);
@@ -780,8 +780,20 @@ async function iniciarTelegram() {
       const entity = await tgClient.getEntity(msg.peerId).catch(() => null);
       const username = (entity?.username || '').toLowerCase();
       const title    = (entity?.title    || '').toLowerCase();
+
+      // Log de debug para canais desconhecidos (entity null = canal não sincronizado)
+      if (!entity) {
+        console.warn(`[TG] getEntity falhou para peerId=${JSON.stringify(msg.peerId)} — canal pode não estar sincronizado`);
+      }
+
       const matches  = TG_CANAIS_MONITORADOS.some(c => username === c || title.includes(c));
-      if (!matches) return;
+      if (!matches) {
+        // Log apenas quando há entity mas não bate com lista monitorada (evita spam de canais anônimos)
+        if (entity && (username || title)) {
+          console.log(`[TG] Mensagem IGNORADA de username="${username}" title="${title}" — não está em TG_CANAIS_MONITORADOS`);
+        }
+        return;
+      }
 
       console.log(`[TG] Mensagem ACEITA de username="${username}" title="${title}" tipo=${update.className}`);
 
