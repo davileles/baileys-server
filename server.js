@@ -801,9 +801,48 @@ async function iniciarTelegram() {
   }
   console.log(`[TG] Conectado! Modo: captura geral | Blacklist: ${TG_CANAIS_IGNORADOS_RAW.join(', ') || 'nenhum'}`);
 
-  // Cache de deduplicação: evita processar mesma mensagem duas vezes (New + Edit ou canal espelhado)
+  // ── KEEPALIVE: mantém sessão ativa para o servidor TG continuar entregando updates ──
+  // Sem isso, sessões inativas perdem updates de canais broadcast após alguns minutos
+  const _keepaliveInterval = setInterval(async () => {
+    try {
+      await tgClient.invoke(new Api.updates.GetState());
+    } catch(e) {
+      console.warn('[TG] Keepalive falhou:', e.message);
+    }
+  }, 30000); // a cada 30 segundos
+
+  // Cache de deduplicação: evita processar mesma mensagem duas vezes (NewMessage + Polling)
   const _msgProcessadas = new Map(); // chave: "channelId:msgId" → timestamp
-  const MSG_DEDUP_TTL = 60 * 1000; // 60 segundos
+  const MSG_DEDUP_TTL = 10 * 60 * 1000; // 10 minutos (cobre janela do polling)
+
+  // ── POLLING de segurança: busca últimas msgs dos canais monitorados a cada 5 min ──
+  // Garante captura mesmo se algum update MTProto for perdido
+  const _ultimosMsgIds = {}; // channelId → último msgId processado
+  const _pollingInterval = setInterval(async () => {
+    for (const canal of TG_CANAIS_MONITORADOS) {
+      try {
+        const ent = await tgClient.getInputEntity(canal);
+        const msgs = await tgClient.getMessages(ent, { limit: 5 });
+        const cid = (ent?.channelId ?? ent?.chatId ?? ent?.userId)?.toString();
+        for (const msg of msgs.reverse()) { // do mais antigo ao mais novo
+          if (!msg.message?.trim()) continue;
+          const ultimoId = _ultimosMsgIds[cid] || 0;
+          if (msg.id <= ultimoId) continue; // já processado
+          _ultimosMsgIds[cid] = msg.id;
+          // Verificar blacklist
+          const bloqueado = _ignoradosIds.has(cid) ||
+            TG_CANAIS_IGNORADOS_RAW.some(t => canal.includes(t));
+          if (bloqueado) continue;
+          // Checar deduplicação — evita reprocessar msg já capturada pelo NewMessage
+          const dedupKeyPolling = `${cid}:${msg.id}`;
+          if (_msgProcessadas.has(dedupKeyPolling)) continue;
+          _msgProcessadas.set(dedupKeyPolling, Date.now());
+          console.log(`[TG] Polling ACEITA @${canal} msgId=${msg.id}: ${msg.message.slice(0,60)}`);
+          await processarMensagemTelegram(msg.message, canal, null);
+        }
+      } catch(e) { /* silencioso — canal pode estar temporariamente inacessível */ }
+    }
+  }, 5 * 60 * 1000); // a cada 5 minutos
 
   // Handler principal: NewMessage captura UpdateNewMessage + UpdateNewChannelMessage de forma normalizada
   tgClient.addEventHandler(async (event) => {
