@@ -842,7 +842,7 @@ async function iniciarTelegram() {
         }
       } catch(e) { /* silencioso — canal pode estar temporariamente inacessível */ }
     }
-  }, 2 * 60 * 1000); // a cada 2 minutos
+  }, 60 * 1000); // a cada 1 minuto
 
   // Handler principal: NewMessage captura UpdateNewMessage + UpdateNewChannelMessage de forma normalizada
   tgClient.addEventHandler(async (event) => {
