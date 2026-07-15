@@ -1837,6 +1837,90 @@ app.post('/fila-envio/marcar-todas-enviado', (req, res) => {
   res.json({ ok: true, marcadas: aprovadas.length, ids: aprovadas.map(o => o.id) });
 });
 
+// ── FILA DO RADAR (ofertas de bonificação aprovadas pelo gerador-cdv) ─────────
+// Intervalo de 3 min entre envios, sem janela horária (envia a qualquer hora)
+const RADAR_INTERVALO_MS = 3 * 60 * 1000;
+const filaRadar = []; // { id, mensagem, grupo, tentativas }
+let radarWorkerRodando = false;
+let radarUltimoEnvioMs = 0;
+
+async function radarWorker() {
+  if (radarWorkerRodando) return;
+  radarWorkerRodando = true;
+  console.log('[RADAR] Worker iniciado. Itens na fila: ' + filaRadar.length);
+  while (filaRadar.length > 0) {
+    const decorrido = Date.now() - radarUltimoEnvioMs;
+    const espera = radarUltimoEnvioMs === 0 ? 0 : Math.max(0, RADAR_INTERVALO_MS - decorrido);
+    if (espera > 0) {
+      console.log('[RADAR] Aguardando ' + Math.round(espera / 1000) + 's antes do próximo envio...');
+      await new Promise(r => setTimeout(r, espera));
+    }
+    try {
+      await aguardarConectado();
+    } catch(e) {
+      console.error('[RADAR] ' + e.message + '. Aguardando 30s.');
+      await new Promise(r => setTimeout(r, 30000));
+      continue;
+    }
+    const item = filaRadar[0];
+    if (!item) break;
+    try {
+      console.log('[RADAR] Enviando oferta "' + item.id + '" para ' + item.grupo + ' (' + filaRadar.length + ' na fila)');
+      await enviarMensagem(item.grupo, { text: item.mensagem });
+      filaRadar.shift();
+      radarUltimoEnvioMs = Date.now();
+      console.log('[RADAR] ✓ Oferta "' + item.id + '" enviada. Restam ' + filaRadar.length + '.');
+    } catch(e) {
+      console.error('[RADAR] ✗ Erro ao enviar "' + item.id + '":', e.message);
+      item.tentativas = (item.tentativas || 0) + 1;
+      if (item.tentativas >= 3) {
+        console.error('[RADAR] Desistindo após 3 tentativas: ' + item.id);
+        filaRadar.shift();
+      }
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+  radarWorkerRodando = false;
+  console.log('[RADAR] Worker encerrado (fila vazia).');
+}
+
+// POST /radar/enviar — enfileira uma oferta do radar para envio
+app.post('/radar/enviar', (req, res) => {
+  const { id, mensagem, grupo } = req.body || {};
+  if (!mensagem?.trim()) return res.status(400).json({ ok: false, erro: 'mensagem obrigatória' });
+  const grupoId = grupo ? (GRUPOS[grupo] || grupo) : GRUPOS['cdv_ofertas'];
+  if (!grupoId) return res.status(400).json({ ok: false, erro: 'grupo inválido: ' + grupo });
+
+  const posicao = filaRadar.length;
+  filaRadar.push({ id: id || ('r_' + Date.now()), mensagem, grupo: grupoId, tentativas: 0 });
+
+  const agora = Date.now();
+  const decorrido = agora - radarUltimoEnvioMs;
+  const esperaMs = radarUltimoEnvioMs === 0 ? 0 : Math.max(0, RADAR_INTERVALO_MS - decorrido);
+  const totalMs = esperaMs + posicao * RADAR_INTERVALO_MS;
+  const minutos = Math.round(totalMs / 60000);
+
+  console.log('[RADAR] Oferta "' + (id || '?') + '" enfileirada na posição ' + (posicao + 1));
+  radarWorker().catch(e => { console.error('[RADAR] Worker erro:', e.message); radarWorkerRodando = false; });
+
+  res.json({ ok: true, posicao: posicao + 1, minutos, total: filaRadar.length });
+});
+
+// GET /radar/fila — inspecionar a fila do radar
+app.get('/radar/fila', (req, res) => {
+  res.json({
+    total: filaRadar.length,
+    workerAtivo: radarWorkerRodando,
+    intervaloMinutos: RADAR_INTERVALO_MS / 60000,
+    itens: filaRadar.map((item, idx) => ({
+      posicao: idx + 1,
+      id: item.id,
+      tentativas: item.tentativas || 0,
+      preview: item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
+    })),
+  });
+});
+
 app.get('/painel', (req, res) => {
   const pendentes   = filaPendentes.filter(o => o.status==='pendente');
   const processados = filaPendentes.filter(o => o.status!=='pendente');
