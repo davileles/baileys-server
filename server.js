@@ -115,6 +115,59 @@ function iniciarConexao() {
 }
 const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
 
+// ── DEDUPLICAÇÃO DE CUPONS TSP ────────────────────────────────────────────────
+// Ignora cupons já vistos (mesma loja + código) nas últimas N horas.
+// Persiste em disco para sobreviver a restarts.
+const CUPONS_VISTOS_PATH = SESSAO_DIR + '/cupons_vistos.json';
+const CUPONS_VISTOS_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
+
+let _cuponsVistos = {};
+
+function carregarCuponsVistos() {
+  try {
+    if (existsSync(CUPONS_VISTOS_PATH)) {
+      _cuponsVistos = JSON.parse(readFileSync(CUPONS_VISTOS_PATH, 'utf-8'));
+      console.log('[DEDUP] Cupons vistos carregados:', Object.keys(_cuponsVistos).length);
+    }
+  } catch(e) { console.warn('[DEDUP] Erro ao carregar cupons_vistos:', e.message); _cuponsVistos = {}; }
+}
+
+function salvarCuponsVistos() {
+  try {
+    // Limpa entradas expiradas antes de salvar
+    const agora = Date.now();
+    for (const k of Object.keys(_cuponsVistos)) {
+      if (agora - _cuponsVistos[k] > CUPONS_VISTOS_TTL_MS) delete _cuponsVistos[k];
+    }
+    writeFileSync(CUPONS_VISTOS_PATH, JSON.stringify(_cuponsVistos), 'utf-8');
+  } catch(e) { console.warn('[DEDUP] Erro ao salvar cupons_vistos:', e.message); }
+}
+
+function chaveDedup(loja, codigo) {
+  const lojaKey = (loja || 'outros').toLowerCase().trim().replace(/\s+/g, '_');
+  const codKey  = (codigo || '__sem_codigo__').toLowerCase().trim();
+  return `${lojaKey}:${codKey}`;
+}
+
+function cupomJaVisto(loja, codigo) {
+  const chave = chaveDedup(loja, codigo);
+  const ts = _cuponsVistos[chave];
+  if (!ts) return false;
+  if (Date.now() - ts > CUPONS_VISTOS_TTL_MS) {
+    delete _cuponsVistos[chave];
+    return false;
+  }
+  return true;
+}
+
+function registrarCupomVisto(loja, codigo) {
+  const chave = chaveDedup(loja, codigo);
+  _cuponsVistos[chave] = Date.now();
+  salvarCuponsVistos();
+}
+
+carregarCuponsVistos();
+
 function carregarFila() {
   try {
     if (existsSync(FILA_PATH)) {
@@ -690,8 +743,15 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', 
         dadosExtraidos: c,
         status: 'pendente',
       };
+      // Verificar deduplicação: ignorar se mesma loja+código já foi visto recentemente
+      if (cupomJaVisto(c.loja, c.codigo)) {
+        console.log(`[DEDUP] Cupom ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
+        continue;
+      }
+
       filaPendentes.unshift(oferta);
       salvarFila();
+      registrarCupomVisto(c.loja, c.codigo);
       console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}`);
 
       // Alerta de novo cupom no grupo do operador
