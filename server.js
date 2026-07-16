@@ -2103,9 +2103,10 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
 // ── Backfill: registra no proxy todos os 'enviados' que ainda não têm enviadoEm ─
 app.post('/backfill-passagens', async (req, res) => {
+  const force = req.body?.force === true;
   const enviados = filaPendentes.filter(o =>
     o.status === 'enviado' &&
-    !o.enviadoEm &&
+    (force || !o.enviadoEm) &&
     o.tipoConteudo !== 'cupom_tsp' &&
     o.dadosExtraidos?.origem &&
     o.dadosExtraidos?.destino &&
