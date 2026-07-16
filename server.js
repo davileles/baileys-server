@@ -360,7 +360,26 @@ async function workerFila() {
 
       // Marca como 'enviado' na filaPendentes para não reentrar na fila após restart
       const ofertaEnviada = filaPendentes.find(o => String(o.id) === String(item.ofertaId));
-      if (ofertaEnviada) { ofertaEnviada.status = 'enviado'; salvarFila(); }
+      if (ofertaEnviada) {
+        ofertaEnviada.status = 'enviado';
+        ofertaEnviada.enviadoEm = new Date().toISOString();
+        salvarFila();
+        // Registra no histórico de passagens do painel (mapa de emissões)
+        const de = ofertaEnviada.dadosExtraidos || {};
+        if (de.origem && de.destino && de.programa && ofertaEnviada.tipoConteudo !== 'cupom_tsp') {
+          registrarPassagemProxy({
+            origem:      de.origem,
+            destino:     de.destino,
+            cia:         de.cia || '',
+            programa:    de.programa,
+            pontos:      Number(de.pontos) || 0,
+            cabine:      de.cabine || 'Economica',
+            datas_ida:   de.datasIda || '',
+            datas_volta: de.datasVolta || '',
+            fonte:       'alerta',
+          }).catch(() => {});
+        }
+      }
 
       console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada.');
     } catch(e) {
@@ -2080,6 +2099,46 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
   enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS]);
   res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
+});
+
+// ── Backfill: registra no proxy todos os 'enviados' que ainda não têm enviadoEm ─
+app.post('/backfill-passagens', async (req, res) => {
+  const enviados = filaPendentes.filter(o =>
+    o.status === 'enviado' &&
+    !o.enviadoEm &&
+    o.tipoConteudo !== 'cupom_tsp' &&
+    o.dadosExtraidos?.origem &&
+    o.dadosExtraidos?.destino &&
+    o.dadosExtraidos?.programa
+  );
+  console.log('[BACKFILL] Iniciando para ' + enviados.length + ' registros sem enviadoEm');
+  let ok = 0, fail = 0;
+  for (const oferta of enviados) {
+    // Usa o timestamp original como data de envio
+    const dataEnvio = oferta.timestamp || new Date().toISOString();
+    oferta.enviadoEm = dataEnvio;
+    const de = oferta.dadosExtraidos;
+    try {
+      await registrarPassagemProxy({
+        origem:      de.origem,
+        destino:     de.destino,
+        cia:         de.cia || '',
+        programa:    de.programa,
+        pontos:      Number(de.pontos) || 0,
+        cabine:      de.cabine || 'Economica',
+        datas_ida:   de.datasIda || '',
+        datas_volta: de.datasVolta || '',
+        fonte:       'alerta',
+      });
+      ok++;
+    } catch(e) {
+      console.warn('[BACKFILL] Falha oferta #' + oferta.id + ':', e.message);
+      fail++;
+    }
+  }
+  salvarFila();
+  console.log('[BACKFILL] Concluído: ' + ok + ' ok, ' + fail + ' falhas');
+  res.json({ ok: true, processados: enviados.length, registrados: ok, falhas: fail });
 });
 
 app.get('/agendamentos', (req, res) => {
