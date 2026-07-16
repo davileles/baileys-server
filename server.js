@@ -2144,9 +2144,20 @@ app.post('/painel/mesclar', (req, res) => {
   const toArray = v => Array.isArray(v)?v:(v?[v]:[]);
   o1.conteudoOriginal  = [...toArray(o1.conteudoOriginal),...toArray(o2.conteudoOriginal)];
   o1.imagens           = [...(o1.imagens||[]),...(o2.imagens||[])];
-  o1.mensagemFormatada = (o1.mensagemFormatada||'').trim()+'\n\n'+(o2.mensagemFormatada||'').trim();
-  o1.tipoConteudo      = 'mesclado';
-  o1.timestamp         = new Date().toISOString();
+
+  // Mesclagem inteligente de datas de volta:
+  // Se o1 tem bloco de volta vazio ("-") e o2 tem datas de ida, injeta em vez de concatenar.
+  const datasVoltaO2 = (o2.dadosExtraidos && o2.dadosExtraidos.datasIda) || '';
+  const blocoVoltaVazio = /(🛬 \*DATAS DE VOLTA\*\n)-\n/;
+  if (datasVoltaO2 && blocoVoltaVazio.test(o1.mensagemFormatada||'')) {
+    o1.mensagemFormatada = (o1.mensagemFormatada||'').replace(blocoVoltaVazio, '$1' + datasVoltaO2 + '\n');
+    if (o1.dadosExtraidos) o1.dadosExtraidos.datasVolta = datasVoltaO2;
+  } else {
+    o1.mensagemFormatada = (o1.mensagemFormatada||'').trim()+'\n\n'+(o2.mensagemFormatada||'').trim();
+  }
+
+  o1.tipoConteudo = 'mesclado';
+  o1.timestamp    = new Date().toISOString();
   o2.status = 'mesclado';
   salvarFila();
   res.json({ ok:true, id:o1.id, mensagemMesclada:o1.mensagemFormatada });
