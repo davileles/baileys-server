@@ -1604,8 +1604,19 @@ function resetarHealthTimer() {
 
 var errosDescripto  = 0;
 var ERROS_DESCR_MAX = 15;
+var isResetting     = false; // true durante limpeza de sessão — bloqueia conexões/timers concorrentes
+var _reconnectTimer = null;  // referência única do timer de reconexão pendente (evita corrida)
+
+// Agenda uma única reconexão, cancelando qualquer timer pendente anterior.
+function _agendarReconexao(delay) {
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); }
+  _reconnectTimer = setTimeout(() => { _reconnectTimer = null; conectar(); }, delay);
+}
 
 async function limparSessaoEReconectar() {
+  if (isResetting) { console.log('[WA] Reset já em andamento, ignorando chamada duplicada.'); return; }
+  isResetting = true;
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   conectado = false;
   const sockRef = sock;
   sock = null;
@@ -1619,7 +1630,8 @@ async function limparSessaoEReconectar() {
     }
   } catch(e) {}
   errosDescripto = 0;
-  setTimeout(conectar, 3000);
+  isResetting = false;
+  _agendarReconexao(3000);
 }
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
@@ -1674,6 +1686,11 @@ function _delayReconexao(codigo) {
 }
 
 async function conectar() {
+  if (isResetting) {
+    console.log('[WA] Reset de sessão em andamento, adiando reconexão.');
+    _agendarReconexao(3000);
+    return;
+  }
   if (isConnecting) {
     console.log('[WA] Conexão já em andamento, ignorando chamada duplicada.');
     return;
@@ -1729,7 +1746,7 @@ async function conectar() {
           // NÃO reconecta automaticamente
         } else {
           const delay = _delayReconexao(codigo);
-          if (delay >= 0) setTimeout(conectar, delay);
+          if (delay >= 0) _agendarReconexao(delay);
         }
       }
     });
@@ -1757,7 +1774,7 @@ async function conectar() {
     isConnecting = false;
 
     const delay = _delayReconexao(null);
-    setTimeout(conectar, delay);
+    if (delay >= 0) _agendarReconexao(delay);
   }
 }
 
@@ -1842,7 +1859,7 @@ app.post('/reconectar', async (req, res) => {
   sock = null;
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
   if (sockRef) { try { sockRef.end(new Error('manual-reconnect')); } catch(e) {} }
-  setTimeout(conectar, 1000);
+  _agendarReconexao(1000);
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
 });
 
@@ -2439,7 +2456,13 @@ app.post('/reset-sessao', async (req, res) => {
 
 app.post('/reset-sessao-completo', async (req, res) => {
   console.log('[RESET] Reset COMPLETO de sessão solicitado via endpoint.');
+  if (isResetting) {
+    console.log('[RESET] Reset já em andamento, ignorando chamada duplicada.');
+    return res.json({ ok:false, mensagem:'Reset já em andamento.' });
+  }
   res.json({ ok:true, mensagem:'Apagando toda a sessão e reconectando...' });
+  isResetting = true;
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   conectado = false;
   const sockRef = sock;
   sock = null;
@@ -2455,8 +2478,9 @@ app.post('/reset-sessao-completo', async (req, res) => {
   } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
   errosDescripto = 0;
   _reconectarTentativas = 0;
+  isResetting = false;
 
-  setTimeout(conectar, 2000);
+  _agendarReconexao(2000);
 });
 
 app.listen(PORT, () => {
