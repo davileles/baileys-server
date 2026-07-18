@@ -2471,7 +2471,7 @@ app.post('/reset-sessao-completo', async (req, res) => {
   try {
     const arquivos = await readdir(SESSAO_DIR);
     for (const arq of arquivos) {
-      if (arq === 'fila_pendentes.json' || arq === 'agendamentos.json') continue; // preserva fila e agendamentos
+      if (arq === 'fila_pendentes.json' || arq === 'agendamentos.json' || arq === 'telegram_session.txt') continue; // preserva fila, agendamentos e sessão do Telegram
       await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
     }
     console.log('[RESET] Sessão apagada completamente. Aguardando novo QR...');
