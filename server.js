@@ -1041,11 +1041,25 @@ async function classificarItens(itens, grupoId) {
     for (let i = 0; i < itensComImagem.length; i++) {
       const item = itensComImagem[i];
       const indiceOriginal = itens.indexOf(item);
+      const temLegenda = !!(item.texto && item.texto.trim());
+      const introducaoImg = temLegenda
+        ? (
+            'Esta imagem é de um grupo de alertas de passagens aéreas com milhas. Ela veio acompanhada da seguinte legenda/descrição em texto:\n\n'
+            +'"""\n'+item.texto.trim()+'\n"""\n\n'
+            +'REGRAS DE PRIORIDADE (IMPORTANTE):\n'
+            +'1. Trate a legenda acima como fonte PRINCIPAL: programa de fidelidade, origem, destino, quantidade de milhas/pontos, classe/cabine e companhia aérea ("cia") normalmente já vêm prontos nela — extraia esses campos do texto.\n'
+            +'2. Use a IMAGEM principalmente para ler as DATAS de ida e volta, que costumam ser a única informação que falta na legenda.\n'
+            +'3. Se algum campo não estiver claro na legenda (ex: código IATA, cia), complemente lendo a imagem.\n'
+            +'4. Se legenda e imagem tiverem informação conflitante em algum campo, priorize a legenda.\n\n'
+          )
+        : (
+            'Esta imagem é de um grupo de alertas de passagens aéreas com milhas e não veio acompanhada de nenhum texto/legenda. Extraia TODOS os dados diretamente da imagem.\n\n'
+          );
       const content = [
         { type:'image', source:{ type:'base64', media_type:'image/jpeg', data:item.imagemBase64 } },
         { type:'text', text:
-          'Esta imagem é de um grupo de alertas de passagens aéreas com milhas. Extraia os dados diretamente da imagem — IGNORE qualquer texto que acompanhe.\n\n'
-          +'Leia da imagem:\n'
+          introducaoImg
+          +'Leia (priorizando a legenda quando houver, complementando com a imagem):\n'
           +'- Programa de fidelidade (ex: LATAM Pass, Smiles, Azul Fidelidade, Azul pelo Mundo)\n'
           +'- Origem e destino com código IATA\n'
           +'- Quantidade de milhas/pontos\n'
@@ -1054,20 +1068,20 @@ async function classificarItens(itens, grupoId) {
           +'- Datas de ida\n'
           +'- Datas de volta (pode estar em imagem separada)\n\n'
           +'CRÍTICO sobre códigos IATA (origemCodigo e destinoCodigo):\n'
-          +'- Leia o código IATA EXATAMENTE como aparece na imagem. Ex: se a imagem mostra "VIX → RAO", origemCodigo="VIX" e destinoCodigo="RAO".\n'
-          +'- NUNCA substitua, corrija ou invente um código IATA diferente do que está na imagem.\n'
+          +'- Leia o código IATA EXATAMENTE como aparece na legenda ou na imagem. Ex: se mostrar "VIX → RAO", origemCodigo="VIX" e destinoCodigo="RAO".\n'
+          +'- NUNCA substitua, corrija ou invente um código IATA diferente do que está na fonte.\n'
           +'- Para o campo "origem" use o nome da cidade do IATA de origem. Para "destino" use o nome da cidade do IATA de destino. Ex: VIX=Vitória, RAO=Ribeirão Preto, CLV=Caldas Novas, CTG=Cartagena, CGB=Cuiabá, SSA=Salvador.\n'
           +'- Se não souber o nome da cidade, use o próprio código IATA como nome — nunca invente.\n\n'
           +'CRÍTICO sobre companhia aérea (campo "cia"):\n'
           +'- "cia" é a companhia que OPERA o voo, não o programa de fidelidade.\n'
-          +'- Quando o programa for "Azul pelo Mundo", a CIA é sempre uma parceira estrangeira mencionada na imagem (ex: COPA, United, TAP, Air France, KLM). NUNCA coloque "Azul" como CIA nesse programa.\n'
-          +'- Leia o texto da imagem: frases como "voando pela COPA", "operado por United" indicam a CIA correta.\n\n'
-          +'Se a imagem mostrar APENAS datas de ida (sem datas de volta) ou APENAS datas de volta, preencha somente o campo correspondente e deixe o outro vazio.\n'
+          +'- Quando o programa for "Azul pelo Mundo", a CIA é sempre uma parceira estrangeira mencionada na fonte (ex: COPA, United, TAP, Air France, KLM, Air Europa). NUNCA coloque "Azul" como CIA nesse programa.\n'
+          +'- Frases como "voando pela COPA", "operado por United", "voando pela Air Europa" indicam a CIA correta.\n\n'
+          +'Se houver APENAS datas de ida (sem datas de volta) ou APENAS datas de volta, preencha somente o campo correspondente e deixe o outro vazio.\n'
           +'Normalize as datas para o formato "Mês/Ano: dias". Ex: "Jun/26: 11, 13, 15".\n'
           +'IMPORTANTE sobre cidades: use o nome completo da cidade, não o código IATA.\n\n'
           +PROGRAMAS_VALIDOS+'\n\n'
           +'Responda com este JSON:\n'+JSON_EXEMPLO(indiceOriginal)+'\n'
-          +'Se não houver passagem aérea na imagem retorne: '+JSON_INVALIDO(indiceOriginal)
+          +'Se não houver passagem aérea retorne: '+JSON_INVALIDO(indiceOriginal)
         }
       ];
       const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
