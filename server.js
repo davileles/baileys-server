@@ -1,8 +1,10 @@
 import makeWASocket, {
-  useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  initAuthCreds,
+  BufferJSON,
+  proto,
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
@@ -10,7 +12,8 @@ import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
-import { readdir, unlink } from 'fs/promises';
+import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync } from 'fs/promises';
+import { join } from 'path';
 import QRCode from 'qrcode';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -81,6 +84,77 @@ const SESSAO_DIR    = './sessao';
 const UPLOAD_DIR    = './tmp-uploads';
 
 [SESSAO_DIR, UPLOAD_DIR].forEach(d => { if (!existsSync(d)) mkdirSync(d, { recursive: true }); });
+
+// ── AUTH STATE ATÔMICO ────────────────────────────────────────────────────────
+// Substitui o useMultiFileAuthState do Baileys mantendo o MESMO formato de
+// arquivos (100% compatível com a sessão existente em ./sessao), mas com duas
+// proteções que ele não tem:
+//   1. Escrita atômica: grava em arquivo .tmp e faz rename() — um restart do
+//      Railway no meio de um write nunca mais deixa JSON truncado (causa raiz
+//      clássica de "Bad MAC" / "Failed to decrypt").
+//   2. Escritas serializadas: uma cadeia única de Promise evita dois writes
+//      concorrentes no mesmo arquivo de chave.
+async function useAuthStateAtomico(pasta) {
+  await mkdirAsync(pasta, { recursive: true });
+  const fixFileName = (file) => file?.replace(/\//g, '__')?.replace(/:/g, '-');
+  let cadeiaEscrita = Promise.resolve();
+
+  const writeData = (data, file) => {
+    const destino = join(pasta, fixFileName(file));
+    const tmp = destino + '.tmp';
+    cadeiaEscrita = cadeiaEscrita
+      .then(async () => {
+        await writeFileAsync(tmp, JSON.stringify(data, BufferJSON.replacer));
+        await renameAsync(tmp, destino);
+      })
+      .catch(e => console.error('[AUTH] Erro ao gravar', file, '-', e.message));
+    return cadeiaEscrita;
+  };
+
+  const readData = async (file) => {
+    try {
+      const raw = await readFileAsync(join(pasta, fixFileName(file)), 'utf-8');
+      return JSON.parse(raw, BufferJSON.reviver);
+    } catch { return null; }
+  };
+
+  const removeData = async (file) => {
+    try { await unlink(join(pasta, fixFileName(file))); } catch {}
+  };
+
+  const creds = (await readData('creds.json')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const data = {};
+          await Promise.all(ids.map(async (id) => {
+            let value = await readData(type + '-' + id + '.json');
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }));
+          return data;
+        },
+        set: async (data) => {
+          const tarefas = [];
+          for (const categoria in data) {
+            for (const id in data[categoria]) {
+              const value = data[categoria][id];
+              const file = categoria + '-' + id + '.json';
+              tarefas.push(value ? writeData(value, file) : removeData(file));
+            }
+          }
+          await Promise.all(tarefas);
+        },
+      },
+    },
+    saveCreds: () => writeData(creds, 'creds.json'),
+  };
+}
 
 const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
@@ -300,7 +374,9 @@ async function enviarMensagem(destino, conteudo, tentativa = 0) {
     if (!ok) throw new Error('WhatsApp não conectado após aguardar reconexão.');
   }
   try {
-    return await sock.sendMessage(destino, conteudo);
+    const resultado = await sock.sendMessage(destino, conteudo);
+    guardarMensagemEnviada(resultado);
+    return resultado;
   } catch (err) {
     const retryable = err.message?.includes('Connection Closed') ||
                       err.message?.includes('Connection Terminated') ||
@@ -1551,6 +1627,7 @@ async function processarMensagem(msg) {
     if (!texto && !imagemB64) return;
 
     console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo, texto ? '| texto: '+texto.slice(0,60) : '| imagem');
+    ultimaCapturaPorGrupo.set(jid, Date.now());
 
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
@@ -1617,7 +1694,8 @@ function resetarHealthTimer() {
 }
 
 var errosDescripto  = 0;
-var ERROS_DESCR_MAX = 15;
+var ERROS_SOFT_MAX  = 8;   // 8 falhas seguidas → cura cirúrgica (só sender keys, sem reconectar)
+var ERROS_DESCR_MAX = 20;  // 20 falhas seguidas → limpa sessions+sender keys (pre-keys preservadas)
 var isResetting     = false; // true durante limpeza de sessão — bloqueia conexões/timers concorrentes
 var _reconnectTimer = null;  // referência única do timer de reconexão pendente (evita corrida)
 
@@ -1638,7 +1716,13 @@ async function limparSessaoEReconectar() {
   try {
     const arquivos = await readdir(SESSAO_DIR);
     for (const arq of arquivos) {
-      if (arq.startsWith('session-') || arq.includes('pre-key') || arq.includes('sender-key')) {
+      // IMPORTANTE: NUNCA apagar arquivos 'pre-key-*'. As pre-keys locais precisam
+      // bater com as registradas nos servidores do WhatsApp; apagá-las tornava
+      // IMPOSSÍVEL decifrar qualquer nova sessão recebida (inclusive as re-tentativas
+      // automáticas dos remetentes) → loop permanente de "Bad MAC" até novo QR.
+      // Sessions e sender-keys são seguras de apagar: os remetentes as recriam
+      // sozinhos via retry receipt, desde que as pre-keys estejam intactas.
+      if (arq.startsWith('session-') || arq.startsWith('sender-key')) {
         await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
       }
     }
@@ -1647,6 +1731,38 @@ async function limparSessaoEReconectar() {
   isResetting = false;
   _agendarReconexao(3000);
 }
+
+// Cura cirúrgica: apaga SOMENTE as sender keys (chaves de decodificação de grupos),
+// sem derrubar a conexão e sem tocar em sessions/pre-keys. Como o auth state lê as
+// chaves do disco sob demanda, o efeito é imediato: na próxima mensagem de cada
+// grupo o Baileys envia retry receipt e o remetente redistribui a chave nova.
+async function limparSenderKeys() {
+  try {
+    const arquivos = await readdir(SESSAO_DIR);
+    let n = 0;
+    for (const arq of arquivos) {
+      if (arq.startsWith('sender-key')) {
+        await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+        n++;
+      }
+    }
+    console.log('[WA] Cura cirúrgica: ' + n + ' sender keys apagadas (conexão mantida, remetentes redistribuirão as chaves).');
+  } catch(e) { console.error('[WA] Erro na cura cirúrgica:', e.message); }
+}
+
+// Guarda as últimas mensagens ENVIADAS para responder retry receipts (getMessage).
+const mensagensEnviadas = new Map();
+function guardarMensagemEnviada(info) {
+  try {
+    if (info?.key?.id && info.message) {
+      mensagensEnviadas.set(info.key.id, info.message);
+      if (mensagensEnviadas.size > 300) mensagensEnviadas.delete(mensagensEnviadas.keys().next().value);
+    }
+  } catch(e) {}
+}
+
+// Última mensagem capturada por grupo monitorado (observabilidade em /status).
+const ultimaCapturaPorGrupo = new Map();
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
 var isConnecting = false; // evita instâncias duplas de conexão
@@ -1682,14 +1798,13 @@ function _delayReconexao(codigo) {
   }
   if (codigo === 500) {
     _erros500Consecutivos++;
-    if (_erros500Consecutivos >= 3) {
-      // 3 erros 500 consecutivos = sessão corrompida. Limpa e reconecta do zero.
-      _erros500Consecutivos = 0;
-      _reconectarTentativas = 0;
-      console.log('[WA] 3 erros 500 consecutivos — limpando sessão corrompida...');
-      limparSessaoEReconectar();
-      return -1; // sinaliza que já foi tratado
-    }
+    // Erros 500 são falhas de stream comuns em conexões longas — NUNCA apagar
+    // sessão por causa deles. O wipe automático que existia aqui destruía as
+    // chaves de decodificação dos grupos a cada instabilidade de rede e era a
+    // causa raiz das mensagens sumirem da aba Alertas. Apenas reconectar com backoff.
+    const delay = Math.min(5000 * _erros500Consecutivos, 60000);
+    console.log('[WA] Stream error 500 (' + _erros500Consecutivos + ' seguido(s)). Reconectando em ' + (delay/1000) + 's...');
+    return delay;
   } else {
     _erros500Consecutivos = 0;
   }
@@ -1712,7 +1827,7 @@ async function conectar() {
   isConnecting = true;
 
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(SESSAO_DIR);
+    const { state, saveCreds } = await useAuthStateAtomico(SESSAO_DIR);
     const { version }          = await fetchLatestBaileysVersion();
     const novaSock = makeWASocket({
       version,
@@ -1721,7 +1836,13 @@ async function conectar() {
       printQRInTerminal: false,
       syncFullHistory: false,
       markOnlineOnConnect: true,
-      getMessage: async () => undefined,
+      // getMessage real: quando um destinatário não consegue decifrar uma mensagem
+      // NOSSA, o WhatsApp pede reenvio (retry receipt). Devolver undefined fazia o
+      // reenvio falhar e o destinatário ficar preso em "aguardando mensagem".
+      getMessage: async (key) => mensagensEnviadas.get(key?.id),
+      // Ignora status e newsletters: reduz drasticamente o volume de decodificação
+      // (e de erros Bad MAC) de conteúdo que o servidor nunca usa.
+      shouldIgnoreJid: (jid) => jid === 'status@broadcast' || (typeof jid === 'string' && jid.endsWith('@newsletter')),
       // Keepalive agressivo para detectar quedas mais rápido
       keepAliveIntervalMs: 30000,
     });
@@ -1770,9 +1891,12 @@ async function conectar() {
       for (const msg of messages) {
         if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
           errosDescripto++;
-          if (errosDescripto >= ERROS_DESCR_MAX) { await limparSessaoEReconectar(); return; }
+          console.warn('[WA] Mensagem indecifrável de ' + (msg.key?.remoteJid || '?') + ' (' + errosDescripto + ' seguidas). Baileys enviou retry receipt ao remetente.');
+          if (errosDescripto === ERROS_SOFT_MAX) { limparSenderKeys(); }
+          else if (errosDescripto >= ERROS_DESCR_MAX) { errosDescripto = 0; await limparSessaoEReconectar(); return; }
           continue;
         }
+        if (msg.message) errosDescripto = 0; // decifrou com sucesso → sessão saudável
         // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos = paralelo
         const jid = msg.key?.remoteJid;
         if (jid) {
@@ -1889,7 +2013,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -2461,6 +2585,12 @@ app.post('/webhook/hubla', async (req, res) => {
   } catch (err) { console.error('[Hubla] Erro:', err); return res.status(500).json({ error: 'Erro interno' }); }
 });
 
+
+app.post('/reset-sender-keys', async (req, res) => {
+  console.log('[RESET] Cura cirúrgica de sender keys solicitada via endpoint.');
+  await limparSenderKeys();
+  res.json({ ok:true, mensagem:'Sender keys apagadas. Conexão mantida — os grupos voltam a decifrar conforme os remetentes redistribuírem as chaves (automático via retry receipt).' });
+});
 
 app.post('/reset-sessao', async (req, res) => {
   console.log('[RESET] Reset de sessão solicitado via endpoint.');
