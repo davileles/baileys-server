@@ -440,21 +440,25 @@ async function workerFila() {
         ofertaEnviada.status = 'enviado';
         ofertaEnviada.enviadoEm = new Date().toISOString();
         salvarFila();
-        // Registra no histórico de passagens do painel (mapa de emissões)
-        const de = ofertaEnviada.dadosExtraidos || {};
-        if (de.origem && de.destino && de.programa && ofertaEnviada.tipoConteudo !== 'cupom_tsp') {
-          registrarPassagemProxy({
-            origem:      de.origem,
-            destino:     de.destino,
-            cia:         de.cia || '',
-            programa:    de.programa,
-            pontos:      Number(de.pontos) || 0,
-            cabine:      de.cabine || 'Economica',
-            datas_ida:   de.datasIda || '',
-            datas_volta: de.datasVolta || '',
-            fonte:       'alerta',
-          }).catch(() => {});
-        }
+      }
+
+      // ÚNICO ponto de gravação definitiva em passagens.json (fonte 'alerta').
+      // Antes da aprovação o pré-registro roda com apenasConsulta:true, então
+      // só emissões efetivamente enviadas entram no histórico divulgado.
+      // Fallback em item.dados cobre agendamentos cuja oferta já saiu da fila.
+      const de = ofertaEnviada?.dadosExtraidos || item.dados || {};
+      if (de.origem && de.destino && de.programa && ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
+        registrarPassagemProxy({
+          origem:      de.origem,
+          destino:     de.destino,
+          cia:         de.cia || '',
+          programa:    de.programa,
+          pontos:      Number(de.pontos) || 0,
+          cabine:      de.cabine || 'Economica',
+          datas_ida:   de.datasIda || '',
+          datas_volta: de.datasVolta || '',
+          fonte:       'alerta',
+        }).catch(() => {});
       }
 
       console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada.');
@@ -468,10 +472,12 @@ async function workerFila() {
   console.log('[FILA] Worker encerrado (fila vazia).');
 }
 
-function enfileirarEnvio(ofertaId, mensagem, grupoAlvo) {
+function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados) {
   const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
   const posicao = filaEnvio.length;
-  filaEnvio.push({ ofertaId, mensagem, destino });
+  // dados: snapshot de dadosExtraidos usado como fallback no registro de passagem
+  // quando a oferta já saiu de filaPendentes (agendamentos de mais de 24h).
+  filaEnvio.push({ ofertaId, mensagem, destino, dados: dados || null });
   console.log('[FILA] Oferta #' + ofertaId + ' enfileirada na posição ' + (posicao + 1));
   workerFila().catch(e => {
     console.error('[FILA] Worker encerrou com erro:', e.message);
@@ -510,7 +516,7 @@ setInterval(() => {
     if (!grupoId) { ag.status = 'erro'; salvarAgendamentos(); continue; }
     const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
     if (isEmissao) {
-      enfileirarEnvio('ag-'+ag.id, ag.mensagem, grupoId);
+      enfileirarEnvio(ag.ofertaId ?? ('ag-'+ag.id), ag.mensagem, grupoId, ag.dados || null);
     } else {
       enviarMensagem(grupoId, { text: ag.mensagem })
         .then(() => { ag.status = 'enviado'; salvarAgendamentos(); })
@@ -1463,7 +1469,7 @@ async function aguardarParIdaVolta(oferta, grupoId) {
       conteudoOriginal: [base.conteudoOriginal, volta.conteudoOriginal].filter(Boolean).join('\n'),
       imagens: [...(base.imagens||[]), ...(volta.imagens||[])],
     };
-    const hist180Par = await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta' });
+    const hist180Par = await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
     mesclada.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV({ ...mesclada.dadosExtraidos }), hist180Par);
     mesclada.tipoConteudo = mesclada.imagens.length > 1 ? mesclada.imagens.length+' imagens' : mesclada.imagens.length === 1 ? 'imagem' : 'texto';
     filaPendentes.unshift(mesclada);
@@ -1477,7 +1483,7 @@ async function aguardarParIdaVolta(oferta, grupoId) {
     if (_esperandoPar.get(chave)?.oferta === oferta) {
       _esperandoPar.delete(chave);
       // Registra no proxy e appenda histórico (fire-and-update antes de entrar na fila)
-      registrarPassagemProxy({ origem:oferta.dadosExtraidos?.origem||'', destino:oferta.dadosExtraidos?.destino||'', cia:oferta.dadosExtraidos?.cia||'', programa:oferta.dadosExtraidos?.programa||'', pontos:Number(oferta.dadosExtraidos?.pontos)||0, cabine:oferta.dadosExtraidos?.cabine||'Economica', datas_ida:oferta.dadosExtraidos?.datasIda||'', datas_volta:oferta.dadosExtraidos?.datasVolta||'', fonte:'alerta' })
+      registrarPassagemProxy({ origem:oferta.dadosExtraidos?.origem||'', destino:oferta.dadosExtraidos?.destino||'', cia:oferta.dadosExtraidos?.cia||'', programa:oferta.dadosExtraidos?.programa||'', pontos:Number(oferta.dadosExtraidos?.pontos)||0, cabine:oferta.dadosExtraidos?.cabine||'Economica', datas_ida:oferta.dadosExtraidos?.datasIda||'', datas_volta:oferta.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true })
         .then(hist180 => {
           if (hist180) oferta.mensagemFormatada = appendHistoricoMensagem(oferta.mensagemFormatada, hist180);
           filaPendentes.unshift(oferta);
@@ -1526,7 +1532,7 @@ async function processarBuffer(grupoId) {
         const indices = v.indices || [v.indice];
         const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
         const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
-        const hist180Bypass = await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta' });
+        const hist180Bypass = await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta_pendente', apenasConsulta:true });
         const mensagem = appendHistoricoMensagem(formatarMensagemCDV(dados), hist180Bypass);
         // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
         const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
@@ -1566,7 +1572,7 @@ async function processarBuffer(grupoId) {
         if (txt && !textosFinal) textosFinal = txt;
       }
 
-      const hist180Normal = await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta' });
+      const hist180Normal = await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
       const mensagemComHist = appendHistoricoMensagem(emissao.mensagem, hist180Normal);
       const oferta = {
         id: gerarId(),
@@ -2225,7 +2231,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
     const agId = gerarId();
-    agendamentos.push({ id:agId, grupo:'cdv_emissao', mensagem, dispararEm, status:'aguardando', criadoEm:new Date().toISOString() });
+    agendamentos.push({ id:agId, ofertaId:oferta.id, dados:oferta.dadosExtraidos || null, grupo:'cdv_emissao', mensagem, dispararEm, status:'aguardando', criadoEm:new Date().toISOString() });
     salvarAgendamentos();
     oferta.status = 'agendado'; oferta.mensagemFinal = mensagem; salvarFila();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
