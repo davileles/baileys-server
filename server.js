@@ -2453,22 +2453,35 @@ app.post('/enviar', async (req, res) => {
   }
 });
 
+// Aceita DOIS formatos:
+//  1) multipart/form-data com campo 'imagem' (compatibilidade com clientes antigos)
+//  2) application/json { grupo, legenda, base64, mimetype } — usado pelo concierge
 app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
-  const { grupo, legenda } = req.body;
+  const { grupo, legenda, base64, mimetype } = req.body;
   const file = req.file;
+  const limpar = () => { try { if (file && existsSync(file.path)) unlinkSync(file.path); } catch(e) {} };
+
+  if (!file && !base64) return res.status(400).json({ ok:false, erro:'Imagem obrigatoria (campo: imagem ou base64).' });
+
   if (!conectado || !sock) {
     const ok = await aguardarSock(15000);
-    if (!ok) { if(file) unlinkSync(file.path); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
+    if (!ok) { limpar(); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
   }
   const grupoId = resolverGrupo(grupo);
-  if (!grupoId) { if(file) unlinkSync(file.path); return res.status(400).json({ ok:false, erro:'Grupo invalido.' }); }
-  if (!file) return res.status(400).json({ ok:false, erro:'Imagem obrigatoria.' });
+  if (!grupoId) { limpar(); return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo }); }
+
   try {
-    const buffer = readFileSync(file.path);
-    await enviarMensagem(grupoId, { image:buffer, caption:legenda||'' });
+    const buffer = file
+      ? readFileSync(file.path)
+      : Buffer.from(String(base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
+    if (!buffer || !buffer.length) throw new Error('Imagem vazia ou base64 invalido.');
+    const conteudo = { image: buffer, caption: legenda || '' };
+    const mt = mimetype || (file && file.mimetype);
+    if (mt) conteudo.mimetype = mt;
+    await enviarMensagem(grupoId, conteudo);
     res.json({ ok:true });
   } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
-  finally { if(existsSync(file.path)) unlinkSync(file.path); }
+  finally { limpar(); }
 });
 
 // ── ENVIAR ÁUDIO / VOICEMAIL ──────────────────────────────────────────────────
