@@ -2460,15 +2460,33 @@ app.post('/enviar', async (req, res) => {
   }
 });
 
+// ── ENVIAR ANEXO (imagem OU documento) ────────────────────────────────────────
+// Handler unico usado por /enviar-imagem (retrocompatibilidade) e /enviar-arquivo.
 // Aceita DOIS formatos:
-//  1) multipart/form-data com campo 'imagem' (compatibilidade com clientes antigos)
-//  2) application/json { grupo, legenda, base64, mimetype } — usado pelo concierge
-app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
-  const { grupo, legenda, base64, mimetype } = req.body;
+//  1) multipart/form-data com campo 'imagem' (gerador-cdv) ou qualquer campo (/enviar-arquivo)
+//  2) application/json { grupo, legenda, base64, mimetype, nomeArquivo } — concierge
+// O tipo da mensagem e decidido pelo mimetype: image/* vai como imagem com legenda;
+// qualquer outro (PDF, DOCX, XLSX, CSV...) vai como documento com caption e fileName.
+const EXT_POR_MIME = {
+  'application/pdf': '.pdf',
+  'application/msword': '.doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.ms-excel': '.xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.ms-powerpoint': '.ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'text/csv': '.csv',
+  'text/plain': '.txt',
+  'text/html': '.html',
+  'application/zip': '.zip',
+};
+
+async function enviarAnexoHandler(req, res, padraoImagem) {
+  const { grupo, legenda, base64, mimetype, nomeArquivo } = req.body;
   const file = req.file;
   const limpar = () => { try { if (file && existsSync(file.path)) unlinkSync(file.path); } catch(e) {} };
 
-  if (!file && !base64) return res.status(400).json({ ok:false, erro:'Imagem obrigatoria (campo: imagem ou base64).' });
+  if (!file && !base64) return res.status(400).json({ ok:false, erro:'Arquivo obrigatorio (campo: imagem/arquivo ou base64).' });
 
   if (!conectado || !sock) {
     const ok = await aguardarSock(15000);
@@ -2481,14 +2499,49 @@ app.post('/enviar-imagem', upload.single('imagem'), async (req, res) => {
     const buffer = file
       ? readFileSync(file.path)
       : Buffer.from(String(base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
-    if (!buffer || !buffer.length) throw new Error('Imagem vazia ou base64 invalido.');
-    const conteudo = { image: buffer, caption: legenda || '' };
-    const mt = mimetype || (file && file.mimetype);
-    if (mt) conteudo.mimetype = mt;
+    if (!buffer || !buffer.length) throw new Error('Arquivo vazio ou base64 invalido.');
+
+    const mt   = String(mimetype || (file && file.mimetype) || '');
+    const nome = String(nomeArquivo || (file && file.originalname) || '');
+    // Sem mimetype: /enviar-imagem assume imagem (clientes antigos), /enviar-arquivo assume documento.
+    const ehImagem = mt ? mt.indexOf('image/') === 0 : !!padraoImagem;
+    const ehAudio  = mt.indexOf('audio/') === 0;
+
+    let conteudo, tipo;
+    if (ehImagem) {
+      tipo = 'imagem';
+      conteudo = { image: buffer, caption: legenda || '' };
+      if (mt) conteudo.mimetype = mt;
+    } else if (ehAudio) {
+      tipo = 'audio';
+      conteudo = { audio: buffer, mimetype: mt, ptt: false };
+    } else {
+      tipo = 'documento';
+      conteudo = {
+        document: buffer,
+        mimetype: mt || 'application/octet-stream',
+        fileName: nome || ('arquivo' + (EXT_POR_MIME[mt] || '')),
+      };
+      if (legenda && String(legenda).trim()) conteudo.caption = legenda;
+    }
+
     await enviarMensagem(grupoId, conteudo);
-    res.json({ ok:true });
-  } catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
+    console.log('[ANEXO] ' + tipo + ' enviado para ' + grupoId + ' (' + buffer.length + ' bytes' + (nome ? ', ' + nome : '') + ')');
+    res.json({ ok:true, tipo });
+  } catch(err) {
+    console.error('[ANEXO] Erro ao enviar anexo:', err.message);
+    res.status(500).json({ ok:false, erro:err.message });
+  }
   finally { limpar(); }
+}
+
+// Rota historica — mantida identica para gerador-cdv e clientes antigos.
+app.post('/enviar-imagem', upload.single('imagem'), (req, res) => enviarAnexoHandler(req, res, true));
+
+// Rota nova — aceita PDF, DOCX, XLSX, imagens etc. (multipart em qualquer campo ou JSON base64).
+app.post('/enviar-arquivo', upload.any(), (req, res) => {
+  if (!req.file && req.files && req.files.length) req.file = req.files[0];
+  return enviarAnexoHandler(req, res, false);
 });
 
 // ── ENVIAR ÁUDIO / VOICEMAIL ──────────────────────────────────────────────────
