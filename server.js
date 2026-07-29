@@ -515,7 +515,7 @@ setInterval(() => {
     const grupoId = resolverGrupo(ag.grupo);
     if (!grupoId) { ag.status = 'erro'; salvarAgendamentos(); continue; }
     const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
-    if (isEmissao) {
+    if (isEmissao && !ag.direto) {
       enfileirarEnvio(ag.ofertaId ?? ('ag-'+ag.id), ag.mensagem, grupoId, ag.dados || null);
     } else {
       enviarMensagem(grupoId, { text: ag.mensagem })
@@ -2409,7 +2409,9 @@ app.post('/injetar', async (req, res) => {
 });
 
 app.post('/enviar', async (req, res) => {
-  const { grupo, mensagem, agendarEm } = req.body;
+  // direto:true → pula a fila de envio (intervalo de 10 min / janela 8h-21h SP).
+  // Usado por mensagens unicas e datadas, como o resumo diario das 20h.
+  const { grupo, mensagem, agendarEm, direto } = req.body;
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
@@ -2424,14 +2426,14 @@ app.post('/enviar', async (req, res) => {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
     const id = gerarId();
-    agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', criadoEm: new Date().toISOString() });
+    agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto, criadoEm: new Date().toISOString() });
     salvarAgendamentos();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
     return res.json({ ok:true, agendado:true, id, horario });
   }
 
   const isEmissao = grupo==='cdv_emissao'||grupoId===GRUPOS['cdv_emissao'];
-  if (isEmissao) {
+  if (isEmissao && !direto) {
     // Comprime datas consecutivas antes de enfileirar (ex: 1, 2, 3, 4 → 1-4)
     const mensagemComprimida = mensagem
       .split('\n')
