@@ -255,12 +255,16 @@ function carregarFila() {
 function limparFila() {
   const agora = Date.now();
   const LIMITE_24H = 24 * 60 * 60 * 1000;
+  const LIMITE_CUPOM_TSP = 12 * 60 * 60 * 1000; // cupons expiram rápido
   const LIMITE_PROCESSADAS = 20;
 
-  // 1. Remove qualquer oferta (pendente ou não) com mais de 24h
+  // 1. Remove ofertas expiradas: cupons TSP em 12h, demais em 24h
   for (let i = filaPendentes.length - 1; i >= 0; i--) {
-    const ts = new Date(filaPendentes[i].timestamp).getTime();
-    if (agora - ts > LIMITE_24H) filaPendentes.splice(i, 1);
+    const item = filaPendentes[i];
+    const ts = new Date(item.timestamp).getTime();
+    if (!ts || isNaN(ts)) continue;
+    const limite = item.tipoConteudo === 'cupom_tsp' ? LIMITE_CUPOM_TSP : LIMITE_24H;
+    if (agora - ts > limite) filaPendentes.splice(i, 1);
   }
 
   // 2. Garante no máximo 20 aprovadas/rejeitadas (remove as mais antigas)
@@ -526,14 +530,14 @@ setInterval(() => {
   }
 }, 30 * 1000);
 
-// ── Limpeza automática da fila (1x/hora) — nível do módulo ──────────────────
+// ── Limpeza automática da fila (a cada 15 min) — nível do módulo ────────────
 setInterval(() => {
   const antes = filaPendentes.length;
   limparFila();
   salvarFila();
   const depois = filaPendentes.length;
   if (antes !== depois) console.log('[FILA] Limpeza automática: ' + (antes - depois) + ' oferta(s) removida(s).');
-}, 60 * 60 * 1000);
+}, 15 * 60 * 1000);
 
 function resolverGrupo(chave) {
   return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
@@ -2210,6 +2214,7 @@ app.post('/api/claude', async (req, res) => {
 
 app.get('/painel-json', (req, res) => {
   try {
+    limparFila(); // garante que cupons com +12h nunca apareçam no painel
     const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
     const ofertas = filaPendentes.slice(0,50).map(o => ({ ...o, conteudoOriginal: typeof o.conteudoOriginal==='string'?o.conteudoOriginal:(Array.isArray(o.conteudoOriginal)?o.conteudoOriginal.join('\n'):''), imagens:Array.isArray(o.imagens)?o.imagens:[] }));
     res.json({ ok:true, bufferAtivo:emBuffer, ofertas });
