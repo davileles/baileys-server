@@ -1082,36 +1082,124 @@ const GRUPOS_TEXTO_ESTRUTURADO = new Set([
 ]);
 
 const SYSTEM_CDV = 'Voce e especialista em passagens aereas com milhas para o mercado brasileiro. Seja GENEROSO: qualquer mencao a rota aerea, milhas/pontos, programa de fidelidade ou companhia aerea deve ser valido. Responda APENAS JSON sem markdown.';
-const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\nIMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade. LatamPass = LATAM Pass.\nCabine deve ser exatamente "Economica" ou "Executiva".';
+const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade, Azul pelo Mundo, LATAM Pass, Iberia Plus, Privilege Club, Executive Club, TAP, AAdvantage, SUMA, Flying Club, Finnair Plus, Aeroplan.\nIMPORTANTE: TudoAzul = Azul Fidelidade. Tudo Azul = Azul Fidelidade. LatamPass = LATAM Pass.\nCabine deve ser exatamente "Economica" ou "Executiva".'
+  + '\nREGRAS DE COMPANHIA AEREA (campo "cia"):'
+  + '\n- "SAA" ou "South African Airways" deve ser sempre gravado como "South African".'
+  + '\n- Voo NACIONAL dentro do Brasil (origem E destino brasileiros): a cia segue o programa — Smiles = "GOL"; Azul Fidelidade/TudoAzul = "Azul"; LATAM Pass = "LATAM". Nunca use outra cia nesses casos.'
+  + '\n- Defina tipoVoo="nacional" sempre que origem e destino forem cidades brasileiras.';
 
 // ── DE-PARA: programa → CIA operadora (para voos nacionais BR e fallback) ─────
 const CIA_POR_PROGRAMA = {
   'Smiles':           'GOL',
   'Azul Fidelidade':  'Azul',
+  'Azul':             'Azul',
+  'TudoAzul':         'Azul',
   'LATAM Pass':       'LATAM',
 };
 
-function corrigirCia(cia, programa, origemCodigo, destinoCodigo) {
-  // Verifica se é voo doméstico brasileiro (ambos os aeroportos no BR ou código desconhecido)
-  const IATAS_BR = new Set([
-    'GRU','CGH','VCP','GIG','SDU','BSB','CNF','SSA','REC','FOR','MAO','BEL',
-    'CWB','POA','FLN','NAT','MCZ','AJU','THE','SLZ','JPA','PMW','VIX','CLV',
-    'RAO','CGB','CWB','IGU','MGF','LDB','UDI','BPS','PPB','JOI','NVT','XAP',
-    'CFB','CFC','CCM','PFB','URG','BVB','STM','IMP','PIN','CAF','TFF','MCP',
-  ]);
-  const oriIsBR  = !origemCodigo  || IATAS_BR.has(origemCodigo.toUpperCase());
-  const destIsBR = !destinoCodigo || IATAS_BR.has(destinoCodigo.toUpperCase());
-  const isDomestico = oriIsBR && destIsBR;
+// ── NORMALIZAÇÃO DE NOME DE CIA (siglas e variações → nome canônico) ──────────
+const ALIAS_CIA = {
+  'saa':'South African', 'south african airways':'South African', 'south african':'South African',
+  'sa':'South African',
+  'gol':'GOL', 'gol linhas aereas':'GOL', 'g3':'GOL', 'voegol':'GOL',
+  'azul':'Azul', 'azul linhas aereas':'Azul', 'ad':'Azul', 'voeazul':'Azul',
+  'latam':'LATAM', 'latam airlines':'LATAM', 'tam':'LATAM', 'la':'LATAM',
+  'aa':'American Airlines', 'american':'American Airlines', 'american airlines':'American Airlines',
+  'tap':'TAP', 'tap air portugal':'TAP', 'tp':'TAP',
+  'af':'Air France', 'air france':'Air France',
+  'kl':'KLM', 'klm':'KLM', 'klm royal dutch airlines':'KLM',
+  'ba':'British Airways', 'british':'British Airways', 'british airways':'British Airways',
+  'ib':'Iberia', 'iberia':'Iberia',
+  'cm':'COPA', 'copa':'COPA', 'copa airlines':'COPA',
+  'ua':'United', 'united':'United', 'united airlines':'United',
+  'dl':'Delta', 'delta':'Delta', 'delta air lines':'Delta',
+  'tk':'Turkish', 'turkish':'Turkish', 'turkish airlines':'Turkish',
+  'qr':'Qatar Airways', 'qatar':'Qatar Airways', 'qatar airways':'Qatar Airways',
+  'ek':'Emirates', 'emirates':'Emirates',
+  'ay':'Finnair', 'finnair':'Finnair',
+  'lh':'Lufthansa', 'lufthansa':'Lufthansa',
+  'ux':'Air Europa', 'air europa':'Air Europa',
+  'ar':'Aerolineas Argentinas', 'aerolineas':'Aerolineas Argentinas', 'aerolineas argentinas':'Aerolineas Argentinas',
+  'av':'Avianca', 'avianca':'Avianca',
+  'et':'Ethiopian', 'ethiopian':'Ethiopian', 'ethiopian airlines':'Ethiopian',
+  'ac':'Air Canada', 'air canada':'Air Canada',
+  'sq':'Singapore Airlines', 'singapore':'Singapore Airlines', 'singapore airlines':'Singapore Airlines',
+  'a3':'Aegean', 'aegean':'Aegean', 'aegean airlines':'Aegean',
+  'ib plus':'Iberia', 'iberia express':'Iberia',
+  'vs':'Virgin Atlantic', 'virgin atlantic':'Virgin Atlantic',
+  'af/klm':'Air France', 'airfrance':'Air France',
+};
 
-  // Smiles: para voos domésticos = GOL. Para internacionais, usa CIA extraída da imagem/texto.
-  // Para outros programas, aplicar de-para só em domésticos.
+function normalizarCia(cia) {
+  const bruto = String(cia == null ? '' : cia).trim();
+  if (!bruto) return bruto;
+  const chave = bruto
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[.]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return ALIAS_CIA[chave] || bruto;
+}
+
+// Aeroportos brasileiros com voo comercial (lista ampla — evita classificar
+// voo nacional como internacional só porque o IATA não estava mapeado)
+const IATAS_BR = new Set([
+  // Sudeste
+  'GRU','CGH','VCP','GIG','SDU','CNF','PLU','VIX','RAO','SJP','SJK','BAU','ARU',
+  'MII','PPB','UBA','UDI','IPN','MOC','GVR','POJ','JDF','VAG','AAX','DIQ','SOD',
+  'QSC','RVD','JTC','MEA','ITR','CAW','MOC',
+  // Sul
+  'CWB','POA','FLN','NVT','JOI','IGU','MGF','LDB','CAC','XAP','CXJ','PFB','PET',
+  'BGX','URG','LAJ','CCM','JJG','CFC','SQX','PTO','TOW','RIA','GEL','ERM','CBW',
+  // Centro-Oeste
+  'BSB','CGB','CGR','GYN','CLV','ROO','OPS','DOU','CMG','AFL','BAT','TJL','SIN',
+  'AQA','MTG',
+  // Nordeste
+  'SSA','REC','FOR','NAT','MCZ','AJU','JPA','SLZ','THE','IOS','BPS','JDO','PNZ',
+  'PHB','CPV','JJD','FEN','LEC','VDC','MVF','BRA','GNM','PTZ','TMT','JDR','ARS',
+  'IMP','PIN','STZ','CZB','SSZ','FLB','BVM','PDF',
+  // Norte
+  'MAO','BEL','STM','MCP','PVH','RBR','BVB','PMW','MAB','ATM','TBT','CZS','TFF',
+  'JPR','CAF','SJL','OAL','ITB','ERN','TMT','RBB','HUW','LBR','MNX','PIN','ALT',
+  'AUX','GRP','PBQ','TUR','SXX','APQ',
+]);
+
+function corrigirCia(cia, programa, origemCodigo, destinoCodigo, tipoVoo) {
+  const oc   = String(origemCodigo  || '').toUpperCase().trim();
+  const dc   = String(destinoCodigo || '').toUpperCase().trim();
+  const tipo = String(tipoVoo || '').toLowerCase();
+
+  const internacionalIA = /internacion/.test(tipo);
+  // "internacional" contém "nacional" — por isso o teste de internacional vem primeiro
+  const nacionalIA      = !internacionalIA && /nacion|domest/.test(tipo);
+
+  const oriBR  = oc ? IATAS_BR.has(oc) : null;
+  const destBR = dc ? IATAS_BR.has(dc) : null;
+
+  let isDomestico;
+  if (oriBR === true && destBR === true) {
+    // Ambos os IATAs reconhecidos como brasileiros → nacional
+    isDomestico = true;
+  } else if (nacionalIA && (oriBR === true || destBR === true || (oriBR === null && destBR === null))) {
+    // A fonte diz que é nacional e nada contradiz (IATA BR fora da lista, p.ex.)
+    isDomestico = true;
+  } else if (oriBR === null && destBR === null) {
+    // Sem códigos IATA: assume nacional salvo se a fonte disser internacional
+    isDomestico = !internacionalIA;
+  } else {
+    isDomestico = false;
+  }
+
+  // Nacional BR: o programa determina a operadora
+  // (Smiles→GOL, Azul Fidelidade→Azul, LATAM Pass→LATAM)
   if (isDomestico && CIA_POR_PROGRAMA[programa]) {
-    return CIA_POR_PROGRAMA[programa];
+    return normalizarCia(CIA_POR_PROGRAMA[programa]);
   }
   // Internacional com CIA explícita na fonte (ex: Air France, Turkish) — respeita
-  if (cia && cia !== programa) return cia;
+  if (cia && cia !== programa) return normalizarCia(cia);
   // Fallback para doméstico sem CIA identificada
-  return CIA_POR_PROGRAMA[programa] || cia;
+  return normalizarCia(CIA_POR_PROGRAMA[programa] || cia);
 }
 const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
@@ -1176,7 +1264,7 @@ async function classificarItens(itens, grupoId) {
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -1212,7 +1300,7 @@ async function classificarItens(itens, grupoId) {
           r.cabine  = 'Executiva';
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -1246,7 +1334,7 @@ async function classificarItens(itens, grupoId) {
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -1281,7 +1369,7 @@ async function classificarItens(itens, grupoId) {
       if (r?.valido) {
         r.origem  = resolverCidade(r.origemCodigo, r.origem);
         r.destino = resolverCidade(r.destinoCodigo, r.destino);
-        r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo);
+        r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
       }
       resultados.push(r || { valido:false, indice:i });
     }
