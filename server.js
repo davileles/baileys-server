@@ -38,6 +38,9 @@ const GRUPOS = {
   tsp:         '120363424721106736@g.us',
   cdv_ofertas: '120363170138704529@g.us',
   cdv_emissao: '120363172490263905@g.us',
+  // Grupo interno do operador — avisos operacionais que NAO vao para clientes
+  // (novo cupom capturado, falha de coleta, etc).
+  operador:    '120363409136599326@g.us',
 };
 const GRUPOS_MONITORADOS      = [
   '120363430801699326@g.us',
@@ -861,7 +864,7 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', 
 
       // Alerta de novo cupom no grupo do operador
       try {
-        await enviarMensagem('120363409136599326@g.us', {
+        await enviarMensagem(GRUPOS.operador, {
           text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
         });
       } catch(e) { console.warn('[TG] Falha ao enviar alerta de cupom:', e.message); }
