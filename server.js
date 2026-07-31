@@ -588,21 +588,34 @@ const PROGRAMAS_CPM = {
   'Executive Club':58,'TAP':43,'AAdvantage':100,'SUMA':80,
   'Flying Club':50,'Finnair Plus':58,'Aeroplan':50
 };
-const PROGRAMAS_LINK = {
-  'Smiles':'https://www.smiles.com.br/home',
-  'Azul Fidelidade':'https://www.voeazul.com.br/br/pt/home',
-  'Azul pelo Mundo':'https://azulpelomundo.voeazul.com.br',
-  'LATAM Pass':'https://www.latamairlines.com/br/pt',
-  'Iberia Plus':'https://www.iberia.com/',
-  'Privilege Club':'https://www.qatarairways.com/',
-  'Executive Club':'https://www.britishairways.com/',
-  'TAP':'https://www.flytap.com/',
-  'AAdvantage':'https://www.aa.com.br/',
-  'SUMA':'https://www.aireuropa.com/en/flights/home',
-  'Flying Club':'https://www.virginatlantic.com/',
-  'Finnair Plus':'https://www.finnair.com/br/gb/finnair-plus',
-  'Aeroplan':'https://www.aircanada.com/home/ca/en/aco/flights'
+// Links mascarados do Clube do Viajante. O destino real (com os parametros de
+// afiliado) vive em painel-cdv/links.json e e resolvido pelo endpoint /ir do
+// proxy. Para trocar um destino NAO mexa aqui: edite links.json.
+// ATENCAO: manter os slugs iguais aos de gerador-cdv/index.html (PROGRAMAS_SLUG).
+const IR_BASE = 'https://ir.clubedoviajante.com.br/';
+const PROGRAMAS_SLUG = {
+  'Smiles':'smiles',
+  'Azul Fidelidade':'azul',
+  'Azul pelo Mundo':'azul-mundo',
+  'LATAM Pass':'latam',
+  'Iberia Plus':'iberia',
+  'Privilege Club':'qatar',
+  'Executive Club':'british',
+  'TAP':'tap',
+  'AAdvantage':'aadvantage',
+  'SUMA':'suma',
+  'Flying Club':'virgin',
+  'Finnair Plus':'finnair',
+  'Aeroplan':'aeroplan'
 };
+function linkPrograma(programa, origem) {
+  const slug = PROGRAMAS_SLUG[programa];
+  if (!slug) {
+    console.warn('[links] programa sem slug cadastrado:', programa);
+    return '';
+  }
+  return IR_BASE + slug + (origem ? '?o=' + encodeURIComponent(origem) : '');
+}
 
 function contarDatas(datasStr) {
   if (!datasStr || datasStr === '-') return 0;
@@ -661,7 +674,7 @@ function formatarMensagemCDV(d) {
   var num = pontosNums.length ? Math.min.apply(null, pontosNums) : 0;
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
-  var link = PROGRAMAS_LINK[d.programa] || '';
+  var link = linkPrograma(d.programa, 'alerta');
   var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Econômica') : '';
   var pts = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
   var msg = '';
