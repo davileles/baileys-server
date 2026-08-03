@@ -574,7 +574,107 @@ const IATA_CIDADES = {
   'SYD':'Sydney','MEL':'Melbourne','AKL':'Auckland',
   'JNB':'Joanesburgo','CPT':'Cidade do Cabo','CAI':'Cairo',
   'CMN':'Casablanca','NBO':'Nairóbi',
+  // Ampliacao para cobrir as cidades mais frequentes da base de emissoes que
+  // ainda nao tinham codigo — sem codigo o link cai no destino padrao.
+  'NVT':'Navegantes','VIX':'Vitória','GYN':'Goiânia','IGU':'Foz do Iguaçu',
+  'BPS':'Porto Seguro','UDI':'Uberlândia','CGR':'Campo Grande','CGB':'Cuiabá',
+  'JOI':'Joinville','FEN':'Fernando de Noronha','LDB':'Londrina','PNZ':'Petrolina',
+  'BYO':'Bonito','IOS':'Ilhéus','MGF':'Maringá','RAO':'Ribeirão Preto',
+  'AUA':'Aruba','CTG':'Cartagena','PUJ':'Punta Cana','ADZ':'San Andrés',
+  'MDZ':'Mendoza','UIO':'Quito','CUR':'Curaçao','CUZ':'Cusco','BRC':'Bariloche',
+  'SJO':'San José','IAD':'Washington','YYZ':'Toronto','YUL':'Montreal',
+  'OPO':'Porto','FNC':'Madeira','LPA':'Las Palmas','EDI':'Edimburgo',
+  'BRU':'Bruxelas','GVA':'Genebra','NCE':'Nice','VCE':'Veneza','ZAG':'Zagreb',
+  'IST':'Istambul','TPE':'Taipei','NGO':'Nagoia','HNL':'Honolulu',
 };
+
+// Grafias alternativas que a IA as vezes devolve em ingles ou sem acento.
+const CIDADE_ALIAS = {
+  'amsterdam':'Amsterdã', 'cape town':'Cidade do Cabo', 'sao francisco':'São Francisco',
+  'san jose':'San José', 'uberlandia':'Uberlândia', 'mexico city':'Cidade do México',
+  'new york':'Nova York', 'lisbon':'Lisboa', 'rome':'Roma', 'milan':'Milão',
+  'panama city':'Cidade do Panamá', 'shangai':'Xangai', 'singapora':'Singapura',
+};
+
+// Reverso de IATA_CIDADES: cidade → aeroporto principal. Como o objeto acima
+// lista o aeroporto principal primeiro em cada cidade (GRU antes de CGH, GIG
+// antes de SDU, EZE antes de AEP, JFK antes de EWR/LGA, NRT antes de HND), a
+// regra "primeiro vence" ja entrega a escolha certa.
+const CIDADE_IATA = (function () {
+  const m = {};
+  for (const cod of Object.keys(IATA_CIDADES)) {
+    const chave = normalizarCidade(IATA_CIDADES[cod]);
+    if (!m[chave]) m[chave] = cod;
+  }
+  return m;
+})();
+
+function normalizarCidade(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function iataDaCidade(nome) {
+  const k = normalizarCidade(nome);
+  if (CIDADE_IATA[k]) return CIDADE_IATA[k];
+  const alias = CIDADE_ALIAS[k];
+  return alias ? (CIDADE_IATA[normalizarCidade(alias)] || null) : null;
+}
+
+// ── Extracao de datas do texto livre de datasIda / datasVolta ────────────────
+// Os formatos usados nas mensagens sao "Ago/26: 15, 20", "18, 20 de Junho" e
+// "26,27/03;04/06". Devolve ISO ordenado; o link usa a PRIMEIRA ida e a ULTIMA
+// volta, que e o intervalo que cobre a oferta inteira.
+const MESES_NUM = { jan:1, fev:2, mar:3, abr:4, mai:5, jun:6, jul:7, ago:8, set:9, out:10, nov:11, dez:12 };
+
+function extrairDatasISO(str, ref) {
+  const txt = String(str || '').trim();
+  if (!txt || txt === '-') return [];
+  const hoje = ref instanceof Date ? ref : new Date();
+  const out = new Set();
+  const add = (a, mes, dia) => {
+    const d = new Date(Date.UTC(a, mes - 1, dia));
+    if (d.getUTCMonth() === mes - 1 && d.getUTCDate() === dia) out.add(d.toISOString().slice(0, 10));
+  };
+  const anoImplicito = (mes) => (mes >= hoje.getUTCMonth() + 1 ? hoje.getUTCFullYear() : hoje.getUTCFullYear() + 1);
+  const expandir = (t) => {
+    const dias = [];
+    for (const p of String(t).split(/[,\s]+|\se\s/)) {
+      const f = p.trim().match(/^(\d{1,2})\s*[-\u2013a]\s*(\d{1,2})$/);
+      if (f) { const a = +f[1], b = +f[2]; if (a <= b && b <= 31) for (let x = a; x <= b; x++) dias.push(x); }
+      else if (/^\d{1,2}$/.test(p.trim())) dias.push(+p.trim());
+    }
+    return dias;
+  };
+  const mesDe = (n) => MESES_NUM[normalizarCidade(n).slice(0, 3)];
+
+  // "Ago/26: 15, 20"  |  "Marco: 03, 09-11"
+  let achou = false;
+  const re1 = /([A-Za-z\u00C0-\u00FF]{3,10})\s*(?:\/\s*(\d{2,4}))?\s*:\s*([0-9][0-9,\s\-\u2013]*)/g;
+  let m;
+  while ((m = re1.exec(txt))) {
+    const mes = mesDe(m[1]); if (!mes) continue;
+    const ano = m[2] ? (+m[2] < 100 ? 2000 + +m[2] : +m[2]) : anoImplicito(mes);
+    for (const d of expandir(m[3])) { add(ano, mes, d); achou = true; }
+  }
+  // "18, 20 de Junho [2026]"
+  if (!achou) {
+    const re2 = /([0-9][0-9,\s\-\u2013]*?)\s*(?:de\s+)?([A-Za-z\u00C0-\u00FF]{3,10})\s*(\d{4})?/g;
+    while ((m = re2.exec(txt))) {
+      const mes = mesDe(m[2]); if (!mes) continue;
+      const ano = m[3] ? +m[3] : anoImplicito(mes);
+      for (const d of expandir(m[1])) { add(ano, mes, d); achou = true; }
+    }
+  }
+  // "26,27/03;04/06"
+  if (!achou) {
+    const re3 = /(\d{1,2}(?:\s*[-\u2013]\s*\d{1,2})?)\s*\/\s*(\d{1,2})(?!\d)/g;
+    while ((m = re3.exec(txt))) {
+      const mes = +m[2]; if (mes < 1 || mes > 12) continue;
+      for (const d of expandir(m[1])) add(anoImplicito(mes), mes, d);
+    }
+  }
+  return [...out].sort();
+}
 
 function resolverCidade(codigo, nomeIA) {
   if (codigo && IATA_CIDADES[codigo.toUpperCase()]) return IATA_CIDADES[codigo.toUpperCase()];
@@ -608,13 +708,44 @@ const PROGRAMAS_SLUG = {
   'Finnair Plus':'finnair',
   'Aeroplan':'aeroplan'
 };
-function linkPrograma(programa, origem) {
+// Programas cujo link mascarado aceita a busca ja preenchida (o proxy monta a
+// URL final em BUSCA_BUILDERS). Adicionar aqui conforme forem mapeados.
+const PROGRAMAS_COM_BUSCA = new Set(['smiles']);
+
+function linkPrograma(programa, origem, busca) {
   const slug = PROGRAMAS_SLUG[programa];
   if (!slug) {
     console.warn('[links] programa sem slug cadastrado:', programa);
     return '';
   }
-  return IR_BASE + slug + (origem ? '?o=' + encodeURIComponent(origem) : '');
+  const qs = [];
+  if (origem) qs.push('o=' + encodeURIComponent(origem));
+  if (busca && PROGRAMAS_COM_BUSCA.has(slug) && busca.bo && busca.bd && busca.bi) {
+    qs.push('bo=' + busca.bo, 'bd=' + busca.bd, 'bi=' + busca.bi);
+    if (busca.bv) qs.push('bv=' + busca.bv);
+    if (busca.bc) qs.push('bc=' + busca.bc);
+  }
+  return IR_BASE + slug + (qs.length ? '?' + qs.join('&') : '');
+}
+
+// Monta os parametros de busca a partir dos dados da emissao.
+// Regra: primeira data de ida; se houver volta, a ULTIMA data de volta.
+function buscaDaEmissao(d) {
+  const bo = iataDaCidade(d.origem), bd = iataDaCidade(d.destino);
+  if (!bo || !bd) return null;   // cidade fora da tabela IATA: link continua o padrao
+  const idas = extrairDatasISO(d.datasIda);
+  if (!idas.length) return null;
+  const bi = idas[0];
+  // A lista de volta nem sempre pertence a mesma combinacao da ida — ha ofertas
+  // com voltas anteriores a primeira ida. Volta antes da ida faria a Smiles
+  // recusar a busca, entao nesse caso o link sai como so-ida.
+  const voltas = extrairDatasISO(d.datasVolta).filter((v) => v >= bi);
+  return {
+    bo, bd,
+    bi,
+    bv: voltas.length ? voltas[voltas.length - 1] : '',
+    bc: /execut|business/i.test(d.cabine || '') ? 'exec' : 'eco',
+  };
 }
 
 function contarDatas(datasStr) {
@@ -674,7 +805,7 @@ function formatarMensagemCDV(d) {
   var num = pontosNums.length ? Math.min.apply(null, pontosNums) : 0;
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
-  var link = linkPrograma(d.programa, 'alerta');
+  var link = linkPrograma(d.programa, 'alerta', buscaDaEmissao(d));
   var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Econômica') : '';
   var pts = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
   var msg = '';
