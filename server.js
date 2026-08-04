@@ -790,6 +790,27 @@ function formatarDatas(str) {
     .join('\n');
 }
 
+// ── CAMPOS EDITAVEIS DO PAINEL ───────────────────────────────────────────────
+// Os campos abaixo sao a fonte unica de verdade da emissao: o que o operador
+// corrige no painel vale tanto para a mensagem que sai no grupo quanto para o
+// registro em passagens.json (gravado pelo worker de envio a partir de
+// dadosExtraidos). Metadados internos (indices, origemCodigo, tipo, indice)
+// nao sao editaveis e ficam preservados.
+const CAMPOS_EDITAVEIS_ALERTA = ['origem','destino','cia','programa','pontos','cabine','tipoVoo','datasIda','datasVolta'];
+
+function aplicarDadosEditados(oferta, dados) {
+  // Sem payload de campos (ex: painel HTML interno do Baileys), nao mexe em nada.
+  if (!dados || typeof dados !== 'object') return oferta.dadosExtraidos || {};
+  if (!oferta.dadosExtraidos) oferta.dadosExtraidos = {};
+  const de = oferta.dadosExtraidos;
+  for (const k of CAMPOS_EDITAVEIS_ALERTA) {
+    const v = dados[k];
+    if (v === undefined || v === null) continue;
+    de[k] = String(v).trim();
+  }
+  return de;
+}
+
 function formatarMensagemCDV(d) {
   var n = '\n';
   var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
@@ -2467,6 +2488,12 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
   const agendarEm = req.body.agendarEm || null;
 
+  // Campos corrigidos no painel entram em dadosExtraidos ANTES do envio, para
+  // que o worker (unico ponto de gravacao definitiva) registre em
+  // passagens.json exatamente o que foi revisado — e nao a extracao bruta da IA.
+  const deFinal = aplicarDadosEditados(oferta, req.body.dados);
+  if (req.body.dados) salvarFila();
+
   if (agendarEm) {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
@@ -2498,7 +2525,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   const info = calcularPosicaoFila(filaEnvio.length);
   oferta.status = 'aprovado'; oferta.mensagemFinal = mensagem; salvarFila();
-  enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS]);
+  enfileirarEnvio(oferta.id, mensagem, GRUPOS[GRUPO_DESTINO_PASSAGENS], deFinal);
   res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
 });
 
@@ -2593,6 +2620,38 @@ app.post('/painel/reprocessar/:id', async (req, res) => {
     oferta.timestamp         = new Date().toISOString();
     salvarFila();
     res.json({ ok:true, mensagemFormatada:oferta.mensagemFormatada });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── Reformatar: regera a mensagem a partir dos campos editados no painel ─────
+// O gerador envia os campos estruturados; aqui eles sobrescrevem dadosExtraidos
+// e a mensagem e remontada pelo MESMO formatador usado na captura, garantindo
+// que mensagem enviada e registro em passagens.json nunca divirjam.
+app.post('/painel/reformatar/:id', async (req, res) => {
+  const id     = parseInt(req.params.id);
+  const oferta = filaPendentes.find(o => String(o.id)===String(id));
+  if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  if (oferta.tipoConteudo === 'cupom_tsp') return res.status(400).json({ ok:false, erro:'Cupom TSP nao usa formatacao de emissao.' });
+  try {
+    const de = aplicarDadosEditados(oferta, req.body && req.body.dados);
+    if (!de.origem || !de.destino || !de.programa) {
+      return res.status(400).json({ ok:false, erro:'Origem, destino e programa sao obrigatorios.' });
+    }
+    const hist180 = await registrarPassagemProxy({
+      origem:      de.origem,
+      destino:     de.destino,
+      cia:         de.cia || '',
+      programa:    de.programa,
+      pontos:      Number(de.pontos) || 0,
+      cabine:      de.cabine || 'Economica',
+      datas_ida:   de.datasIda || '',
+      datas_volta: de.datasVolta || '',
+      fonte:       'alerta_pendente',
+      apenasConsulta: true,
+    });
+    oferta.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV(de), hist180);
+    salvarFila();
+    res.json({ ok:true, mensagemFormatada: oferta.mensagemFormatada, dadosExtraidos: de });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
