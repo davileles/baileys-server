@@ -2940,6 +2940,131 @@ app.post('/reset-sessao-completo', async (req, res) => {
 
   _agendarReconexao(2000);
 });
+---
+name: seats-aero-coleta-C
+description: Coleta diária de histórico seats.aero (Grupo C — Air France e KLM, seg a sex 03h): 10 combinações. Grava no banco de histórico, NÃO injeta na fila de alertas.
+---
+
+Automação de COLETA DE HISTÓRICO de disponibilidade de passagens com milhas no seats.aero. Esta execução roda sozinha, sem memória de conversas anteriores.
+
+ATENÇÃO: esta tarefa NÃO injeta ofertas na fila de aprovação. Ela apenas grava os dados brutos para construção de histórico. NUNCA chame o endpoint `/injetar`. NUNCA monte texto de oferta. NUNCA aprove nada.
+
+PASSO 0 — Datas: via mcp__workspace__bash, calcule:
+- `date -d '+180 days' +%Y-%m-%d` → chame de DATA180
+- `date -u +%Y-%m-%dT%H:%M:%SZ` → chame de COLETADO_EM
+
+PASSO 1 — Em cada URL de IDA e VOLTA das rotas, substitua o literal `DATA180` no parâmetro `date=` pelo valor calculado. Mantenha todos os demais parâmetros exatamente como estão.
+
+PASSO 2 — Claude in Chrome (o seats.aero já está logado nesse navegador):
+- Carregue as ferramentas do Claude in Chrome se necessário (ToolSearch query "mcp__Claude_in_Chrome").
+- mcp__Claude_in_Chrome__tabs_context_mcp com createIfEmpty=true para obter um tabId.
+- navigate até a URL de IDA, aguarde ~4s, rode via javascript_tool o JS de extração abaixo.
+- navigate até a URL de VOLTA e rode o mesmo JS.
+- CRÍTICO: nunca retorne location.href, URLs nem query strings no resultado do JS (são bloqueados pelo ambiente) — retorne só os dados extraídos.
+
+Se uma rota falhar (página não carrega, JS retorna erro), registre-a como falha e SIGA para a próxima. Não aborte a execução inteira.
+
+IMPORTANTE (filtro de programa): o parâmetro `sources=` da URL NÃO filtra a tabela renderizada — quando a fonte pedida não tem resultados, o seats.aero exibe outra fonte (ex.: Aeroplan) no lugar. Por isso o JS abaixo filtra pela coluna "Program" (índice 2), mantendo só as linhas cujo programa é exatamente o `programa` da rota.
+
+JS DE EXTRAÇÃO (ajuste col, maxK e programa por rota — economy=5, premium=6, business=7, first=8; maxK em milhares; programa = nome EXATO da coluna "Program"). FILTRO DE RECÊNCIA (coluna "Seen", índice 1, padrão maxDias=3): descarta disponibilidade vista há mais de 3 dias — "Just now" e "Xh ago" sempre passam; "Xd ago" passa só se X≤3; semanas/meses ou formato desconhecido são descartados:
+
+```
+const col = 5;
+const maxK = 130;
+const maxDias = 3;    // FILTRO DE RECÊNCIA: descarta disponibilidade vista há mais de 3 dias (coluna "Seen", índice 1)
+const programa = 'Smiles';  // nome EXATO da coluna "Program" (prog da rota). Mapa: azul→Azul, smiles→Smiles, american→American
+const seenOK=s=>{s=(s||'').toLowerCase(); if(s.includes('now'))return true; let m; if(m=s.match(/(\d+)\s*m(in)?\b/))return true; if(m=s.match(/(\d+)\s*h/))return true; if(m=s.match(/(\d+)\s*d/))return parseInt(m[1],10)<=maxDias; return false;};
+const t=[...document.querySelectorAll('table')][1];
+const rows=[...t.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll('td')].map(td=>td.innerText.trim().replace(/\s+/g,' '))).filter(c=>c[0]);
+const mn={Jan:'Jan',Feb:'Fev',Mar:'Mar',Apr:'Abr',May:'Mai',Jun:'Jun',Jul:'Jul',Aug:'Ago',Sep:'Set',Oct:'Out',Nov:'Nov',Dec:'Dez'};
+const g={}; let cheapest=null;
+rows.forEach(c=>{if((c[2]||'').toLowerCase()!==programa.toLowerCase()) return; if(!seenOK(c[1])) return; const cell=c[col]||''; const km=cell.match(/([\d.]+)k/); if(!km) return; const k=parseFloat(km[1]); if(k>maxK) return; if(cheapest===null||k<cheapest) cheapest=k; const m=c[0].match(/(\w{3}) (\d{1,2}), (\d{2})(\d{2})/); if(m){const key=mn[m[1]]+'/'+m[4]; (g[key]=g[key]||[]).push(+m[2]);}});
+const lines=Object.entries(g).map(([k,v])=>k+': '+v.sort((a,b)=>a-b).join(', '));
+JSON.stringify({total:Object.values(g).reduce((s,a)=>s+a.length,0), cheapestK:cheapest, lines});
+```
+
+PASSO 3 — Montar os registros. Para CADA rota e CADA direção (ida e volta), monte um objeto:
+
+```
+{
+  "cia": "<Companhia>",
+  "programa": "<Programa da rota>",
+  "programaColuna": "<valor usado na variável programa do JS>",
+  "cabine": "<Econômica|Business|Executiva>",
+  "origem": "<IATA de origem do trecho>",
+  "destino": "<IATA de destino do trecho>",
+  "direcao": "ida" ou "volta",
+  "limiteK": <maxK da rota>,
+  "menorK": <cheapestK retornado, ou null>,
+  "menorKComDesconto": <menorK com desconto Smiles aplicado, ou null>,
+  "totalDatas": <total retornado>,
+  "datas": <array lines retornado>
+}
+```
+
+CRÍTICO — registre SEMPRE as 20 direções (10 rotas × 2), inclusive quando não houver nenhuma data dentro dos filtros. Nesse caso use `menorK: null`, `totalDatas: 0`, `datas: []`. Ausência de disponibilidade é informação e precisa ficar registrada, senão depois não é possível distinguir "não havia assento" de "a coleta não rodou". NUNCA omita uma direção. Se a rota falhou tecnicamente, use `"erro": true` no objeto em vez de zerar os campos.
+
+DESCONTO SMILES (9%): quando o `programa` da rota for **Smiles**, calcule `menorKComDesconto` multiplicando `menorK` por 0,91 e arredondando para no máximo 1 casa decimal (ex.: 100 → 91; 86.6 → 78.8; 80 → 72.8). Para os demais programas (Azul pelo Mundo, AAdvantage, Qatar), `menorKComDesconto` recebe o MESMO valor de `menorK`. Se `menorK` for null, `menorKComDesconto` também é null.
+
+O campo `menorK` guarda SEMPRE o valor original do seats.aero, sem desconto — nunca o sobrescreva com o valor descontado. O filtro `maxK` continua sendo aplicado sobre o valor ORIGINAL, como já é hoje.
+
+NÃO monte texto de oferta. NÃO faça comparação de diferença de preço entre ida e volta. NÃO pule pares vazios. Nada disso se aplica à coleta.
+
+PASSO 4 — Gravar. navigate a aba para https://baileys-server-production-ebfe.up.railway.app/status e rode via javascript_tool um ÚNICO POST com todos os registros:
+
+```
+const payload = { coletadoEm: '<COLETADO_EM>', grupo: 'C', registros: [ /* os 20 objetos */ ] };
+const r = await fetch('/historico-seats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+JSON.stringify({s:r.status, j:await r.json()});
+```
+
+Confirme `ok:true`. O fetch precisa ser feito a partir dessa origem do Railway.
+
+PASSO 5 — Reporte um resumo curto: para cada rota, o menor valor e a quantidade de datas de ida e de volta, marcando explicitamente as direções que vieram vazias ou com erro. Total de registros gravados.
+
+---
+
+ROTAS — GRUPO C (Air France e KLM):
+
+1) Air France | Smiles | Econômica | São Paulo (GRU) ↔ Paris (CDG) | limite 130k | col 5 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=GRU&destinations=CDG&sources=smiles&maxPoints=130000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=GRU&sources=smiles&maxPoints=130000&view=default
+
+2) Air France | Smiles | Econômica | Rio de Janeiro (GIG) ↔ Paris (CDG) | limite 130k | col 5 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=GIG&destinations=CDG&sources=smiles&maxPoints=130000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=GIG&sources=smiles&maxPoints=130000&view=default
+
+3) Air France | Smiles | Econômica | Fortaleza (FOR) ↔ Paris (CDG) | limite 100k | col 5 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=FOR&destinations=CDG&sources=smiles&maxPoints=100000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=FOR&sources=smiles&maxPoints=100000&view=default
+
+4) Air France | Smiles | Econômica | Salvador (SSA) ↔ Paris (CDG) | limite 115k | col 5 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=SSA&destinations=CDG&sources=smiles&maxPoints=115000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=SSA&sources=smiles&maxPoints=115000&view=default
+
+5) Air France | Smiles | Business | São Paulo (GRU) ↔ Paris (CDG) | limite 600k | col 7 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=GRU&destinations=CDG&sources=smiles&maxPoints=600000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=GRU&sources=smiles&maxPoints=600000&view=default
+
+6) Air France | Smiles | Business | Rio de Janeiro (GIG) ↔ Paris (CDG) | limite 600k | col 7 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=GIG&destinations=CDG&sources=smiles&maxPoints=600000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=GIG&sources=smiles&maxPoints=600000&view=default
+
+7) Air France | Smiles | Business | Fortaleza (FOR) ↔ Paris (CDG) | limite 490k | col 7 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=FOR&destinations=CDG&sources=smiles&maxPoints=490000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=FOR&sources=smiles&maxPoints=490000&view=default
+
+8) Air France | Smiles | Business | Salvador (SSA) ↔ Paris (CDG) | limite 520k | col 7 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=SSA&destinations=CDG&sources=smiles&maxPoints=520000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=AF&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=CDG&destinations=SSA&sources=smiles&maxPoints=520000&view=default
+
+9) KLM | Smiles | Econômica | São Paulo (GRU) ↔ Amsterdã (AMS) | limite 135k | col 5 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=KL&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=GRU&destinations=AMS&sources=smiles&maxPoints=135000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=KL&applicable_cabin=economy&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=AMS&destinations=GRU&sources=smiles&maxPoints=135000&view=default
+
+10) KLM | Smiles | Executiva | São Paulo (GRU) ↔ Amsterdã (AMS) | limite 610k | col 7 | programa Smiles
+IDA:   https://seats.aero/search?min_seats=1&op_carriers=KL&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=GRU&destinations=AMS&sources=smiles&maxPoints=610000&view=default
+VOLTA: https://seats.aero/search?min_seats=1&op_carriers=KL&applicable_cabin=business&additional_days=true&additional_days_num=180&direct_only=true&max_fees=40000&disable_live_filtering=false&date=DATA180&origins=AMS&destinations=GRU&sources=smiles&maxPoints=610000&view=default
 
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
