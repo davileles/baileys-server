@@ -331,7 +331,8 @@ function reformatarCupomsTSPPendentes() {
   }
   return n;
 }
-reformatarCupomsTSPPendentes();
+// A chamada de boot fica LOGO APÓS a definição de LINKS_TSP/formatarCupomTSP:
+// a função é hoisted, mas LINKS_TSP é `const` e estaria em TDZ aqui.
 
 // Varredura periódica (15 min): garante que a expiração de 18h aconteça mesmo
 // sem ninguém abrir o painel ou aprovar/rejeitar nada.
@@ -978,6 +979,10 @@ function formatarCupomTSP(dados) {
   msg += '\n\n`Convide seus amigos para entrar aqui no grupo: https://chat.whatsapp.com/HK7NL13BdPXKJPAGtvTKKg`';
   return msg;
 }
+
+// Boot: reaplica links de afiliado nos cupons TSP que já estavam na fila.
+// Precisa rodar aqui (e não junto de carregarFila) porque depende de LINKS_TSP.
+reformatarCupomsTSPPendentes();
 
 // ── CHAMADA ANTHROPIC ─────────────────────────────────────────────────────────
 async function chamarClaude(system, userContent, maxTokens) {
