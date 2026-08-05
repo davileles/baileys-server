@@ -257,32 +257,26 @@ function carregarFila() {
 
 function limparFila() {
   const agora = Date.now();
-  const LIMITE_24H = 24 * 60 * 60 * 1000;
+  const LIMITE_PENDENTE = 18 * 60 * 60 * 1000; // pendentes somem 18h após a captura
   const LIMITE_CUPOM_TSP = 12 * 60 * 60 * 1000; // cupons expiram rápido
-  const LIMITE_POS_ENVIO = 18 * 60 * 60 * 1000; // enviadas/rejeitadas somem 18h após o envio/registro
+  const LIMITE_PROCESSADAS_MS = 24 * 60 * 60 * 1000;
   const LIMITE_PROCESSADAS = 20;
 
-  // 1. Remove ofertas expiradas
-  //    - enviado/rejeitado: 18h contadas a partir de enviadoEm (momento do envio e
-  //      do registro em passagens.json); fallback para timestamp quando ausente
-  //    - aprovado/agendado: nunca removidos por tempo (ainda aguardam disparo e são
-  //      reenfileirados por requeueAprovadas() após restart)
-  //    - pendente: cupons TSP em 12h, demais em 24h
+  // 1. Remove ofertas expiradas, sempre contando a partir de item.timestamp
+  //    (momento em que a captura foi registrada na fila):
+  //    - pendente: 18h — se não foi aprovada nesse prazo, sai sozinha
+  //    - pendente do tipo cupom_tsp: 12h, pois perde validade antes
+  //    - já processada (aprovado/agendado/enviado/rejeitado): 24h, só histórico
   for (let i = filaPendentes.length - 1; i >= 0; i--) {
     const item = filaPendentes[i];
-
-    if (item.status === 'aprovado' || item.status === 'agendado') continue;
-
-    if (item.status === 'enviado' || item.status === 'rejeitado') {
-      const ref = new Date(item.enviadoEm || item.timestamp).getTime();
-      if (!ref || isNaN(ref)) continue;
-      if (agora - ref > LIMITE_POS_ENVIO) filaPendentes.splice(i, 1);
-      continue;
-    }
-
     const ts = new Date(item.timestamp).getTime();
     if (!ts || isNaN(ts)) continue;
-    const limite = item.tipoConteudo === 'cupom_tsp' ? LIMITE_CUPOM_TSP : LIMITE_24H;
+
+    let limite;
+    if (item.status !== 'pendente') limite = LIMITE_PROCESSADAS_MS;
+    else if (item.tipoConteudo === 'cupom_tsp') limite = LIMITE_CUPOM_TSP;
+    else limite = LIMITE_PENDENTE;
+
     if (agora - ts > limite) filaPendentes.splice(i, 1);
   }
 
