@@ -1039,25 +1039,37 @@ reformatarCupomsTSPPendentes();
 
 // ── CHAMADA ANTHROPIC ─────────────────────────────────────────────────────────
 async function chamarClaude(system, userContent, maxTokens) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5',
-      max_tokens: maxTokens || 1024,
-      system,
-      messages: [{ role: 'user', content: userContent }],
-    }),
-  });
-  const data = await response.json();
-  if (data.error) { console.log('API erro:', JSON.stringify(data.error)); return null; }
-  const raw = data.content?.[0]?.text || '{}';
-  try { return JSON.parse(raw.replace(/```json|```/g,'').trim()); }
-  catch(e) { console.log('JSON parse falhou:', e.message); return null; }
+  // 3 tentativas com backoff — antes uma falha momentânea da API/parse fazia
+  // a classificação retornar null e o item sumia silenciosamente do buffer.
+  const ESPERAS = [0, 2000, 5000];
+  for (let tentativa = 0; tentativa < ESPERAS.length; tentativa++) {
+    if (ESPERAS[tentativa] > 0) await new Promise(r => setTimeout(r, ESPERAS[tentativa]));
+    try {
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': ANTHROPIC_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5',
+          max_tokens: maxTokens || 1024,
+          system,
+          messages: [{ role: 'user', content: userContent }],
+        }),
+      });
+      const data = await response.json();
+      if (data.error) { console.log('API erro (tentativa '+(tentativa+1)+'/3):', JSON.stringify(data.error)); continue; }
+      const raw = data.content?.[0]?.text || '{}';
+      try { return JSON.parse(raw.replace(/```json|```/g,'').trim()); }
+      catch(e) { console.log('JSON parse falhou (tentativa '+(tentativa+1)+'/3):', e.message); continue; }
+    } catch(e) {
+      console.log('Fetch API falhou (tentativa '+(tentativa+1)+'/3):', e.message);
+    }
+  }
+  console.log('[CLAUDE] Todas as tentativas falharam — retornando null.');
+  return null;
 }
 
 // ── EXTRAIR CAMPOS DO CUPOM TELEGRAM ─────────────────────────────────────────
@@ -1659,14 +1671,26 @@ async function classificarItens(itens, grupoId) {
   const resultados = [];
 
   if (grupoId === GRUPO_APENAS_IMAGEM) {
-    const itensComImagem = itens.filter(item => item.imagemBase64);
-    if (itensComImagem.length === 0) { console.log('[GRUPO-IMG] Nenhuma imagem encontrada, descartando.'); return []; }
+    // Aceita também itens SEM imagem mas COM legenda (ex: download da imagem
+    // falhou) — a legenda deste grupo traz rota, programa e milhas completos,
+    // o que permite ao menos classificar e parear ida/volta. Antes esses itens
+    // eram descartados silenciosamente e o par nunca fechava.
+    const itensClassificaveis = itens.filter(item => item.imagemBase64 || (item.texto && item.texto.trim() && item.texto.trim() !== '[imagem sem legenda]'));
+    const descartados = itens.length - itensClassificaveis.length;
+    if (descartados > 0) console.log('[GRUPO-IMG] '+descartados+' item(ns) sem imagem e sem legenda descartado(s).');
+    if (itensClassificaveis.length === 0) { console.log('[GRUPO-IMG] Nenhum item classificável, descartando.'); return []; }
 
-    for (let i = 0; i < itensComImagem.length; i++) {
-      const item = itensComImagem[i];
+    for (let i = 0; i < itensClassificaveis.length; i++) {
+      const item = itensClassificaveis[i];
       const indiceOriginal = itens.indexOf(item);
+      const temImagem  = !!item.imagemBase64;
       const temLegenda = !!(item.texto && item.texto.trim());
-      const introducaoImg = temLegenda
+      const introducaoImg = !temImagem
+        ? (
+            'Este texto é a legenda de uma postagem de um grupo de alertas de passagens aéreas com milhas. A imagem que a acompanhava não pôde ser baixada — extraia TODOS os dados possíveis da legenda abaixo. As datas de ida/volta normalmente ficam na imagem; se não constarem na legenda, deixe os campos de datas vazios.\n\n'
+            +'"""\n'+item.texto.trim()+'\n"""\n\n'
+          )
+        : temLegenda
         ? (
             'Esta imagem é de um grupo de alertas de passagens aéreas com milhas. Ela veio acompanhada da seguinte legenda/descrição em texto:\n\n'
             +'"""\n'+item.texto.trim()+'\n"""\n\n'
@@ -1680,7 +1704,7 @@ async function classificarItens(itens, grupoId) {
             'Esta imagem é de um grupo de alertas de passagens aéreas com milhas e não veio acompanhada de nenhum texto/legenda. Extraia TODOS os dados diretamente da imagem.\n\n'
           );
       const content = [
-        { type:'image', source:{ type:'base64', media_type:'image/jpeg', data:item.imagemBase64 } },
+        ...(temImagem ? [{ type:'image', source:{ type:'base64', media_type:'image/jpeg', data:item.imagemBase64 } }] : []),
         { type:'text', text:
           introducaoImg
           +'Leia (priorizando a legenda quando houver, complementando com a imagem):\n'
@@ -1719,6 +1743,9 @@ async function classificarItens(itens, grupoId) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
           r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
+        } else {
+          // Diagnóstico: item do grupo-imagem descartado como inválido
+          console.log('[GRUPO-IMG] Item '+indiceOriginal+' classificado como INVÁLIDO ('+(temImagem?'com imagem':'sem imagem')+'). Legenda: '+(item.texto||'').slice(0,80).replace(/\n/g,' | '));
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
