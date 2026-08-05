@@ -1228,6 +1228,16 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos);
       const rotulo   = `${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
 
+      // Veredito fica gravado na oferta para aparecer no card da fila (o log do
+      // Railway sozinho nao serve: em modo sombra o operador precisa comparar a
+      // decisao do gate com a propria aprovacao manual, cupom a cupom.
+      oferta.autoAvaliacao = {
+        auto: veredito.auto,
+        motivo: veredito.motivo,
+        modo: AUTO_ENVIO_MODO,
+        avaliadoEm: new Date().toISOString(),
+      };
+
       // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
       // acerto do gate contra a aprovacao manual antes de ligar 'on'.
       if (AUTO_ENVIO_MODO === 'sombra') {
