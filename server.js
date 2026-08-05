@@ -2783,11 +2783,20 @@ app.post('/painel/mesclar', (req, res) => {
 });
 
 app.post('/painel/limpar', (req, res) => {
-  const { confirmar } = req.body;
+  const { confirmar, tipoConteudo } = req.body;
   if (confirmar!=='sim') return res.status(400).json({ ok:false, erro:'Envie { "confirmar": "sim" } para confirmar.' });
-  filaPendentes.forEach(o => { if (o.status==='pendente') o.status='rejeitado'; });
+  // tipoConteudo opcional: limpa apenas pendentes daquele tipo (ex.: 'cupom_tsp'
+  // vindo do painel Tudo Sobre Promos), preservando as emissoes CDV da fila.
+  // Sem tipoConteudo mantem o comportamento antigo: limpa todos os pendentes.
+  let removidos = 0;
+  filaPendentes.forEach(o => {
+    if (o.status !== 'pendente') return;
+    if (tipoConteudo && o.tipoConteudo !== tipoConteudo) return;
+    o.status = 'rejeitado';
+    removidos++;
+  });
   salvarFila();
-  res.json({ ok:true });
+  res.json({ ok:true, removidos });
 });
 
 app.post('/injetar', async (req, res) => {
