@@ -909,6 +909,7 @@ const LINKS_TSP = {
   'Mercado Livre': 'https://meli.la/2xystLt',
   'Shopee_sem':    'https://s.shopee.com.br/9fHPmP3QZF',
   'Shopee_com':    'https://s.shopee.com.br/30kdYeLY0W',
+  'Magazine Luiza':'https://magazineluiza.onelink.me/589508454/3jdc7bbv',
 };
 
 function formatarCupomTSP(dados) {
@@ -938,10 +939,14 @@ function formatarCupomTSP(dados) {
     msg += '\n\n';
   }
 
+  const lojaNorm = loja.toLowerCase().replace(/^outro:\s*/, '').trim();
+  const isMagalu = /magazine\s*luiza|magalu/.test(lojaNorm);
+
   let url = '';
   if (loja === 'Amazon')        url = LINKS_TSP['Amazon'];
   else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
   else if (loja === 'Shopee')   url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
+  else if (isMagalu)            url = LINKS_TSP['Magazine Luiza'];
 
   if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
 
@@ -980,7 +985,7 @@ Analise a mensagem e retorne SOMENTE JSON válido, sem texto extra, sem markdown
 Campos:
 {
   "eh_cupom": true/false,
-  "loja": "Amazon" | "Mercado Livre" | "Shopee" | "Outro: nome",
+  "loja": "Amazon" | "Mercado Livre" | "Shopee" | "Magazine Luiza" | "Outro: nome",
   "tipo": "pct" | "reais",
   "valor": número (ex: 10, 30, 15),
   "minimo": número (valor mínimo de compra, 0 se não informado),
@@ -994,6 +999,7 @@ Regras:
 - Se não for cupom de desconto com código de DESCONTO aplicável em compras, retorne {"eh_cupom": false}
 - NÃO é cupom: ofertas de milhas, pontos, cashback em programas de fidelidade (Azul Fidelidade, Smiles, TudoAzul, Livelo, etc), bônus de cadastro, promoções de acúmulo de pontos, sorteios, gifts, reembolso, indique-e-ganhe — mesmo que tenham um código
 - É cupom: código de desconto (%) ou valor fixo (R$) aplicável em compras em lojas como Amazon, Mercado Livre, Shopee, iFood, Uber Eats, Rappi, Magazine Luiza, etc
+- Magalu / Magazine Luiza / Magazine Você = sempre retorne "loja": "Magazine Luiza"
 - Shopee sem código = "codigo": null
 - "tipo": use "pct" quando o desconto for em porcentagem (ex: 20% OFF, 15% de desconto). Use "reais" quando for valor fixo em R$ (ex: R$30 OFF, R$10 de desconto)
 - Em "multiplos", cada item DEVE ter seu próprio campo "tipo" ("pct" ou "reais") — não herde o tipo do cupom principal
