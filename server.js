@@ -196,7 +196,9 @@ const FILA_PATH = SESSAO_DIR + '/fila_pendentes.json';
 // Ignora cupons já vistos (mesma loja + código) nas últimas N horas.
 // Persiste em disco para sobreviver a restarts.
 const CUPONS_VISTOS_PATH = SESSAO_DIR + '/cupons_vistos.json';
-const CUPONS_VISTOS_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
+// TTL de 24h: cupons costumam durar mais que 6h e, com auto-envio ligado, um
+// repost do mesmo cupom 7h depois viraria mensagem duplicada para os clientes.
+const CUPONS_VISTOS_TTL_MS = 24 * 60 * 60 * 1000; // 24 horas
 
 let _cuponsVistos = {};
 
@@ -220,14 +222,33 @@ function salvarCuponsVistos() {
   } catch(e) { console.warn('[DEDUP] Erro ao salvar cupons_vistos:', e.message); }
 }
 
-function chaveDedup(loja, codigo) {
-  const lojaKey = (loja || 'outros').toLowerCase().trim().replace(/\s+/g, '_');
-  const codKey  = (codigo || '__sem_codigo__').toLowerCase().trim();
-  return `${lojaKey}:${codKey}`;
+// Normaliza forte para que "Outro: Casas Bahia", "outro: casasbahia" e
+// "Casas Bahia" gerem a MESMA chave. Sem isso, os dois canais monitorados
+// escrevendo a loja de formas diferentes furam a deduplicacao.
+function normalizarDedup(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // remove acentos
+    .replace(/^outro:\s*/, '')
+    .replace(/[^a-z0-9]/g, '');
 }
 
-function cupomJaVisto(loja, codigo) {
-  const chave = chaveDedup(loja, codigo);
+function chaveDedup(cupom) {
+  const lojaKey = normalizarDedup(cupom?.loja) || 'outros';
+  const codKey  = normalizarDedup(cupom?.codigo);
+  // Com codigo: loja+codigo identifica o cupom sem ambiguidade.
+  // Sem codigo (caso Shopee): usar so "__sem_codigo__" faria QUALQUER cupom sem
+  // codigo da mesma loja dedupar contra outro na janela, suprimindo cupons
+  // legitimamente diferentes. Entao a chave incorpora tipo+valor+minimo.
+  if (codKey) return `${lojaKey}:${codKey}`;
+  const tipo   = normalizarDedup(cupom?.tipo) || 'x';
+  const valor  = Number(cupom?.valor)  || 0;
+  const minimo = Number(cupom?.minimo) || 0;
+  return `${lojaKey}:sc:${tipo}:${valor}:${minimo}`;
+}
+
+function cupomJaVisto(cupom) {
+  const chave = chaveDedup(cupom);
   const ts = _cuponsVistos[chave];
   if (!ts) return false;
   if (Date.now() - ts > CUPONS_VISTOS_TTL_MS) {
@@ -237,8 +258,8 @@ function cupomJaVisto(loja, codigo) {
   return true;
 }
 
-function registrarCupomVisto(loja, codigo) {
-  const chave = chaveDedup(loja, codigo);
+function registrarCupomVisto(cupom) {
+  const chave = chaveDedup(cupom);
   _cuponsVistos[chave] = Date.now();
   salvarCuponsVistos();
 }
@@ -964,15 +985,25 @@ function formatarCupomTSP(dados) {
   const loja   = dados.loja   || '';
   const tipo   = dados.tipo   || 'reais';
   const valor  = dados.valor  || 0;
-  const minimo = dados.minimo || 0;
+  // minimo null/0 = sem valor minimo. Antes caia em `|| 0` e a mensagem saia
+  // como "Válido em compras acima de R$ 0".
+  const minimo = (dados.minimo === null || dados.minimo === undefined) ? null : Number(dados.minimo);
+  const temMin = minimo !== null && minimo > 0;
   const limite = dados.limite || null;
   const codigo = dados.codigo || null;
   const isPct  = tipo === 'pct';
   const tipoStr = isPct ? '%' : ' reais';
 
-  const validade = (isPct && limite)
-    ? `Válido em compras acima de R$ ${minimo} com limite de R$ ${limite} de desconto.`
-    : `Válido em compras acima de R$ ${minimo}.`;
+  let validade;
+  if (isPct && limite) {
+    validade = temMin
+      ? `Válido em compras acima de R$ ${minimo} com limite de R$ ${limite} de desconto.`
+      : `Válido sem valor mínimo de compra, com limite de R$ ${limite} de desconto.`;
+  } else {
+    validade = temMin
+      ? `Válido em compras acima de R$ ${minimo}.`
+      : `Válido sem valor mínimo de compra.`;
+  }
 
   let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*\n\n`;
   msg += validade + '\n\n';
@@ -1040,7 +1071,7 @@ Campos:
   "loja": "Amazon" | "Mercado Livre" | "Shopee" | "Magazine Luiza" | "Outro: nome",
   "tipo": "pct" | "reais",
   "valor": número (ex: 10, 30, 15),
-  "minimo": número (valor mínimo de compra, 0 se não informado),
+  "minimo": número | null (valor mínimo de compra; use null se a mensagem NÃO informar mínimo),
   "limite": número | null (limite máximo de desconto em R$, só para tipo "pct"),
   "codigo": "CUPOM123" | null,
   "multiplos": [ {valor, minimo, codigo, tipo} ] | null (quando há múltiplos cupons na mesma mensagem),
@@ -1057,13 +1088,103 @@ Regras:
 - Em "multiplos", cada item DEVE ter seu próprio campo "tipo" ("pct" ou "reais") — não herde o tipo do cupom principal
 - Para múltiplos cupons na mesma mensagem (ex: 20% OFF em TVs + 15% OFF em Celulares), use "multiplos" com um item por cupom
 - Valores devem ser números puros sem símbolo (ex: 20 para 20%, 30 para R$30)
-- "minimo": 0 se não houver valor mínimo informado`;
+- "minimo": use null quando a mensagem não informar valor mínimo de compra. Use 0 SOMENTE se a mensagem disser explicitamente que não há mínimo ("sem valor mínimo", "sem mínimo"). Nunca chute um valor.`;
 
   return await chamarClaude(system, [{ type:'text', text: texto }], 500);
 }
 
+// ── AUTO-ENVIO DE CUPOM TSP ──────────────────────────────────────────────────
+// AUTO_ENVIO_CUPOM: 'off' (tudo vai para fila) | 'sombra' (avalia e loga, mas
+// continua indo para fila) | 'on' (envia direto quando passa em todos os gates).
+// Default 'sombra': ligar em producao exige acao explicita no Railway.
+const AUTO_ENVIO_MODO       = (process.env.AUTO_ENVIO_CUPOM || 'sombra').toLowerCase();
+const AUTO_ENVIO_INTERVALO  = 90 * 1000; // intervalo minimo entre auto-envios
+const AUTO_ENVIO_TEXTO_MIN  = 20;        // texto curto demais = info provavelmente na imagem
+let   _ultimoAutoEnvio      = 0;
+
+// Lojas elegiveis: precisam ter link de afiliado em LINKS_TSP, senao a mensagem
+// sai sem "RESGATE O CUPOM AQUI" — comercialmente inutil.
+function lojaComLink(loja, codigo) {
+  const norm = (loja || '').toLowerCase().replace(/^outro:\s*/, '').trim();
+  if (loja === 'Amazon')        return !!LINKS_TSP['Amazon'];
+  if (loja === 'Mercado Livre') return !!LINKS_TSP['Mercado Livre'];
+  // Shopee: auto-envio SOMENTE com codigo (decisao do operador).
+  if (loja === 'Shopee')        return !!codigo && !!LINKS_TSP['Shopee_com'];
+  if (/magazine\s*luiza|magalu/.test(norm)) return !!LINKS_TSP['Magazine Luiza'];
+  return false;
+}
+
+// Confere se um numero extraido pela IA aparece de fato no texto original.
+// Pega a maior parte das alucinacoes numericas do modelo por um custo trivial.
+function numeroNoTexto(texto, n) {
+  if (n === null || n === undefined) return true;
+  const num = Number(n);
+  if (!isFinite(num)) return false;
+  const digitos = String(Math.round(num));
+  // aceita 1000, 1.000, 1,000 e variacoes com separador
+  const re = new RegExp(digitos.split('').join('[.,\\s]?'), 'i');
+  return re.test(texto);
+}
+
+// Gate deterministico. Retorna { auto:boolean, motivo:string }.
+function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos) {
+  const t = textoOriginal || '';
+
+  if (AUTO_ENVIO_MODO === 'off')          return { auto:false, motivo:'modo off' };
+  if (tinhaMultiplos)                     return { auto:false, motivo:'mensagem com multiplos cupons' };
+  if (t.trim().length < AUTO_ENVIO_TEXTO_MIN) return { auto:false, motivo:'texto curto demais (info pode estar na imagem)' };
+
+  if (!cupom.loja)                        return { auto:false, motivo:'sem loja' };
+  if (!cupom.codigo)                      return { auto:false, motivo:'sem codigo do cupom' };
+  if (!lojaComLink(cupom.loja, cupom.codigo)) return { auto:false, motivo:`loja sem link de afiliado (${cupom.loja})` };
+
+  if (cupom.tipo !== 'pct' && cupom.tipo !== 'reais') return { auto:false, motivo:'tipo invalido' };
+  if (!(Number(cupom.valor) > 0))         return { auto:false, motivo:'valor ausente ou zero' };
+
+  if (cupom.minimo === null || cupom.minimo === undefined)
+    return { auto:false, motivo:'minimo nao informado (regra de aplicacao incompleta)' };
+  if (Number(cupom.minimo) < 0)           return { auto:false, motivo:'minimo invalido' };
+
+  if (cupom.tipo === 'pct' && !(Number(cupom.limite) > 0))
+    return { auto:false, motivo:'cupom percentual sem limite de desconto' };
+
+  // Validacao cruzada contra o texto original
+  if (!numeroNoTexto(t, cupom.valor))     return { auto:false, motivo:'valor nao confere com o texto original' };
+  if (Number(cupom.minimo) > 0 && !numeroNoTexto(t, cupom.minimo))
+    return { auto:false, motivo:'minimo nao confere com o texto original' };
+  if (cupom.limite && !numeroNoTexto(t, cupom.limite))
+    return { auto:false, motivo:'limite nao confere com o texto original' };
+  if (!t.toLowerCase().includes(String(cupom.codigo).toLowerCase()))
+    return { auto:false, motivo:'codigo nao aparece no texto original' };
+
+  // Janela de horario (mesma da fila CDV) — nada de cupom as 3h da manha
+  const h = horaSP();
+  if (h < HORA_INICIO_ENVIO || h >= HORA_FIM_ENVIO)
+    return { auto:false, motivo:`fora da janela ${HORA_INICIO_ENVIO}h-${HORA_FIM_ENVIO}h SP` };
+
+  // Anti-flood: canal despejando varios cupons de uma vez
+  const desde = Date.now() - _ultimoAutoEnvio;
+  if (desde < AUTO_ENVIO_INTERVALO)
+    return { auto:false, motivo:`intervalo minimo (faltam ${Math.ceil((AUTO_ENVIO_INTERVALO-desde)/1000)}s)` };
+
+  return { auto:true, motivo:'aprovado' };
+}
+
 // ── PROCESSAR MENSAGEM DO TELEGRAM ────────────────────────────────────────────
-async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null) {
+// Serializacao: o gate de dedup so roda DEPOIS da chamada a Anthropic (1-3s).
+// Sem mutex, o mesmo cupom chegando pelos dois canais com poucos segundos de
+// diferenca passa duas vezes pelo gate — e com auto-envio isso vira mensagem
+// duplicada no grupo de clientes. Uma cadeia de promises basta (processo unico).
+let _tgChain = Promise.resolve();
+
+function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null) {
+  _tgChain = _tgChain
+    .then(() => _processarMensagemTelegram(texto, canalUsername, imagemBase64))
+    .catch(e => console.error('[TG] Erro na cadeia:', e.message));
+  return _tgChain;
+}
+
+async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null) {
   if (!texto?.trim()) return;
   console.log('[TG] Nova mensagem recebida:', texto.slice(0, 80));
 
@@ -1076,8 +1197,9 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', 
 
     console.log(`[TG] Cupom identificado: ${campos.loja} | ${campos.valor}${campos.tipo === 'pct' ? '%' : ' R$'}`);
 
-    const lista = campos.multiplos?.length
-      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo ?? 0, codigo: m.codigo ?? campos.codigo, tipo: m.tipo ?? campos.tipo, limite: m.limite ?? campos.limite ?? null, multiplos: null }))
+    const tinhaMultiplos = !!campos.multiplos?.length;
+    const lista = tinhaMultiplos
+      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo ?? null, codigo: m.codigo ?? campos.codigo, tipo: m.tipo ?? campos.tipo, limite: m.limite ?? campos.limite ?? null, multiplos: null }))
       : [campos];
 
     for (const c of lista) {
@@ -1093,16 +1215,59 @@ async function processarMensagemTelegram(texto, canalUsername = 'desconhecido', 
         dadosExtraidos: c,
         status: 'pendente',
       };
-      // Verificar deduplicação: ignorar se mesma loja+código já foi visto recentemente
-      if (cupomJaVisto(c.loja, c.codigo)) {
+      // Verificar deduplicação: ignorar se o mesmo cupom já foi visto recentemente
+      if (cupomJaVisto(c)) {
         console.log(`[DEDUP] Cupom ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
         continue;
       }
 
+      // Registra ANTES de qualquer envio: se o envio falhar preferimos perder um
+      // cupom a arriscar mandar duplicado quando o outro canal repostar.
+      registrarCupomVisto(c);
+
+      const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos);
+      const rotulo   = `${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
+
+      // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
+      // acerto do gate contra a aprovacao manual antes de ligar 'on'.
+      if (AUTO_ENVIO_MODO === 'sombra') {
+        console.log(`[AUTO-SOMBRA] ${veredito.auto ? 'ENVIARIA' : 'BLOQUEADO'} — ${rotulo} — ${veredito.motivo}`);
+      }
+
+      if (AUTO_ENVIO_MODO === 'on' && veredito.auto) {
+        try {
+          const imagem = oferta.imagens?.[0];
+          if (imagem?.imagemBase64) {
+            await enviarMensagem(GRUPOS['tsp'], {
+              image: Buffer.from(imagem.imagemBase64, 'base64'),
+              caption: mensagemFormatada,
+              mimetype: imagem.mime || 'image/jpeg',
+            });
+          } else {
+            await enviarMensagem(GRUPOS['tsp'], { text: mensagemFormatada });
+          }
+          _ultimoAutoEnvio    = Date.now();
+          oferta.status       = 'enviado';
+          oferta.mensagemFinal = mensagemFormatada;
+          oferta.autoEnviado  = true;
+          filaPendentes.unshift(oferta);
+          salvarFila();
+          console.log(`[AUTO] Cupom #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
+          try {
+            await enviarMensagem(GRUPOS.operador, {
+              text: `*Cupom enviado automaticamente* 🤖\n\n${rotulo}\n\nOrigem: @${canalUsername}`
+            });
+          } catch(e) { console.warn('[AUTO] Falha ao avisar operador:', e.message); }
+          continue;
+        } catch(err) {
+          // Falha no envio: cai para a fila manual em vez de perder o cupom.
+          console.error(`[AUTO] Falha no envio automatico, caindo para fila: ${err.message}`);
+        }
+      }
+
       filaPendentes.unshift(oferta);
       salvarFila();
-      registrarCupomVisto(c.loja, c.codigo);
-      console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}`);
+      console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${rotulo} (${veredito.motivo})`);
 
       // Alerta de novo cupom no grupo do operador
       try {
@@ -2370,7 +2535,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
