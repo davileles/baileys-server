@@ -2232,12 +2232,34 @@ function enfileirarPorGrupo(jid, fn) {
   return proxima;
 }
 
+// Desembrulha wrappers comuns do WhatsApp (mensagens efêmeras, view-once,
+// documento com legenda, etc.) até chegar ao conteúdo real.
+const _WRAPPERS_WA = ['ephemeralMessage','viewOnceMessage','viewOnceMessageV2','viewOnceMessageV2Extension','documentWithCaptionMessage','deviceSentMessage'];
+function desembrulharMessage(m) {
+  let atual = m, prof = 0;
+  while (atual && prof < 5) {
+    const chave = _WRAPPERS_WA.find(w => atual[w]);
+    if (!chave) break;
+    atual = atual[chave].message || atual[chave];
+    prof++;
+  }
+  return atual || m;
+}
+
+// Tipos que geram captura. A detecção busca por PRIORIDADE entre as chaves —
+// nunca pela primeira chave do objeto (Object.keys(m)[0]), pois mensagens com
+// metadados E2E na frente (ex: messageContextInfo, comum em imagens enviadas
+// como álbum) eram classificadas com o tipo errado e descartadas SEM LOG.
+const _TIPOS_TRATADOS = ['imageMessage','extendedTextMessage','conversation'];
+// Tipos sem valor de captura — descartados sem log para não poluir
+const _TIPOS_IGNORADOS = new Set(['protocolMessage','reactionMessage','pollUpdateMessage','senderKeyDistributionMessage','messageContextInfo','stickerMessage','audioMessage','pollCreationMessage','pollCreationMessageV2','pollCreationMessageV3']);
+
 async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
     if (!GRUPOS_MONITORADOS.includes(jid)) return;
-    const m    = msg.message;
-    const tipo = Object.keys(m || {})[0];
+    const m    = desembrulharMessage(msg.message);
+    const tipo = _TIPOS_TRATADOS.find(t => m && m[t]) || Object.keys(m || {})[0];
     let texto = '', imagemB64 = null;
     if (tipo === 'conversation') { texto = m.conversation; }
     else if (tipo === 'extendedTextMessage') { texto = m.extendedTextMessage.text; }
@@ -2247,7 +2269,15 @@ async function processarMensagem(msg) {
         const buffer = await downloadMediaMessage(msg,'buffer',{},{ logger:pino({level:'silent'}), reuploadRequest:sock.updateMediaMessage });
         imagemB64 = buffer.toString('base64');
       } catch(e) { console.error('[IMG] Erro ao baixar imagem:', e.message); if (!texto) texto = '[imagem sem legenda]'; }
-    } else { return; }
+    } else {
+      // Antes: return silencioso. Agora loga o tipo não tratado de grupos
+      // monitorados para nenhuma mensagem sumir sem rastro.
+      const chaves = Object.keys(m || {});
+      if (!chaves.every(k => _TIPOS_IGNORADOS.has(k))) {
+        console.log('[MSG] Tipo não tratado de ' + jid.split('@')[0] + ': [' + chaves.join(', ') + '] — descartada.');
+      }
+      return;
+    }
     if (!texto && !imagemB64) return;
 
     console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo, texto ? '| texto: '+texto.slice(0,60) : '| imagem');
