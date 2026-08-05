@@ -1934,6 +1934,16 @@ function mesclarParesIdaVolta(validas) {
     const wDes = normalizar(w.destinoCodigo, w.destino);
     const rotaInvertida = vOri && vDes && wOri && wDes && vOri === wDes && vDes === wOri;
 
+    // Diagnóstico: rota é invertida mas alguma condição barrou a mescla
+    if (rotaInvertida && !(mesmoPrograma && mesmaCabine && mesmaCia && milhasSimilares)) {
+      const motivos = [];
+      if (!mesmoPrograma)   motivos.push('programa "'+(v.programa||'?')+'"≠"'+(w.programa||'?')+'"');
+      if (!mesmaCabine)     motivos.push('cabine "'+(v.cabine||'?')+'"≠"'+(w.cabine||'?')+'"');
+      if (!mesmaCia)        motivos.push('cia "'+(v.cia||'?')+'"≠"'+(w.cia||'?')+'"');
+      if (!milhasSimilares) motivos.push('milhas '+pV+' vs '+pW+' ('+Math.round(Math.abs(pV-pW)/Math.max(pV,pW)*100)+'%)');
+      console.log('[MERGE-SKIP] '+(v.origemCodigo||v.origem)+'<->'+(w.origemCodigo||w.origem)+' rota invertida mas: '+motivos.join(' | '));
+    }
+
     return mesmoPrograma && mesmaCabine && mesmaCia && milhasSimilares && rotaInvertida;
   }
 
@@ -1944,10 +1954,11 @@ function mesclarParesIdaVolta(validas) {
     const v = validas[i];
 
     let parIdx = -1;
-    // Busca par ida/volta nas próximas 2 posições.
-    // Se msg 1 não é par de msg 2, verifica se msg 2 é par de msg 3, etc.
+    // Busca par ida/volta em TODO o restante do buffer.
+    // (Antes limitava a 2 posições à frente — perdia pares separados por
+    // outras postagens dentro da mesma janela de 3 min.)
     // O Set "usados" garante que nenhuma mensagem é reutilizada.
-    for (let j = i + 1; j <= Math.min(i + 2, validas.length - 1); j++) {
+    for (let j = i + 1; j <= validas.length - 1; j++) {
       if (!usados.has(j) && ehParInvertido(v, validas[j])) {
         parIdx = j;
         break;
@@ -2003,6 +2014,24 @@ async function aguardarParIdaVolta(oferta, grupoId) {
 
   const esperando = _esperandoPar.get(chave);
   if (esperando) {
+    // Valida cia e milhas antes de mesclar (mesmo rigor de ehParInvertido):
+    // rota+programa+cabine já batem pela chave; cia deve bater (leniente se vazia)
+    // e milhas devem estar dentro de ±15%.
+    const dE = esperando.oferta.dadosExtraidos || {};
+    const dO = oferta.dadosExtraidos || {};
+    const ciaE = (dE.cia||'').toLowerCase().trim();
+    const ciaO = (dO.cia||'').toLowerCase().trim();
+    const mesmaCia = !ciaE || !ciaO || ciaE === ciaO;
+    const pE = Number(dE.pontos) || 0;
+    const pO = Number(dO.pontos) || 0;
+    const milhasSimilares = pE === 0 || pO === 0 || Math.abs(pE - pO) / Math.max(pE, pO) <= 0.15;
+    if (!mesmaCia || !milhasSimilares) {
+      const motivos = [];
+      if (!mesmaCia)        motivos.push('cia "'+(dE.cia||'?')+'"≠"'+(dO.cia||'?')+'"');
+      if (!milhasSimilares) motivos.push('milhas '+pE+' vs '+pO);
+      console.log('[PAR-BUFFER] Par com mesma chave mas incompatível ('+motivos.join(' | ')+') — liberando ambas separadas.');
+      return false; // libera a nova como somente-ida; a que espera segue no timer
+    }
     // Par encontrado — mescla e libera
     clearTimeout(esperando.timer);
     _esperandoPar.delete(chave);
@@ -2093,9 +2122,15 @@ async function processarBuffer(grupoId) {
         // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
         const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
         const oferta   = { id:gerarId(), timestamp:new Date().toISOString(), grupoOrigem:grupoId, tipoConteudo:imagens.length>1?imagens.length+' imagens':imagens.length===1?'imagem':'texto', conteudoOriginal:textos, imagens, mensagemFormatada:mensagem, dadosExtraidos:{ ...dados, indices }, status:'pendente' };
-        filaPendentes.unshift(oferta);
-        salvarFila();
-        console.log('[BYPASS] Oferta criada direto: '+v.origemCodigo+'->'+v.destinoCodigo+' ('+v.programa+')');
+        // Somente-ida: aguarda até 5 min por par ida/volta de outro buffer
+        // (antes o bypass entrava direto na fila e pares divididos entre
+        // buffers viravam duas ofertas separadas)
+        const parEsperandoBypass = await aguardarParIdaVolta(oferta, grupoId);
+        if (!parEsperandoBypass) {
+          filaPendentes.unshift(oferta);
+          salvarFila();
+          console.log('[BYPASS] Oferta criada direto: '+v.origemCodigo+'->'+v.destinoCodigo+' ('+v.programa+')');
+        }
       }
       return;
     }
