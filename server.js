@@ -308,6 +308,31 @@ let contadorId = filaPendentes.length > 0
   : 1;
 console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
 
+// ── Reaplica links de afiliado em cupons TSP já pendentes ────────────────────
+// Quando o formatador passa a conhecer um link novo (ex.: Magazine Luiza), os
+// cupons que já estavam na fila continuariam sem o bloco de resgate. Esta
+// varredura regenera a mensagem a partir de dadosExtraidos, mas SOMENTE quando
+// a mensagem atual está sem link — nunca sobrescreve algo que já tem link nem
+// edições manuais feitas no painel.
+function reformatarCupomsTSPPendentes() {
+  let n = 0;
+  for (const o of filaPendentes) {
+    if (o.tipoConteudo !== 'cupom_tsp' || o.status !== 'pendente') continue;
+    if (!o.dadosExtraidos) continue;
+    if ((o.mensagemFormatada || '').includes('RESGATE O CUPOM AQUI')) continue;
+    const nova = formatarCupomTSP(o.dadosExtraidos);
+    if (!nova.includes('RESGATE O CUPOM AQUI')) continue; // loja sem link cadastrado
+    o.mensagemFormatada = nova;
+    n++;
+  }
+  if (n > 0) {
+    salvarFila();
+    console.log('[FILA] ' + n + ' cupom(ns) TSP pendente(s) reformatado(s) com link de afiliado.');
+  }
+  return n;
+}
+reformatarCupomsTSPPendentes();
+
 // Varredura periódica (15 min): garante que a expiração de 18h aconteça mesmo
 // sem ninguém abrir o painel ou aprovar/rejeitar nada.
 setInterval(() => {
@@ -2677,6 +2702,14 @@ app.post('/painel/reformatar/:id', async (req, res) => {
     oferta.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV(de), hist180);
     salvarFila();
     res.json({ ok:true, mensagemFormatada: oferta.mensagemFormatada, dadosExtraidos: de });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Reaplica links de afiliado nos cupons TSP pendentes sob demanda (sem restart)
+app.post('/painel/reformatar-tsp', (req, res) => {
+  try {
+    const n = reformatarCupomsTSPPendentes();
+    res.json({ ok:true, atualizados:n });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
