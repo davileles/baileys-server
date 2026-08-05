@@ -2541,7 +2541,15 @@ async function conectar() {
     });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (conectado) resetarHealthTimer();
-      if (type !== 'notify') return;
+      if (type !== 'notify') {
+        // Upserts 'append' (sync/reconexão) eram descartados sem rastro.
+        // Loga quando envolvem grupos monitorados para diagnóstico de sumiços.
+        const dosMonitorados = (messages || []).filter(mm => GRUPOS_MONITORADOS.includes(mm.key?.remoteJid));
+        if (dosMonitorados.length > 0) {
+          console.log('[WA] Upsert tipo "' + type + '" com ' + dosMonitorados.length + ' msg(s) de grupos monitorados DESCARTADA(S): ' + dosMonitorados.map(mm => mm.key?.remoteJid?.split('@')[0] + (mm.message ? ' [' + Object.keys(mm.message).join(',') + ']' : ' [sem message]')).join(' | '));
+        }
+        return;
+      }
       for (const msg of messages) {
         if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
           errosDescripto++;
