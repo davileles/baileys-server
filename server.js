@@ -259,11 +259,27 @@ function limparFila() {
   const agora = Date.now();
   const LIMITE_24H = 24 * 60 * 60 * 1000;
   const LIMITE_CUPOM_TSP = 12 * 60 * 60 * 1000; // cupons expiram rápido
+  const LIMITE_POS_ENVIO = 18 * 60 * 60 * 1000; // enviadas/rejeitadas somem 18h após o envio/registro
   const LIMITE_PROCESSADAS = 20;
 
-  // 1. Remove ofertas expiradas: cupons TSP em 12h, demais em 24h
+  // 1. Remove ofertas expiradas
+  //    - enviado/rejeitado: 18h contadas a partir de enviadoEm (momento do envio e
+  //      do registro em passagens.json); fallback para timestamp quando ausente
+  //    - aprovado/agendado: nunca removidos por tempo (ainda aguardam disparo e são
+  //      reenfileirados por requeueAprovadas() após restart)
+  //    - pendente: cupons TSP em 12h, demais em 24h
   for (let i = filaPendentes.length - 1; i >= 0; i--) {
     const item = filaPendentes[i];
+
+    if (item.status === 'aprovado' || item.status === 'agendado') continue;
+
+    if (item.status === 'enviado' || item.status === 'rejeitado') {
+      const ref = new Date(item.enviadoEm || item.timestamp).getTime();
+      if (!ref || isNaN(ref)) continue;
+      if (agora - ref > LIMITE_POS_ENVIO) filaPendentes.splice(i, 1);
+      continue;
+    }
+
     const ts = new Date(item.timestamp).getTime();
     if (!ts || isNaN(ts)) continue;
     const limite = item.tipoConteudo === 'cupom_tsp' ? LIMITE_CUPOM_TSP : LIMITE_24H;
@@ -297,6 +313,15 @@ let contadorId = filaPendentes.length > 0
   ? filaPendentes.reduce((max, o) => Math.max(max, parseInt(o.id)||0), 0) + 1
   : 1;
 console.log('[FILA] Contador de IDs iniciado em: ' + contadorId);
+
+// Varredura periódica (15 min): garante que a expiração de 18h aconteça mesmo
+// sem ninguém abrir o painel ou aprovar/rejeitar nada.
+setInterval(() => {
+  const antes = filaPendentes.length;
+  salvarFila();
+  const removidos = antes - filaPendentes.length;
+  if (removidos > 0) console.log('[FILA] Varredura automática removeu ' + removidos + ' item(ns) expirado(s).');
+}, 15 * 60 * 1000);
 
 // Recolocar na fila de envio ofertas que foram aprovadas mas não enviadas (survives restart)
 function requeueAprovadas() {
