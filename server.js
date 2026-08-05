@@ -856,6 +856,28 @@ function aplicarDadosEditados(oferta, dados) {
   return de;
 }
 
+// Corrige a grafia da cabine APENAS para exibicao. O valor canonico interno
+// segue sem acento ("Economica"), porque a deduplicacao de emissoes e o
+// registro em passagens.json comparam esse formato por igualdade estrita.
+function rotuloCabine(c) {
+  var s = String(c == null ? '' : c).trim();
+  if (!s) return 'Econômica';
+  var base = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  var alta = s === s.toUpperCase();
+  var MAP = {
+    'economica': 'Econômica',
+    'economy': 'Econômica',
+    'economica premium': 'Econômica Premium',
+    'premium economica': 'Premium Econômica',
+    'executiva': 'Executiva',
+    'business': 'Executiva',
+    'primeira classe': 'Primeira Classe'
+  };
+  var r = MAP[base];
+  if (!r) return s;
+  return alta ? r.toUpperCase() : r;
+}
+
 function formatarMensagemCDV(d) {
   var n = '\n';
   var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
@@ -872,7 +894,7 @@ function formatarMensagemCDV(d) {
   var valR = cpm > 0 ? Math.round((num/1000)*cpm) : 0;
   var valStr = valR > 0 ? 'R$ '+valR.toLocaleString('pt-BR') : '-';
   var link = linkPrograma(d.programa, 'alerta', buscaDaEmissao(d));
-  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+(d.cabine||'Econômica') : '';
+  var trecho = d.tipoVoo === 'internacional' ? ' o trecho em '+rotuloCabine(d.cabine) : '';
   var pts = num > 0 ? num.toLocaleString('pt-BR') : (d.pontos||'-');
   var msg = '';
   msg += '*'+d.origem+' - '+d.destino+' por '+pts+' pontos OU '+valStr+trecho+'*'+n+n;
@@ -2502,7 +2524,7 @@ app.get('/painel', (req, res) => {
     }
 
     const tipoTag   = d.tipo==='ida_volta'?'<span class="tag tag-iv">Ida e volta</span>':d.tipo==='ida'?'<span class="tag tag-ida">Somente ida</span>':'';
-    const cabineTag = d.cabine==='Executiva'?'<span class="tag tag-exec">Executiva</span>':'<span class="tag tag-eco">Economica</span>';
+    const cabineTag = d.cabine==='Executiva'?'<span class="tag tag-exec">Executiva</span>':'<span class="tag tag-eco">Econômica</span>';
     const rota = d.origem&&d.destino?`<span style="color:#f0f0f0;font-weight:600">${d.origem} - ${d.destino}</span>`:'';
     const prog = d.programa?`<span class="tag">${d.programa}</span>`:'';
     const imgsHtml = (o.imagens||[]).length>0?'<div class="imgs-grid">'+(o.imagens.map(b=>'<img src="data:image/jpeg;base64,'+b+'" />')).join('')+'</div>':'';
