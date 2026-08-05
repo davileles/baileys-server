@@ -1126,13 +1126,41 @@ function numeroNoTexto(texto, n) {
   return re.test(texto);
 }
 
+// Em mensagem com varios cupons, o risco nao e a extracao em si — e a IA
+// ATRIBUIR o minimo/limite de um cupom ao outro. Em vez de bloquear tudo,
+// particiona o texto por codigo: o escopo de um cupom vai do fim do bloco
+// anterior ate a linha onde o proprio codigo aparece. Validar os numeros
+// dentro desse escopo prova que a atribuicao esta correta.
+function escopoDoCupom(texto, codigo, todosCodigos) {
+  const linhas = (texto || '').split('\n');
+  const alvo = String(codigo || '').toLowerCase();
+  if (!alvo) return null;
+  const marcadas = linhas.map(l => {
+    const low = l.toLowerCase();
+    return todosCodigos.some(cd => cd && low.includes(String(cd).toLowerCase()));
+  });
+  const idx = linhas.findIndex(l => l.toLowerCase().includes(alvo));
+  if (idx === -1) return null;
+  let prev = -1;
+  for (let i = 0; i < idx; i++) if (marcadas[i]) prev = i;
+  return linhas.slice(prev + 1, idx + 1).join('\n');
+}
+
 // Gate deterministico. Retorna { auto:boolean, motivo:string }.
-function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos) {
-  const t = textoOriginal || '';
+function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = []) {
+  let t = textoOriginal || '';
 
   if (AUTO_ENVIO_MODO === 'off')          return { auto:false, motivo:'modo off' };
-  if (tinhaMultiplos)                     return { auto:false, motivo:'mensagem com multiplos cupons' };
   if (t.trim().length < AUTO_ENVIO_TEXTO_MIN) return { auto:false, motivo:'texto curto demais (info pode estar na imagem)' };
+
+  // Mensagem com varios cupons: restringe a validacao cruzada ao bloco deste
+  // cupom. Se o bloco nao for identificavel, cai para a fila.
+  if (tinhaMultiplos) {
+    if (!cupom.codigo) return { auto:false, motivo:'multiplos cupons e este item sem codigo' };
+    const escopo = escopoDoCupom(textoOriginal, cupom.codigo, codigosIrmaos);
+    if (!escopo) return { auto:false, motivo:'multiplos cupons e bloco do codigo nao identificado' };
+    t = escopo;
+  }
 
   if (!cupom.loja)                        return { auto:false, motivo:'sem loja' };
   if (!cupom.codigo)                      return { auto:false, motivo:'sem codigo do cupom' };
@@ -1149,13 +1177,14 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos) {
     return { auto:false, motivo:'cupom percentual sem limite de desconto' };
 
   // Validacao cruzada contra o texto original
-  if (!numeroNoTexto(t, cupom.valor))     return { auto:false, motivo:'valor nao confere com o texto original' };
+  const ondeStr = tinhaMultiplos ? 'no bloco deste cupom' : 'no texto original';
+  if (!numeroNoTexto(t, cupom.valor))     return { auto:false, motivo:'valor nao confere '+ondeStr };
   if (Number(cupom.minimo) > 0 && !numeroNoTexto(t, cupom.minimo))
-    return { auto:false, motivo:'minimo nao confere com o texto original' };
+    return { auto:false, motivo:'minimo nao confere '+ondeStr };
   if (cupom.limite && !numeroNoTexto(t, cupom.limite))
-    return { auto:false, motivo:'limite nao confere com o texto original' };
+    return { auto:false, motivo:'limite nao confere '+ondeStr };
   if (!t.toLowerCase().includes(String(cupom.codigo).toLowerCase()))
-    return { auto:false, motivo:'codigo nao aparece no texto original' };
+    return { auto:false, motivo:'codigo nao aparece '+ondeStr };
 
   // Janela de horario (mesma da fila CDV) — nada de cupom as 3h da manha
   const h = horaSP();
@@ -1201,6 +1230,7 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
     const lista = tinhaMultiplos
       ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo ?? null, codigo: m.codigo ?? campos.codigo, tipo: m.tipo ?? campos.tipo, limite: m.limite ?? campos.limite ?? null, multiplos: null }))
       : [campos];
+    const codigosLista = lista.map(x => x.codigo).filter(Boolean);
 
     for (const c of lista) {
       const mensagemFormatada = formatarCupomTSP(c);
@@ -1225,7 +1255,7 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       // cupom a arriscar mandar duplicado quando o outro canal repostar.
       registrarCupomVisto(c);
 
-      const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos);
+      const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos, codigosLista);
       const rotulo   = `${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
 
       // Veredito fica gravado na oferta para aparecer no card da fila (o log do
