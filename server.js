@@ -1506,6 +1506,10 @@ async function classificarItens(itens, grupoId) {
       const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
+        // Indice deterministico do item no buffer - nunca confia no valor devolvido
+        // pela IA (ela renumera quando um mesmo item contem varias emissoes,
+        // fazendo a oferta herdar imagem/texto original de OUTRA mensagem).
+        if (r) r.indice = indiceOriginal;
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
@@ -1541,6 +1545,10 @@ async function classificarItens(itens, grupoId) {
       const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
+        // Indice deterministico do item no buffer - nunca confia no valor devolvido
+        // pela IA (ela renumera quando um mesmo item contem varias emissoes,
+        // fazendo a oferta herdar imagem/texto original de OUTRA mensagem).
+        if (r) r.indice = indiceOriginal;
         if (r?.valido) {
           r.cabine  = 'Executiva';
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
@@ -1576,6 +1584,10 @@ async function classificarItens(itens, grupoId) {
       const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
       const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:indiceOriginal }]);
       for (const r of lista) {
+        // Indice deterministico do item no buffer - nunca confia no valor devolvido
+        // pela IA (ela renumera quando um mesmo item contem varias emissoes,
+        // fazendo a oferta herdar imagem/texto original de OUTRA mensagem).
+        if (r) r.indice = indiceOriginal;
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
@@ -1611,6 +1623,8 @@ async function classificarItens(itens, grupoId) {
     const resultado = await chamarClaude(SYSTEM_CDV, content, 4096);
     const lista = resultado?.resultados || (resultado?.valido !== undefined ? [resultado] : [{ valido:false, indice:i }]);
     for (const r of lista) {
+      // Indice deterministico do item no buffer (ver comentario acima).
+      if (r) r.indice = i;
       if (r?.valido) {
         r.origem  = resolverCidade(r.origemCodigo, r.origem);
         r.destino = resolverCidade(r.destinoCodigo, r.destino);
