@@ -36,6 +36,9 @@ process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledReject
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
 const GRUPOS = {
   tsp:         '120363424721106736@g.us',
+  // Grupo exclusivo de cupons — recebe copia de todo cupom_tsp com rodape
+  // convidando para o grupo de ofertas (convite cruzado).
+  tsp_cupons:  '120363410183381243@g.us',
   cdv_ofertas: '120363170138704529@g.us',
   cdv_emissao: '120363172490263905@g.us',
   // Grupo interno do operador — avisos operacionais que NAO vao para clientes
@@ -1234,19 +1237,54 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   return { auto:true, motivo:'aprovado' };
 }
 
-// Envia um cupom aprovado pelo gate para o grupo TSP e marca a oferta como
-// enviada. Lanca excecao se o envio falhar (caller decide o fallback).
-async function despacharCupomAuto(oferta) {
-  const imagem = oferta.imagens?.[0];
+// Rodape usado na copia enviada ao grupo so-cupons: em vez de convidar para o
+// proprio grupo, faz o convite cruzado para o grupo de ofertas.
+const RODAPE_TSP_CUPONS = '`Entre no grupo de ofertas: https://chat.whatsapp.com/C7ed3Z1tYIb980POo9MqF8?s=cl&p=i&ilr=4`';
+
+// Troca o rodape padrao do TSP pelo convite cruzado. Se o operador tiver
+// editado/removido o rodape na fila, apenas anexa o novo ao final.
+function mensagemParaGrupoCupons(msg) {
+  const rodapeTsp = /`Convide seus amigos para entrar aqui no grupo:[^`]*`/;
+  if (rodapeTsp.test(msg)) return msg.replace(rodapeTsp, RODAPE_TSP_CUPONS);
+  return msg + '\n\n' + RODAPE_TSP_CUPONS;
+}
+
+// Envia um cupom para o grupo TSP principal e a copia (com rodape trocado)
+// para o grupo so-cupons. Falha no grupo so-cupons NAO derruba o envio
+// principal: loga e avisa o operador.
+async function enviarCupomParaGrupos(mensagem, imagem) {
   if (imagem?.imagemBase64) {
     await enviarMensagem(GRUPOS['tsp'], {
       image: Buffer.from(imagem.imagemBase64, 'base64'),
-      caption: oferta.mensagemFormatada,
+      caption: mensagem,
       mimetype: imagem.mime || 'image/jpeg',
     });
   } else {
-    await enviarMensagem(GRUPOS['tsp'], { text: oferta.mensagemFormatada });
+    await enviarMensagem(GRUPOS['tsp'], { text: mensagem });
   }
+  try {
+    const msgCupons = mensagemParaGrupoCupons(mensagem);
+    if (imagem?.imagemBase64) {
+      await enviarMensagem(GRUPOS['tsp_cupons'], {
+        image: Buffer.from(imagem.imagemBase64, 'base64'),
+        caption: msgCupons,
+        mimetype: imagem.mime || 'image/jpeg',
+      });
+    } else {
+      await enviarMensagem(GRUPOS['tsp_cupons'], { text: msgCupons });
+    }
+  } catch(e) {
+    console.error('[CUPONS] Falha ao enviar para o grupo so-cupons:', e.message);
+    try {
+      await enviarMensagem(GRUPOS.operador, { text: '*Falha ao enviar cupom no grupo so-cupons* \u26a0\ufe0f\n\n' + e.message });
+    } catch(_) {}
+  }
+}
+
+// Envia um cupom aprovado pelo gate para os grupos de cupons e marca a oferta
+// como enviada. Lanca excecao se o envio principal falhar (caller decide o fallback).
+async function despacharCupomAuto(oferta) {
+  await enviarCupomParaGrupos(oferta.mensagemFormatada, oferta.imagens?.[0]);
   _ultimoAutoEnvio     = Date.now();
   oferta.status        = 'enviado';
   oferta.mensagemFinal = oferta.mensagemFormatada;
@@ -3071,16 +3109,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
-      const imagem = oferta.imagens?.[0];
-      if (imagem?.imagemBase64) {
-        await enviarMensagem(GRUPOS['tsp'], {
-          image: Buffer.from(imagem.imagemBase64, 'base64'),
-          caption: mensagem,
-          mimetype: imagem.mime || 'image/jpeg',
-        });
-      } else {
-        await enviarMensagem(GRUPOS['tsp'], { text: mensagem });
-      }
+      await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0]);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem; salvarFila();
       res.json({ ok:true });
     } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
@@ -3480,50 +3509,6 @@ app.get('/grupos', async (req, res) => {
     }
     res.status(500).json({ ok:false, erro:err.message });
   }
-});
-
-// ── UTILITARIOS DE CONVITE DE GRUPO ──────────────────────────────────────────
-// Aceita link completo (https://chat.whatsapp.com/XXXX?...) ou apenas o codigo.
-function extrairCodigoConvite(raw) {
-  return String(raw || '')
-    .replace(/^https?:\/\/chat\.whatsapp\.com\//i, '')
-    .split('?')[0]
-    .trim();
-}
-
-// Consulta os dados de um grupo pelo convite SEM entrar nele.
-// Uso: GET /grupos/info-convite?codigo=<link ou codigo>
-app.get('/grupos/info-convite', async (req, res) => {
-  const codigo = extrairCodigoConvite(req.query.codigo);
-  if (!codigo) return res.status(400).json({ ok:false, erro:'Informe ?codigo= com o link ou codigo do convite.' });
-  if (!sock || !conectado) {
-    const ok = await aguardarSock(15000);
-    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
-  }
-  try {
-    const info = await sock.groupGetInviteInfo(codigo);
-    res.json({
-      ok: true,
-      id: info.id,
-      nome: info.subject || '(sem nome)',
-      participantes: info.size ?? null,
-      criadoEm: info.creation ? new Date(info.creation * 1000).toISOString() : null,
-    });
-  } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
-});
-
-// Entra em um grupo pelo convite. Uso: POST /grupos/entrar { "codigo": "<link ou codigo>" }
-app.post('/grupos/entrar', async (req, res) => {
-  const codigo = extrairCodigoConvite(req.body?.codigo || req.query.codigo);
-  if (!codigo) return res.status(400).json({ ok:false, erro:'Informe o codigo do convite no body ou em ?codigo=.' });
-  if (!sock || !conectado) {
-    const ok = await aguardarSock(15000);
-    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
-  }
-  try {
-    const id = await sock.groupAcceptInvite(codigo);
-    res.json({ ok:true, id });
-  } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
 });
 
 // ── HUBLA WEBHOOK ─────────────────────────────────────────────────────────────
