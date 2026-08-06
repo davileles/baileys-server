@@ -1548,6 +1548,7 @@ const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade,
   + '\nREGRAS DE COMPANHIA AEREA (campo "cia"):'
   + '\n- "SAA" ou "South African Airways" deve ser sempre gravado como "South African".'
   + '\n- Voo NACIONAL dentro do Brasil (origem E destino brasileiros): a cia segue o programa — Smiles = "GOL"; Azul Fidelidade/TudoAzul = "Azul"; LATAM Pass = "LATAM". Nunca use outra cia nesses casos.'
+  + '\n- Voo INTERNACIONAL: identifique a companhia aerea OPERADORA ("cia") lendo o texto e principalmente a IMAGEM quando houver — screenshots da Smiles mostram o nome da cia (ex: "AIR FRANCE"). Preencha "cia" apenas com o que estiver visivel na fonte; NUNCA deduza a cia a partir do programa (Smiles NAO implica GOL em voo internacional). Se nao estiver visivel, deixe "cia" vazia.'
   + '\n- Defina tipoVoo="nacional" sempre que origem e destino forem cidades brasileiras.';
 
 // ── DE-PARA: programa → CIA operadora (para voos nacionais BR e fallback) ─────
@@ -1558,6 +1559,31 @@ const CIA_POR_PROGRAMA = {
   'TudoAzul':         'Azul',
   'LATAM Pass':       'LATAM',
 };
+
+// ── DE-PARA: destino internacional Smiles → parceira típica ──────────────────
+// Fallback usado APENAS quando a fonte não informa a cia em voo internacional
+// do programa Smiles. Chaves: código IATA ou nome de cidade normalizado
+// (maiúsculas, sem acento). Nunca inclui destinos que a GOL também opera
+// (EUA, Buenos Aires etc.) para evitar atribuição errada.
+const CIA_SMILES_POR_DESTINO = {
+  'CDG':'Air France', 'ORY':'Air France', 'PARIS':'Air France',
+  'AMS':'KLM', 'AMSTERDA':'KLM', 'AMSTERDAM':'KLM',
+  'MAD':'Air Europa', 'MADRI':'Air Europa', 'MADRID':'Air Europa',
+  'BOG':'Avianca', 'BOGOTA':'Avianca',
+  'MDE':'Avianca', 'MEDELLIN':'Avianca',
+  'PTY':'COPA', 'PANAMA':'COPA', 'CIDADE DO PANAMA':'COPA',
+  'DXB':'Emirates', 'DUBAI':'Emirates',
+  'IST':'Turkish', 'ISTAMBUL':'Turkish', 'ISTANBUL':'Turkish',
+  'ADD':'Ethiopian', 'ADIS ABEBA':'Ethiopian',
+};
+
+function chaveDestinoSmiles(s) {
+  return String(s == null ? '' : s)
+    .toUpperCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 // ── NORMALIZAÇÃO DE NOME DE CIA (siglas e variações → nome canônico) ──────────
 const ALIAS_CIA = {
@@ -1627,7 +1653,7 @@ const IATAS_BR = new Set([
   'AUX','GRP','PBQ','TUR','SXX','APQ',
 ]);
 
-function corrigirCia(cia, programa, origemCodigo, destinoCodigo, tipoVoo) {
+function corrigirCia(cia, programa, origemCodigo, destinoCodigo, tipoVoo, destinoNome) {
   const oc   = String(origemCodigo  || '').toUpperCase().trim();
   const dc   = String(destinoCodigo || '').toUpperCase().trim();
   const tipo = String(tipoVoo || '').toLowerCase();
@@ -1660,8 +1686,17 @@ function corrigirCia(cia, programa, origemCodigo, destinoCodigo, tipoVoo) {
   }
   // Internacional com CIA explícita na fonte (ex: Air France, Turkish) — respeita
   if (cia && cia !== programa) return normalizarCia(cia);
-  // Fallback para doméstico sem CIA identificada
-  return normalizarCia(CIA_POR_PROGRAMA[programa] || cia);
+  // Doméstico sem CIA identificada: programa determina a operadora
+  if (isDomestico) return normalizarCia(CIA_POR_PROGRAMA[programa] || cia);
+  // Internacional Smiles sem CIA: a GOL quase não voa internacional —
+  // tenta a parceira típica do destino; senão, "Desconhecida" (nunca GOL).
+  if (programa === 'Smiles') {
+    const porDestino = CIA_SMILES_POR_DESTINO[dc] || CIA_SMILES_POR_DESTINO[chaveDestinoSmiles(destinoNome)];
+    return porDestino || 'Desconhecida';
+  }
+  // Demais programas (LATAM Pass, Azul Fidelidade): a própria cia do programa
+  // opera amplamente voos internacionais — mantém o comportamento anterior.
+  return normalizarCia(CIA_POR_PROGRAMA[programa] || cia || 'Desconhecida');
 }
 const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
@@ -1742,7 +1777,7 @@ async function classificarItens(itens, grupoId) {
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
         } else {
           // Diagnóstico: item do grupo-imagem descartado como inválido
           console.log('[GRUPO-IMG] Item '+indiceOriginal+' classificado como INVÁLIDO ('+(temImagem?'com imagem':'sem imagem')+'). Legenda: '+(item.texto||'').slice(0,80).replace(/\n/g,' | '));
@@ -1785,7 +1820,7 @@ async function classificarItens(itens, grupoId) {
           r.cabine  = 'Executiva';
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -1823,7 +1858,7 @@ async function classificarItens(itens, grupoId) {
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
+          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -1860,7 +1895,7 @@ async function classificarItens(itens, grupoId) {
       if (r?.valido) {
         r.origem  = resolverCidade(r.origemCodigo, r.origem);
         r.destino = resolverCidade(r.destinoCodigo, r.destino);
-        r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo);
+        r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
       }
       resultados.push(r || { valido:false, indice:i });
     }
