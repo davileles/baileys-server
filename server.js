@@ -3482,6 +3482,50 @@ app.get('/grupos', async (req, res) => {
   }
 });
 
+// ── UTILITARIOS DE CONVITE DE GRUPO ──────────────────────────────────────────
+// Aceita link completo (https://chat.whatsapp.com/XXXX?...) ou apenas o codigo.
+function extrairCodigoConvite(raw) {
+  return String(raw || '')
+    .replace(/^https?:\/\/chat\.whatsapp\.com\//i, '')
+    .split('?')[0]
+    .trim();
+}
+
+// Consulta os dados de um grupo pelo convite SEM entrar nele.
+// Uso: GET /grupos/info-convite?codigo=<link ou codigo>
+app.get('/grupos/info-convite', async (req, res) => {
+  const codigo = extrairCodigoConvite(req.query.codigo);
+  if (!codigo) return res.status(400).json({ ok:false, erro:'Informe ?codigo= com o link ou codigo do convite.' });
+  if (!sock || !conectado) {
+    const ok = await aguardarSock(15000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
+  try {
+    const info = await sock.groupGetInviteInfo(codigo);
+    res.json({
+      ok: true,
+      id: info.id,
+      nome: info.subject || '(sem nome)',
+      participantes: info.size ?? null,
+      criadoEm: info.creation ? new Date(info.creation * 1000).toISOString() : null,
+    });
+  } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
+});
+
+// Entra em um grupo pelo convite. Uso: POST /grupos/entrar { "codigo": "<link ou codigo>" }
+app.post('/grupos/entrar', async (req, res) => {
+  const codigo = extrairCodigoConvite(req.body?.codigo || req.query.codigo);
+  if (!codigo) return res.status(400).json({ ok:false, erro:'Informe o codigo do convite no body ou em ?codigo=.' });
+  if (!sock || !conectado) {
+    const ok = await aguardarSock(15000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
+  try {
+    const id = await sock.groupAcceptInvite(codigo);
+    res.json({ ok:true, id });
+  } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
+});
+
 // ── HUBLA WEBHOOK ─────────────────────────────────────────────────────────────
 
 const MENSAGEM_BOAS_VINDAS = (nome) => `Olá, ${nome}! Seja muito bem-vindo ao Clube do Viajante Premium! ✈️
