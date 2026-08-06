@@ -1134,6 +1134,7 @@ Regras:
 const AUTO_ENVIO_MODO       = (process.env.AUTO_ENVIO_CUPOM || 'sombra').toLowerCase();
 const AUTO_ENVIO_INTERVALO  = 90 * 1000; // intervalo minimo entre auto-envios
 const AUTO_ENVIO_TEXTO_MIN  = 20;        // texto curto demais = info provavelmente na imagem
+const AUTO_ENVIO_MAX_ESPERA = 30 * 60 * 1000; // agendado ha mais que isso = cupom provavelmente vencido, vira aprovacao manual
 let   _ultimoAutoEnvio      = 0;
 
 // Lojas elegiveis: precisam ter link de afiliado em LINKS_TSP, senao a mensagem
@@ -1233,6 +1234,100 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   return { auto:true, motivo:'aprovado' };
 }
 
+// Envia um cupom aprovado pelo gate para o grupo TSP e marca a oferta como
+// enviada. Lanca excecao se o envio falhar (caller decide o fallback).
+async function despacharCupomAuto(oferta) {
+  const imagem = oferta.imagens?.[0];
+  if (imagem?.imagemBase64) {
+    await enviarMensagem(GRUPOS['tsp'], {
+      image: Buffer.from(imagem.imagemBase64, 'base64'),
+      caption: oferta.mensagemFormatada,
+      mimetype: imagem.mime || 'image/jpeg',
+    });
+  } else {
+    await enviarMensagem(GRUPOS['tsp'], { text: oferta.mensagemFormatada });
+  }
+  _ultimoAutoEnvio     = Date.now();
+  oferta.status        = 'enviado';
+  oferta.mensagemFinal = oferta.mensagemFormatada;
+  oferta.autoEnviado   = true;
+  delete oferta.autoAgendado;
+}
+
+// ── WORKER DE ESPACAMENTO DO AUTO-ENVIO ──────────────────────────────────────
+// Cupons que passaram em TODAS as regras de conteudo mas foram bloqueados por
+// motivo apenas temporal (janela de horario ou intervalo minimo entre envios)
+// ficam na fila com autoAgendado=true. Este worker envia um por vez, sempre
+// respeitando a janela e o intervalo de 90s. Cupons agendados ha mais de
+// AUTO_ENVIO_MAX_ESPERA viram aprovacao manual (provavelmente ja venceram).
+let _workerAutoRodando = false;
+setInterval(async () => {
+  if (AUTO_ENVIO_MODO !== 'on') return;
+  if (_workerAutoRodando) return;
+  _workerAutoRodando = true;
+  try {
+    const agora = Date.now();
+
+    // 1. Expira agendamentos velhos → viram aprovacao manual (com o alerta de
+    //    "novo cupom" que foi pulado na captura, para o operador ficar sabendo)
+    for (const o of filaPendentes) {
+      if (!o.autoAgendado || o.status !== 'pendente') continue;
+      const ts = new Date(o.timestamp).getTime();
+      if (!ts || isNaN(ts) || agora - ts <= AUTO_ENVIO_MAX_ESPERA) continue;
+      delete o.autoAgendado;
+      if (o.autoAvaliacao) o.autoAvaliacao.motivo += ' — prazo de auto-envio expirado, requer aprovacao manual';
+      salvarFila();
+      console.log(`[AUTO-FILA] Cupom #${o.id} expirou o prazo de auto-envio — caindo para aprovacao manual.`);
+      try {
+        await enviarMensagem(GRUPOS.operador, {
+          text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+        });
+      } catch(e) { console.warn('[AUTO-FILA] Falha ao avisar operador:', e.message); }
+    }
+
+    // 2. Condicoes temporais para enviar o proximo da fila
+    const h = horaSP();
+    if (h < HORA_INICIO_ENVIO || h >= HORA_FIM_ENVIO) return;
+    if (agora - _ultimoAutoEnvio < AUTO_ENVIO_INTERVALO) return;
+    if (!conectado || !sock) return;
+
+    // 3. Mais antigo primeiro (ordem de captura)
+    const candidatos = filaPendentes
+      .filter(o => o.autoAgendado && o.status === 'pendente' && o.tipoConteudo === 'cupom_tsp')
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    const oferta = candidatos[0];
+    if (!oferta) return;
+
+    const d = oferta.dadosExtraidos || {};
+    const rotulo = `${d.loja} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
+
+    // Marca como 'enviando' antes do await para o card sumir do painel e
+    // reduzir a janela de corrida com uma aprovacao manual simultanea.
+    oferta.status = 'enviando';
+    try {
+      await despacharCupomAuto(oferta);
+      salvarFila();
+      console.log(`[AUTO-FILA] Cupom #${oferta.id} ENVIADO automaticamente (espacamento) — ${rotulo}`);
+      try {
+        await enviarMensagem(GRUPOS.operador, {
+          text: `*Cupom enviado automaticamente* 🤖\n\n${rotulo}\n\nOrigem: ${oferta.grupoOrigem || '?'}`
+        });
+      } catch(e) { console.warn('[AUTO-FILA] Falha ao avisar operador:', e.message); }
+    } catch(err) {
+      oferta.status = 'pendente';
+      delete oferta.autoAgendado;
+      if (oferta.autoAvaliacao) oferta.autoAvaliacao.motivo += ' — falha no envio automatico, requer aprovacao manual';
+      salvarFila();
+      console.error(`[AUTO-FILA] Falha no envio do cupom #${oferta.id}: ${err.message} — caindo para aprovacao manual`);
+      try {
+        await enviarMensagem(GRUPOS.operador, {
+          text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+        });
+      } catch(e) { console.warn('[AUTO-FILA] Falha ao avisar operador:', e.message); }
+    }
+  } finally { _workerAutoRodando = false; }
+}, 15 * 1000);
+
 // ── PROCESSAR MENSAGEM DO TELEGRAM ────────────────────────────────────────────
 // Serializacao: o gate de dedup so roda DEPOIS da chamada a Anthropic (1-3s).
 // Sem mutex, o mesmo cupom chegando pelos dois canais com poucos segundos de
@@ -1302,6 +1397,12 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
         avaliadoEm: new Date().toISOString(),
       };
 
+      // Bloqueio APENAS temporal (janela/intervalo): todas as regras de conteudo
+      // passaram. Em modo 'on', em vez de exigir aprovacao manual, o cupom entra
+      // agendado e o worker de espacamento envia quando a condicao liberar.
+      const bloqueioTemporal = !veredito.auto && /^(fora da janela|intervalo minimo)/.test(veredito.motivo);
+      if (AUTO_ENVIO_MODO === 'on' && bloqueioTemporal) oferta.autoAgendado = true;
+
       // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
       // acerto do gate contra a aprovacao manual antes de ligar 'on'.
       if (AUTO_ENVIO_MODO === 'sombra') {
@@ -1310,20 +1411,7 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
 
       if (AUTO_ENVIO_MODO === 'on' && veredito.auto) {
         try {
-          const imagem = oferta.imagens?.[0];
-          if (imagem?.imagemBase64) {
-            await enviarMensagem(GRUPOS['tsp'], {
-              image: Buffer.from(imagem.imagemBase64, 'base64'),
-              caption: mensagemFormatada,
-              mimetype: imagem.mime || 'image/jpeg',
-            });
-          } else {
-            await enviarMensagem(GRUPOS['tsp'], { text: mensagemFormatada });
-          }
-          _ultimoAutoEnvio    = Date.now();
-          oferta.status       = 'enviado';
-          oferta.mensagemFinal = mensagemFormatada;
-          oferta.autoEnviado  = true;
+          await despacharCupomAuto(oferta);
           filaPendentes.unshift(oferta);
           salvarFila();
           console.log(`[AUTO] Cupom #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
@@ -1342,6 +1430,13 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       filaPendentes.unshift(oferta);
       salvarFila();
       console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${rotulo} (${veredito.motivo})`);
+
+      // Cupom agendado para auto-envio: sem alerta de aprovacao — o worker de
+      // espacamento avisa o operador quando de fato enviar (ou se expirar).
+      if (oferta.autoAgendado) {
+        console.log(`[AUTO-FILA] Cupom #${oferta.id} agendado para auto-envio com espacamento.`);
+        continue;
+      }
 
       // Alerta de novo cupom no grupo do operador
       try {
