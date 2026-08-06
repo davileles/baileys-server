@@ -1857,6 +1857,20 @@ const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"orige
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
 
 // ── PASSO 1: CLASSIFICAR (CDV) ────────────────────────────────────────────────
+// ── FILTRO: programas descartados automaticamente nos monitoramentos ─────────
+// Emissoes cujo programa seja Aeroplan ou Aegean nao devem alimentar a aba
+// Alertas do gerador-cdv — marcamos como invalidas (preserva indices p/ pareamento).
+const PROGRAMAS_BLOQUEADOS_ALERTA = /aeroplan|aegean/i;
+function filtrarProgramasBloqueados(resultados) {
+  return resultados.map(r => {
+    if (r?.valido && PROGRAMAS_BLOQUEADOS_ALERTA.test(String(r.programa || ''))) {
+      console.log('   [FILTRO] Descartada por programa bloqueado: ' + r.programa + ' (' + (r.origemCodigo || r.origem || '?') + '->' + (r.destinoCodigo || r.destino || '?') + ')');
+      return { ...r, valido: false };
+    }
+    return r;
+  });
+}
+
 async function classificarItens(itens, grupoId) {
   const resultados = [];
 
@@ -1940,7 +1954,7 @@ async function classificarItens(itens, grupoId) {
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
     }
-    return resultados;
+    return filtrarProgramasBloqueados(resultados);
   }
 
   if (grupoId === GRUPO_EXECUTIVA) {
@@ -1980,7 +1994,7 @@ async function classificarItens(itens, grupoId) {
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
     }
-    return resultados;
+    return filtrarProgramasBloqueados(resultados);
   }
 
   if (GRUPOS_TEXTO_ESTRUTURADO.has(grupoId)) {
@@ -2018,7 +2032,7 @@ async function classificarItens(itens, grupoId) {
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
     }
-    return resultados;
+    return filtrarProgramasBloqueados(resultados);
   }
 
   for (let i = 0; i < itens.length; i++) {
@@ -2055,7 +2069,7 @@ async function classificarItens(itens, grupoId) {
       resultados.push(r || { valido:false, indice:i });
     }
   }
-  return resultados;
+  return filtrarProgramasBloqueados(resultados);
 }
 
 // ── PASSO 2: AGRUPAR E FORMATAR (CDV) ─────────────────────────────────────────
