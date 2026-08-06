@@ -972,6 +972,28 @@ function appendHistoricoMensagem(msg, hist180) {
   return msg.slice(0, linkIdx) + bloco + msg.slice(linkIdx);
 }
 
+// ── FILTRO: preço fora da curva vs média 180 dias ────────────────────────────
+// Descarta emissões cujo valor supera a média dos últimos 180 dias da MESMA
+// chave (origem|destino|programa|cabine|cia — a mesma usada pelo proxy no
+// hist180) em mais de 30% (internacional) ou 50% (nacional). Valores tão
+// acima do histórico já computado não valem alerta.
+function precoForaDaCurva(pontos, hist180, tipoVoo) {
+  if (!hist180 || !hist180.mediaPts || hist180.count < 1) return false;
+  const pts = Number(pontos) || 0;
+  if (pts <= 0) return false;
+  const tipo = String(tipoVoo || '').toLowerCase();
+  // "internacional" contém "nacional" — teste de internacional vem primeiro;
+  // tipoVoo ausente assume internacional (mesmo default do restante do código)
+  const nacional = !/internacion/.test(tipo) && /nacion|domest/.test(tipo);
+  const fator  = nacional ? 1.50 : 1.30;
+  const limite = Math.round(hist180.mediaPts * fator);
+  if (pts > limite) {
+    console.log('[FILTRO-180D] Fora da curva: ' + pts.toLocaleString('pt-BR') + ' pts > limite ' + limite.toLocaleString('pt-BR') + ' (média ' + hist180.mediaPts.toLocaleString('pt-BR') + ' × ' + fator + ', ' + hist180.count + ' amostra(s), ' + (nacional ? 'nacional' : 'internacional') + ')');
+    return true;
+  }
+  return false;
+}
+
 // ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
 const LINKS_TSP = {
   'Amazon':        'https://amzn.to/4dFRSzy',
@@ -2117,6 +2139,10 @@ async function aguardarParIdaVolta(oferta, grupoId) {
       imagens: [...(base.imagens||[]), ...(volta.imagens||[])],
     };
     const hist180Par = await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
+    if (precoForaDaCurva(mesclada.dadosExtraidos?.pontos, hist180Par, mesclada.dadosExtraidos?.tipoVoo)) {
+      console.log('[PAR-BUFFER] Par mesclado descartado pelo filtro 180d: ' + (mesclada.dadosExtraidos?.origemCodigo) + '↔' + (mesclada.dadosExtraidos?.destinoCodigo));
+      return true; // consumido (descartado)
+    }
     mesclada.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV({ ...mesclada.dadosExtraidos }), hist180Par);
     mesclada.tipoConteudo = mesclada.imagens.length > 1 ? mesclada.imagens.length+' imagens' : mesclada.imagens.length === 1 ? 'imagem' : 'texto';
     filaPendentes.unshift(mesclada);
@@ -2132,6 +2158,10 @@ async function aguardarParIdaVolta(oferta, grupoId) {
       // Registra no proxy e appenda histórico (fire-and-update antes de entrar na fila)
       registrarPassagemProxy({ origem:oferta.dadosExtraidos?.origem||'', destino:oferta.dadosExtraidos?.destino||'', cia:oferta.dadosExtraidos?.cia||'', programa:oferta.dadosExtraidos?.programa||'', pontos:Number(oferta.dadosExtraidos?.pontos)||0, cabine:oferta.dadosExtraidos?.cabine||'Economica', datas_ida:oferta.dadosExtraidos?.datasIda||'', datas_volta:oferta.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true })
         .then(hist180 => {
+          if (precoForaDaCurva(oferta.dadosExtraidos?.pontos, hist180, oferta.dadosExtraidos?.tipoVoo)) {
+            console.log('[PAR-BUFFER] Somente-ida descartada pelo filtro 180d: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
+            return;
+          }
           if (hist180) oferta.mensagemFormatada = appendHistoricoMensagem(oferta.mensagemFormatada, hist180);
           filaPendentes.unshift(oferta);
           salvarFila();
@@ -2180,6 +2210,10 @@ async function processarBuffer(grupoId) {
         const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
         const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
         const hist180Bypass = await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta_pendente', apenasConsulta:true });
+        if (precoForaDaCurva(dados.pontos, hist180Bypass, dados.tipoVoo)) {
+          console.log('[BYPASS] Emissão descartada pelo filtro 180d: ' + v.origemCodigo + '->' + v.destinoCodigo + ' (' + v.programa + ')');
+          continue;
+        }
         const mensagem = appendHistoricoMensagem(formatarMensagemCDV(dados), hist180Bypass);
         // indices já contém os índices reais de itens[] — inclui par ida+volta após mesclarParesIdaVolta
         const imagens  = indices.map(i => itens[i]?.imagemBase64).filter(Boolean);
@@ -2226,6 +2260,10 @@ async function processarBuffer(grupoId) {
       }
 
       const hist180Normal = await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
+      if (precoForaDaCurva(emissao.pontos, hist180Normal, emissao.tipoVoo)) {
+        console.log('[FILTRO-180D] Emissão descartada: ' + emissao.origem + '->' + emissao.destino + ' (' + emissao.programa + ')');
+        continue;
+      }
       const mensagemComHist = appendHistoricoMensagem(emissao.mensagem, hist180Normal);
       const oferta = {
         id: gerarId(),
