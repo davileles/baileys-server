@@ -75,6 +75,113 @@ export function ehFonteRadar(jid) {
   return _cfg.ativo !== false && _cfg.papeis?.[jid] === 'fonte';
 }
 
+// ── MONITORAMENTO POR GRUPO ───────────────────────────────────────────────
+// Cada grupo-fonte precisa de um cadastro dizendo QUAIS lojas capturar e EM QUE
+// janela. Sem cadastro o grupo nao captura nada — marcar como fonte passa a ser
+// so metade da configuracao.
+//
+// A janela e restrita ao mesmo dia (inicio < fim); horarios e dia da semana sao
+// avaliados no fuso de Sao Paulo, nao no do servidor.
+
+export const LOJAS_MONITORAVEIS = ['Amazon', 'Shopee'];
+const TZ_SP = 'America/Sao_Paulo';
+
+function minutosAgoraSP(d = new Date()) {
+  const s = d.toLocaleString('en-GB', { timeZone: TZ_SP, hour12: false, hour: '2-digit', minute: '2-digit' });
+  const [h, m] = s.split(':').map(Number);
+  return h * 60 + m;
+}
+
+function diaSemanaSP(d = new Date()) {
+  const s = d.toLocaleDateString('en-US', { timeZone: TZ_SP, weekday: 'short' });
+  return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(s);
+}
+
+function paraMinutos(hhmm, padrao) {
+  const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return padrao;
+  const h = Number(m[1]), min = Number(m[2]);
+  if (h > 23 || min > 59) return padrao;
+  return h * 60 + min;
+}
+
+export function listarMonitor() { return _cfg.monitor || {}; }
+
+export function monitorDoGrupo(jid) { return (_cfg.monitor || {})[jid] || null; }
+
+export function salvarMonitor(jid, dados = {}) {
+  if (!jid) return null;
+  if (!_cfg.monitor) _cfg.monitor = {};
+  const anterior = _cfg.monitor[jid] || {};
+
+  const lojas = Array.isArray(dados.lojas)
+    ? dados.lojas.filter(l => LOJAS_MONITORAVEIS.includes(l))
+    : (anterior.lojas || []);
+
+  _cfg.monitor[jid] = {
+    jid,
+    lojas,
+    inicio: dados.inicio !== undefined ? String(dados.inicio) : (anterior.inicio || '00:00'),
+    fim:    dados.fim    !== undefined ? String(dados.fim)    : (anterior.fim    || '23:59'),
+    dias:   dados.dias === 'uteis' ? 'uteis' : (dados.dias === 'todos' ? 'todos' : (anterior.dias || 'todos')),
+    ativo:  dados.ativo !== undefined ? !!dados.ativo : (anterior.ativo !== false),
+    atualizadoEm: new Date().toISOString(),
+  };
+  salvarRadarConfig({ monitor: _cfg.monitor });
+  return _cfg.monitor[jid];
+}
+
+export function removerMonitor(jid) {
+  if (!_cfg.monitor?.[jid]) return false;
+  delete _cfg.monitor[jid];
+  salvarRadarConfig({ monitor: _cfg.monitor });
+  return true;
+}
+
+/**
+ * Decide se um grupo pode capturar uma loja neste instante.
+ * Devolve { ok, motivo } — o motivo alimenta o log, para um silencio no radar
+ * sempre ter explicacao.
+ */
+export function podeCapturar(jid, loja, quando = new Date()) {
+  const cfg = monitorDoGrupo(jid);
+  if (!cfg)             return { ok: false, motivo: 'grupo sem cadastro de monitoramento' };
+  if (cfg.ativo === false) return { ok: false, motivo: 'monitoramento desativado neste grupo' };
+  if (!cfg.lojas?.length)  return { ok: false, motivo: 'nenhuma loja selecionada' };
+  if (!cfg.lojas.includes(loja)) return { ok: false, motivo: loja + ' nao monitorada neste grupo' };
+
+  const dia = diaSemanaSP(quando);
+  if (cfg.dias === 'uteis' && (dia === 0 || dia === 6)) {
+    return { ok: false, motivo: 'fora dos dias uteis' };
+  }
+
+  const agora  = minutosAgoraSP(quando);
+  const inicio = paraMinutos(cfg.inicio, 0);
+  const fim    = paraMinutos(cfg.fim, 23 * 60 + 59);
+  if (agora < inicio || agora > fim) {
+    return { ok: false, motivo: 'fora da janela ' + cfg.inicio + '-' + cfg.fim + ' (agora ' +
+      String(Math.floor(agora / 60)).padStart(2, '0') + ':' + String(agora % 60).padStart(2, '0') + ' SP)' };
+  }
+  return { ok: true, motivo: 'dentro da janela' };
+}
+
+/**
+ * Garante cadastro para todo grupo marcado como fonte. Sem isto, ativar a regra
+ * "sem cadastro nao captura" desligaria em silencio os grupos ja configurados.
+ * O cadastro semeado e permissivo e fica visivel no painel para ajuste.
+ */
+export function semearMonitorDasFontes() {
+  const fontes = radarFontes();
+  let novos = 0;
+  for (const jid of fontes) {
+    if (monitorDoGrupo(jid)) continue;
+    salvarMonitor(jid, { lojas: [...LOJAS_MONITORAVEIS], inicio: '00:00', fim: '23:59', dias: 'todos', ativo: true });
+    novos++;
+  }
+  if (novos) console.log('[MONITOR] ' + novos + ' grupo(s) fonte receberam cadastro inicial (todas as lojas, 24h).');
+  return novos;
+}
+
 // ── DEDUPLICACAO ──────────────────────────────────────────────────────────
 // Persiste em disco para nao repostar o mesmo ASIN depois de um restart.
 
@@ -774,6 +881,7 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 }
 
 carregarRadarConfig();
+semearMonitorDasFontes();
 carregarTemplates();
 
 // ── VITRINE ───────────────────────────────────────────────────────────────
