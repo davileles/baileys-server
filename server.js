@@ -28,7 +28,7 @@ import {
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
-  carregarCuponsBase, carregarTemplates, carregarVitrine,
+  carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
 } from './radar-amazon.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -4105,6 +4105,13 @@ app.post('/cupons/base/:chave', (req, res) => {
 app.delete('/cupons/base/:chave', (req, res) => {
   if (!removerCupomBase(req.params.chave)) return res.status(404).json({ ok:false, erro:'Cupom nao encontrado.' });
   res.json({ ok:true });
+});
+
+// Diagnostico: descobre quais recursos a Creators API aceita para um ASIN.
+app.post('/mkt/sonda', async (req, res) => {
+  try {
+    res.json(await sondarRecursos(req.body?.asin, req.body?.recursos || []));
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // Cola um link e ve a mensagem que sairia, sem enfileirar nem publicar nada.
