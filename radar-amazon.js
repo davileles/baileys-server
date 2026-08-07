@@ -818,12 +818,22 @@ export function listarVitrine() {
   return Object.values(_vitrine).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
 }
 
+const NOME_PROVISORIO = /^Produto [A-Z0-9]{10}$/;
+
 export function salvarItemVitrine(item) {
   if (!item?.asin) return null;
   const anterior = _vitrine[item.asin];
+
+  // Um nome provisorio nunca sobrescreve um nome bom: o mesmo produto colado por
+  // dois formatos de link (um com slug, outro encurtado) perderia o nome legivel.
+  let nome = item.nome !== undefined ? item.nome : (anterior?.nome || '');
+  if (NOME_PROVISORIO.test(nome) && anterior?.nome && !NOME_PROVISORIO.test(anterior.nome)) {
+    nome = anterior.nome;
+  }
+
   _vitrine[item.asin] = {
     asin: item.asin,
-    nome: item.nome !== undefined ? item.nome : (anterior?.nome || ''),
+    nome,
     url: item.url || anterior?.url || '',
     loja: item.loja || anterior?.loja || 'Amazon',
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
@@ -866,7 +876,7 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
     // Link sem slug entra como "Produto ASIN"; o disparo e a primeira vez que
     // temos o titulo real, entao aproveita para gravar.
     let nome = salvo?.nome || p.titulo;
-    if (salvo && /^Produto [A-Z0-9]{10}$/.test(nome) && p.titulo) {
+    if (salvo && NOME_PROVISORIO.test(nome) && p.titulo) {
       nome = p.titulo; salvarItemVitrine({ asin: p.asin, nome });
     }
 
