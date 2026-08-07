@@ -576,6 +576,28 @@ const RECURSOS = [
   'customerReviews.count',
 ];
 
+/**
+ * Sonda de diagnostico: pede recursos arbitrarios a Creators API e devolve o
+ * JSON cru. Serve para descobrir o que a API expoe (ex.: promocao/cupom da
+ * pagina) sem arriscar o pipeline com um recurso invalido.
+ */
+export async function sondarRecursos(asin, recursos) {
+  const token = await getToken();
+  const partnerTag = _cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
+  const res = await fetch(API_BASE + '/catalog/v1/getItems', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'x-marketplace': MARKETPLACE },
+    body: JSON.stringify({
+      itemIds: [asin], itemIdType: 'ASIN', marketplace: MARKETPLACE,
+      partnerTag, partnerType: 'Associates', resources: recursos,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const texto = await res.text();
+  try { return { status: res.status, corpo: JSON.parse(texto) }; }
+  catch (e) { return { status: res.status, corpo: texto.slice(0, 600) }; }
+}
+
 // GetItems aceita ate 10 ASINs por chamada.
 export async function buscarProdutos(asins) {
   if (!asins.length) return [];
