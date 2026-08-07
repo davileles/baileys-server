@@ -4215,6 +4215,12 @@ app.get('/ml/callback', async (req, res) => {
 app.post('/ml/webhook', (req, res) => res.sendStatus(200));
 app.get('/ml/webhook', (req, res) => res.sendStatus(200));
 
+// Consulta crua de um item, para ver a resposta da API sem o pipeline no meio.
+app.get('/ml/item', async (req, res) => {
+  try { res.json({ ok:true, item: await buscarProdutoMl(req.query.id) }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.post('/ml/testar', async (req, res) => {
   try { res.json({ ok:true, resultados: await processarTextoMl(req.body?.texto || '') }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
