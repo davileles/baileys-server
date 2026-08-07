@@ -233,27 +233,28 @@ export function calcularDesconto(reg, preco) {
 }
 
 /**
- * Melhor cupom vigente para (loja, preco). Considera os codigos citados no
- * texto da oferta e tambem os cupons gerais vigentes da mesma loja — a base
- * costuma estar mais atualizada que o texto do grupo. Empate vai para o codigo
- * que veio citado.
+ * Melhor cupom para (loja, preco) DENTRE os codigos citados na mensagem
+ * original. Nao aplica cupom que a mensagem nao mencione: o cupom costuma valer
+ * para uma selecao especifica de produtos, e cruzar um cupom generico da base
+ * com um produto qualquer anunciaria um preco que nao existe no checkout.
+ * A base entra para fornecer as regras (percentual, minimo, teto) que o texto
+ * do grupo quase nunca traz por completo.
  */
 export function melhorCupom(loja, preco, textoOriginal = '') {
   const lojaKey = normalizarTexto(loja);
   const texto = normalizarTexto(textoOriginal);
+  if (!texto) return null;
   let melhor = null;
 
   for (const reg of Object.values(_cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== lojaKey) continue;
+    if (!reg.codigo || !texto.includes(normalizarTexto(reg.codigo))) continue;
 
     const desconto = calcularDesconto(reg, preco);
     if (desconto <= 0) continue;
 
-    const citado = !!reg.codigo && texto.includes(normalizarTexto(reg.codigo));
-    if (!melhor || desconto > melhor.desconto || (desconto === melhor.desconto && citado && !melhor.citado)) {
-      melhor = { reg, desconto, citado };
-    }
+    if (!melhor || desconto > melhor.desconto) melhor = { reg, desconto, citado: true };
   }
   return melhor;
 }
@@ -476,30 +477,10 @@ export function formatarOfertaAmazon(p, opcoes = {}) {
     msg += 'Por: R$ ' + brl(precoFinal) + '\n';
   }
 
-  if (cupom) {
-    const r = cupom.reg;
-    const detalhe = r.tipo === 'pct'
-      ? r.valor + '% OFF' + (r.limite != null ? ' (max R$ ' + brl(r.limite) + ')' : '')
-      : 'R$ ' + brl(r.valor) + ' OFF';
-    msg += '\n\uD83C\uDFAB *CUPOM* ' + r.codigo + ' \u2014 ' + detalhe;
-    if (r.minimo) msg += ' em compras acima de R$ ' + brl(r.minimo);
-    msg += '\n';
-  }
+  // Só o código: as regras (mínimo, teto, percentual) já foram aplicadas no
+  // preço acima, então repeti-las aqui só polui a mensagem.
+  if (cupom) msg += '\n\uD83C\uDFAB *CUPOM* ' + cupom.reg.codigo + '\n';
   msg += '\n';
-
-  const importantes = [];
-  const descTotal = (riscado && riscado > precoFinal)
-    ? Math.round((1 - precoFinal / riscado) * 100)
-    : p.desconto;
-  if (descTotal >= 40) importantes.push(descTotal + '% de desconto');
-  if (p.dealTermina) {
-    const fim = new Date(p.dealTermina).toLocaleString('pt-BR', {
-      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-      timeZone: 'America/Sao_Paulo',
-    });
-    importantes.push('Oferta relâmpago, termina em ' + fim);
-  }
-  if (importantes.length) msg += '⚠️ *IMPORTANTE* ' + importantes.join('. ') + '\n\n';
 
   msg += '🛒 *LOJA* AMAZON\n\n🔗 *LINK* ' + p.link + '\n\n';
   msg += '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`';
