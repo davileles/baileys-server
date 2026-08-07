@@ -107,6 +107,159 @@ function registrarVisto(p) {
   salvarVistos();
 }
 
+// ── BASE DE CUPONS ────────────────────────────────────────────────────────
+// Alimentada pelo mesmo ponto que registra a deduplicacao no server.js: todo
+// cupom capturado (Telegram ou WhatsApp) entra aqui com os campos que a IA ja
+// extrai. Serve para aplicar o desconto sobre o preco cheio que a Creators API
+// devolve, que e sempre o preco de tabela — a API nao conhece cupom.
+//
+// Validade: 2 dias a partir da captura, salvo se o registro for editado a mao
+// via endpoint. Flag 'ativo' permite desligar um cupom sem apagar o historico.
+
+const CUPONS_BASE_PATH = SESSAO_DIR + '/cupons_base.json';
+const CUPOM_VALIDADE_PADRAO_MS = 2 * 24 * 3600e3;
+
+let _cupons = {};   // chave -> registro
+
+function normalizarTexto(s) {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/^outro:\s*/, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+// Mesma logica de chave do dedup do server.js, para os dois lados baterem.
+export function chaveCupom(loja, codigo) {
+  const l = normalizarTexto(loja) || 'outros';
+  const c = normalizarTexto(codigo);
+  return c ? `${l}:${c}` : null;
+}
+
+export function carregarCuponsBase() {
+  try {
+    if (existsSync(CUPONS_BASE_PATH)) {
+      _cupons = JSON.parse(readFileSync(CUPONS_BASE_PATH, 'utf-8'));
+      console.log('[CUPONS] Base carregada — ' + Object.keys(_cupons).length + ' cupom(ns).');
+    }
+  } catch (e) { console.log('[CUPONS] Erro ao carregar base:', e.message); _cupons = {}; }
+  return _cupons;
+}
+
+function salvarCuponsBase() {
+  try {
+    // Purga o que venceu ha mais de 7 dias para o arquivo nao crescer sem fim.
+    const corte = Date.now() - 7 * 24 * 3600e3;
+    for (const k of Object.keys(_cupons)) {
+      if (new Date(_cupons[k].validadeAte).getTime() < corte) delete _cupons[k];
+    }
+    writeFileSync(CUPONS_BASE_PATH, JSON.stringify(_cupons, null, 2), 'utf-8');
+  } catch (e) { console.log('[CUPONS] Erro ao salvar base:', e.message); }
+}
+
+/**
+ * Grava (ou atualiza) um cupom na base a partir do objeto que a IA extraiu.
+ * Cupom sem codigo nao entra: sem codigo nao ha o que aplicar no checkout.
+ */
+export function registrarCupomBase(c) {
+  const chave = chaveCupom(c?.loja, c?.codigo);
+  if (!chave) return null;
+  const agora = Date.now();
+  const anterior = _cupons[chave];
+
+  const reg = {
+    chave,
+    loja: c.loja || null,
+    codigo: c.codigo,
+    tipo: c.tipo === 'reais' ? 'reais' : 'pct',
+    valor: Number(c.valor) || 0,
+    minimo: c.minimo === null || c.minimo === undefined ? null : Number(c.minimo),
+    limite: c.limite === null || c.limite === undefined ? null : Number(c.limite),
+    observacao: c.observacao || null,
+    capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
+    atualizadoEm: new Date(agora).toISOString(),
+    validadeAte: new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
+    // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
+    ativo: anterior ? anterior.ativo !== false : true,
+  };
+  _cupons[chave] = reg;
+  salvarCuponsBase();
+  console.log('[CUPONS] ' + (anterior ? 'Atualizado' : 'Novo') + ' — ' + reg.loja + ' ' + reg.codigo +
+    ' ' + reg.valor + (reg.tipo === 'pct' ? '%' : ' R$'));
+  return reg;
+}
+
+export function listarCuponsBase() {
+  return Object.values(_cupons).sort((a, b) => (a.loja || '').localeCompare(b.loja || '', 'pt-BR'));
+}
+
+export function atualizarCupomBase(chave, campos = {}) {
+  const reg = _cupons[chave];
+  if (!reg) return null;
+  for (const k of ['ativo', 'valor', 'minimo', 'limite', 'tipo', 'validadeAte', 'observacao']) {
+    if (campos[k] !== undefined) reg[k] = campos[k];
+  }
+  reg.atualizadoEm = new Date().toISOString();
+  salvarCuponsBase();
+  return reg;
+}
+
+export function removerCupomBase(chave) {
+  if (!_cupons[chave]) return false;
+  delete _cupons[chave];
+  salvarCuponsBase();
+  return true;
+}
+
+export function cupomVigente(reg) {
+  return !!reg && reg.ativo !== false && new Date(reg.validadeAte).getTime() > Date.now();
+}
+
+/**
+ * Desconto em R$ que o cupom gera sobre um preco. 0 quando nao se aplica.
+ * O teto ('limite') so faz sentido em cupom percentual.
+ */
+export function calcularDesconto(reg, preco) {
+  if (!reg || !preco || preco <= 0) return 0;
+  if (reg.minimo != null && preco < reg.minimo) return 0;
+
+  let d = reg.tipo === 'reais'
+    ? (Number(reg.valor) || 0)
+    : preco * (Number(reg.valor) || 0) / 100;
+
+  if (reg.tipo === 'pct' && reg.limite != null) d = Math.min(d, Number(reg.limite));
+  d = Math.min(d, preco);                       // nunca zera ou inverte o preco
+  return d > 0 ? Math.round(d * 100) / 100 : 0;
+}
+
+/**
+ * Melhor cupom vigente para (loja, preco). Considera os codigos citados no
+ * texto da oferta e tambem os cupons gerais vigentes da mesma loja — a base
+ * costuma estar mais atualizada que o texto do grupo. Empate vai para o codigo
+ * que veio citado.
+ */
+export function melhorCupom(loja, preco, textoOriginal = '') {
+  const lojaKey = normalizarTexto(loja);
+  const texto = normalizarTexto(textoOriginal);
+  let melhor = null;
+
+  for (const reg of Object.values(_cupons)) {
+    if (!cupomVigente(reg)) continue;
+    if (normalizarTexto(reg.loja) !== lojaKey) continue;
+
+    const desconto = calcularDesconto(reg, preco);
+    if (desconto <= 0) continue;
+
+    const citado = !!reg.codigo && texto.includes(normalizarTexto(reg.codigo));
+    if (!melhor || desconto > melhor.desconto || (desconto === melhor.desconto && citado && !melhor.citado)) {
+      melhor = { reg, desconto, citado };
+    }
+  }
+  return melhor;
+}
+
+carregarCuponsBase();
+
 // ── EXTRACAO DE ASIN ──────────────────────────────────────────────────────
 
 const PADROES_ASIN = [
@@ -311,14 +464,34 @@ export function formatarOfertaAmazon(p, opcoes = {}) {
 
   msg += '*' + encurtarTitulo(p.titulo) + '*\n\n';
 
-  if (p.precoDe && p.desconto > 0) {
-    msg += 'De: ~R$ ' + brl(p.precoDe) + '~\nPor: R$ ' + brl(p.preco) + '\n\n';
+  // Com cupom aplicavel, o 'Por' passa a ser o preco final e o riscado vira o
+  // maior valor conhecido (preco de lista, ou o proprio preco cheio da API).
+  const cupom = opcoes.cupom || null;
+  const precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
+  const riscado = cupom ? (p.precoDe || p.preco) : p.precoDe;
+
+  if (riscado && riscado > precoFinal) {
+    msg += 'De: ~R$ ' + brl(riscado) + '~\nPor: R$ ' + brl(precoFinal) + '\n';
   } else {
-    msg += 'Por: R$ ' + brl(p.preco) + '\n\n';
+    msg += 'Por: R$ ' + brl(precoFinal) + '\n';
   }
 
+  if (cupom) {
+    const r = cupom.reg;
+    const detalhe = r.tipo === 'pct'
+      ? r.valor + '% OFF' + (r.limite != null ? ' (max R$ ' + brl(r.limite) + ')' : '')
+      : 'R$ ' + brl(r.valor) + ' OFF';
+    msg += '\n\uD83C\uDFAB *CUPOM* ' + r.codigo + ' \u2014 ' + detalhe;
+    if (r.minimo) msg += ' em compras acima de R$ ' + brl(r.minimo);
+    msg += '\n';
+  }
+  msg += '\n';
+
   const importantes = [];
-  if (p.desconto >= 40) importantes.push(p.desconto + '% de desconto');
+  const descTotal = (riscado && riscado > precoFinal)
+    ? Math.round((1 - precoFinal / riscado) * 100)
+    : p.desconto;
+  if (descTotal >= 40) importantes.push(descTotal + '% de desconto');
   if (p.dealTermina) {
     const fim = new Date(p.dealTermina).toLocaleString('pt-BR', {
       day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
@@ -366,7 +539,19 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
       continue;
     }
 
-    saida.push({ produto: p, mensagem: formatarOfertaAmazon(p, opcoes) });
+    // A API devolve sempre o preco de tabela; o cupom vem da base alimentada
+    // pelo pipeline de cupons e e aplicado aqui sobre esse preco cheio.
+    const cupom = melhorCupom(p.loja, p.preco, texto);
+    if (cupom) {
+      console.log('[MKT] ' + p.asin + ' + cupom ' + cupom.reg.codigo +
+        ' (-R$ ' + cupom.desconto.toFixed(2) + ')' + (cupom.citado ? ' [citado no texto]' : ''));
+    }
+    saida.push({
+      produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado } : null,
+      precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      mensagem: formatarOfertaAmazon(p, { ...opcoes, cupom }),
+    });
     if (!opcoes.ignorarDedup) registrarVisto(p);
   }
   return saida;

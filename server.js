@@ -21,6 +21,7 @@ import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
   processarTextoAmazon,
+  registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase,
 } from './radar-amazon.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -1467,6 +1468,9 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       // Registra ANTES de qualquer envio: se o envio falhar preferimos perder um
       // cupom a arriscar mandar duplicado quando o outro canal repostar.
       registrarCupomVisto(c);
+      // Mesmo ponto, mesma garantia: o cupom entra na base antes de qualquer
+      // envio, para ja estar disponivel quando uma oferta do radar chegar.
+      try { registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
 
       const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos, codigosLista);
       const rotulo   = `${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
@@ -2574,6 +2578,8 @@ async function processarRadarMarketplace(jid, texto) {
         link: p.link,
         vendedor: p.vendedor,
         ehDeal: p.ehDeal,
+        cupom: r.cupom || null,
+        precoFinal: r.precoFinal ?? p.preco,
       },
       imagens: imagem ? [imagem] : [],
       status: 'pendente',
@@ -3665,6 +3671,33 @@ app.post('/mkt/config', (req, res) => {
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── BASE DE CUPONS ───────────────────────────────────────────────────────────
+// Alimentada automaticamente pelo pipeline de cupons. Estes endpoints existem
+// para o operador corrigir um valor mal extraido ou desligar um cupom que a
+// loja derrubou antes da validade.
+app.get('/cupons/base', (req, res) => {
+  const itens = listarCuponsBase();
+  const agora = Date.now();
+  res.json({
+    ok: true,
+    total: itens.length,
+    vigentes: itens.filter(c => c.ativo !== false && new Date(c.validadeAte).getTime() > agora).length,
+    itens,
+  });
+});
+
+app.post('/cupons/base/:chave', (req, res) => {
+  const reg = atualizarCupomBase(req.params.chave, req.body || {});
+  if (!reg) return res.status(404).json({ ok:false, erro:'Cupom nao encontrado: ' + req.params.chave });
+  console.log('[CUPONS] Editado via painel — ' + reg.chave);
+  res.json({ ok:true, cupom: reg });
+});
+
+app.delete('/cupons/base/:chave', (req, res) => {
+  if (!removerCupomBase(req.params.chave)) return res.status(404).json({ ok:false, erro:'Cupom nao encontrado.' });
+  res.json({ ok:true });
 });
 
 // Cola um link e ve a mensagem que sairia, sem enfileirar nem publicar nada.
