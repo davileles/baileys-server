@@ -254,7 +254,13 @@ export async function processarTextoMl(texto) {
   for (const id of ids) {
     let it;
     try { it = await buscarProdutoMl(id); }
-    catch (e) { console.error('[ML] Falha ao consultar ' + id + ':', e.message); continue; }
+    catch (e) {
+      console.error('[ML] Falha ao consultar ' + id + ':', e.message);
+      // Erro de API precisa aparecer no teste, senao o resultado vazio nao
+      // distingue "link nao reconhecido" de "consulta rejeitada".
+      saida.push({ produto: { id, loja: 'Mercado Livre' }, descartadoPor: 'API: ' + e.message });
+      continue;
+    }
 
     const p = normalizarMl(it);
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
