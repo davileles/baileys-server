@@ -2527,6 +2527,18 @@ const _filaGrupo = new Map(); // jid → Promise (última tarefa na fila)
 // Buffer circular de diagnostico dos ultimos upserts recebidos (ver /debug-upserts).
 const _debugUpserts = [];
 
+// jid -> nome do grupo. Preenchido sob demanda para o painel mostrar de onde
+// veio cada oferta sem depender de uma chamada extra ao WhatsApp.
+const NOMES_GRUPOS = new Map();
+async function atualizarNomesGrupos() {
+  if (!sock || !conectado) return;
+  try {
+    const chats = await sock.groupFetchAllParticipating();
+    for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
+    console.log('[GRUPOS] Cache de nomes atualizado — ' + NOMES_GRUPOS.size + ' grupo(s).');
+  } catch (e) { console.warn('[GRUPOS] Falha ao atualizar cache de nomes:', e.message); }
+}
+
 // Arquivos de ./sessao que sobrevivem a um reset completo: nao sao credenciais
 // do WhatsApp e nao se regeneram sozinhos. Ao criar um arquivo novo nessa pasta,
 // avaliar se ele pertence a esta lista.
@@ -2653,6 +2665,10 @@ async function processarRadarMarketplace(jid, texto) {
         precoFinal: r.precoFinal ?? p.preco,
       },
       imagens: imagem ? [imagem] : [],
+      // Nome do grupo resolvido na captura: no painel o jid sozinho nao diz nada,
+      // e a lista de grupos pode nao estar carregada quando a fila renderiza.
+      grupoOrigem: jid,
+      grupoOrigemNome: (NOMES_GRUPOS.get(jid) || null),
       status: 'pendente',
       timestamp: new Date().toISOString(),
     };
@@ -2934,6 +2950,8 @@ async function conectar() {
         _erros500Consecutivos = 0;
         resetarHealthTimer();
         console.log('[WA] ✓ WhatsApp conectado!');
+        // Aquece o cache de nomes: a fila mostra de qual grupo veio cada oferta.
+        atualizarNomesGrupos().catch(()=>{});
       }
       if (connection === 'close') {
         // Ignora eventos de sock antigo (pode acontecer durante troca de instância)
@@ -3308,6 +3326,11 @@ app.post('/api/claude', async (req, res) => {
     const resp = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-api-key':process.env.ANTHROPIC_API_KEY, 'anthropic-version':'2023-06-01' }, body:JSON.stringify(req.body) });
     res.json(await resp.json());
   } catch(e) { res.status(500).json({ error:{ message:e.message } }); }
+});
+
+app.get('/grupos/nomes', (req, res) => {
+  if (!NOMES_GRUPOS.size) atualizarNomesGrupos().catch(()=>{});
+  res.json({ ok:true, nomes: Object.fromEntries(NOMES_GRUPOS) });
 });
 
 app.get('/painel-json', (req, res) => {
@@ -4083,6 +4106,7 @@ app.get('/grupos', async (req, res) => {
   }
   try {
     const chats  = await sock.groupFetchAllParticipating();
+    for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
     const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
     res.json({ ok:true, total:grupos.length, grupos });
   } catch(err) {
