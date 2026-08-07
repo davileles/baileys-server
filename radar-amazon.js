@@ -370,20 +370,40 @@ export function calcularDesconto(reg, preco) {
   return d > 0 ? Math.round(d * 100) / 100 : 0;
 }
 
-/**
- * Melhor cupom para (loja, preco) DENTRE os codigos citados na mensagem
- * original. Nao aplica cupom que a mensagem nao mencione: o cupom costuma valer
- * para uma selecao especifica de produtos, e cruzar um cupom generico da base
- * com um produto qualquer anunciaria um preco que nao existe no checkout.
- * A base entra para fornecer as regras (percentual, minimo, teto) que o texto
- * do grupo quase nunca traz por completo.
- */
 /** Busca um cupom da base pelo par (loja, codigo). Usado pela vitrine. */
 export function cupomPorCodigo(loja, codigo) {
   const k = chaveCupom(loja, codigo);
   return k ? (_cupons[k] || null) : null;
 }
 
+// Mensagens que falam de cupom sem dar o codigo: "resgate cupom do anuncio",
+// "com cupom", "aplique o cupom". Exige a palavra cupom — nao inferimos cupom a
+// partir de "desconto" ou "promocao", que aparecem em qualquer oferta.
+const REGEX_CUPOM_GENERICO = /\bcupom\b|\bcupons\b|\bcoupon\b/i;
+
+/** Cupom vigente mais recente de uma loja, pela data de captura. */
+export function ultimoCupomDaLoja(loja) {
+  const alvo = normalizarTexto(loja);
+  let recente = null;
+  for (const reg of Object.values(_cupons)) {
+    if (!cupomVigente(reg)) continue;
+    if (normalizarTexto(reg.loja) !== alvo) continue;
+    if (!recente || new Date(reg.capturadoEm) > new Date(recente.capturadoEm)) recente = reg;
+  }
+  return recente;
+}
+
+/**
+ * Melhor cupom para (loja, preco), em duas etapas:
+ *
+ *   1. Codigo citado na mensagem — caminho preferencial. A base entra so para
+ *      dar as regras (percentual, minimo, teto) que o texto raramente traz.
+ *   2. Se a mensagem fala de cupom mas nao da o codigo ("resgate cupom do
+ *      anuncio"), usa o ultimo cupom registrado para aquela loja.
+ *
+ * Fora esses dois casos nao aplica nada: cruzar um cupom qualquer com um produto
+ * que nunca falou em cupom anunciaria um preco que nao existe no checkout.
+ */
 export function melhorCupom(loja, preco, textoOriginal = '') {
   const lojaKey = normalizarTexto(loja);
   const texto = normalizarTexto(textoOriginal);
@@ -400,7 +420,15 @@ export function melhorCupom(loja, preco, textoOriginal = '') {
 
     if (!melhor || desconto > melhor.desconto) melhor = { reg, desconto, citado: true };
   }
-  return melhor;
+  if (melhor) return melhor;
+
+  // Etapa 2: mencao generica ao cupom, sem codigo.
+  if (!REGEX_CUPOM_GENERICO.test(String(textoOriginal))) return null;
+  const reg = ultimoCupomDaLoja(loja);
+  if (!reg) return null;
+  const desconto = calcularDesconto(reg, preco);
+  if (desconto <= 0) return null;
+  return { reg, desconto, citado: false, generico: true };
 }
 
 carregarCuponsBase();
@@ -871,11 +899,13 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
     const cupom = melhorCupom(p.loja, p.preco, texto);
     if (cupom) {
       console.log('[MKT] ' + p.asin + ' + cupom ' + cupom.reg.codigo +
-        ' (-R$ ' + cupom.desconto.toFixed(2) + ')' + (cupom.citado ? ' [citado no texto]' : ''));
+        ' (-R$ ' + cupom.desconto.toFixed(2) + ')' +
+        (cupom.citado ? ' [citado no texto]' : ' [ultimo da loja — texto cita cupom sem codigo]'));
     }
     saida.push({
       produto: p,
-      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado } : null,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado,
+                       generico: !!cupom.generico } : null,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaAmazon(p, { ...opcoes, cupom }),
     });
