@@ -276,6 +276,34 @@ export async function verificarTokenAff(urlTeste, aoFalhar) {
   }
 }
 
+/**
+ * Se o token for um JWT, le o payload sem validar assinatura. Responde duas
+ * perguntas sem expor o segredo: para qual API ele serve (iss/aud) e se tem
+ * prazo de validade (exp).
+ */
+export function inspecionarTokenAff() {
+  const tk = (process.env.ML_AFF_TOKEN || '').replace(/^Bearer\s+/i, '').trim();
+  if (!tk) return { configurado: false };
+  const base = { configurado: true, tamanho: tk.length, prefixo: tk.slice(0, 6) + '…', formatoJwt: false };
+  const partes = tk.split('.');
+  if (partes.length !== 3) return { ...base, observacao: 'nao e JWT — provavelmente token opaco de sessao' };
+  try {
+    const payload = JSON.parse(Buffer.from(partes[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'));
+    const exp = payload.exp ? new Date(payload.exp * 1000) : null;
+    return {
+      ...base, formatoJwt: true,
+      emissor: payload.iss || null,
+      audiencia: payload.aud || null,
+      escopos: payload.scope || payload.scopes || null,
+      emitidoEm: payload.iat ? new Date(payload.iat * 1000).toISOString() : null,
+      expiraEm: exp ? exp.toISOString() : null,
+      jaExpirou: exp ? exp.getTime() < Date.now() : null,
+      duracaoHoras: (payload.exp && payload.iat) ? Math.round((payload.exp - payload.iat) / 360) / 10 : null,
+      campos: Object.keys(payload).sort(),
+    };
+  } catch (e) { return { ...base, erro: 'falha ao decodificar payload: ' + e.message }; }
+}
+
 /** Sonda: chama qualquer caminho da API com o token atual. Diagnostico. */
 export async function sondarMl(caminho) {
   const token = await tokenValido();
