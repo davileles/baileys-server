@@ -3688,6 +3688,30 @@ app.get('/cupons/base', (req, res) => {
   });
 });
 
+// Criacao manual (um objeto ou um array). Usa o mesmo caminho de gravacao da
+// captura automatica, entao um cupom semeado a mao e indistinguivel de um
+// capturado do grupo — inclusive na validade de 2 dias.
+app.post('/cupons/base', (req, res) => {
+  const body = req.body;
+  const lista = Array.isArray(body) ? body : [body];
+  const criados = [], erros = [];
+
+  for (const c of lista) {
+    if (!c?.loja || !c?.codigo) { erros.push({ item: c, erro: 'loja e codigo sao obrigatorios' }); continue; }
+    if (c.valor === undefined || c.valor === null || !isFinite(Number(c.valor)) || Number(c.valor) <= 0) {
+      erros.push({ item: c, erro: 'valor deve ser numero maior que zero' }); continue;
+    }
+    try {
+      const reg = registrarCupomBase(c);
+      // Validade explicita sobrescreve o padrao de 2 dias.
+      const final = c.validadeAte ? atualizarCupomBase(reg.chave, { validadeAte: c.validadeAte }) : reg;
+      criados.push(final);
+    } catch (e) { erros.push({ item: c, erro: e.message }); }
+  }
+  console.log('[CUPONS] Criacao manual — ' + criados.length + ' ok, ' + erros.length + ' erro(s).');
+  res.status(erros.length && !criados.length ? 400 : 200).json({ ok: !!criados.length, criados, erros });
+});
+
 app.post('/cupons/base/:chave', (req, res) => {
   const reg = atualizarCupomBase(req.params.chave, req.body || {});
   if (!reg) return res.status(404).json({ ok:false, erro:'Cupom nao encontrado: ' + req.params.chave });
