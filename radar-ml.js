@@ -204,6 +204,18 @@ export function comTagAfiliado(url) {
 
 // ── PRODUTOS ──────────────────────────────────────────────────────────────
 
+/** Sonda: chama qualquer caminho da API com o token atual. Diagnostico. */
+export async function sondarMl(caminho) {
+  const token = await tokenValido();
+  const res = await fetch(API + caminho, {
+    headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
+    signal: AbortSignal.timeout(20000),
+  });
+  const texto = await res.text();
+  let corpo; try { corpo = JSON.parse(texto); } catch (e) { corpo = texto.slice(0, 300); }
+  return { status: res.status, corpo };
+}
+
 export async function buscarProdutoMl(id) {
   return apiMl('/items/' + encodeURIComponent(id));
 }
