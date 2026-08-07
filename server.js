@@ -4114,6 +4114,38 @@ app.post('/mkt/sonda', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// Sonda de rede: busca uma URL a partir do Railway e resume a resposta. Existe
+// porque o bloqueio anti-bot depende do IP de origem — testar do meu ambiente
+// nao diz nada sobre o que o servidor consegue acessar.
+app.get('/sonda-url', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
+  try {
+    const r = await fetch(url, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none', 'Upgrade-Insecure-Requests': '1',
+      },
+      signal: AbortSignal.timeout(25000),
+    });
+    const html = await r.text();
+    const titulo = (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || null;
+    const precos = [...html.matchAll(/"price"\s*:\s*"?([\d.,]+)/gi)].slice(0,4).map(m=>m[1]);
+    res.json({
+      ok: r.ok, status: r.status, urlFinal: r.url, tamanho: html.length, titulo,
+      temNextData: html.includes('__NEXT_DATA__'),
+      temLdJson: html.includes('application/ld+json'),
+      bloqueado: /captcha|nao e possivel acessar|não é possível acessar|access denied/i.test(html),
+      precosEncontrados: precos,
+      amostra: html.slice(0, 260),
+    });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 // Cola um link e ve a mensagem que sairia, sem enfileirar nem publicar nada.
 app.post('/mkt/testar', async (req, res) => {
   try {
