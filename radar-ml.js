@@ -204,6 +204,78 @@ export function comTagAfiliado(url) {
 
 // ── PRODUTOS ──────────────────────────────────────────────────────────────
 
+// ── TOKEN DO PAINEL DE AFILIADOS ──────────────────────────────────────────
+// A API publica so devolve itens do proprio vendedor (403 para terceiros), entao
+// os dados de produto vem da API interna do painel de afiliados — a mesma que a
+// extensao do Busqy usa. O token vive em ML_AFF_TOKEN.
+//
+// Nao sabemos de antemao se esse token expira: o operador relata meses sem
+// precisar trocar. Por isso o monitor abaixo nao assume validade — ele testa
+// periodicamente e avisa no ato se parar de funcionar.
+
+let _saudeAff = { ok: null, verificadoEm: null, erro: null, avisado: false };
+
+export function tokenAffOk() { return !!process.env.ML_AFF_TOKEN; }
+export function saudeAff() { return { ..._saudeAff, configurado: tokenAffOk() }; }
+
+/** Chamada crua a um endpoint do painel de afiliados, com o token de sessao. */
+export async function chamarAff(url, opcoes = {}) {
+  const tk = process.env.ML_AFF_TOKEN;
+  if (!tk) throw new Error('ML_AFF_TOKEN nao configurado');
+  const res = await fetch(url, {
+    ...opcoes,
+    headers: {
+      'Authorization': tk.startsWith('Bearer ') ? tk : 'Bearer ' + tk,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+      ...(opcoes.headers || {}),
+    },
+    signal: AbortSignal.timeout(20000),
+  });
+  const texto = await res.text();
+  let corpo; try { corpo = JSON.parse(texto); } catch (e) { corpo = texto.slice(0, 400); }
+  return { status: res.status, corpo, ok: res.ok };
+}
+
+/**
+ * Verifica se o token ainda responde. Chamado no boot e periodicamente.
+ * @param {function} aoFalhar  callback para avisar o operador na primeira falha
+ */
+export async function verificarTokenAff(urlTeste, aoFalhar) {
+  if (!tokenAffOk()) {
+    _saudeAff = { ok: false, verificadoEm: new Date().toISOString(),
+                  erro: 'ML_AFF_TOKEN nao configurado', avisado: _saudeAff.avisado };
+    return _saudeAff;
+  }
+  try {
+    const r = await chamarAff(urlTeste);
+    const valido = r.ok && r.status !== 401 && r.status !== 403;
+    const antes = _saudeAff.ok;
+    _saudeAff = {
+      ok: valido,
+      verificadoEm: new Date().toISOString(),
+      erro: valido ? null : ('HTTP ' + r.status),
+      // Avisa uma vez por queda; se voltar a funcionar, rearma o aviso.
+      avisado: valido ? false : _saudeAff.avisado,
+    };
+    if (!valido && !_saudeAff.avisado && typeof aoFalhar === 'function') {
+      _saudeAff.avisado = true;
+      await aoFalhar('HTTP ' + r.status);
+    }
+    if (valido && antes === false) console.log('[ML-AFF] Token voltou a funcionar.');
+    return _saudeAff;
+  } catch (e) {
+    _saudeAff = { ok: false, verificadoEm: new Date().toISOString(), erro: e.message, avisado: _saudeAff.avisado };
+    if (!_saudeAff.avisado && typeof aoFalhar === 'function') {
+      _saudeAff.avisado = true;
+      await aoFalhar(e.message);
+    }
+    return _saudeAff;
+  }
+}
+
 /** Sonda: chama qualquer caminho da API com o token atual. Diagnostico. */
 export async function sondarMl(caminho) {
   const token = await tokenValido();
