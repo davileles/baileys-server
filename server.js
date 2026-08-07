@@ -2489,6 +2489,9 @@ async function processarBuffer(grupoId) {
 // Grupos diferentes processam em paralelo entre si.
 const _filaGrupo = new Map(); // jid → Promise (última tarefa na fila)
 
+// Buffer circular de diagnostico dos ultimos upserts recebidos (ver /debug-upserts).
+const _debugUpserts = [];
+
 function enfileirarPorGrupo(jid, fn) {
   const anterior = _filaGrupo.get(jid) || Promise.resolve();
   const proxima  = anterior.then(() => fn()).catch(err => {
@@ -2889,6 +2892,23 @@ async function conectar() {
       }
     });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      // Diagnostico: registra o evento CRU, antes de qualquer filtro. Sem isso
+      // nao da para distinguir "socket nao recebe nada" de "recebe e descarta".
+      try {
+        for (const mm of (messages || [])) {
+          _debugUpserts.push({
+            em: new Date().toISOString(),
+            type,
+            jid: mm.key?.remoteJid || null,
+            fromMe: !!mm.key?.fromMe,
+            monitorado: GRUPOS_MONITORADOS.includes(mm.key?.remoteJid),
+            fonteRadar: ehFonteRadar(mm.key?.remoteJid),
+            chaves: mm.message ? Object.keys(mm.message) : null,
+            stub: mm.messageStubType ?? null,
+          });
+          if (_debugUpserts.length > 60) _debugUpserts.shift();
+        }
+      } catch (e) {}
       if (conectado) resetarHealthTimer();
       if (type !== 'notify') {
         // Upserts 'append' (sync/reconexão) eram descartados sem rastro.
@@ -3010,6 +3030,15 @@ app.post('/reconectar', async (req, res) => {
   if (sockRef) { try { sockRef.end(new Error('manual-reconnect')); } catch(e) {} }
   _agendarReconexao(1000);
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
+});
+
+app.get('/debug-upserts', (req, res) => {
+  res.json({
+    ok: true,
+    total: _debugUpserts.length,
+    ultimoEventoEm: _debugUpserts.length ? _debugUpserts[_debugUpserts.length - 1].em : null,
+    eventos: _debugUpserts.slice().reverse(),
+  });
 });
 
 app.get('/debug-fila', (req, res) => {
