@@ -520,19 +520,27 @@ const TEMPLATES_PATH = SESSAO_DIR + '/templates.json';
 const TEMPLATE_PADRAO = [
   '*{{titulo_curto}}*',
   '',
-  '{{#preco_de}}De: ~R$ {{preco_de}}~',
-  '{{/preco_de}}Por: R$ {{preco}}',
-  '{{#cupom}}',
+  'De: ~R$ {{preco_de}}~',
+  'Por: R$ {{preco}}',
+  '',
   '\uD83C\uDFAB *CUPOM* {{cupom}}',
-  '{{/cupom}}',
-  '{{#alerta}}',
   '\u26A0\uFE0F *IMPORTANTE* {{alerta}}',
-  '{{/alerta}}',
   '',
   '\uD83D\uDED2 *LOJA* {{loja_upper}}',
   '',
   '\uD83D\uDD17 *LINK* {{link}}',
   '',
+  '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`',
+].join('\n');
+
+// Corpo da versao anterior, que exigia {{#var}}...{{/var}}. Serve so para
+// reconhecer o padrao nao editado e migra-lo para a sintaxe simples — template
+// que o operador ja customizou nao e tocado.
+const TEMPLATE_PADRAO_LEGADO = [
+  '*{{titulo_curto}}*', '', '{{#preco_de}}De: ~R$ {{preco_de}}~', '{{/preco_de}}Por: R$ {{preco}}',
+  '{{#cupom}}', '\uD83C\uDFAB *CUPOM* {{cupom}}', '{{/cupom}}', '{{#alerta}}',
+  '\u26A0\uFE0F *IMPORTANTE* {{alerta}}', '{{/alerta}}', '', '\uD83D\uDED2 *LOJA* {{loja_upper}}',
+  '', '\uD83D\uDD17 *LINK* {{link}}', '',
   '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`',
 ].join('\n');
 
@@ -553,6 +561,11 @@ export function carregarTemplates() {
     _templates._padrao = { nome: 'Padrão', corpo: TEMPLATE_PADRAO, usarLinkPreview: true,
                            atualizadoEm: new Date().toISOString() };
     salvarTemplates();
+  } else if ((_templates._padrao.corpo || '').trim() === TEMPLATE_PADRAO_LEGADO.trim()) {
+    _templates._padrao.corpo = TEMPLATE_PADRAO;
+    _templates._padrao.atualizadoEm = new Date().toISOString();
+    salvarTemplates();
+    console.log('[TPL] Padrao migrado para a sintaxe sem condicionais.');
   }
   console.log('[TPL] ' + Object.keys(_templates).length + ' template(s) carregado(s).');
   return _templates;
@@ -593,14 +606,26 @@ export function removerTemplate(loja) {
 }
 
 export function renderTemplate(corpo, vars) {
-  let out = String(corpo || '');
   const vazio = v => v === null || v === undefined || v === '' || v === false;
+  let out = String(corpo || '');
 
+  // Condicionais explicitas seguem valendo para casos que a regra de linha nao
+  // cobre (bloco de varias linhas, ou negacao com {{^var}}).
   out = out.replace(/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, k, dentro) => vazio(vars[k]) ? '' : dentro);
   out = out.replace(/\{\{\^(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, k, dentro) => vazio(vars[k]) ? dentro : '');
-  out = out.replace(/\{\{(\w+)\}\}/g, (_, k) => vazio(vars[k]) ? '' : String(vars[k]));
 
-  // Condicional que nao renderiza deixa linha em branco sobrando: colapsa.
+  // Omissao automatica: uma linha que so contem variaveis vazias nao tem o que
+  // dizer, entao sai inteira. Assim "De: ~R$ {{preco_de}}~" desaparece sozinho
+  // quando nao ha preco de lista, sem o operador escrever condicional nenhuma.
+  // Linha sem variavel e texto fixo e nunca some; linha com pelo menos uma
+  // variavel preenchida e mantida.
+  out = out.split('\n').filter(linha => {
+    const usadas = (linha.match(/\{\{(\w+)\}\}/g) || []).map(t => t.slice(2, -2));
+    if (!usadas.length) return true;
+    return usadas.some(k => !vazio(vars[k]));
+  }).join('\n');
+
+  out = out.replace(/\{\{(\w+)\}\}/g, (_, k) => vazio(vars[k]) ? '' : String(vars[k]));
   return out.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
