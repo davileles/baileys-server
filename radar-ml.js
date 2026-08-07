@@ -218,15 +218,38 @@ let _saudeAff = { ok: null, verificadoEm: null, erro: null, avisado: false };
 export function tokenAffOk() { return !!process.env.ML_AFF_TOKEN; }
 export function saudeAff() { return { ..._saudeAff, configurado: tokenAffOk() }; }
 
-/** Chamada crua a um endpoint do painel de afiliados, com o token de sessao. */
+/**
+ * O token e o cookie de sessao do ML em base64 (comeca com c3NpZD…, que decodifica
+ * para "ssid="). Vai no header Cookie, nao em Authorization — foi por isso que a
+ * primeira tentativa deu 404/403.
+ */
+export function cookieAff() {
+  const bruto = (process.env.ML_AFF_TOKEN || '').trim();
+  if (!bruto) return null;
+  try {
+    const decodificado = Buffer.from(bruto, 'base64').toString('utf-8');
+    // So aceita se decodificar em algo com cara de cookie; senao usa como veio.
+    if (/^[\w-]+=/.test(decodificado)) return decodificado;
+  } catch (e) {}
+  return bruto;
+}
+
+/** Nomes dos cookies presentes, sem revelar valores. */
+export function chavesCookieAff() {
+  const c = cookieAff();
+  if (!c) return [];
+  return c.split(/;\s*/).map(p => p.split('=')[0]).filter(Boolean);
+}
+
+/** Chamada crua a um endpoint do painel de afiliados, com o cookie de sessao. */
 export async function chamarAff(url, opcoes = {}) {
-  const tk = process.env.ML_AFF_TOKEN;
-  if (!tk) throw new Error('ML_AFF_TOKEN nao configurado');
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
   const res = await fetch(url, {
     ...opcoes,
     headers: {
-      'Authorization': tk.startsWith('Bearer ') ? tk : 'Bearer ' + tk,
-      'Accept': 'application/json',
+      'Cookie': cookie,
+      'Accept': 'application/json, text/plain, */*',
       'Content-Type': 'application/json',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
       'Accept-Language': 'pt-BR,pt;q=0.9',
@@ -286,7 +309,10 @@ export function inspecionarTokenAff() {
   if (!tk) return { configurado: false };
   const base = { configurado: true, tamanho: tk.length, prefixo: tk.slice(0, 6) + '…', formatoJwt: false };
   const partes = tk.split('.');
-  if (partes.length !== 3) return { ...base, observacao: 'nao e JWT — provavelmente token opaco de sessao' };
+  if (partes.length !== 3) {
+    return { ...base, observacao: 'cookie de sessao (nao e JWT)',
+             cookiesPresentes: chavesCookieAff() };
+  }
   try {
     const payload = JSON.parse(Buffer.from(partes[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'));
     const exp = payload.exp ? new Date(payload.exp * 1000) : null;
