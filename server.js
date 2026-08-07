@@ -3803,16 +3803,6 @@ app.post('/vitrine', async (req, res) => {
   res.json({ ok: salvos.length > 0, salvos, erros });
 });
 
-app.post('/vitrine/:asin', (req, res) => {
-  if (!itemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'produto não está na vitrine' });
-  res.json({ ok:true, item: salvarItemVitrine({ asin: req.params.asin, ...req.body }) });
-});
-
-app.delete('/vitrine/:asin', (req, res) => {
-  if (!removerItemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'não encontrado' });
-  res.json({ ok:true });
-});
-
 // Dispara direto para os grupos destino: o operador ja revisou ao cadastrar.
 // O preco e SEMPRE consultado agora — item salvo tem preco velho, e anunciar
 // preco que nao existe mais e o erro que este pipeline existe para evitar.
@@ -3884,6 +3874,16 @@ app.post('/vitrine/disparar', async (req, res) => {
   console.log('[VITRINE] Disparo — ' + enviados.length + ' enviada(s), '
     + falhas.length + ' falha(s), ' + montado.descartados.length + ' descartada(s).');
   res.json({ ok:true, enviados, falhas, descartados: montado.descartados });
+});
+
+app.post('/vitrine/:asin', (req, res) => {
+  if (!itemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'produto não está na vitrine' });
+  res.json({ ok:true, item: salvarItemVitrine({ asin: req.params.asin, ...req.body }) });
+});
+
+app.delete('/vitrine/:asin', (req, res) => {
+  if (!removerItemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'não encontrado' });
+  res.json({ ok:true });
 });
 
 // ── TEMPLATES DE MENSAGEM POR LOJA ───────────────────────────────────────────
