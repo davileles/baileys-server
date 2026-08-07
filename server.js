@@ -33,7 +33,7 @@ import {
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
-  baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva,
+  baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso,
 } from './sync-github.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
@@ -3827,7 +3827,10 @@ app.post('/mkt/config', (req, res) => {
 });
 
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
-app.get('/sync', (req, res) => res.json({ ok:true, ...estadoSync() }));
+app.get('/sync', async (req, res) => {
+  const base = estadoSync();
+  res.json({ ok:true, ...base, acesso: base.ativo ? await testarAcesso() : null });
+});
 
 app.post('/sync/push', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
