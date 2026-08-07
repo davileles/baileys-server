@@ -24,6 +24,8 @@ import {
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
+  resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
+  itemVitrine, marcarDisparo, montarOfertasVitrine,
 } from './radar-amazon.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -3738,6 +3740,95 @@ app.post('/mkt/config', (req, res) => {
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── VITRINE ──────────────────────────────────────────────────────────────────
+app.get('/vitrine', (req, res) => {
+  const itens = listarVitrine();
+  res.json({ ok:true, total: itens.length, itens });
+});
+
+// Recebe o texto colado (um link por linha) e cadastra o que conseguir resolver.
+// So resolve o ASIN e o nome — preco fica para o disparo.
+app.post('/vitrine', async (req, res) => {
+  const linhas = String(req.body?.texto || '').split('\n').map(l => l.trim()).filter(Boolean);
+  if (!linhas.length) return res.status(400).json({ ok:false, erro:'nenhuma linha enviada' });
+  if (linhas.length > 60) return res.status(400).json({ ok:false, erro:'máximo de 60 linhas por vez' });
+
+  const cupom = req.body?.cupom || null;
+  const salvos = [], erros = [];
+
+  for (const linha of linhas) {
+    try {
+      const r = await resolverLinhaVitrine(linha);
+      if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
+      const jaTinha = !!itemVitrine(r.asin);
+      salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha });
+    } catch (e) { erros.push({ linha, erro: e.message }); }
+  }
+  console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s).');
+  res.json({ ok: salvos.length > 0, salvos, erros });
+});
+
+app.post('/vitrine/:asin', (req, res) => {
+  if (!itemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'produto não está na vitrine' });
+  res.json({ ok:true, item: salvarItemVitrine({ asin: req.params.asin, ...req.body }) });
+});
+
+app.delete('/vitrine/:asin', (req, res) => {
+  if (!removerItemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'não encontrado' });
+  res.json({ ok:true });
+});
+
+// Dispara direto para os grupos destino: o operador ja revisou ao cadastrar.
+// O preco e SEMPRE consultado agora — item salvo tem preco velho, e anunciar
+// preco que nao existe mais e o erro que este pipeline existe para evitar.
+app.post('/vitrine/disparar', async (req, res) => {
+  const asins = Array.isArray(req.body?.asins) ? req.body.asins.filter(Boolean) : [];
+  if (!asins.length) return res.status(400).json({ ok:false, erro:'selecione ao menos um produto' });
+  if (!conectado || !sock) {
+    const ok = await aguardarSock();
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp não conectado.' });
+  }
+
+  let montado;
+  try { montado = await montarOfertasVitrine(asins, req.body?.cupom || null); }
+  catch (e) { return res.status(500).json({ ok:false, erro:'falha ao consultar a API: ' + e.message }); }
+
+  const enviados = [], falhas = [];
+  for (const o of montado.prontos) {
+    const oferta = {
+      id: gerarId(), tipoConteudo:'oferta_amazon', origem:'vitrine',
+      mensagemFormatada: o.mensagem,
+      dadosExtraidos: {
+        loja:'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
+        precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
+        cupom:o.cupom, precoFinal:o.precoFinal,
+      },
+      imagens: [],
+    };
+    // A imagem alimenta o thumbnail do link preview; falha nela nao impede o envio.
+    try {
+      const img = await baixarImagemProduto(o.produto.imagemUrl);
+      if (img) oferta.imagens = [img];
+    } catch (e) {}
+
+    try {
+      const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta);
+      marcarDisparo(o.asin);
+      enviados.push({ asin:o.asin, nome:o.nome, grupos:r.enviados.length,
+                      cupom:o.cupom?.codigo || null, aviso:o.avisoCupom || null });
+    } catch (e) {
+      falhas.push({ asin:o.asin, nome:o.nome, erro:e.message });
+    }
+    // Mesmo espacamento do radar: rajada em varios grupos e o padrao que o
+    // WhatsApp usa para identificar automacao.
+    if (montado.prontos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+  }
+
+  console.log('[VITRINE] Disparo — ' + enviados.length + ' enviada(s), '
+    + falhas.length + ' falha(s), ' + montado.descartados.length + ' descartada(s).');
+  res.json({ ok:true, enviados, falhas, descartados: montado.descartados });
 });
 
 // ── TEMPLATES DE MENSAGEM POR LOJA ───────────────────────────────────────────

@@ -240,6 +240,12 @@ export function calcularDesconto(reg, preco) {
  * A base entra para fornecer as regras (percentual, minimo, teto) que o texto
  * do grupo quase nunca traz por completo.
  */
+/** Busca um cupom da base pelo par (loja, codigo). Usado pela vitrine. */
+export function cupomPorCodigo(loja, codigo) {
+  const k = chaveCupom(loja, codigo);
+  return k ? (_cupons[k] || null) : null;
+}
+
 export function melhorCupom(loja, preco, textoOriginal = '') {
   const lojaKey = normalizarTexto(loja);
   const texto = normalizarTexto(textoOriginal);
@@ -325,13 +331,13 @@ async function asinPorHtml(url) {
     const html = (await res.text()).slice(0, 300000);
 
     const canonical = html.match(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i);
-    if (canonical) { const a = asinDeUrl(canonical[1]); if (a) return a; }
+    if (canonical) { const a = asinDeUrl(canonical[1]); if (a) return { asin: a, canonical: canonical[1] }; }
 
     const og = html.match(/<meta[^>]+property=["']og:url["'][^>]*content=["']([^"']+)["']/i);
-    if (og) { const a = asinDeUrl(og[1]); if (a) return a; }
+    if (og) { const a = asinDeUrl(og[1]); if (a) return { asin: a, canonical: og[1] }; }
 
     const campo = html.match(/["']asin["']\s*:\s*["']([A-Z0-9]{10})["']/i);
-    if (campo) return campo[1].toUpperCase();
+    if (campo) return { asin: campo[1].toUpperCase(), canonical: null };
 
     return null;
   } catch (e) {
@@ -352,7 +358,7 @@ export async function extrairAsins(texto) {
       try { destino = await resolverEncurtador(url); asin = asinDeUrl(destino); }
       catch (e) { console.warn('[MKT] Falha ao resolver', url, '-', e.message); }
     }
-    if (!asin) asin = await asinPorHtml(destino);
+    if (!asin) { const r = await asinPorHtml(destino); asin = r?.asin || null; }
     if (asin) asins.add(asin);
     else console.warn('[MKT] Sem ASIN para', url, '— destino:', destino);
   }
@@ -741,3 +747,162 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 
 carregarRadarConfig();
 carregarTemplates();
+
+// ── VITRINE ───────────────────────────────────────────────────────────────
+// Produtos que o operador quer manter a mao para disparar quando sair um cupom
+// bom. Guarda so link, ASIN e nome: preco, estoque e desconto sao consultados
+// no disparo, porque preco salvo envelhece e anunciar preco velho e o erro que
+// esse pipeline inteiro existe para evitar.
+
+const VITRINE_PATH = SESSAO_DIR + '/vitrine.json';
+let _vitrine = {};
+
+export function carregarVitrine() {
+  try { if (existsSync(VITRINE_PATH)) _vitrine = JSON.parse(readFileSync(VITRINE_PATH, 'utf-8')); }
+  catch (e) { console.log('[VITRINE] Erro ao carregar:', e.message); _vitrine = {}; }
+  return _vitrine;
+}
+function salvarVitrine() {
+  try { writeFileSync(VITRINE_PATH, JSON.stringify(_vitrine, null, 2), 'utf-8'); }
+  catch (e) { console.log('[VITRINE] Erro ao salvar:', e.message); }
+}
+
+// O slug da URL da Amazon ja traz o nome do produto
+// (/Carrinho-Eletrico-Infantil-Maxi-Toys/dp/B0FPT9JLMX), entao da para gravar um
+// nome legivel sem gastar uma chamada de API no cadastro.
+function nomeDoSlug(url) {
+  try {
+    // Precisa ser o pathname: casar na URL inteira faria o host virar "nome"
+    // em links no formato /dp/ASIN, que nao tem slug.
+    const m = new URL(url).pathname.match(/^\/([^\/]+)\/dp\//i);
+    if (!m) return '';
+    return decodeURIComponent(m[1]).replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  } catch (e) { return ''; }
+}
+
+/**
+ * Resolve uma linha colada pelo operador. Aceita "nome | link" ou so o link.
+ * Faz apenas o trabalho de rede necessario para achar o ASIN (encurtador);
+ * nao consulta a Creators API.
+ */
+export async function resolverLinhaVitrine(linha) {
+  const bruto = String(linha || '').trim();
+  if (!bruto) return null;
+
+  let nomeManual = '', url = bruto;
+  const sep = bruto.match(/^(.*?)\s*[|;]\s*(https?:\/\/\S+)$/);
+  if (sep) { nomeManual = sep[1].trim(); url = sep[2].trim(); }
+  else {
+    const m = bruto.match(REGEX_URL_AMAZON);
+    if (!m) return { erro: 'sem link da Amazon', linha: bruto };
+    url = m[0].replace(/[)\]}.,;!]+$/, '');
+    REGEX_URL_AMAZON.lastIndex = 0;
+  }
+
+  let asin = asinDeUrl(url), destino = url;
+  if (!asin) {
+    try { destino = await resolverEncurtador(url); asin = asinDeUrl(destino); }
+    catch (e) { /* segue para o fallback por HTML */ }
+  }
+  if (!asin) {
+    const r = await asinPorHtml(destino);
+    if (r?.asin) { asin = r.asin; if (r.canonical) destino = r.canonical; }
+  }
+  if (!asin) return { erro: 'não foi possível identificar o produto', linha: bruto };
+
+  const nome = nomeManual || nomeDoSlug(destino) || nomeDoSlug(url) || ('Produto ' + asin);
+  return { asin, nome, url: destino, loja: 'Amazon' };
+}
+
+export function listarVitrine() {
+  return Object.values(_vitrine).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
+}
+
+export function salvarItemVitrine(item) {
+  if (!item?.asin) return null;
+  const anterior = _vitrine[item.asin];
+  _vitrine[item.asin] = {
+    asin: item.asin,
+    nome: item.nome !== undefined ? item.nome : (anterior?.nome || ''),
+    url: item.url || anterior?.url || '',
+    loja: item.loja || anterior?.loja || 'Amazon',
+    cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
+    criadoEm: anterior?.criadoEm || new Date().toISOString(),
+    atualizadoEm: new Date().toISOString(),
+    ultimoDisparo: anterior?.ultimoDisparo || null,
+  };
+  salvarVitrine();
+  return _vitrine[item.asin];
+}
+
+export function removerItemVitrine(asin) {
+  if (!_vitrine[asin]) return false;
+  delete _vitrine[asin];
+  salvarVitrine();
+  return true;
+}
+
+export function marcarDisparo(asin) {
+  if (_vitrine[asin]) { _vitrine[asin].ultimoDisparo = new Date().toISOString(); salvarVitrine(); }
+}
+
+export function itemVitrine(asin) { return _vitrine[asin] || null; }
+
+/**
+ * Monta as mensagens de uma lista de ASINs no momento do disparo: consulta a
+ * Creators API agora, aplica o cupom (o informado no disparo tem prioridade
+ * sobre o vinculado ao produto) e renderiza o template da loja.
+ * Devolve { prontos, descartados } — nada e enviado aqui.
+ */
+export async function montarOfertasVitrine(asins, codigoCupom = null) {
+  const itens = await buscarProdutos(asins);
+  const prontos = [], descartados = [];
+  const achados = new Set();
+
+  for (const item of itens) {
+    const p = normalizar(item);
+    achados.add(p.asin);
+    const salvo = _vitrine[p.asin];
+    // Link sem slug entra como "Produto ASIN"; o disparo e a primeira vez que
+    // temos o titulo real, entao aproveita para gravar.
+    let nome = salvo?.nome || p.titulo;
+    if (salvo && /^Produto [A-Z0-9]{10}$/.test(nome) && p.titulo) {
+      nome = p.titulo; salvarItemVitrine({ asin: p.asin, nome });
+    }
+
+    if (!p.preco)      { descartados.push({ asin:p.asin, nome, motivo:'sem preço disponível' }); continue; }
+    if (!p.disponivel) { descartados.push({ asin:p.asin, nome, motivo:'produto esgotado' }); continue; }
+
+    // Cupom do disparo vence o vinculado; sem nenhum dos dois, vai sem cupom.
+    const codigo = codigoCupom || salvo?.cupom || null;
+    let cupom = null, avisoCupom = null;
+    if (codigo) {
+      const reg = cupomPorCodigo(p.loja, codigo);
+      if (!reg)                   avisoCupom = 'cupom ' + codigo + ' não está na base';
+      else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
+      else {
+        const desconto = calcularDesconto(reg, p.preco);
+        if (desconto > 0) cupom = { reg, desconto, citado: true };
+        else avisoCupom = 'cupom ' + codigo + ' não se aplica a R$ ' + brl(p.preco)
+                        + (reg.minimo != null ? ' (mínimo R$ ' + brl(reg.minimo) + ')' : '');
+      }
+    }
+
+    prontos.push({
+      asin: p.asin, nome, produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+      avisoCupom,
+      precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      mensagem: formatarOfertaAmazon(p, { cupom }),
+    });
+  }
+
+  for (const a of asins) {
+    if (!achados.has(a)) {
+      descartados.push({ asin:a, nome:_vitrine[a]?.nome || a, motivo:'produto não retornado pela API' });
+    }
+  }
+  return { prontos, descartados };
+}
+
+carregarVitrine();
