@@ -47,6 +47,7 @@ import {
 import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
+  sondarMl,
 } from './radar-ml.js';
 
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
@@ -4214,6 +4215,11 @@ app.get('/ml/callback', async (req, res) => {
 // mas respondemos 200 para o ML nao acumular erro de entrega.
 app.post('/ml/webhook', (req, res) => res.sendStatus(200));
 app.get('/ml/webhook', (req, res) => res.sendStatus(200));
+
+app.get('/ml/sonda', async (req, res) => {
+  try { res.json(await sondarMl(req.query.caminho || '/users/me')); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
 
 // Consulta crua de um item, para ver a resposta da API sem o pipeline no meio.
 app.get('/ml/item', async (req, res) => {
