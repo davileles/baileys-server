@@ -48,6 +48,7 @@ import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
+  chavesCookieAff,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
