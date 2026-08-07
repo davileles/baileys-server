@@ -4100,12 +4100,22 @@ app.get('/shopee/status', async (req, res) => {
 });
 
 app.get('/grupos', async (req, res) => {
+  // groupFetchAllParticipating leva ~6s com 400 grupos e trava a aba a cada
+  // abertura. O cache e preenchido na conexao e a lista muda raramente, entao
+  // responde na hora e so busca de verdade com ?refresh=1 ou cache vazio.
+  if (NOMES_GRUPOS.size && req.query.refresh !== '1') {
+    const grupos = [...NOMES_GRUPOS.entries()]
+      .map(([id, nome]) => ({ id, nome }))
+      .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+    return res.json({ ok:true, total:grupos.length, grupos, doCache:true });
+  }
   if (!sock || !conectado) {
     const ok = await aguardarSock(15000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
   try {
     const chats  = await sock.groupFetchAllParticipating();
+    NOMES_GRUPOS.clear();
     for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
     const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
     res.json({ ok:true, total:grupos.length, grupos });
