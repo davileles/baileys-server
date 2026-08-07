@@ -21,7 +21,7 @@ import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
   processarTextoAmazon,
-  registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase,
+  registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
@@ -3908,6 +3908,17 @@ app.post('/cupons/base', (req, res) => {
   }
   console.log('[CUPONS] Criacao manual — ' + criados.length + ' ok, ' + erros.length + ' erro(s).');
   res.status(erros.length && !criados.length ? 400 : 200).json({ ok: !!criados.length, criados, erros });
+});
+
+// Liga/desliga todos os cupons de uma loja de uma vez. Existe como endpoint (em
+// vez de N chamadas do painel) para a operacao ser atomica no arquivo.
+app.post('/cupons/loja/:loja', (req, res) => {
+  if (typeof req.body?.ativo !== 'boolean') {
+    return res.status(400).json({ ok:false, erro:'informe { ativo: true|false }' });
+  }
+  const n = definirAtivoPorLoja(req.params.loja, req.body.ativo);
+  console.log('[CUPONS] ' + req.params.loja + ' — ' + n + ' cupom(ns) ' + (req.body.ativo ? 'ativado(s)' : 'desativado(s)') + '.');
+  res.json({ ok:true, alterados:n });
 });
 
 app.post('/cupons/base/:chave', (req, res) => {

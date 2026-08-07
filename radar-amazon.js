@@ -117,7 +117,7 @@ function registrarVisto(p) {
 // via endpoint. Flag 'ativo' permite desligar um cupom sem apagar o historico.
 
 const CUPONS_BASE_PATH = SESSAO_DIR + '/cupons_base.json';
-const CUPOM_VALIDADE_PADRAO_MS = 2 * 24 * 3600e3;
+const CUPOM_VALIDADE_PADRAO_MS = 24 * 3600e3;
 
 let _cupons = {};   // chave -> registro
 
@@ -140,6 +140,19 @@ export function carregarCuponsBase() {
   try {
     if (existsSync(CUPONS_BASE_PATH)) {
       _cupons = JSON.parse(readFileSync(CUPONS_BASE_PATH, 'utf-8'));
+      // A validade padrao caiu de 48h para 24h: recalcula quem foi gravado com a
+      // janela antiga, para a base nao ficar com dois criterios convivendo.
+      let migrados = 0;
+      for (const reg of Object.values(_cupons)) {
+        const base = new Date(reg.capturadoEm).getTime();
+        if (!isFinite(base)) continue;
+        const alvo = base + CUPOM_VALIDADE_PADRAO_MS;
+        if (new Date(reg.validadeAte).getTime() > alvo + 60e3) {
+          reg.validadeAte = new Date(alvo).toISOString();
+          migrados++;
+        }
+      }
+      if (migrados) { salvarCuponsBase(); console.log('[CUPONS] ' + migrados + ' cupom(ns) migrado(s) para validade de 24h.'); }
       console.log('[CUPONS] Base carregada — ' + Object.keys(_cupons).length + ' cupom(ns).');
     }
   } catch (e) { console.log('[CUPONS] Erro ao carregar base:', e.message); _cupons = {}; }
@@ -209,6 +222,21 @@ export function removerCupomBase(chave) {
   delete _cupons[chave];
   salvarCuponsBase();
   return true;
+}
+
+/** Liga ou desliga de uma vez todos os cupons de uma loja. */
+export function definirAtivoPorLoja(loja, ativo) {
+  const alvo = normalizarTexto(loja);
+  let n = 0;
+  for (const reg of Object.values(_cupons)) {
+    if (normalizarTexto(reg.loja) !== alvo) continue;
+    if (reg.ativo === ativo) continue;
+    reg.ativo = ativo;
+    reg.atualizadoEm = new Date().toISOString();
+    n++;
+  }
+  if (n) salvarCuponsBase();
+  return n;
 }
 
 export function cupomVigente(reg) {
