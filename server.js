@@ -3745,21 +3745,6 @@ app.get('/templates', (req, res) => {
   res.json({ ok:true, templates: listarTemplates(), variaveis: VARIAVEIS_TEMPLATE });
 });
 
-app.post('/templates/:loja', (req, res) => {
-  try {
-    const tpl = salvarTemplate(req.params.loja, req.body || {});
-    console.log('[TPL] Template salvo — ' + req.params.loja);
-    res.json({ ok:true, template: tpl });
-  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
-});
-
-app.delete('/templates/:loja', (req, res) => {
-  if (!removerTemplate(req.params.loja)) {
-    return res.status(400).json({ ok:false, erro:'Template nao encontrado, ou e o padrao (que nao pode ser removido).' });
-  }
-  res.json({ ok:true });
-});
-
 // Renderiza um corpo de template com dados de exemplo. Serve ao preview ao vivo
 // do editor: o operador ve o resultado sem precisar esperar uma oferta real.
 app.post('/templates/preview', (req, res) => {
@@ -3778,6 +3763,21 @@ app.post('/templates/preview', (req, res) => {
       : (templateDaLoja(req.body.loja)?.corpo || '');
     res.json({ ok:true, mensagem: renderTemplate(corpo, varsDoProduto(exemplo, cupom)) });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.post('/templates/:loja', (req, res) => {
+  try {
+    const tpl = salvarTemplate(req.params.loja, req.body || {});
+    console.log('[TPL] Template salvo — ' + req.params.loja);
+    res.json({ ok:true, template: tpl });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.delete('/templates/:loja', (req, res) => {
+  if (!removerTemplate(req.params.loja)) {
+    return res.status(400).json({ ok:false, erro:'Template nao encontrado, ou e o padrao (que nao pode ser removido).' });
+  }
+  res.json({ ok:true });
 });
 
 // ── BASE DE CUPONS ───────────────────────────────────────────────────────────
