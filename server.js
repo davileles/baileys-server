@@ -2492,6 +2492,20 @@ const _filaGrupo = new Map(); // jid → Promise (última tarefa na fila)
 // Buffer circular de diagnostico dos ultimos upserts recebidos (ver /debug-upserts).
 const _debugUpserts = [];
 
+// Arquivos de ./sessao que sobrevivem a um reset completo: nao sao credenciais
+// do WhatsApp e nao se regeneram sozinhos. Ao criar um arquivo novo nessa pasta,
+// avaliar se ele pertence a esta lista.
+const PRESERVAR_NO_RESET = new Set([
+  'fila_pendentes.json',    // fila de aprovacao
+  'agendamentos.json',      // envios agendados
+  'telegram_session.txt',   // sessao do Telegram (independente do WhatsApp)
+  'cupons_base.json',       // base de cupons — cadastro manual/capturado
+  'radar_config.json',      // papeis fonte/destino dos grupos do radar
+  'cupons_vistos.json',     // dedup de cupons
+  'radar_vistos.json',      // dedup do radar
+  'msgs-enviadas.json',     // dedup de mensagens enviadas
+]);
+
 function enfileirarPorGrupo(jid, fn) {
   const anterior = _filaGrupo.get(jid) || Promise.resolve();
   const proxima  = anterior.then(() => fn()).catch(err => {
@@ -3872,7 +3886,10 @@ app.post('/reset-sessao-completo', async (req, res) => {
   try {
     const arquivos = await readdir(SESSAO_DIR);
     for (const arq of arquivos) {
-      if (arq === 'fila_pendentes.json' || arq === 'agendamentos.json' || arq === 'telegram_session.txt') continue; // preserva fila, agendamentos e sessão do Telegram
+      // Preserva tudo que NAO e credencial do WhatsApp. A pasta ./sessao guarda
+      // dados de negocio junto com as chaves; apagar sem filtro custaria a base
+      // de cupons e os papeis fonte/destino do radar, que sao trabalho manual.
+      if (PRESERVAR_NO_RESET.has(arq)) continue;
       await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
     }
     console.log('[RESET] Sessão apagada completamente. Aguardando novo QR...');
