@@ -47,8 +47,38 @@ import {
 import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
-  sondarMl,
+  sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff,
 } from './radar-ml.js';
+
+// URL usada para testar a validade do token do painel de afiliados. Fica em
+// variavel porque o endpoint interno pode mudar sem aviso.
+const ML_AFF_URL_TESTE = process.env.ML_AFF_URL_TESTE
+  || 'https://www.mercadolivre.com.br/affiliate-program/api/users/me';
+
+// Aviso no grupo do operador — o token parar em silencio custaria um dia
+// inteiro de ofertas do ML sem ninguem perceber.
+async function avisarTokenMlCaiu(motivo) {
+  const texto = '⚠️ *Token do Mercado Livre parou de funcionar*\n\n'
+    + 'Motivo: ' + motivo + '\n\n'
+    + 'O radar do ML está parado até a renovação. Para resolver:\n'
+    + '1. Abra o Chrome logado na conta de colaborador do ML\n'
+    + '2. Clique na extensão e copie o token\n'
+    + '3. Atualize ML_AFF_TOKEN no Railway\n\n'
+    + 'Amazon, Shopee e Magalu seguem normalmente.';
+  try {
+    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    console.error('[ML-AFF] Operador avisado: token caiu (' + motivo + ')');
+  } catch (e) { console.error('[ML-AFF] Falha ao avisar operador:', e.message); }
+}
+
+// Verifica no boot e a cada 30 min. Frequencia alta de proposito: o custo de
+// uma chamada e irrelevante perto de descobrir tarde que o radar parou.
+setInterval(() => {
+  if (tokenAffOk()) verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+}, 30 * 60 * 1000);
+setTimeout(() => {
+  if (tokenAffOk()) verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+}, 45000);
 
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
@@ -4215,6 +4245,21 @@ app.get('/ml/callback', async (req, res) => {
 // mas respondemos 200 para o ML nao acumular erro de entrega.
 app.post('/ml/webhook', (req, res) => res.sendStatus(200));
 app.get('/ml/webhook', (req, res) => res.sendStatus(200));
+
+// Estado do token de afiliados + verificacao sob demanda.
+app.get('/ml/aff/status', async (req, res) => {
+  if (req.query.verificar === '1' && tokenAffOk()) {
+    await verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+  }
+  res.json({ ok:true, urlTeste: ML_AFF_URL_TESTE, ...saudeAff() });
+});
+
+// Sonda do painel de afiliados: descobre quais endpoints o token abre.
+app.get('/ml/aff/sonda', async (req, res) => {
+  if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
+  try { res.json(await chamarAff(req.query.url)); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
 
 app.get('/ml/sonda', async (req, res) => {
   try { res.json(await sondarMl(req.query.caminho || '/users/me')); }
