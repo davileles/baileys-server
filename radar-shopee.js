@@ -182,7 +182,11 @@ export function normalizarShopee(n) {
     shopId: String(n.shopId),
     titulo: n.productName || '',
     marca: '',
-    imagemUrl: n.imageUrl || null,
+    // A imagem cheia da Shopee passa de 350KB e estoura o limite do
+    // jpegThumbnail do WhatsApp (~100KB), o que derruba o preview. O sufixo
+    // _tn devolve a mesma imagem em ~34KB.
+    imagemUrl: n.imageUrl ? n.imageUrl.replace(/(_tn)?$/, '_tn') : null,
+    imagemUrlCheia: n.imageUrl || null,
     link: n.offerLink || n.productLink || '',
     preco: isFinite(preco) ? preco : null,
     precoTexto: isFinite(preco) ? 'R$ ' + preco.toFixed(2).replace('.', ',') : null,
