@@ -270,7 +270,13 @@ const PADROES_ASIN = [
   /[?&]asin=([A-Z0-9]{10})/i,
 ];
 
-const REGEX_URL_AMAZON = /https?:\/\/(?:[\w-]+\.)*(?:amazon\.com\.br|amzn\.to|a\.co|amzn\.eu)\/\S+/gi;
+// Dois formatos convivem nos grupos-fonte: link direto (amazon.com.br/dp/ASIN)
+// e encurtador (amzn.to, a.co, link.amazon). O encurtador NAO carrega o ASIN no
+// path — o codigo ali e do shortlink, nao do produto — entao precisa ser
+// resolvido por redirect antes de virar consulta na API.
+const REGEX_URL_AMAZON = /https?:\/\/(?:[\w-]+\.)*(?:amazon\.com\.br|amzn\.to|amzn\.eu|a\.co|link\.amazon(?:\.com)?)\/\S+/gi;
+
+const UA_NAVEGADOR = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 
 function asinDeUrl(url) {
   for (const re of PADROES_ASIN) {
@@ -290,7 +296,8 @@ async function resolverEncurtador(url, tentativas = 5) {
       method: 'GET',
       redirect: 'manual',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'User-Agent': UA_NAVEGADOR,
+        'Accept-Language': 'pt-BR,pt;q=0.9',
         'Range': 'bytes=0-0',
       },
       signal: AbortSignal.timeout(8000),
@@ -303,6 +310,36 @@ async function resolverEncurtador(url, tentativas = 5) {
   return atual;
 }
 
+// Nem todo encurtador entrega o destino por header Location: alguns respondem
+// 200 com redirect via JS ou meta refresh, e ai a cadeia de redirects termina
+// sem ASIN. Neste caso busca a pagina e le o ASIN do canonical.
+// So aceita canonical/og:url/campo "asin" — nunca um /dp/ solto no corpo, que
+// costuma ser produto recomendado e anunciaria o item errado.
+async function asinPorHtml(url) {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': UA_NAVEGADOR, 'Accept-Language': 'pt-BR,pt;q=0.9' },
+      signal: AbortSignal.timeout(12000),
+    });
+    if (!res.ok) return null;
+    const html = (await res.text()).slice(0, 300000);
+
+    const canonical = html.match(/<link[^>]+rel=["']canonical["'][^>]*href=["']([^"']+)["']/i);
+    if (canonical) { const a = asinDeUrl(canonical[1]); if (a) return a; }
+
+    const og = html.match(/<meta[^>]+property=["']og:url["'][^>]*content=["']([^"']+)["']/i);
+    if (og) { const a = asinDeUrl(og[1]); if (a) return a; }
+
+    const campo = html.match(/["']asin["']\s*:\s*["']([A-Z0-9]{10})["']/i);
+    if (campo) return campo[1].toUpperCase();
+
+    return null;
+  } catch (e) {
+    console.warn('[MKT] Falha ao ler HTML de', url, '-', e.message);
+    return null;
+  }
+}
+
 export async function extrairAsins(texto) {
   if (!texto) return [];
   const urls = [...new Set(texto.match(REGEX_URL_AMAZON) || [])]
@@ -310,11 +347,14 @@ export async function extrairAsins(texto) {
   const asins = new Set();
   for (const url of urls) {
     let asin = asinDeUrl(url);
+    let destino = url;
     if (!asin) {
-      try { asin = asinDeUrl(await resolverEncurtador(url)); }
+      try { destino = await resolverEncurtador(url); asin = asinDeUrl(destino); }
       catch (e) { console.warn('[MKT] Falha ao resolver', url, '-', e.message); }
     }
+    if (!asin) asin = await asinPorHtml(destino);
     if (asin) asins.add(asin);
+    else console.warn('[MKT] Sem ASIN para', url, '— destino:', destino);
   }
   return [...asins];
 }
