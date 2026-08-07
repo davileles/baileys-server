@@ -26,6 +26,8 @@ import {
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
+  listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
+  podeCapturar, LOJAS_MONITORAVEIS,
 } from './radar-amazon.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
@@ -2599,11 +2601,22 @@ async function processarRadarMarketplace(jid, texto) {
   // Uma mensagem pode trazer link de mais de uma loja; cada pipeline cuida dos
   // links que reconhece e ignora o resto.
   const resultados = [];
-  try { resultados.push(...await processarTextoAmazon(texto)); }
-  catch (e) { console.error('[MKT] Falha no pipeline Amazon:', e.message); }
+
+  // O cadastro de monitoramento decide loja a loja: um grupo pode estar dentro
+  // da janela para Amazon e fora para Shopee.
+  const podeAmazon = podeCapturar(jid, 'Amazon');
+  if (podeAmazon.ok) {
+    try { resultados.push(...await processarTextoAmazon(texto)); }
+    catch (e) { console.error('[MKT] Falha no pipeline Amazon:', e.message); }
+  } else if (/amazon|amzn|a\.co/i.test(texto)) {
+    console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
+  }
 
   if (ehLinkShopee(texto)) {
-    if (!credenciaisShopeeOk()) {
+    const podeShopee = podeCapturar(jid, 'Shopee');
+    if (!podeShopee.ok) {
+      console.log('[MONITOR] Shopee ignorada em ' + jid.split('@')[0] + ' — ' + podeShopee.motivo);
+    } else if (!credenciaisShopeeOk()) {
       console.warn('[SHOPEE] Link detectado mas SHOPEE_APP_ID/SHOPEE_SECRET nao estao configurados.');
     } else {
       try { resultados.push(...await processarTextoShopee(texto)); }
@@ -3756,6 +3769,35 @@ app.post('/mkt/config', (req, res) => {
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── MONITORAMENTO POR GRUPO ──────────────────────────────────────────────────
+app.get('/monitor', (req, res) => {
+  const monitor = listarMonitor();
+  const fontes = radarFontes();
+  res.json({
+    ok: true,
+    lojas: LOJAS_MONITORAVEIS,
+    monitor,
+    // Fonte sem cadastro nao captura nada: o painel precisa destacar isso.
+    fontesSemCadastro: fontes.filter(j => !monitor[j]),
+    agoraSP: new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle: 'short', timeStyle: 'short' }).format(new Date()),
+  });
+});
+
+app.post('/monitor/:jid', (req, res) => {
+  try {
+    const cfg = salvarMonitor(req.params.jid, req.body || {});
+    if (!cfg) return res.status(400).json({ ok:false, erro:'jid invalido' });
+    console.log('[MONITOR] ' + req.params.jid.split('@')[0] + ' — ' + (cfg.lojas.join('+') || 'nenhuma loja')
+      + ' ' + cfg.inicio + '-' + cfg.fim + ' (' + cfg.dias + ')' + (cfg.ativo ? '' : ' [inativo]'));
+    res.json({ ok:true, cfg, estadoAgora: podeCapturar(req.params.jid, cfg.lojas[0] || 'Amazon') });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.delete('/monitor/:jid', (req, res) => {
+  if (!removerMonitor(req.params.jid)) return res.status(404).json({ ok:false, erro:'sem cadastro para este grupo' });
+  res.json({ ok:true });
 });
 
 // ── VITRINE ──────────────────────────────────────────────────────────────────
