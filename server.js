@@ -32,6 +32,7 @@ import {
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
   normalizarShopee, credenciaisShopeeOk, montarOfertasShopeeVitrine,
+  validarAtribuicao,
 } from './radar-shopee.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -4004,6 +4005,19 @@ app.post('/shopee/testar', async (req, res) => {
   try {
     const r = await processarTextoShopee(req.body?.texto || '');
     res.json({ ok:true, resultados: r });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Prova que o link gerado rende comissao para esta conta: confere procedencia,
+// parametros de tracking e o sub id injetado.
+app.get('/shopee/validar', async (req, res) => {
+  if (!credenciaisShopeeOk()) {
+    return res.status(400).json({ ok:false, erro:'SHOPEE_APP_ID / SHOPEE_SECRET nao configurados.' });
+  }
+  if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url= com o link do produto' });
+  try {
+    const subId = req.query.subId || ('cdvteste' + Date.now().toString().slice(-6));
+    res.json(await validarAtribuicao(req.query.url, subId));
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 

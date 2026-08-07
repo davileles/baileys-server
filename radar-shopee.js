@@ -248,6 +248,95 @@ export async function processarTextoShopee(texto, opcoes = {}) {
   return saida;
 }
 
+// ── VALIDACAO DE ATRIBUICAO ───────────────────────────────────────────────
+// Tres provas independentes de que o link rende comissao para ESTA conta:
+//   1. Procedencia: o offerLink vem de uma chamada assinada com o seu appId —
+//      a API so devolve link de afiliado da conta autenticada.
+//   2. Parametros de tracking: expandindo o shortlink, utm_campaign carrega o
+//      affiliate id e utm_medium fica como 'affiliates'.
+//   3. Sub ID: o valor injetado aqui reaparece no campo utmContent do
+//      conversionReport, ligando a venda a este disparo especifico.
+
+const CAMPOS_TRACKING = [
+  'utm_campaign', 'utm_source', 'utm_medium', 'utm_content', 'utm_term',
+  'af_siteid', 'af_click_lookback', 'pid', 'c', 'is_retargeting', 'af_sub1',
+];
+
+/** Segue os redirects de um shortlink ate a URL final, sem baixar a pagina. */
+async function expandirLink(url, tentativas = 6) {
+  let atual = url;
+  for (let i = 0; i < tentativas; i++) {
+    const res = await fetch(atual, {
+      method: 'GET', redirect: 'manual',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9', 'Range': 'bytes=0-0',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    const loc = res.headers.get('location');
+    if (!loc) return atual;
+    atual = new URL(loc, atual).href;
+  }
+  return atual;
+}
+
+/**
+ * Valida a atribuicao de um link Shopee.
+ * @param {string} url      link do produto (qualquer formato)
+ * @param {string} subId    sub id a injetar, para conferir depois no relatorio
+ */
+export async function validarAtribuicao(url, subId = null) {
+  const ids = await extrairIdsShopee(url);
+  if (!ids.length) return { ok: false, erro: 'não foi possível identificar o produto no link' };
+
+  const node = await buscarProdutoShopee(ids[0]);
+  if (!node) return { ok: false, erro: 'produto não encontrado na API de afiliados' };
+
+  const offerLink = node.offerLink || null;
+  const marcado = subId
+    ? await gerarLinkAfiliado(node.productLink || url, [subId]).catch(e => null)
+    : null;
+
+  const alvo = marcado || offerLink;
+  let expandido = null, parametros = {}, erroExpansao = null;
+  if (alvo) {
+    try {
+      expandido = await expandirLink(alvo);
+      const qs = new URL(expandido).searchParams;
+      for (const c of CAMPOS_TRACKING) { const v = qs.get(c); if (v) parametros[c] = v; }
+    } catch (e) { erroExpansao = e.message; }
+  }
+
+  // O affiliate id costuma vir embutido em utm_campaign no formato id_XXXXX.
+  const campanha = parametros.utm_campaign || '';
+  const affiliateId = (campanha.match(/id_(\w+)/) || [])[1] || null;
+
+  return {
+    ok: true,
+    produto: { itemId: String(node.itemId), shopId: String(node.shopId), nome: node.productName },
+    // A comissao so vem preenchida para ofertas elegiveis a esta conta: valor
+    // presente e mais uma confirmacao de que o item rende para voce.
+    comissao: {
+      taxa: node.commissionRate ? Math.round(Number(node.commissionRate) * 1000) / 10 + '%' : null,
+      valorEstimado: node.commission || null,
+    },
+    linkOriginal: node.productLink || null,
+    offerLink,
+    linkComSubId: marcado,
+    linkExpandido: expandido,
+    parametros,
+    affiliateId,
+    subIdEnviado: subId,
+    erroExpansao,
+    veredito: {
+      offerLinkVeioDaApi: !!offerLink,
+      temParametrosDeAfiliado: !!(parametros.utm_medium || parametros.utm_campaign || parametros.af_siteid),
+      subIdPresenteNoLink: !!(subId && expandido && expandido.includes(subId)),
+    },
+  };
+}
+
 /** Monta ofertas da vitrine para itens Shopee, com preco consultado agora. */
 export async function montarOfertasShopeeVitrine(itens, codigoCupom = null) {
   const prontos = [], descartados = [];
