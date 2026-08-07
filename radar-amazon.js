@@ -864,6 +864,10 @@ export function salvarItemVitrine(item) {
     nome,
     url: item.url || anterior?.url || '',
     loja: item.loja || anterior?.loja || 'Amazon',
+    // Shopee identifica o produto por (shopId, itemId), nao por um codigo unico
+    // como o ASIN — os dois precisam sobreviver no cadastro.
+    shopId: item.shopId || anterior?.shopId || null,
+    itemId: item.itemId || anterior?.itemId || null,
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),

@@ -28,6 +28,12 @@ import {
   itemVitrine, marcarDisparo, montarOfertasVitrine,
 } from './radar-amazon.js';
 
+// ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
+import {
+  processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
+  normalizarShopee, credenciaisShopeeOk, montarOfertasShopeeVitrine,
+} from './radar-shopee.js';
+
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
@@ -2588,18 +2594,26 @@ async function baixarImagemProduto(url) {
 
 async function processarRadarMarketplace(jid, texto) {
   if (!texto) return;
-  let resultados;
-  try {
-    resultados = await processarTextoAmazon(texto);
-  } catch (e) {
-    console.error('[MKT] Falha no pipeline:', e.message);
-    return;
+
+  // Uma mensagem pode trazer link de mais de uma loja; cada pipeline cuida dos
+  // links que reconhece e ignora o resto.
+  const resultados = [];
+  try { resultados.push(...await processarTextoAmazon(texto)); }
+  catch (e) { console.error('[MKT] Falha no pipeline Amazon:', e.message); }
+
+  if (ehLinkShopee(texto)) {
+    if (!credenciaisShopeeOk()) {
+      console.warn('[SHOPEE] Link detectado mas SHOPEE_APP_ID/SHOPEE_SECRET nao estao configurados.');
+    } else {
+      try { resultados.push(...await processarTextoShopee(texto)); }
+      catch (e) { console.error('[SHOPEE] Falha no pipeline:', e.message); }
+    }
   }
   if (!resultados.length) return;
 
   for (const r of resultados) {
     if (!r.mensagem) {
-      console.log('[MKT] ' + r.produto.asin + ' descartado — ' + r.descartadoPor);
+      console.log('[MKT] ' + (r.produto?.asin || r.produto?.itemId || '?') + ' descartado — ' + r.descartadoPor);
       continue;
     }
     const p = r.produto;
@@ -2607,12 +2621,12 @@ async function processarRadarMarketplace(jid, texto) {
 
     const oferta = {
       id: gerarId(),
-      tipoConteudo: 'oferta_amazon',
+      tipoConteudo: p.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
       origem: jid,
       conteudoOriginal: texto,
       mensagemFormatada: r.mensagem,
       dadosExtraidos: {
-        loja: 'Amazon',
+        loja: p.loja || 'Amazon',
         asin: p.asin,
         titulo: p.titulo,
         preco: p.preco,
@@ -3727,6 +3741,7 @@ app.get('/mkt/config', (req, res) => {
     fontes: radarFontes(),
     destinos: radarDestinos(),
     credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
+    credenciaisShopeeOk: credenciaisShopeeOk(),
   });
 });
 
@@ -3760,6 +3775,24 @@ app.post('/vitrine', async (req, res) => {
 
   for (const linha of linhas) {
     try {
+      // Shopee tem seu proprio formato de link e de identificador.
+      if (ehLinkShopee(linha)) {
+        if (!credenciaisShopeeOk()) { erros.push({ linha, erro: 'Shopee não configurada no Railway' }); continue; }
+        const nomeManual = (linha.match(/^(.*?)\s*[|;]\s*https?:\/\//) || [])[1];
+        const ids = await extrairIdsShopee(linha);
+        if (!ids.length) { erros.push({ linha, erro: 'não foi possível identificar o produto Shopee' }); continue; }
+        const node = await buscarProdutoShopee(ids[0]);
+        const chave = 'SHOPEE-' + ids[0].shopId + '-' + ids[0].itemId;
+        const jaTinha = !!itemVitrine(chave);
+        salvos.push({ ...salvarItemVitrine({
+          asin: chave, loja: 'Shopee',
+          shopId: String(ids[0].shopId), itemId: String(ids[0].itemId),
+          nome: (nomeManual || '').trim() || node?.productName || ('Produto ' + ids[0].itemId),
+          url: node?.offerLink || node?.productLink || linha.trim(),
+          cupom,
+        }), jaExistia: jaTinha });
+        continue;
+      }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
@@ -3791,17 +3824,39 @@ app.post('/vitrine/disparar', async (req, res) => {
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp não conectado.' });
   }
 
-  let montado;
-  try { montado = await montarOfertasVitrine(asins, req.body?.cupom || null); }
-  catch (e) { return res.status(500).json({ ok:false, erro:'falha ao consultar a API: ' + e.message }); }
+  // Cada loja tem sua API: separa antes de consultar e junta os resultados.
+  const itens = asins.map(a => itemVitrine(a)).filter(Boolean);
+  const daShopee = itens.filter(i => i.loja === 'Shopee');
+  const daAmazon = asins.filter(a => !daShopee.some(s => s.asin === a));
+
+  let montado = { prontos: [], descartados: [] };
+  if (daAmazon.length) {
+    try {
+      const m = await montarOfertasVitrine(daAmazon, req.body?.cupom || null);
+      montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+    } catch (e) { return res.status(500).json({ ok:false, erro:'falha na API da Amazon: ' + e.message }); }
+  }
+  if (daShopee.length) {
+    if (!credenciaisShopeeOk()) {
+      daShopee.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Shopee não configurada' }));
+    } else {
+      try {
+        const m = await montarOfertasShopeeVitrine(daShopee, req.body?.cupom || null);
+        montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+      } catch (e) {
+        daShopee.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Shopee: ' + e.message }));
+      }
+    }
+  }
 
   const enviados = [], falhas = [];
   for (const o of montado.prontos) {
     const oferta = {
-      id: gerarId(), tipoConteudo:'oferta_amazon', origem:'vitrine',
+      id: gerarId(), origem:'vitrine',
+      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
       mensagemFormatada: o.mensagem,
       dadosExtraidos: {
-        loja:'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
+        loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
         precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
         cupom:o.cupom, precoFinal:o.precoFinal,
       },
@@ -3939,6 +3994,30 @@ app.post('/mkt/testar', async (req, res) => {
     const r = await processarTextoAmazon(req.body.texto || '', { ignorarDedup: true });
     res.json({ ok:true, resultados: r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Cola um link Shopee e ve a mensagem que sairia, sem enfileirar nem publicar.
+app.post('/shopee/testar', async (req, res) => {
+  if (!credenciaisShopeeOk()) {
+    return res.status(400).json({ ok:false, erro:'SHOPEE_APP_ID / SHOPEE_SECRET nao configurados no Railway.' });
+  }
+  try {
+    const r = await processarTextoShopee(req.body?.texto || '');
+    res.json({ ok:true, resultados: r });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Diagnostico da credencial: uma consulta minima que prova assinatura e acesso.
+app.get('/shopee/status', async (req, res) => {
+  if (!credenciaisShopeeOk()) {
+    return res.json({ ok:false, configurado:false, erro:'SHOPEE_APP_ID / SHOPEE_SECRET ausentes.' });
+  }
+  try {
+    const ids = await extrairIdsShopee(req.query.url || '');
+    if (!ids.length) return res.json({ ok:true, configurado:true, aviso:'passe ?url= com um link Shopee para testar a consulta.' });
+    const node = await buscarProdutoShopee(ids[0]);
+    res.json({ ok:true, configurado:true, produto: node ? normalizarShopee(node) : null });
+  } catch(e) { res.json({ ok:false, configurado:true, erro:e.message }); }
 });
 
 app.get('/grupos', async (req, res) => {
