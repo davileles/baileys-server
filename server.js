@@ -22,6 +22,8 @@ import {
   radarFontes, radarDestinos, ehFonteRadar,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase,
+  listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
+  renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
 } from './radar-amazon.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -1301,22 +1303,44 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
 // O espacamento de 3–5s entre grupos e proposital: disparo simultaneo em varios
 // grupos e justamente o padrao que o WhatsApp usa para identificar automacao, e
 // o custo de perder a sessao e muito maior que o de a oferta sair 1min depois.
-async function enviarOfertaParaDestinos(mensagem, imagem) {
+// Monta o preview de link nativo. O Baileys aceita um linkPreview pronto
+// (Utils/messages.js), entao nao precisamos de link-preview-js nem de raspar a
+// pagina da Amazon — que bloqueia bots. A thumbnail vem da propria API.
+// Acima de ~100KB o WhatsApp descarta o jpegThumbnail e a mensagem sai sem
+// imagem; melhor mandar preview sem foto do que a mensagem falhar.
+const THUMB_MAX_BYTES = 100 * 1024;
+
+function montarLinkPreview(oferta, mensagem) {
+  const d = oferta.dadosExtraidos || {};
+  const url = d.link;
+  if (!url) return null;
+
+  const preview = {
+    'canonical-url': url,
+    'matched-text': url,
+    title: d.titulo || d.loja || 'Oferta',
+    description: [d.precoFinal != null ? 'R$ ' + Number(d.precoFinal).toFixed(2).replace('.', ',') : null,
+                  d.loja].filter(Boolean).join(' · '),
+  };
+
+  const img = (oferta.imagens || [])[0];
+  if (img?.imagemBase64) {
+    const buf = Buffer.from(img.imagemBase64, 'base64');
+    if (buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
+    else console.log('[MKT] Thumbnail de ' + buf.length + ' bytes acima do limite — preview sem imagem.');
+  }
+  return preview;
+}
+
+async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
   const destinos = radarDestinos();
   const alvos = destinos.length ? destinos : [GRUPOS['tsp']];
   const enviados = [], falhas = [];
+  const preview = oferta ? montarLinkPreview(oferta, mensagem) : null;
 
   for (const jid of alvos) {
     try {
-      if (imagem?.imagemBase64) {
-        await enviarMensagem(jid, {
-          image: Buffer.from(imagem.imagemBase64, 'base64'),
-          caption: mensagem,
-          mimetype: imagem.mime || 'image/jpeg',
-        });
-      } else {
-        await enviarMensagem(jid, { text: mensagem });
-      }
+      await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem });
       enviados.push(jid);
       if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
     } catch (e) {
@@ -3304,7 +3328,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   if (TIPOS_OFERTA_MARKETPLACE.has(oferta.tipoConteudo)) {
     try {
-      const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0]);
+      const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
       oferta.destinos = r.enviados; oferta.falhas = r.falhas;
       salvarFila();
@@ -3713,6 +3737,46 @@ app.post('/mkt/config', (req, res) => {
     const cfg = salvarRadarConfig(permitido);
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── TEMPLATES DE MENSAGEM POR LOJA ───────────────────────────────────────────
+app.get('/templates', (req, res) => {
+  res.json({ ok:true, templates: listarTemplates(), variaveis: VARIAVEIS_TEMPLATE });
+});
+
+app.post('/templates/:loja', (req, res) => {
+  try {
+    const tpl = salvarTemplate(req.params.loja, req.body || {});
+    console.log('[TPL] Template salvo — ' + req.params.loja);
+    res.json({ ok:true, template: tpl });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.delete('/templates/:loja', (req, res) => {
+  if (!removerTemplate(req.params.loja)) {
+    return res.status(400).json({ ok:false, erro:'Template nao encontrado, ou e o padrao (que nao pode ser removido).' });
+  }
+  res.json({ ok:true });
+});
+
+// Renderiza um corpo de template com dados de exemplo. Serve ao preview ao vivo
+// do editor: o operador ve o resultado sem precisar esperar uma oferta real.
+app.post('/templates/preview', (req, res) => {
+  try {
+    const exemplo = {
+      asin:'B0H6N6K239', loja: req.body.loja || 'Amazon', marca:'Samsung',
+      titulo:'Samsung Smart TV 58" Crystal UHD 4K U8000H 2026, Vision AI Companion, Modo Jogo',
+      preco:3032.10, precoDe:3639.00, desconto:17, disponivel:true,
+      nota:4.6, avaliacoes:812, vendedor:'Amazon.com.br', dealTermina:null,
+      link:'https://www.amazon.com.br/dp/B0H6N6K239?tag=tdsobrepromos-20',
+    };
+    const cupom = req.body.comCupom === false ? null
+      : { reg:{ codigo:'CURTEAPROMO' }, desconto:100, citado:true };
+    const corpo = req.body.corpo !== undefined
+      ? req.body.corpo
+      : (templateDaLoja(req.body.loja)?.corpo || '');
+    res.json({ ok:true, mensagem: renderTemplate(corpo, varsDoProduto(exemplo, cupom)) });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 

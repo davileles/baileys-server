@@ -392,6 +392,7 @@ async function getToken() {
 const RECURSOS = [
   'itemInfo.title',
   'itemInfo.byLineInfo',
+  'images.primary.medium',
   'images.primary.large',
   'offersV2.listings.price',
   'offersV2.listings.availability',
@@ -466,7 +467,7 @@ export function normalizar(item) {
     asin: item.asin,
     titulo: item?.itemInfo?.title?.displayValue || '',
     marca: item?.itemInfo?.byLineInfo?.brand?.displayValue || '',
-    imagemUrl: item?.images?.primary?.large?.url || null,
+    imagemUrl: item?.images?.primary?.medium?.url || item?.images?.primary?.large?.url || null,
     link: item.detailPageURL,          // ja vem com o partnerTag aplicado
     preco: preco?.amount ?? null,
     precoTexto: preco?.displayAmount || null,
@@ -498,35 +499,170 @@ function encurtarTitulo(t, max = 80) {
 }
 
 export function formatarOfertaAmazon(p, opcoes = {}) {
-  const gatilho = opcoes.gatilho ?? _cfg.gatilhoPadrao ?? '';
-  let msg = '';
-
-  if (gatilho) msg += '`🚨 ' + gatilho + '`\n\n';
-
-  msg += '*' + encurtarTitulo(p.titulo) + '*\n\n';
-
-  // Com cupom aplicavel, o 'Por' passa a ser o preco final e o riscado vira o
-  // maior valor conhecido (preco de lista, ou o proprio preco cheio da API).
   const cupom = opcoes.cupom || null;
+  const tpl   = opcoes.template || templateDaLoja(p.loja);
+  const vars  = varsDoProduto(p, cupom);
+  if (opcoes.gatilho ?? _cfg.gatilhoPadrao) vars.gatilho = opcoes.gatilho ?? _cfg.gatilhoPadrao;
+  return renderTemplate(tpl?.corpo || TEMPLATE_PADRAO, vars);
+}
+
+// ── TEMPLATES POR LOJA ────────────────────────────────────────────────────
+// O formato da mensagem deixa de ser codigo e passa a ser dado editavel. Cada
+// loja tem o seu; quem nao tiver cai no '_padrao'. Sintaxe estilo Mustache:
+//   {{var}}            insere o valor (vazio se ausente)
+//   {{#var}}...{{/var}} so renderiza o bloco se var tiver valor
+//   {{^var}}...{{/var}} so renderiza o bloco se var estiver vazia
+// As condicionais existem porque sem elas a mensagem sai com "De: ~R$ ~" ou um
+// selo de cupom orfao quando o campo nao veio da API.
+
+const TEMPLATES_PATH = SESSAO_DIR + '/templates.json';
+
+const TEMPLATE_PADRAO = [
+  '*{{titulo_curto}}*',
+  '',
+  '{{#preco_de}}De: ~R$ {{preco_de}}~',
+  '{{/preco_de}}Por: R$ {{preco}}',
+  '{{#cupom}}',
+  '\uD83C\uDFAB *CUPOM* {{cupom}}',
+  '{{/cupom}}',
+  '{{#alerta}}',
+  '\u26A0\uFE0F *IMPORTANTE* {{alerta}}',
+  '{{/alerta}}',
+  '',
+  '\uD83D\uDED2 *LOJA* {{loja_upper}}',
+  '',
+  '\uD83D\uDD17 *LINK* {{link}}',
+  '',
+  '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`',
+].join('\n');
+
+let _templates = {};
+
+function chaveLoja(loja) {
+  return (loja || '')
+    .toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '') || '_padrao';
+}
+
+export function carregarTemplates() {
+  try {
+    if (existsSync(TEMPLATES_PATH)) _templates = JSON.parse(readFileSync(TEMPLATES_PATH, 'utf-8'));
+  } catch (e) { console.log('[TPL] Erro ao carregar templates:', e.message); _templates = {}; }
+  // Semeia o padrao na primeira execucao para o operador ter de onde partir.
+  if (!_templates._padrao) {
+    _templates._padrao = { nome: 'Padrão', corpo: TEMPLATE_PADRAO, usarLinkPreview: true,
+                           atualizadoEm: new Date().toISOString() };
+    salvarTemplates();
+  }
+  console.log('[TPL] ' + Object.keys(_templates).length + ' template(s) carregado(s).');
+  return _templates;
+}
+
+function salvarTemplates() {
+  try { writeFileSync(TEMPLATES_PATH, JSON.stringify(_templates, null, 2), 'utf-8'); }
+  catch (e) { console.log('[TPL] Erro ao salvar templates:', e.message); }
+}
+
+export function listarTemplates() { return _templates; }
+
+export function templateDaLoja(loja) {
+  return _templates[chaveLoja(loja)] || _templates._padrao;
+}
+
+export function salvarTemplate(loja, dados = {}) {
+  const k = chaveLoja(loja);
+  const anterior = _templates[k] || {};
+  _templates[k] = {
+    nome: dados.nome || anterior.nome || loja || 'Padrão',
+    corpo: dados.corpo !== undefined ? dados.corpo : (anterior.corpo || TEMPLATE_PADRAO),
+    usarLinkPreview: dados.usarLinkPreview !== undefined
+      ? !!dados.usarLinkPreview
+      : (anterior.usarLinkPreview !== false),
+    atualizadoEm: new Date().toISOString(),
+  };
+  salvarTemplates();
+  return _templates[k];
+}
+
+export function removerTemplate(loja) {
+  const k = chaveLoja(loja);
+  if (k === '_padrao' || !_templates[k]) return false;   // o padrao nunca some
+  delete _templates[k];
+  salvarTemplates();
+  return true;
+}
+
+export function renderTemplate(corpo, vars) {
+  let out = String(corpo || '');
+  const vazio = v => v === null || v === undefined || v === '' || v === false;
+
+  out = out.replace(/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, k, dentro) => vazio(vars[k]) ? '' : dentro);
+  out = out.replace(/\{\{\^(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, k, dentro) => vazio(vars[k]) ? dentro : '');
+  out = out.replace(/\{\{(\w+)\}\}/g, (_, k) => vazio(vars[k]) ? '' : String(vars[k]));
+
+  // Condicional que nao renderiza deixa linha em branco sobrando: colapsa.
+  return out.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** Variaveis disponiveis no template, a partir do produto ja normalizado. */
+export function varsDoProduto(p, cupom) {
   const precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
   const riscado = cupom ? (p.precoDe || p.preco) : p.precoDe;
+  const descTotal = (riscado && riscado > precoFinal)
+    ? Math.round((1 - precoFinal / riscado) * 100)
+    : p.desconto;
 
-  if (riscado && riscado > precoFinal) {
-    msg += 'De: ~R$ ' + brl(riscado) + '~\nPor: R$ ' + brl(precoFinal) + '\n';
-  } else {
-    msg += 'Por: R$ ' + brl(precoFinal) + '\n';
+  const alertas = [];
+  if (descTotal >= 40) alertas.push(descTotal + '% de desconto');
+  if (p.dealTermina) {
+    alertas.push('Oferta relâmpago, termina em ' + new Date(p.dealTermina).toLocaleString('pt-BR', {
+      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
+    }));
   }
 
-  // Só o código: as regras (mínimo, teto, percentual) já foram aplicadas no
-  // preço acima, então repeti-las aqui só polui a mensagem.
-  if (cupom) msg += '\n\uD83C\uDFAB *CUPOM* ' + cupom.reg.codigo + '\n';
-  msg += '\n';
-
-  msg += '🛒 *LOJA* AMAZON\n\n🔗 *LINK* ' + p.link + '\n\n';
-  msg += '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`';
-
-  return msg;
+  return {
+    titulo: p.titulo || '',
+    titulo_curto: encurtarTitulo(p.titulo),
+    preco: brl(precoFinal),
+    preco_cheio: brl(p.preco),
+    preco_de: (riscado && riscado > precoFinal) ? brl(riscado) : '',
+    desconto: descTotal > 0 ? descTotal : '',
+    economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
+    cupom: cupom ? cupom.reg.codigo : '',
+    cupom_desconto: cupom ? brl(cupom.desconto) : '',
+    alerta: alertas.join('. '),
+    link: p.link || '',
+    loja: p.loja || '',
+    loja_upper: (p.loja || '').toUpperCase(),
+    vendedor: p.vendedor || '',
+    asin: p.asin || '',
+    avaliacao: p.nota ? String(p.nota).replace('.', ',') : '',
+    avaliacoes: p.avaliacoes || '',
+    marca: p.marca || '',
+  };
 }
+
+/** Lista para a UI montar os botoes de insercao. */
+export const VARIAVEIS_TEMPLATE = [
+  { chave:'titulo_curto',  desc:'Título do produto, cortado em 80 caracteres' },
+  { chave:'titulo',        desc:'Título completo do produto' },
+  { chave:'preco',         desc:'Preço final, já com o cupom aplicado' },
+  { chave:'preco_cheio',   desc:'Preço da API, sem o cupom' },
+  { chave:'preco_de',      desc:'Preço de lista (vazio quando não há)' },
+  { chave:'desconto',      desc:'Percentual total de desconto' },
+  { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
+  { chave:'cupom',         desc:'Código do cupom (vazio quando não há)' },
+  { chave:'cupom_desconto',desc:'Valor do desconto do cupom, em R$' },
+  { chave:'alerta',        desc:'Aviso de desconto alto ou oferta relâmpago' },
+  { chave:'link',          desc:'Link do produto com a sua tag de afiliado' },
+  { chave:'loja',          desc:'Nome da loja' },
+  { chave:'loja_upper',    desc:'Nome da loja em maiúsculas' },
+  { chave:'vendedor',      desc:'Vendedor do anúncio' },
+  { chave:'marca',         desc:'Marca do produto' },
+  { chave:'avaliacao',     desc:'Nota média (ex: 4,5)' },
+  { chave:'avaliacoes',    desc:'Quantidade de avaliações' },
+  { chave:'asin',          desc:'Código ASIN do produto' },
+];
 
 // ── PIPELINE ──────────────────────────────────────────────────────────────
 
@@ -579,3 +715,4 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 }
 
 carregarRadarConfig();
+carregarTemplates();
