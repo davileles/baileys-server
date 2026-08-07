@@ -47,7 +47,7 @@ import {
 import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
-  sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff,
+  sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -4253,6 +4253,8 @@ app.get('/ml/aff/status', async (req, res) => {
   }
   res.json({ ok:true, urlTeste: ML_AFF_URL_TESTE, ...saudeAff() });
 });
+
+app.get('/ml/aff/inspecionar', (req, res) => res.json({ ok:true, ...inspecionarTokenAff() }));
 
 // Sonda do painel de afiliados: descobre quais endpoints o token abre.
 app.get('/ml/aff/sonda', async (req, res) => {
