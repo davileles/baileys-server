@@ -85,7 +85,7 @@ export function ehFonteRadar(jid) {
 // A janela e restrita ao mesmo dia (inicio < fim); horarios e dia da semana sao
 // avaliados no fuso de Sao Paulo, nao no do servidor.
 
-export const LOJAS_MONITORAVEIS = ['Amazon', 'Shopee', 'Magazine Luiza'];
+export const LOJAS_MONITORAVEIS = ['Amazon', 'Shopee', 'Magazine Luiza', 'Mercado Livre'];
 const TZ_SP = 'America/Sao_Paulo';
 
 function minutosAgoraSP(d = new Date()) {

@@ -43,6 +43,12 @@ import {
   validarAtribuicao,
 } from './radar-shopee.js';
 
+// ── RADAR MERCADO LIVRE ───────────────────────────────────────────────────────
+import {
+  processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
+  credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
+} from './radar-ml.js';
+
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
   processarTextoMagalu, ehLinkMagalu, converterLinkMagalu, lojaMagalu,
@@ -2661,6 +2667,18 @@ async function processarRadarMarketplace(jid, texto) {
     console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
   }
 
+  if (ehLinkMl(texto)) {
+    const podeMl = podeCapturar(jid, 'Mercado Livre');
+    if (!podeMl.ok) {
+      console.log('[MONITOR] ML ignorado em ' + jid.split('@')[0] + ' — ' + podeMl.motivo);
+    } else if (!credenciaisMlOk()) {
+      console.warn('[ML] Link detectado mas ML_CLIENT_ID/ML_CLIENT_SECRET nao configurados.');
+    } else {
+      try { resultados.push(...await processarTextoMl(texto)); }
+      catch (e) { console.error('[ML] Falha no pipeline:', e.message); }
+    }
+  }
+
   if (ehLinkMagalu(texto)) {
     const podeMagalu = podeCapturar(jid, 'Magazine Luiza');
     if (!podeMagalu.ok) {
@@ -2695,7 +2713,8 @@ async function processarRadarMarketplace(jid, texto) {
     const oferta = {
       id: gerarId(),
       tipoConteudo: p.loja === 'Shopee' ? 'oferta_shopee'
-                  : p.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
+                  : p.loja === 'Magazine Luiza' ? 'oferta_magalu'
+                  : p.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
       origem: jid,
       conteudoOriginal: texto,
       mensagemFormatada: r.mensagem,
@@ -4163,6 +4182,42 @@ app.get('/sonda-url', async (req, res) => {
       amostra: html.slice(0, 260),
     });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── MERCADO LIVRE: OAuth ─────────────────────────────────────────────────────
+app.get('/ml/status', (req, res) => res.json({ ok:true, ...estadoMl() }));
+
+app.get('/ml/conectar', (req, res) => {
+  if (!credenciaisMlOk()) {
+    return res.status(400).send('<h3>ML_CLIENT_ID / ML_CLIENT_SECRET nao configurados no Railway.</h3>');
+  }
+  res.redirect(urlAutorizacao());
+});
+
+app.get('/ml/callback', async (req, res) => {
+  if (req.query.error) {
+    return res.status(400).send('<h3>Autorizacao negada: ' + String(req.query.error_description || req.query.error) + '</h3>');
+  }
+  if (!req.query.code) return res.status(400).send('<h3>Sem code na resposta do Mercado Livre.</h3>');
+  try {
+    const t = await trocarCodePorToken(String(req.query.code));
+    console.log('[ML] Autorizado — user_id ' + t.user_id);
+    res.send('<h2>Mercado Livre conectado.</h2><p>Pode fechar esta aba. '
+      + 'O token sera renovado automaticamente.</p>');
+  } catch (e) {
+    console.error('[ML] Falha no callback:', e.message);
+    res.status(500).send('<h3>Falha ao obter token: ' + e.message + '</h3>');
+  }
+});
+
+// O ML exige uma URL de notificacoes ao criar a aplicacao. Nao usamos webhooks,
+// mas respondemos 200 para o ML nao acumular erro de entrega.
+app.post('/ml/webhook', (req, res) => res.sendStatus(200));
+app.get('/ml/webhook', (req, res) => res.sendStatus(200));
+
+app.post('/ml/testar', async (req, res) => {
+  try { res.json({ ok:true, resultados: await processarTextoMl(req.body?.texto || '') }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 app.post('/magalu/testar', async (req, res) => {
