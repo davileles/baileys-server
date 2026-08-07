@@ -39,8 +39,34 @@ let _ultimoErro = null;
 
 export function sincronizacaoAtiva() { return !!process.env.GITHUB_TOKEN; }
 export function estadoSync() {
-  return { ativo: sincronizacaoAtiva(), repo: REPO, pasta: PASTA, ultimoErro: _ultimoErro,
-           arquivos: Object.keys(ARQUIVOS_SINCRONIZADOS) };
+  const t = process.env.GITHUB_TOKEN || '';
+  return {
+    ativo: sincronizacaoAtiva(), repo: REPO, pasta: PASTA, ultimoErro: _ultimoErro,
+    arquivos: Object.keys(ARQUIVOS_SINCRONIZADOS),
+    // Diagnostico sem vazar o segredo: so presenca, tamanho e prefixo. Variavel
+    // adicionada no Railway so entra no processo apos o restart do container.
+    diagnostico: {
+      GITHUB_TOKEN_presente: !!t,
+      GITHUB_TOKEN_tamanho: t.length,
+      GITHUB_TOKEN_prefixo: t ? t.slice(0, 11) + '…' : null,
+      GITHUB_REPO_DADOS: process.env.GITHUB_REPO_DADOS || '(usando padrao)',
+      variaveis_github_vistas: Object.keys(process.env).filter(k => /GITHUB|GH_/i.test(k)).sort(),
+    },
+  };
+}
+
+/** Testa credencial e permissao de escrita sem alterar nada. */
+export async function testarAcesso() {
+  if (!sincronizacaoAtiva()) return { ok: false, erro: 'GITHUB_TOKEN ausente no processo.' };
+  try {
+    const res = await fetch('https://api.github.com/repos/' + REPO, {
+      headers: { 'Authorization': 'Bearer ' + process.env.GITHUB_TOKEN, 'Accept': 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) return { ok: false, erro: 'HTTP ' + res.status + ' ao ler ' + REPO };
+    const d = await res.json();
+    return { ok: true, repo: d.full_name, privado: d.private, permissoes: d.permissions || null };
+  } catch (e) { return { ok: false, erro: e.message }; }
 }
 
 async function api(caminho, opcoes = {}) {
