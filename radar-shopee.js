@@ -32,12 +32,15 @@ export function credenciaisShopeeOk() {
  * Executa uma operacao GraphQL assinada.
  * O corpo e montado UMA vez e reusado na assinatura e no envio.
  */
-async function chamarShopee(query, variables = {}) {
+async function chamarShopee(query, variables = null) {
   const appId  = process.env.SHOPEE_APP_ID;
   const secret = process.env.SHOPEE_SECRET;
   if (!appId || !secret) throw new Error('SHOPEE_APP_ID / SHOPEE_SECRET nao configurados.');
 
-  const payload   = JSON.stringify({ query, variables });
+  // A Shopee rejeita Int64 passado por variavel ("wrong type"); os exemplos
+  // oficiais montam os valores inline na query. Só envia 'variables' quando
+  // houver de fato, para nao mandar um objeto vazio junto.
+  const payload = JSON.stringify(variables ? { query, variables } : { query });
   const timestamp = Math.floor(Date.now() / 1000);
   const assinatura = createHash('sha256').update(appId + timestamp + payload + secret).digest('hex');
 
@@ -129,28 +132,32 @@ export async function extrairIdsShopee(texto) {
 
 // ── CONSULTA DE PRODUTO ───────────────────────────────────────────────────
 
-const QUERY_PRODUTO = `query Produto($shopId: Int64, $itemId: Int64) {
-  productOfferV2(shopId: $shopId, itemId: $itemId, limit: 1) {
-    nodes {
-      itemId shopId productName imageUrl productLink offerLink
+const CAMPOS_PRODUTO = `itemId shopId productName imageUrl productLink offerLink
       priceMin priceMax priceDiscountRate ratingStar sales
-      shopName commissionRate commission
-    }
-  }
-}`;
-
-const MUTATION_LINK = `mutation Link($originUrl: String!, $subIds: [String]) {
-  generateShortLink(input: { originUrl: $originUrl, subIds: $subIds }) { shortLink }
-}`;
+      shopName commissionRate commission`;
 
 /** Gera o link curto de afiliado. Usado so quando offerLink nao vem na oferta. */
 export async function gerarLinkAfiliado(originUrl, subIds = ['cdv']) {
-  const d = await chamarShopee(MUTATION_LINK, { originUrl, subIds });
+  // JSON.stringify escapa aspas da URL, que entra literal na query.
+  const listaSubIds = (subIds || []).map(s => JSON.stringify(String(s))).join(',');
+  const mutation = `mutation {
+    generateShortLink(input: { originUrl: ${JSON.stringify(originUrl)}, subIds: [${listaSubIds}] }) {
+      shortLink
+    }
+  }`;
+  const d = await chamarShopee(mutation);
   return d?.generateShortLink?.shortLink || null;
 }
 
 export async function buscarProdutoShopee({ shopId, itemId }) {
-  const d = await chamarShopee(QUERY_PRODUTO, { shopId, itemId });
+  const sid = Number(shopId), iid = Number(itemId);
+  if (!Number.isFinite(sid) || !Number.isFinite(iid)) throw new Error('shopId/itemId invalidos');
+  const query = `{
+    productOfferV2(shopId: ${sid}, itemId: ${iid}, limit: 1) {
+      nodes { ${CAMPOS_PRODUTO} }
+    }
+  }`;
+  const d = await chamarShopee(query);
   return d?.productOfferV2?.nodes?.[0] || null;
 }
 
