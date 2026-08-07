@@ -16,6 +16,13 @@ import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync
 import { join } from 'path';
 import QRCode from 'qrcode';
 
+// ── RADAR DE MARKETPLACE (Amazon hoje; ML e Shopee entram pelo mesmo pipeline) ─
+import {
+  carregarRadarConfig, salvarRadarConfig, radarConfig,
+  radarFontes, radarDestinos, ehFonteRadar,
+  processarTextoAmazon,
+} from './radar-amazon.js';
+
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
@@ -279,6 +286,10 @@ function carregarFila() {
   } catch(e) { console.log('[FILA] Erro ao carregar fila:', e.message); }
 }
 
+// Tipos que o painel Gestao TSP trata como oferta de marketplace. Amazon hoje;
+// ML e Shopee entram aqui sem mudar mais nada no roteamento.
+const TIPOS_OFERTA_MARKETPLACE = new Set(['oferta_amazon', 'oferta_ml', 'oferta_shopee']);
+
 function limparFila() {
   const agora = Date.now();
   const LIMITE_PENDENTE = 18 * 60 * 60 * 1000; // pendentes somem 18h após a captura
@@ -299,6 +310,8 @@ function limparFila() {
     let limite;
     if (item.status !== 'pendente') limite = LIMITE_PROCESSADAS_MS;
     else if (item.tipoConteudo === 'cupom_tsp') limite = LIMITE_CUPOM_TSP;
+    // Oferta de produto envelhece igual cupom: preco muda e estoque acaba.
+    else if (TIPOS_OFERTA_MARKETPLACE.has(item.tipoConteudo)) limite = LIMITE_CUPOM_TSP;
     else limite = LIMITE_PENDENTE;
 
     if (agora - ts > limite) filaPendentes.splice(i, 1);
@@ -1279,6 +1292,39 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
       await enviarMensagem(GRUPOS.operador, { text: '*Falha ao enviar cupom no grupo so-cupons* \u26a0\ufe0f\n\n' + e.message });
     } catch(_) {}
   }
+}
+
+// Envia uma oferta de marketplace para os grupos marcados como 'destino' no
+// painel. Sem destino marcado, cai no grupo TSP principal.
+//
+// O espacamento de 3–5s entre grupos e proposital: disparo simultaneo em varios
+// grupos e justamente o padrao que o WhatsApp usa para identificar automacao, e
+// o custo de perder a sessao e muito maior que o de a oferta sair 1min depois.
+async function enviarOfertaParaDestinos(mensagem, imagem) {
+  const destinos = radarDestinos();
+  const alvos = destinos.length ? destinos : [GRUPOS['tsp']];
+  const enviados = [], falhas = [];
+
+  for (const jid of alvos) {
+    try {
+      if (imagem?.imagemBase64) {
+        await enviarMensagem(jid, {
+          image: Buffer.from(imagem.imagemBase64, 'base64'),
+          caption: mensagem,
+          mimetype: imagem.mime || 'image/jpeg',
+        });
+      } else {
+        await enviarMensagem(jid, { text: mensagem });
+      }
+      enviados.push(jid);
+      if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+    } catch (e) {
+      console.error('[MKT] Falha ao enviar em ' + jid + ':', e.message);
+      falhas.push({ jid, erro: e.message });
+    }
+  }
+  if (!enviados.length) throw new Error('Nenhum grupo recebeu a oferta.');
+  return { enviados, falhas };
 }
 
 // Envia um cupom aprovado pelo gate para os grupos de cupons e marca a oferta
@@ -2474,10 +2520,80 @@ const _TIPOS_TRATADOS = ['imageMessage','extendedTextMessage','conversation'];
 // Tipos sem valor de captura — descartados sem log para não poluir
 const _TIPOS_IGNORADOS = new Set(['protocolMessage','reactionMessage','pollUpdateMessage','senderKeyDistributionMessage','messageContextInfo','stickerMessage','audioMessage','pollCreationMessage','pollCreationMessageV2','pollCreationMessageV3']);
 
+// ── RADAR DE MARKETPLACE ─────────────────────────────────────────────────────
+// Extrai o link do produto da mensagem do grupo-fonte, consulta a Creators API
+// (que e a fonte da verdade de preco e estoque — nunca o texto do grupo) e
+// enfileira em filaPendentes com tipoConteudo 'oferta_amazon'. A partir dai
+// segue exatamente o mesmo caminho de aprovacao dos cupons TSP.
+async function baixarImagemProduto(url) {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return null;
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > 4 * 1024 * 1024) return null;
+    return { imagemBase64: buf.toString('base64'), mime: res.headers.get('content-type') || 'image/jpeg' };
+  } catch (e) {
+    console.warn('[MKT] Nao baixou a imagem do produto:', e.message);
+    return null;
+  }
+}
+
+async function processarRadarMarketplace(jid, texto) {
+  if (!texto) return;
+  let resultados;
+  try {
+    resultados = await processarTextoAmazon(texto);
+  } catch (e) {
+    console.error('[MKT] Falha no pipeline:', e.message);
+    return;
+  }
+  if (!resultados.length) return;
+
+  for (const r of resultados) {
+    if (!r.mensagem) {
+      console.log('[MKT] ' + r.produto.asin + ' descartado — ' + r.descartadoPor);
+      continue;
+    }
+    const p = r.produto;
+    const imagem = await baixarImagemProduto(p.imagemUrl);
+
+    const oferta = {
+      id: gerarId(),
+      tipoConteudo: 'oferta_amazon',
+      origem: jid,
+      conteudoOriginal: texto,
+      mensagemFormatada: r.mensagem,
+      dadosExtraidos: {
+        loja: 'Amazon',
+        asin: p.asin,
+        titulo: p.titulo,
+        preco: p.preco,
+        precoDe: p.precoDe,
+        desconto: p.desconto,
+        link: p.link,
+        vendedor: p.vendedor,
+        ehDeal: p.ehDeal,
+      },
+      imagens: imagem ? [imagem] : [],
+      status: 'pendente',
+      timestamp: new Date().toISOString(),
+    };
+
+    filaPendentes.unshift(oferta);
+    salvarFila();
+    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)');
+  }
+}
+
 async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
-    if (!GRUPOS_MONITORADOS.includes(jid)) return;
+    // Dois monitoramentos convivem: GRUPOS_MONITORADOS alimenta o pipeline de
+    // emissoes CDV; os grupos marcados como 'fonte' no painel alimentam o radar
+    // de marketplace. Um grupo pode estar so em um dos dois.
+    const _ehRadar = ehFonteRadar(jid);
+    if (!GRUPOS_MONITORADOS.includes(jid) && !_ehRadar) return;
     const m    = desembrulharMessage(msg.message);
     const tipo = _TIPOS_TRATADOS.find(t => m && m[t]) || Object.keys(m || {})[0];
     let texto = '', imagemB64 = null;
@@ -2509,6 +2625,13 @@ async function processarMensagem(msg) {
       texto.includes('Faca parte do Balcao clicando aqui') ||
       texto.includes('Faça parte do Balcão clicando aqui')
     )) { return; }
+
+    // Radar de marketplace: sai antes do buffer de agrupamento, que e do
+    // pipeline de emissoes CDV e nao sabe lidar com link de produto.
+    if (_ehRadar) {
+      await processarRadarMarketplace(jid, texto);
+      if (!GRUPOS_MONITORADOS.includes(jid)) return;
+    }
 
     if (!bufferAgrupamento.has(jid)) bufferAgrupamento.set(jid, { itens:[], timer:null });
     const entrada = bufferAgrupamento.get(jid);
@@ -2895,7 +3018,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -3126,6 +3249,17 @@ app.post('/painel/aprovar/:id', async (req, res) => {
       await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0]);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem; salvarFila();
       res.json({ ok:true });
+    } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
+    return;
+  }
+
+  if (TIPOS_OFERTA_MARKETPLACE.has(oferta.tipoConteudo)) {
+    try {
+      const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0]);
+      oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
+      oferta.destinos = r.enviados; oferta.falhas = r.falhas;
+      salvarFila();
+      res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
     } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
     return;
   }
@@ -3499,6 +3633,46 @@ app.post('/enviar-audio', upload.single('audio'), async (req, res) => {
   } finally {
     if (existsSync(file.path)) unlinkSync(file.path);
   }
+});
+
+// ── RADAR DE MARKETPLACE (TSP) ───────────────────────────────────────────────
+// Nao confundir com /radar/* e filaRadar acima, que sao do Radar de Ofertas CDV.
+
+// Config do radar de marketplace — a aba Grupos do painel Gestao TSP grava aqui.
+app.get('/mkt/config', (req, res) => {
+  const cfg = radarConfig();
+  res.json({
+    ok: true,
+    papeis: cfg.papeis || {},
+    ativo: cfg.ativo !== false,
+    descontoMinimo: cfg.descontoMinimo,
+    dedupHoras: cfg.dedupHoras,
+    partnerTag: cfg.partnerTag,
+    gatilhoPadrao: cfg.gatilhoPadrao || '',
+    fontes: radarFontes(),
+    destinos: radarDestinos(),
+    credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
+  });
+});
+
+app.post('/mkt/config', (req, res) => {
+  try {
+    const permitido = {};
+    for (const k of ['papeis','ativo','descontoMinimo','dedupHoras','partnerTag','gatilhoPadrao']) {
+      if (req.body[k] !== undefined) permitido[k] = req.body[k];
+    }
+    const cfg = salvarRadarConfig(permitido);
+    console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
+    res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Cola um link e ve a mensagem que sairia, sem enfileirar nem publicar nada.
+app.post('/mkt/testar', async (req, res) => {
+  try {
+    const r = await processarTextoAmazon(req.body.texto || '', { ignorarDedup: true });
+    res.json({ ok:true, resultados: r });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 app.get('/grupos', async (req, res) => {
