@@ -43,6 +43,11 @@ import {
   validarAtribuicao,
 } from './radar-shopee.js';
 
+// ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
+import {
+  processarTextoMagalu, ehLinkMagalu, converterLinkMagalu, lojaMagalu,
+} from './radar-magalu.js';
+
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
@@ -321,7 +326,7 @@ function carregarFila() {
 
 // Tipos que o painel Gestao TSP trata como oferta de marketplace. Amazon hoje;
 // ML e Shopee entram aqui sem mudar mais nada no roteamento.
-const TIPOS_OFERTA_MARKETPLACE = new Set(['oferta_amazon', 'oferta_ml', 'oferta_shopee']);
+const TIPOS_OFERTA_MARKETPLACE = new Set(['oferta_amazon', 'oferta_ml', 'oferta_shopee', 'oferta_magalu']);
 
 function limparFila() {
   const agora = Date.now();
@@ -2656,6 +2661,16 @@ async function processarRadarMarketplace(jid, texto) {
     console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
   }
 
+  if (ehLinkMagalu(texto)) {
+    const podeMagalu = podeCapturar(jid, 'Magazine Luiza');
+    if (!podeMagalu.ok) {
+      console.log('[MONITOR] Magalu ignorada em ' + jid.split('@')[0] + ' — ' + podeMagalu.motivo);
+    } else {
+      try { resultados.push(...await processarTextoMagalu(texto)); }
+      catch (e) { console.error('[MAGALU] Falha no pipeline:', e.message); }
+    }
+  }
+
   if (ehLinkShopee(texto)) {
     const podeShopee = podeCapturar(jid, 'Shopee');
     if (!podeShopee.ok) {
@@ -2679,7 +2694,8 @@ async function processarRadarMarketplace(jid, texto) {
 
     const oferta = {
       id: gerarId(),
-      tipoConteudo: p.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+      tipoConteudo: p.loja === 'Shopee' ? 'oferta_shopee'
+                  : p.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
       origem: jid,
       conteudoOriginal: texto,
       mensagemFormatada: r.mensagem,
@@ -2695,6 +2711,9 @@ async function processarRadarMarketplace(jid, texto) {
         ehDeal: p.ehDeal,
         cupom: r.cupom || null,
         precoFinal: r.precoFinal ?? p.preco,
+        // Magalu nao tem fonte verificavel de preco: o painel precisa avisar
+        // antes da aprovacao que aquele valor veio do texto do grupo.
+        precoDeReferencia: !!r.precoDeReferencia,
       },
       imagens: imagem ? [imagem] : [],
       // Nome do grupo resolvido na captura: no painel o jid sozinho nao diz nada,
@@ -4143,6 +4162,19 @@ app.get('/sonda-url', async (req, res) => {
       precosEncontrados: precos,
       amostra: html.slice(0, 260),
     });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.post('/magalu/testar', async (req, res) => {
+  try { res.json({ ok:true, loja: lojaMagalu(), resultados: await processarTextoMagalu(req.body?.texto || '') }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.get('/magalu/converter', async (req, res) => {
+  if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
+  try {
+    const r = await converterLinkMagalu(req.query.url);
+    res.json(r ? { ok:true, ...r } : { ok:false, erro:'não foi possível extrair o código do produto' });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
