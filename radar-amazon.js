@@ -16,6 +16,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { agendarPush } from './sync-github.js';
 
 const SESSAO_DIR      = './sessao';
 const RADAR_CFG_PATH  = SESSAO_DIR + '/radar_config.json';
@@ -59,6 +60,7 @@ export function salvarRadarConfig(novo = {}) {
   if (novo.papeis) _cfg.papeis = novo.papeis;
   try {
     writeFileSync(RADAR_CFG_PATH, JSON.stringify(_cfg, null, 2), 'utf-8');
+    agendarPush('radar_config.json');
   } catch (e) {
     console.log('[MKT] Erro ao salvar config:', e.message);
   }
@@ -274,6 +276,7 @@ function salvarCuponsBase() {
       if (new Date(_cupons[k].validadeAte).getTime() < corte) delete _cupons[k];
     }
     writeFileSync(CUPONS_BASE_PATH, JSON.stringify(_cupons, null, 2), 'utf-8');
+    agendarPush('cupons_base.json');
   } catch (e) { console.log('[CUPONS] Erro ao salvar base:', e.message); }
 }
 
@@ -713,7 +716,8 @@ export function carregarTemplates() {
 }
 
 function salvarTemplates() {
-  try { writeFileSync(TEMPLATES_PATH, JSON.stringify(_templates, null, 2), 'utf-8'); }
+  try { writeFileSync(TEMPLATES_PATH, JSON.stringify(_templates, null, 2), 'utf-8');
+    agendarPush('templates.json'); }
   catch (e) { console.log('[TPL] Erro ao salvar templates:', e.message); }
 }
 
@@ -899,7 +903,8 @@ export function carregarVitrine() {
   return _vitrine;
 }
 function salvarVitrine() {
-  try { writeFileSync(VITRINE_PATH, JSON.stringify(_vitrine, null, 2), 'utf-8'); }
+  try { writeFileSync(VITRINE_PATH, JSON.stringify(_vitrine, null, 2), 'utf-8');
+    agendarPush('vitrine.json'); }
   catch (e) { console.log('[VITRINE] Erro ao salvar:', e.message); }
 }
 

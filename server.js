@@ -27,8 +27,14 @@ import {
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
-  podeCapturar, LOJAS_MONITORAVEIS,
+  podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
+  carregarCuponsBase, carregarTemplates, carregarVitrine,
 } from './radar-amazon.js';
+
+// ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
+import {
+  baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva,
+} from './sync-github.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
@@ -49,6 +55,19 @@ const baileysLogger = pino({ level: 'silent' });
 // Intercepta console.log/warn para suprimir dumps de criptografia do Baileys
 // que causam rate limit de 500 logs/s no Railway e derrubam o processo.
 // Filtro de noise removido temporariamente para diagnóstico.
+
+// Boot: o GitHub e a copia durável. Os modulos ja carregaram do disco no import;
+// depois do download recarregam, agora com o conteudo do repositorio.
+(async () => {
+  try {
+    const r = await baixarDoGitHub();
+    if (r.baixados) {
+      carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
+      semearMonitorDasFontes();
+      console.log('[SYNC] Modulos recarregados a partir do repositorio.');
+    }
+  } catch (e) { console.error('[SYNC] Falha no boot:', e.message); }
+})();
 
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
@@ -1031,7 +1050,18 @@ const LINKS_TSP = {
   'Shopee_sem':    'https://s.shopee.com.br/9fHPmP3QZF',
   'Shopee_com':    'https://s.shopee.com.br/30kdYeLY0W',
   'Magazine Luiza':'https://magazineluiza.onelink.me/589508454/3jdc7bbv',
+  'Zé Delivery':   'https://ze.onelink.me/qZhP/p8z09c1x',
 };
+
+// A IA devolve a loja como "Zé Delivery", "Ze Delivery", "zedelivery" ou
+// "Outro: Zé Delivery" dependendo de como o texto original escreveu. Uma unica
+// funcao de reconhecimento evita repetir a variacao em cada ponto.
+function ehZeDelivery(loja) {
+  const n = String(loja || '').toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/^outro:\s*/, '').replace(/[^a-z]/g, '');
+  return n.includes('zedelivery') || n === 'ze';
+}
 
 function formatarCupomTSP(dados) {
   const loja   = dados.loja   || '';
@@ -1078,6 +1108,7 @@ function formatarCupomTSP(dados) {
   else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
   else if (loja === 'Shopee')   url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
   else if (isMagalu)            url = LINKS_TSP['Magazine Luiza'];
+  else if (ehZeDelivery(loja))  url = LINKS_TSP['Zé Delivery'];
 
   if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
 
@@ -1176,6 +1207,7 @@ function lojaComLink(loja, codigo) {
   // Shopee: auto-envio SOMENTE com codigo (decisao do operador).
   if (loja === 'Shopee')        return !!codigo && !!LINKS_TSP['Shopee_com'];
   if (/magazine\s*luiza|magalu/.test(norm)) return !!LINKS_TSP['Magazine Luiza'];
+  if (ehZeDelivery(loja))       return !!LINKS_TSP['Zé Delivery'];
   return false;
 }
 
@@ -3791,6 +3823,24 @@ app.post('/mkt/config', (req, res) => {
     const cfg = salvarRadarConfig(permitido);
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── SINCRONIZACAO ────────────────────────────────────────────────────────────
+app.get('/sync', (req, res) => res.json({ ok:true, ...estadoSync() }));
+
+app.post('/sync/push', async (req, res) => {
+  if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
+  try { res.json({ ok:true, enviados: await pushImediato() }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.post('/sync/pull', async (req, res) => {
+  if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
+  try {
+    const r = await baixarDoGitHub();
+    carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
+    res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
