@@ -82,12 +82,28 @@ export function ehLinkShopee(texto) {
   return r.test(String(texto || ''));
 }
 
+// A Shopee expoe o mesmo produto em tres formatos de URL, e o encurtador
+// resolve para qualquer um deles dependendo da origem do link:
+//   1. canonico  .../Nome-Do-Produto-i.{shopId}.{itemId}
+//   2. classico  .../product/{shopId}/{itemId}
+//   3. afiliado  .../opaanlp/{shopId}/{itemId}   (landing de campanha)
+// O fallback pega prefixos novos que sigam o mesmo par shopId/itemId no path,
+// exigindo 6+ digitos em cada um para nao confundir com paginacao ou categoria.
 function idsDeUrl(url) {
-  const m = String(url || '').match(/-i\.(\d+)\.(\d+)/);
-  return m ? { shopId: Number(m[1]), itemId: Number(m[2]) } : null;
+  const s = String(url || '');
+  const padroes = [
+    /-i\.(\d+)\.(\d+)/,
+    /\/(?:product|opaanlp)\/(\d+)\/(\d+)/i,
+    /\/(\d{6,})\/(\d{6,})(?:[/?#]|$)/,
+  ];
+  for (const re of padroes) {
+    const m = s.match(re);
+    if (m) return { shopId: Number(m[1]), itemId: Number(m[2]) };
+  }
+  return null;
 }
 
-async function resolverEncurtadorShopee(url, tentativas = 5) {
+export async function resolverEncurtadorShopee(url, tentativas = 5) {
   let atual = url;
   for (let i = 0; i < tentativas; i++) {
     const res = await fetch(atual, {
