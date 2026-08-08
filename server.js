@@ -609,6 +609,7 @@ function contaDisponivel(id) {
 
 async function conectarConta(id) {
   const c = estadoConta(id);
+  if (c.removida) return c;
   if (c.conectando || (c.conectado && c.sock)) return c;
   c.conectando = true;
   try {
@@ -649,6 +650,7 @@ async function conectarConta(id) {
         }
         // Backoff ate 5 min: a conta secundaria nao e critica, entao insistir
         // rapido so gastaria tentativa de conexao com os servidores do WhatsApp.
+        if (c.removida) return;
         c.tentativas++;
         const espera = Math.min(5 * 60000, 5000 * Math.pow(2, Math.min(c.tentativas, 6)));
         clearTimeout(c.timer);
@@ -3489,9 +3491,15 @@ app.post('/contas/:id/conectar', async (req, res) => {
 
 app.get('/contas/:id/qr', async (req, res) => {
   const id = String(req.params.id || '').trim();
-  const c = estadoConta(id);
+  // NAO usa estadoConta() aqui: ela CRIA a conta se nao existir. Como esta
+  // pagina se auto-recarrega a cada 3-30s, uma aba esquecida aberta ressuscitava
+  // a conta a cada refresh — inclusive depois de excluida pelo painel.
+  // Criar conta e responsabilidade exclusiva do POST /contas/:id/conectar.
+  const c = contasExtras.get(id);
+  if (!c) {
+    return res.status(404).send('<html><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:12px;margin:0"><h2 style="color:#ffa500">Conexao "' + id + '" nao existe</h2><p style="color:#aaa">Ela foi removida ou ainda nao foi criada. Pode fechar esta aba.</p><p style="color:#aaa">Para criar: painel Gestao TSP - aba Conexao - Gerar QR.</p></body></html>');
+  }
   if (c.conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Conta ' + id + ' ja conectada!</h2></body></html>');
-  if (!c.conectando && !c.sock) conectarConta(id).catch(()=>{});
   if (!c.qr) return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR de ' + id + '...</h2></body></html>');
   res.send('<html><head><title>QR ' + id + '</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Parear conta: ' + id + '</h2><img src="' + c.qr + '" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
 });
@@ -3509,6 +3517,9 @@ app.delete('/contas/:id', async (req, res) => {
   const c = contasExtras.get(id);
   let desvinculou = false;
   if (c) {
+    // Uma reconexao ja agendada ou um connection.update em voo recolocaria a
+    // conta no mapa depois do delete. A flag faz esses caminhos desistirem.
+    c.removida = true;
     clearTimeout(c.timer);
     if (c.sock) {
       // logout() desvincula o aparelho na lista de dispositivos conectados.
