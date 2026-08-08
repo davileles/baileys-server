@@ -34,6 +34,10 @@ const CFG_PADRAO = {
   dedupHoras: 24,
   partnerTag: process.env.AMZ_PARTNER_TAG || '',
   gatilhoPadrao: '',      // texto opcional no topo da mensagem
+  // Janela de publicacao dos cupons no auto-envio. Antes era o horario fixo da
+  // fila CDV (8h-21h) no codigo; virou config porque cupom e oferta tem ritmos
+  // diferentes e quem decide isso e o operador, nao o deploy.
+  janelaCupom: { inicio: '08:00', fim: '21:00', dias: 'todos', intervaloSeg: 90 },
 };
 
 let _cfg = { ...CFG_PADRAO };
@@ -105,6 +109,51 @@ function paraMinutos(hhmm, padrao) {
   const h = Number(m[1]), min = Number(m[2]);
   if (h > 23 || min > 59) return padrao;
   return h * 60 + min;
+}
+
+// ── JANELA DE PUBLICACAO DOS CUPONS ───────────────────────────────────────
+// Mesma mecanica da janela por grupo da aba Grupos, mas global: vale para todo
+// cupom que o gate de auto-envio liberar.
+
+export function janelaCupom() {
+  return { ...CFG_PADRAO.janelaCupom, ...(_cfg.janelaCupom || {}) };
+}
+
+export function salvarJanelaCupom(dados = {}) {
+  const atual = janelaCupom();
+  const nova = {
+    inicio: dados.inicio !== undefined ? String(dados.inicio) : atual.inicio,
+    fim:    dados.fim    !== undefined ? String(dados.fim)    : atual.fim,
+    dias:   dados.dias === 'uteis' ? 'uteis' : (dados.dias === 'todos' ? 'todos' : atual.dias),
+    intervaloSeg: dados.intervaloSeg !== undefined
+      ? Math.max(0, Math.min(3600, Number(dados.intervaloSeg) || 0))
+      : atual.intervaloSeg,
+  };
+  // Horario invalido cairia no padrao do paraMinutos e o operador nunca saberia
+  // por que a janela nao mudou — melhor recusar na hora de gravar.
+  if (paraMinutos(nova.inicio, null) === null) throw new Error('horario inicial invalido (use HH:MM)');
+  if (paraMinutos(nova.fim, null) === null)    throw new Error('horario final invalido (use HH:MM)');
+  salvarRadarConfig({ janelaCupom: nova });
+  return nova;
+}
+
+/** { ok, motivo } — o motivo aparece no veredito do gate, no card da fila. */
+export function dentroDaJanelaCupom(quando = new Date()) {
+  const j = janelaCupom();
+  if (j.dias === 'uteis') {
+    const dia = diaSemanaSP(quando);
+    if (dia === 0 || dia === 6) return { ok: false, motivo: 'fora da janela (so dias uteis)' };
+  }
+  const agora  = minutosAgoraSP(quando);
+  const inicio = paraMinutos(j.inicio, 8 * 60);
+  const fim    = paraMinutos(j.fim, 21 * 60);
+  // Janela que vira a meia-noite (ex: 20:00-02:00) e um intervalo unico partido
+  // em dois pedacos do dia, nao um erro de digitacao.
+  const dentro = inicio <= fim
+    ? (agora >= inicio && agora < fim)
+    : (agora >= inicio || agora < fim);
+  if (!dentro) return { ok: false, motivo: `fora da janela ${j.inicio}-${j.fim} SP` };
+  return { ok: true, motivo: 'dentro da janela' };
 }
 
 export function listarMonitor() { return _cfg.monitor || {}; }
