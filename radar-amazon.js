@@ -434,6 +434,14 @@ function salvarCuponsBase() {
  * Grava (ou atualiza) um cupom na base a partir do objeto que a IA extraiu.
  * Cupom sem codigo nao entra: sem codigo nao ha o que aplicar no checkout.
  */
+// Aceita ISO ou Date; devolve null para lixo, para nunca gravar 'Invalid Date'
+// como validade e derrubar o cupomVigente() de todos os cupons da loja.
+function validadeInformada(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isFinite(d.getTime()) ? d.toISOString() : null;
+}
+
 export function registrarCupomBase(c) {
   const chave = chaveCupom(c?.loja, c?.codigo);
   if (!chave) return null;
@@ -456,7 +464,9 @@ export function registrarCupomBase(c) {
     observacao: c.observacao || null,
     capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
     atualizadoEm: new Date(agora).toISOString(),
-    validadeAte: new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
+    // Validade informada pela fonte (ex.: endDate da Awin) vale mais que o
+    // prazo padrao chutado — so cai no padrao quando a fonte nao diz nada.
+    validadeAte: validadeInformada(c?.validadeAte) || new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
     // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
     ativo: anterior ? anterior.ativo !== false : true,
   };
