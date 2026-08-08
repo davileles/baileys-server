@@ -53,8 +53,10 @@ import {
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
 // variavel porque o endpoint interno pode mudar sem aviso.
+// Testa a pagina do proprio linkbuilder: exige sessao valida e nao gera link
+// nenhum. Cookie caido redireciona para login, o que muda o status.
 const ML_AFF_URL_TESTE = process.env.ML_AFF_URL_TESTE
-  || 'https://www.mercadolivre.com.br/affiliate-program/api/users/me';
+  || 'https://www.mercadolivre.com.br/afiliados/linkbuilder';
 
 // Aviso no grupo do operador — o token parar em silencio custaria um dia
 // inteiro de ofertas do ML sem ninguem perceber.
