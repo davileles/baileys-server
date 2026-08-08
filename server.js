@@ -5221,6 +5221,61 @@ app.get('/grupos/censo/historico', (req, res) => {
   });
 });
 
+// POST /grupos/censo/importar — carga de historico anterior ao censo automatico.
+// Body: { registros:[{ dia:'YYYY-MM-DD', jid?|nome?, membros:N }], sobrescrever?:bool }
+// Mescla na serie existente: por padrao NAO altera dia+grupo ja medido (a
+// medicao real do servidor vale mais que planilha), a nao ser com sobrescrever.
+// O grupo pode vir por jid ou por nome — o nome e resolvido contra os grupos
+// conhecidos, e o que nao casar volta na resposta em vez de ser descartado calado.
+app.post('/grupos/censo/importar', (req, res) => {
+  const { registros, sobrescrever } = req.body || {};
+  if (!Array.isArray(registros) || !registros.length)
+    return res.status(400).json({ ok:false, erro:'registros obrigatorio (array nao vazio).' });
+
+  const norm = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const porNome = new Map();
+  for (const [jid, nome] of NOMES_GRUPOS) porNome.set(norm(nome), jid);
+  for (const g of (_censo.grupos || [])) if (g.nome) porNome.set(norm(g.nome), g.jid);
+
+  let gravados = 0, ignorados = 0, invalidos = 0;
+  const semGrupo = new Set(), dias = new Set();
+
+  for (const r of registros) {
+    const dia = String(r?.dia || '').trim();
+    const membros = Number(r?.membros);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia) || !Number.isFinite(membros) || membros < 0) { invalidos++; continue; }
+
+    const jid = String(r.jid || '').endsWith('@g.us') ? r.jid : porNome.get(norm(r.nome));
+    if (!jid) { semGrupo.add(r.nome || r.jid || '(vazio)'); invalidos++; continue; }
+
+    if (!_censoHist.dias[dia]) _censoHist.dias[dia] = { total: 0, grupos: {}, importado: true };
+    const reg = _censoHist.dias[dia];
+    if (reg.grupos[jid] != null && !sobrescrever) { ignorados++; continue; }
+    reg.grupos[jid] = Math.round(membros);
+    gravados++; dias.add(dia);
+  }
+
+  // Total recalculado em todos os dias tocados: importar um grupo novo num dia
+  // antigo muda a soma daquele dia.
+  for (const d of dias)
+    _censoHist.dias[d].total = Object.values(_censoHist.dias[d].grupos).reduce((s, n) => s + n, 0);
+
+  const chaves = Object.keys(_censoHist.dias).sort();
+  while (chaves.length > CENSO_HIST_DIAS) delete _censoHist.dias[chaves.shift()];
+
+  try {
+    writeFileSync(CENSO_HIST_FILE, JSON.stringify(_censoHist, null, 2), 'utf-8');
+    agendarPush(CENSO_HIST_ARQ);
+  } catch(e) { return res.status(500).json({ ok:false, erro:'falha ao gravar: ' + e.message }); }
+
+  console.log('[CENSO] Importacao — ' + gravados + ' ponto(s) em ' + dias.size + ' dia(s).');
+  res.json({
+    ok: true, gravados, ignorados, invalidos,
+    dias: dias.size, totalDiasNaSerie: Object.keys(_censoHist.dias).length,
+    gruposNaoResolvidos: [...semGrupo],
+  });
+});
+
 // POST /grupos/censo/atualizar — mede agora, sob demanda do painel.
 app.post('/grupos/censo/atualizar', async (req, res) => {
   try {
