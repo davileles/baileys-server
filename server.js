@@ -4477,7 +4477,9 @@ setInterval(async () => {
           + ex.enviados.length + ' enviado(s)\n' + ex.falhas.length + ' falha(s)\n'
           + ex.pulados.length + ' pulado(s) (sem preco, esgotado ou fora da base)' });
       } catch(_) {}
-      atualizarExecucaoLista(lista.id, null);
+      // Envio unico nao vira historico: cumprida a fila, o registro sai do painel.
+      if (lista.efemera) removerLista(lista.id);
+      else atualizarExecucaoLista(lista.id, null);
       return;
     }
 
@@ -4571,6 +4573,41 @@ app.post('/listas/:id/disparar', async (req, res) => {
   res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos });
 });
 
+// Envio unico: mesma maquina de disparo das listas salvas, so que o registro e
+// descartavel. Cria e inicia num passo so — se nao der para iniciar, a lista e
+// desfeita, porque envio unico parado no painel vira lixo que ninguem entende.
+app.post('/listas/disparo-unico', async (req, res) => {
+  const produtos = Array.isArray(req.body?.produtos) ? req.body.produtos.filter(Boolean) : [];
+  if (!produtos.length) return res.status(400).json({ ok:false, erro:'selecione ao menos um produto' });
+  if (!conectado || !sock) {
+    const ok = await aguardarSock(10000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
+
+  const agora = new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, day:'2-digit', month:'2-digit',
+                                                   hour:'2-digit', minute:'2-digit' }).format(new Date());
+  const lista = salvarLista({
+    nome: String(req.body?.nome || '').trim() || ('Envio único · ' + agora),
+    produtos,
+    intervaloMin: req.body?.intervaloMin,
+    cupomModo: req.body?.cupomModo,
+    cupomCodigo: req.body?.cupomCodigo,
+    efemera: true,
+    agenda: { ativo:false },
+  });
+
+  try {
+    const atualizada = iniciarExecucaoLista(lista);
+    console.log('[LISTA] Envio unico iniciado — ' + produtos.length + ' produto(s), '
+      + lista.intervaloMin + ' min de intervalo.');
+    res.json({ ok:true, lista: atualizada, produtos: produtos.length,
+               duracaoMin: (produtos.length - 1) * lista.intervaloMin });
+  } catch (e) {
+    removerLista(lista.id);
+    res.status(500).json({ ok:false, erro:e.message });
+  }
+});
+
 // Pausar/retomar/cancelar no meio: lista longa pode precisar parar (grupo
 // reclamando, cupom que caiu, preco errado).
 app.post('/listas/:id/pausar', (req, res) => {
@@ -4592,7 +4629,8 @@ app.post('/listas/:id/cancelar', (req, res) => {
   const lista = listaPorId(req.params.id);
   if (!lista?.execucao) return res.status(400).json({ ok:false, erro:'lista nao esta em disparo' });
   const parcial = lista.execucao;
-  atualizarExecucaoLista(lista.id, null);
+  if (lista.efemera) removerLista(lista.id);
+  else atualizarExecucaoLista(lista.id, null);
   res.json({ ok:true, enviados: parcial.enviados.length, restantes: lista.produtos.length - parcial.indice });
 });
 
@@ -4642,7 +4680,10 @@ app.post('/vitrine', async (req, res) => {
   res.json({ ok: salvos.length > 0, salvos, erros });
 });
 
-// Dispara direto para os grupos destino: o operador ja revisou ao cadastrar.
+// LEGADO — o painel nao usa mais este caminho. Todo disparo da vitrine passa
+// agora pelas listas (salvas ou de envio unico), que enviam um produto por vez
+// com intervalo em vez da rajada de 3-5s que este endpoint faz. Mantido apenas
+// para nao quebrar chamada externa que ainda aponte para ca.
 // O preco e SEMPRE consultado agora — item salvo tem preco velho, e anunciar
 // preco que nao existe mais e o erro que este pipeline existe para evitar.
 app.post('/vitrine/disparar', async (req, res) => {
