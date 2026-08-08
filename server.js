@@ -3584,12 +3584,41 @@ app.get('/contas/:id/grupos', async (req, res) => {
     const daConta = Object.keys(await c.sock.groupFetchAllParticipating());
     const destinos = radarDestinos().length ? radarDestinos() : [GRUPOS['tsp']];
     const alvos = [...new Set([...destinos, GRUPOS['tsp'], GRUPOS['tsp_cupons']])];
-    res.json({
+    const ausentes = (lista) => [...new Set(lista)]
+      .filter(j => !daConta.includes(j))
+      .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
+
+    // Resposta padrao = so grupos de destino do TSP. E o que o painel de gestao
+    // do TSP consome, e grupo do CDV nao diz respeito aquele painel.
+    const resposta = {
       ok: true,
       total: daConta.length,
-      faltando: alvos.filter(j => !daConta.includes(j)).map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null })),
+      faltando: ausentes(alvos),
       conferidos: alvos.length,
-    });
+    };
+
+    // Escopo ampliado (?escopo=tudo): grupos de LEITURA do ecossistema CDV.
+    // Hoje quem le e sempre a conta principal, entao isso nao afeta envio nenhum.
+    // Serve para responder "posso promover esta conta a principal sem cegar o
+    // radar de emissoes?" — se faltar grupo aqui, o pipeline para em silencio.
+    if (String(req.query.escopo || '') === 'tudo') {
+      const fontes = radarFontes();
+      resposta.leitura = {
+        monitorados: {
+          conferidos: GRUPOS_MONITORADOS.length,
+          faltando: ausentes(GRUPOS_MONITORADOS),
+        },
+        fontesRadar: {
+          conferidos: [...new Set(fontes)].length,
+          faltando: ausentes(fontes),
+        },
+      };
+      resposta.leitura.aptaAPrincipal =
+        resposta.leitura.monitorados.faltando.length === 0 &&
+        resposta.leitura.fontesRadar.faltando.length === 0;
+    }
+
+    res.json(resposta);
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
