@@ -23,6 +23,7 @@ import {
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto,
+  janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
@@ -1297,7 +1298,9 @@ const AUTO_ENVIO_MODO       = (process.env.AUTO_ENVIO_CUPOM || 'sombra').toLower
 // Ofertas de marketplace (Amazon/Shopee/ML/Magalu). Diferente dos cupons, aqui
 // nao ha modo 'sombra': ou vai direto, ou vai para a fila.
 const AUTO_ENVIO_OFERTA     = (process.env.AUTO_ENVIO_OFERTA || 'off').toLowerCase();
-const AUTO_ENVIO_INTERVALO  = 90 * 1000; // intervalo minimo entre auto-envios
+// Intervalo minimo entre auto-envios. Vem da janela de cupons (aba Cupons do
+// painel) para o operador ajustar o ritmo sem redeploy.
+function intervaloAutoEnvioMs() { return (janelaCupom().intervaloSeg ?? 90) * 1000; }
 const AUTO_ENVIO_TEXTO_MIN  = 20;        // texto curto demais = info provavelmente na imagem
 const AUTO_ENVIO_MAX_ESPERA = 30 * 60 * 1000; // agendado ha mais que isso = cupom provavelmente vencido, vira aprovacao manual
 let   _ultimoAutoEnvio      = 0;
@@ -1387,15 +1390,15 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   if (!t.toLowerCase().includes(String(cupom.codigo).toLowerCase()))
     return { auto:false, motivo:'codigo nao aparece '+ondeStr };
 
-  // Janela de horario (mesma da fila CDV) — nada de cupom as 3h da manha
-  const h = horaSP();
-  if (h < HORA_INICIO_ENVIO || h >= HORA_FIM_ENVIO)
-    return { auto:false, motivo:`fora da janela ${HORA_INICIO_ENVIO}h-${HORA_FIM_ENVIO}h SP` };
+  // Janela de publicacao configurada na aba Cupons — nada de cupom as 3h da manha
+  const janela = dentroDaJanelaCupom();
+  if (!janela.ok) return { auto:false, motivo: janela.motivo };
 
   // Anti-flood: canal despejando varios cupons de uma vez
+  const intervalo = intervaloAutoEnvioMs();
   const desde = Date.now() - _ultimoAutoEnvio;
-  if (desde < AUTO_ENVIO_INTERVALO)
-    return { auto:false, motivo:`intervalo minimo (faltam ${Math.ceil((AUTO_ENVIO_INTERVALO-desde)/1000)}s)` };
+  if (desde < intervalo)
+    return { auto:false, motivo:`intervalo minimo (faltam ${Math.ceil((intervalo-desde)/1000)}s)` };
 
   return { auto:true, motivo:'aprovado' };
 }
@@ -1570,9 +1573,8 @@ setInterval(async () => {
     }
 
     // 2. Condicoes temporais para enviar o proximo da fila
-    const h = horaSP();
-    if (h < HORA_INICIO_ENVIO || h >= HORA_FIM_ENVIO) return;
-    if (agora - _ultimoAutoEnvio < AUTO_ENVIO_INTERVALO) return;
+    if (!dentroDaJanelaCupom().ok) return;
+    if (agora - _ultimoAutoEnvio < intervaloAutoEnvioMs()) return;
     if (!conectado || !sock) return;
 
     // 3. Mais antigo primeiro (ordem de captura)
@@ -4023,6 +4025,7 @@ app.get('/mkt/config', (req, res) => {
     credenciaisShopeeOk: credenciaisShopeeOk(),
     autoEnvioOferta: AUTO_ENVIO_OFERTA,
     autoEnvioCupom: AUTO_ENVIO_MODO,
+    janelaCupom: janelaCupom(),
   });
 });
 
@@ -4033,8 +4036,15 @@ app.post('/mkt/config', (req, res) => {
       if (req.body[k] !== undefined) permitido[k] = req.body[k];
     }
     const cfg = salvarRadarConfig(permitido);
+    // Janela de cupons tem gravacao propria (valida os horarios antes de salvar).
+    let janela = janelaCupom();
+    if (req.body.janelaCupom !== undefined) {
+      janela = salvarJanelaCupom(req.body.janelaCupom || {});
+      console.log('[CUPONS] Janela de publicacao — ' + janela.inicio + '-' + janela.fim
+        + ' (' + janela.dias + '), intervalo ' + janela.intervaloSeg + 's.');
+    }
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
-    res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos() });
+    res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos(), janelaCupom: janela });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
