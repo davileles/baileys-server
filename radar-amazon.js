@@ -447,6 +447,11 @@ export function registrarCupomBase(c) {
     valor: Number(c.valor) || 0,
     minimo: c.minimo === null || c.minimo === undefined ? null : Number(c.minimo),
     limite: c.limite === null || c.limite === undefined ? null : Number(c.limite),
+    // 'maximo' e o teto do PRODUTO/PEDIDO elegivel ("15% em produtos ate R$700"),
+    // coisa diferente de 'limite', que e o teto do DESCONTO ("15%, ate R$60").
+    // Confundir os dois faz o cupom ser anunciado para uma faixa de preco em que
+    // ele nem se aplica.
+    maximo: c.maximo === null || c.maximo === undefined ? null : Number(c.maximo),
     observacao: c.observacao || null,
     capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
     atualizadoEm: new Date(agora).toISOString(),
@@ -468,7 +473,7 @@ export function listarCuponsBase() {
 export function atualizarCupomBase(chave, campos = {}) {
   const reg = _cupons[chave];
   if (!reg) return null;
-  for (const k of ['ativo', 'valor', 'minimo', 'limite', 'tipo', 'validadeAte', 'observacao']) {
+  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
   }
   reg.atualizadoEm = new Date().toISOString();
@@ -504,11 +509,15 @@ export function cupomVigente(reg) {
 
 /**
  * Desconto em R$ que o cupom gera sobre um preco. 0 quando nao se aplica.
- * O teto ('limite') so faz sentido em cupom percentual.
+ * Tres regras distintas, que nao devem ser confundidas:
+ *   minimo — piso do pedido para o cupom valer ("acima de R$ 79")
+ *   maximo — teto do produto/pedido elegivel ("em produtos ate R$ 700")
+ *   limite — teto do proprio desconto, so em cupom percentual ("ate R$ 60")
  */
 export function calcularDesconto(reg, preco) {
   if (!reg || !preco || preco <= 0) return 0;
   if (reg.minimo != null && preco < reg.minimo) return 0;
+  if (reg.maximo != null && preco > reg.maximo) return 0;
 
   let d = reg.tipo === 'reais'
     ? (Number(reg.valor) || 0)
@@ -1273,8 +1282,12 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
       else {
         const desconto = calcularDesconto(reg, p.preco);
         if (desconto > 0) cupom = { reg, desconto, citado: true };
-        else avisoCupom = 'cupom ' + codigo + ' não se aplica a R$ ' + brl(p.preco)
-                        + (reg.minimo != null ? ' (mínimo R$ ' + brl(reg.minimo) + ')' : '');
+        else {
+          const regra = reg.maximo != null && p.preco > reg.maximo
+            ? ' (vale só até R$ ' + brl(reg.maximo) + ')'
+            : (reg.minimo != null ? ' (mínimo R$ ' + brl(reg.minimo) + ')' : '');
+          avisoCupom = 'cupom ' + codigo + ' não se aplica a R$ ' + brl(p.preco) + regra;
+        }
       }
     }
 
