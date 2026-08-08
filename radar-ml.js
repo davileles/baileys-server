@@ -699,7 +699,7 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
   // Os dois primeiros formatos dao o codigo direto; o terceiro exige tratar a
   // ultima palavra como codigo; o quarto precisa ser ignorado, senao viraria um
   // cupom fantasma chamado "CASA".
-  const re = /Cupom ativado de (?:(\d+)% OFF|R\$\s?([\d.,]+) OFF)\s+([^]{0,60}?)(?=Em produtos|Sem compra|Compra mínima|$)/g;
+  const re = /Cupom ativado de (?:(\d+)% OFF|R\$\s?([\d.,]+) OFF)\s+([^]{0,60}?)(?=Em produtos|Sem compra|Compra mínima|Cupom ativado de|$)/g;
   const achados = [];
   for (const m of texto.matchAll(re)) {
     const rotulo = (m[3] || '').trim();
@@ -713,9 +713,12 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
     const codigo = bruto.replace(/\s+/g, '').toUpperCase();
     if (!/^[A-Z0-9]{4,30}$/.test(codigo)) continue;
 
-    // O restante do card, para minimo/limite/validade.
-    const pos = texto.indexOf(m[0]);
-    const trecho = texto.slice(pos, pos + 320);
+    // Escopo do card: do rotulo ate o proximo "Cupom ativado de". Uma janela
+    // fixa invadiria o card seguinte — foi assim que "Sem compra minima" de um
+    // cupom virou minimo 0 em outro.
+    const pos = m.index;
+    const prox = texto.indexOf('Cupom ativado de', pos + m[0].length);
+    const trecho = texto.slice(pos, prox === -1 ? pos + 320 : prox);
     const hhmmss = trecho.match(/Encerra em (\d{1,2}):(\d{2}):(\d{2})/);
 
     achados.push({
