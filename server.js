@@ -24,6 +24,7 @@ import {
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
+  turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
@@ -577,7 +578,123 @@ async function aguardarConectado(timeoutMs = 180000) {
 
 // Envia mensagem com retry automático (1 tentativa extra) caso a conexão caia no momento do envio.
 // Isso resolve o erro que você vê na página TSP na primeira tentativa de envio.
-async function enviarMensagem(destino, conteudo, tentativa = 0) {
+// ── CONTAS SECUNDARIAS DE ENVIO ──────────────────────────────────────────────
+// A conta principal continua sendo o unico socket que LE mensagens: as duas
+// contas estao nos mesmos grupos-fonte, e deixar as duas processarem
+// 'messages.upsert' dobraria o pipeline inteiro (inclusive as chamadas de IA)
+// para publicar exatamente a mesma coisa. As secundarias so enviam.
+//
+// Cada conta tem pasta de credenciais propria e cache de mensagens enviadas
+// proprio: o getMessage responde retry receipt: buscar a mensagem da conta A no
+// cache da B deixaria o destinatario preso em "aguardando mensagem".
+const CONTAS_DIR = SESSAO_DIR + '/contas';
+
+const contasExtras = new Map();
+
+function estadoConta(id) {
+  if (!contasExtras.has(id)) {
+    contasExtras.set(id, {
+      id, sock: null, conectado: false, qr: null, conectando: false,
+      tentativas: 0, timer: null, enviadas: new Map(),
+      ultimoEnvio: null, ultimoErro: null,
+    });
+  }
+  return contasExtras.get(id);
+}
+
+function contaDisponivel(id) {
+  const c = contasExtras.get(id);
+  return !!(c && c.conectado && c.sock);
+}
+
+async function conectarConta(id) {
+  const c = estadoConta(id);
+  if (c.conectando || (c.conectado && c.sock)) return c;
+  c.conectando = true;
+  try {
+    const dir = CONTAS_DIR + '/' + id;
+    await mkdirAsync(dir, { recursive: true });
+    const { state, saveCreds } = await useAuthStateAtomico(dir);
+    const { version } = await fetchLatestBaileysVersion();
+    const s = makeWASocket({
+      version,
+      auth: state,
+      logger: baileysLogger,
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      // Este numero e usado por outra ferramenta ao mesmo tempo. Marcar online
+      // aqui roubaria a presenca dele e mudaria o comportamento de notificacao
+      // no celular do operador — nao vale, ja que esta conta so envia.
+      markOnlineOnConnect: false,
+      getMessage: async (key) => c.enviadas.get(key?.id),
+      shouldIgnoreJid: (jid) => jid === 'status@broadcast' || (typeof jid === 'string' && jid.endsWith('@newsletter')),
+      keepAliveIntervalMs: 30000,
+    });
+    c.sock = s;
+    s.ev.on('creds.update', saveCreds);
+    s.ev.on('connection.update', async (u) => {
+      if (u.qr) c.qr = await QRCode.toDataURL(u.qr);
+      if (u.connection === 'open') {
+        c.conectado = true; c.qr = null; c.conectando = false; c.tentativas = 0;
+        console.log('[CONTA:' + id + '] ✓ conectada.');
+      }
+      if (u.connection === 'close') {
+        if (s !== c.sock && c.sock !== null) return;   // evento de socket antigo
+        c.conectado = false; c.conectando = false; c.sock = null;
+        const codigo = new Boom(u.lastDisconnect?.error)?.output?.statusCode;
+        console.log('[CONTA:' + id + '] conexao fechada. Codigo: ' + codigo);
+        if (codigo === DisconnectReason.loggedOut) {
+          c.ultimoErro = 'deslogada — escaneie o QR de novo';
+          return;   // logout nao reconecta sozinho
+        }
+        // Backoff ate 5 min: a conta secundaria nao e critica, entao insistir
+        // rapido so gastaria tentativa de conexao com os servidores do WhatsApp.
+        c.tentativas++;
+        const espera = Math.min(5 * 60000, 5000 * Math.pow(2, Math.min(c.tentativas, 6)));
+        clearTimeout(c.timer);
+        c.timer = setTimeout(() => conectarConta(id).catch(()=>{}), espera);
+      }
+    });
+    // De proposito sem handler de 'messages.upsert': quem le e a conta principal.
+  } catch (e) {
+    c.conectando = false;
+    c.ultimoErro = e.message;
+    console.error('[CONTA:' + id + '] falha ao conectar:', e.message);
+  }
+  return c;
+}
+
+async function enviarPelaConta(id, destino, conteudo) {
+  const c = contasExtras.get(id);
+  if (!c?.conectado || !c.sock) throw new Error('conta ' + id + ' nao conectada');
+  const r = await c.sock.sendMessage(destino, conteudo);
+  try {
+    if (r?.key?.id && r?.message) {
+      c.enviadas.set(r.key.id, r.message);
+      if (c.enviadas.size > 300) c.enviadas.delete(c.enviadas.keys().next().value);
+    }
+  } catch (e) {}
+  c.ultimoEnvio = new Date().toISOString();
+  return r;
+}
+
+async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
+  // Conta escolhida pela escala de turnos. Falha ou indisponibilidade cai na
+  // principal em vez de abortar: a mensagem sair pelo numero "errado" e menos
+  // grave do que nao sair.
+  const contaId = opcoes.conta;
+  if (contaId && contaId !== 'principal' && tentativa === 0) {
+    if (contaDisponivel(contaId)) {
+      try { return await enviarPelaConta(contaId, destino, conteudo); }
+      catch (e) {
+        console.warn('[WA] Envio pela conta ' + contaId + ' falhou (' + e.message + ') — indo pela principal.');
+        const c = contasExtras.get(contaId); if (c) c.ultimoErro = e.message;
+      }
+    } else {
+      console.warn('[WA] Conta ' + contaId + ' indisponivel — enviando pela principal.');
+    }
+  }
+
   if (!conectado || !sock) {
     const ok = await aguardarSock(20000);
     if (!ok) throw new Error('WhatsApp não conectado após aguardar reconexão.');
@@ -597,7 +714,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0) {
       await new Promise(r => setTimeout(r, 2000));
       const ok = await aguardarSock(20000);
       if (!ok) throw new Error('WhatsApp não reconectou a tempo para reenvio.');
-      return enviarMensagem(destino, conteudo, tentativa + 1);
+      return enviarMensagem(destino, conteudo, tentativa + 1, opcoes);
     }
     throw err;
   }
@@ -1419,14 +1536,17 @@ function mensagemParaGrupoCupons(msg) {
 // para o grupo so-cupons. Falha no grupo so-cupons NAO derruba o envio
 // principal: loga e avisa o operador.
 async function enviarCupomParaGrupos(mensagem, imagem) {
+  // Mesma conta nos dois grupos: o cupom e a copia dele saem juntos, e alternar
+  // no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
+  const op = { conta: contaDoTurno() };
   if (imagem?.imagemBase64) {
     await enviarMensagem(GRUPOS['tsp'], {
       image: Buffer.from(imagem.imagemBase64, 'base64'),
       caption: mensagem,
       mimetype: imagem.mime || 'image/jpeg',
-    });
+    }, 0, op);
   } else {
-    await enviarMensagem(GRUPOS['tsp'], { text: mensagem });
+    await enviarMensagem(GRUPOS['tsp'], { text: mensagem }, 0, op);
   }
   try {
     const msgCupons = mensagemParaGrupoCupons(mensagem);
@@ -1435,9 +1555,9 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
         image: Buffer.from(imagem.imagemBase64, 'base64'),
         caption: msgCupons,
         mimetype: imagem.mime || 'image/jpeg',
-      });
+      }, 0, op);
     } else {
-      await enviarMensagem(GRUPOS['tsp_cupons'], { text: msgCupons });
+      await enviarMensagem(GRUPOS['tsp_cupons'], { text: msgCupons }, 0, op);
     }
   } catch(e) {
     console.error('[CUPONS] Falha ao enviar para o grupo so-cupons:', e.message);
@@ -1515,10 +1635,11 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
   const alvos = destinos.length ? destinos : [GRUPOS['tsp']];
   const enviados = [], falhas = [];
   const preview = oferta ? montarLinkPreview(oferta, mensagem) : null;
+  const op = { conta: contaDoTurno() };
 
   for (const jid of alvos) {
     try {
-      await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem });
+      await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem }, 0, op);
       enviados.push(jid);
       if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
     } catch (e) {
@@ -2717,6 +2838,7 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
+  'contas',                 // credenciais dos numeros secundarios de envio
 ]);
 
 function enfileirarPorGrupo(jid, fn) {
@@ -3337,6 +3459,57 @@ app.get('/qr', (req, res) => {
   if (!isConnecting && !sock) iniciarConexao();
   if (!qrAtual)  return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR...</h2></body></html>');
   res.send('<html><head><title>QR</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Escanear QR Code</h2><img src="'+qrAtual+'" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+});
+
+// ── CONTAS SECUNDARIAS ───────────────────────────────────────────────────────
+app.get('/contas', (req, res) => {
+  const extras = [...contasExtras.values()].map(c => ({
+    id: c.id, conectado: c.conectado, conectando: c.conectando,
+    qrDisponivel: !!c.qr, ultimoEnvio: c.ultimoEnvio, ultimoErro: c.ultimoErro,
+  }));
+  res.json({
+    ok: true,
+    principal: { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual },
+    extras,
+    turnosTsp: turnosTsp(),
+    contaAgora: contaDoTurno(),
+  });
+});
+
+app.post('/contas/:id/conectar', async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'use /reconectar para a conta principal' });
+  if (!/^[a-z0-9_-]{2,24}$/i.test(id)) return res.status(400).json({ ok:false, erro:'id invalido (a-z, 0-9, - e _)' });
+  conectarConta(id).catch(()=>{});
+  res.json({ ok:true, mensagem:'Conectando. Abra /contas/' + id + '/qr para parear.' });
+});
+
+app.get('/contas/:id/qr', async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const c = estadoConta(id);
+  if (c.conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Conta ' + id + ' ja conectada!</h2></body></html>');
+  if (!c.conectando && !c.sock) conectarConta(id).catch(()=>{});
+  if (!c.qr) return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR de ' + id + '...</h2></body></html>');
+  res.send('<html><head><title>QR ' + id + '</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Parear conta: ' + id + '</h2><img src="' + c.qr + '" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+});
+
+// Compara os grupos das duas contas. Um numero que nao esta num grupo de destino
+// falha o envio na hora do turno dele — melhor descobrir antes.
+app.get('/contas/:id/grupos', async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  const c = contasExtras.get(id);
+  if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
+  try {
+    const daConta = Object.keys(await c.sock.groupFetchAllParticipating());
+    const destinos = radarDestinos().length ? radarDestinos() : [GRUPOS['tsp']];
+    const alvos = [...new Set([...destinos, GRUPOS['tsp'], GRUPOS['tsp_cupons']])];
+    res.json({
+      ok: true,
+      total: daConta.length,
+      faltando: alvos.filter(j => !daConta.includes(j)).map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null })),
+      conferidos: alvos.length,
+    });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 app.post('/reconectar', async (req, res) => {
@@ -4026,6 +4199,8 @@ app.get('/mkt/config', (req, res) => {
     autoEnvioOferta: AUTO_ENVIO_OFERTA,
     autoEnvioCupom: AUTO_ENVIO_MODO,
     janelaCupom: janelaCupom(),
+    turnosTsp: turnosTsp(),
+    contaAgora: contaDoTurno(),
   });
 });
 
@@ -4043,8 +4218,15 @@ app.post('/mkt/config', (req, res) => {
       console.log('[CUPONS] Janela de publicacao — ' + janela.inicio + '-' + janela.fim
         + ' (' + janela.dias + '), intervalo ' + janela.intervaloSeg + 's.');
     }
+    let turnos = turnosTsp();
+    if (req.body.turnosTsp !== undefined) {
+      turnos = salvarTurnosTsp(req.body.turnosTsp || {});
+      console.log('[TSP] Escala de numeros — ' + (turnos.ativo ? turnos.turnos.length + ' turno(s)' : 'desligada')
+        + '. Agora: ' + contaDoTurno() + '.');
+    }
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
-    res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos(), janelaCupom: janela });
+    res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos(),
+               janelaCupom: janela, turnosTsp: turnos, contaAgora: contaDoTurno() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
@@ -5100,3 +5282,17 @@ app.listen(PORT, () => {
 // Garante que mensagens dos grupos monitorados não sejam perdidas após deploy.
 console.log("[SERVER] Iniciando conexão com WhatsApp...");
 conectar();
+
+// Retoma as contas secundarias que ja foram pareadas alguma vez. O atraso deixa
+// a principal (que e quem le os grupos) subir primeiro: se o Railway derrubar o
+// container no meio do boot, a conta que nao pode perder mensagem ja esta de pe.
+setTimeout(async () => {
+  try {
+    const dirs = await readdir(CONTAS_DIR).catch(() => []);
+    for (const id of dirs) {
+      if (!existsSync(CONTAS_DIR + '/' + id + '/creds.json')) continue;
+      console.log('[CONTA:' + id + '] credenciais encontradas, reconectando...');
+      conectarConta(id).catch(() => {});
+    }
+  } catch (e) { console.warn('[CONTA] Falha ao retomar contas secundarias:', e.message); }
+}, 20000);
