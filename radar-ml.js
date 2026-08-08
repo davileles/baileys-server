@@ -298,9 +298,15 @@ export async function gerarLinksAfiliadoMl(urls) {
   if (!r.ok || typeof r.corpo !== 'object') throw new Error('createLink respondeu HTTP ' + r.status);
   const mapa = new Map();
   for (const u of (r.corpo.urls || [])) {
-    mapa.set(u.origin_url, u.created
+    const valor = u.created
       ? { link: u.short_url, linkLongo: u.long_url, codigoBusca: u.regex }
-      : { erro: u.message || ('error_code ' + u.error_code) });
+      : { erro: u.message || ('error_code ' + u.error_code) };
+    mapa.set(u.origin_url, valor);
+    // Indexa tambem pelo MLB: o painel pode devolver a origin_url normalizada
+    // (barra final, maiusculas, parametro a mais) e o casamento por string
+    // exata falharia em silencio, virando 'sem resposta do painel'.
+    const id = idDeUrl(u.origin_url);
+    if (id && !mapa.has(id)) mapa.set(id, valor);
   }
   return mapa;
 }
@@ -542,6 +548,19 @@ export async function produtoDePerfilSocial(urlSocial) {
   return { url: url.split('?')[0], titulo: tituloAlvo };
 }
 
+/**
+ * URL que vai ao painel de afiliados: sem fragmento e sem query.
+ * Link copiado do navegador vem com tracking colado (#position=1&search_layout,
+ * ?pdp_filters=...). Nada disso identifica o produto, e o painel responde com a
+ * origin_url ja limpa — a chave do mapa deixava de bater e o link "sumia".
+ * No radar isso nao aparecia porque os links dos grupos chegam encurtados e o
+ * redirect ja entrega a URL canonica.
+ */
+function urlCanonicaMl(u) {
+  try { const x = new URL(u); return x.origin + x.pathname; }
+  catch (e) { return String(u).split('#')[0].split('?')[0]; }
+}
+
 export async function processarTextoMl(texto) {
   // URLs completas, nao so o MLB: o createLink recebe a URL de origem.
   const urls = [...new Set(String(texto || '').match(REGEX_URL_ML) || [])]
@@ -565,7 +584,7 @@ export async function processarTextoMl(texto) {
         alvo = prod.url;
       } catch (e) { console.warn('[ML] Falha no perfil social:', e.message); continue; }
     }
-    if (idDeUrl(alvo)) canonicas.push(alvo);
+    if (idDeUrl(alvo)) canonicas.push(urlCanonicaMl(alvo));
     else console.warn('[ML] Sem MLB apos resolver:', u);
   }
   if (!canonicas.length) return [];
@@ -580,7 +599,7 @@ export async function processarTextoMl(texto) {
 
   const saida = [];
   for (const url of canonicas) {
-    const r = links.get(url) || { erro: 'sem resposta do painel' };
+    const r = links.get(url) || links.get(idDeUrl(url)) || { erro: 'sem resposta do painel' };
     if (r.erro) {
       saida.push({ produto: { loja: 'Mercado Livre', titulo: url, link: url },
                    descartadoPor: r.erro });
