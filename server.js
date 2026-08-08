@@ -1294,8 +1294,15 @@ function ehZeDelivery(loja) {
   return n.includes('zedelivery') || n === 'ze';
 }
 
+// A IA devolve lojas fora das quatro principais como "Outro: Casas Bahia".
+// O prefixo e um rotulo interno de classificacao — nunca deve vazar para a
+// mensagem enviada ao grupo, onde so o nome da loja faz sentido.
+function nomeLojaExibicao(loja) {
+  return String(loja || '').replace(/^outr[oa]s?\s*:\s*/i, '').trim();
+}
+
 function formatarCupomTSP(dados) {
-  const loja   = dados.loja   || '';
+  const loja   = nomeLojaExibicao(dados.loja);
   const tipo   = dados.tipo   || 'reais';
   const valor  = dados.valor  || 0;
   // minimo null/0 = sem valor minimo. Antes caia em `|| 0` e a mensagem saia
@@ -1760,7 +1767,7 @@ setInterval(async () => {
     if (!oferta) return;
 
     const d = oferta.dadosExtraidos || {};
-    const rotulo = `${d.loja} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
+    const rotulo = `${nomeLojaExibicao(d.loja)} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
 
     // Marca como 'enviando' antes do await para o card sumir do painel e
     // reduzir a janela de corrida com uma aprovacao manual simultanea.
@@ -1849,7 +1856,7 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       try { registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
 
       const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos, codigosLista);
-      const rotulo   = `${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
+      const rotulo   = `${nomeLojaExibicao(c.loja)} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
 
       // Veredito fica gravado na oferta para aparecer no card da fila (o log do
       // Railway sozinho nao serve: em modo sombra o operador precisa comparar a
@@ -3860,7 +3867,7 @@ app.get('/painel', (req, res) => {
     const isTSP = o.tipoConteudo === 'cupom_tsp';
 
     if (isTSP) {
-      const loja  = d.loja || '';
+      const loja  = nomeLojaExibicao(d.loja);
       const valor = d.valor || '';
       const tipo  = d.tipo === 'pct' ? '%' : ' R$';
       const cod   = d.codigo ? `<span class="tag">${d.codigo}</span>` : '';
