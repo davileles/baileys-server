@@ -22,6 +22,7 @@ import {
   radarFontes, radarDestinos, ehFonteRadar,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
+  cupomPorCodigo, cupomVigente, calcularDesconto,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
@@ -1463,6 +1464,30 @@ function montarLinkPreview(oferta, mensagem) {
     if (!ehJpeg) console.log('[MKT] Thumbnail nao e JPEG (' + (img.mime || 'mime desconhecido') + ') — preview sem imagem.');
     else if (buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
     else console.log('[MKT] Thumbnail de ' + buf.length + ' bytes acima do limite — preview sem imagem.');
+  }
+  return preview;
+}
+
+// Mesma ideia do montarLinkPreview, mas a partir de campos soltos: o gerador
+// manual nao tem uma oferta na fila, so o produto que o operador acabou de
+// consultar. A thumbnail passa pelo baixarImagemProduto para herdar a conversao
+// de webp -> jpg do Mercado Livre.
+async function montarLinkPreviewManual(dados) {
+  const url = String(dados?.link || '').trim();
+  if (!url) return null;
+  const preview = {
+    'canonical-url': url,
+    'matched-text': url,
+    title: dados.titulo || dados.loja || 'Oferta',
+    description: dados.descricao || '',
+  };
+  if (dados.imagemUrl) {
+    const img = await baixarImagemProduto(dados.imagemUrl);
+    if (img?.imagemBase64) {
+      const buf = Buffer.from(img.imagemBase64, 'base64');
+      const ehJpeg = buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+      if (ehJpeg && buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
+    }
   }
   return preview;
 }
@@ -3787,7 +3812,10 @@ app.post('/injetar', async (req, res) => {
 app.post('/enviar', async (req, res) => {
   // direto:true → pula a fila de envio (intervalo de 10 min / janela 8h-21h SP).
   // Usado por mensagens unicas e datadas, como o resumo diario das 20h.
-  const { grupo, mensagem, agendarEm, direto } = req.body;
+  // preview: { link, titulo, descricao, imagemUrl } — opcional. Existe para a
+  // mensagem montada a mao no gerador sair com o mesmo card de link das ofertas
+  // do radar. So vale no envio imediato: agendamento guarda apenas o texto.
+  const { grupo, mensagem, agendarEm, direto, preview } = req.body;
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
@@ -3826,7 +3854,11 @@ app.post('/enviar', async (req, res) => {
     enfileirarEnvio('manual', mensagemComprimida, grupoId);
     res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
   } else {
-    try { await enviarMensagem(grupoId, { text:mensagem }); res.json({ ok:true }); }
+    try {
+      const lp = preview?.link ? await montarLinkPreviewManual(preview) : null;
+      await enviarMensagem(grupoId, lp ? { text:mensagem, linkPreview:lp } : { text:mensagem });
+      res.json({ ok:true, comPreview: !!lp });
+    }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
   }
 });
@@ -4495,6 +4527,99 @@ app.post('/mkt/testar', async (req, res) => {
     const r = await processarTextoAmazon(req.body.texto || '', { ignorarDedup: true });
     res.json({ ok:true, resultados: r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── MONTAR OFERTA A PARTIR DE UM LINK ────────────────────────────────────────
+// Serve ao gerador de mensagens do TSP: o operador cola o link de um produto e
+// recebe o preco verificado na fonte (nunca digitado a mao), o link de afiliado
+// da nossa conta e os cupons vigentes daquela loja para vincular. So consulta —
+// nao enfileira, nao dispara e nao marca dedup, entao pode ser chamado a
+// vontade sem sujar o radar automatico.
+function chaveLojaSimples(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function pipelineDoLink(texto) {
+  if (ehLinkMl(texto))     return { loja: 'Mercado Livre',  run: t => processarTextoMl(t) };
+  if (ehLinkShopee(texto)) return { loja: 'Shopee',         run: t => processarTextoShopee(t) };
+  if (ehLinkMagalu(texto)) return { loja: 'Magazine Luiza', run: t => processarTextoMagalu(t) };
+  return { loja: 'Amazon', run: t => processarTextoAmazon(t, { ignorarDedup: true, ignorarMinimo: true }) };
+}
+
+app.post('/mkt/montar', async (req, res) => {
+  const link = String(req.body?.link || '').trim();
+  if (!link) return res.status(400).json({ ok:false, erro:'informe { link }' });
+
+  const pipe = pipelineDoLink(link);
+  let resultados;
+  try { resultados = await pipe.run(link); }
+  catch (e) { return res.status(500).json({ ok:false, loja:pipe.loja, erro:e.message }); }
+
+  // Um resultado descartado (dedup, desconto baixo) ainda traz o produto: aqui
+  // quem decide o que divulgar e o operador, entao o descarte vira aviso.
+  const achado = resultados.find(r => r.produto?.preco) || resultados[0];
+  if (!achado) return res.status(404).json({ ok:false, loja:pipe.loja,
+    erro:'nenhum produto reconhecido nesse link.' });
+
+  const p = achado.produto;
+  if (!p.preco) return res.status(422).json({ ok:false, loja:pipe.loja, produto:p,
+    erro: achado.descartadoPor || 'nao foi possivel ler o preco do produto' });
+
+  const loja = p.loja || pipe.loja;
+
+  // Cupons vinculaveis: vigentes, da mesma loja e que realmente rendem desconto
+  // neste preco — cupom com minimo acima do produto nem aparece na lista.
+  const cupons = listarCuponsBase()
+    .filter(cp => cupomVigente(cp) && chaveLojaSimples(cp.loja) === chaveLojaSimples(loja))
+    .map(cp => ({ codigo:cp.codigo, tipo:cp.tipo, valor:cp.valor, minimo:cp.minimo,
+                  limite:cp.limite, validadeAte:cp.validadeAte,
+                  descontoAplicado: calcularDesconto(cp, p.preco) }))
+    .filter(cp => cp.descontoAplicado > 0)
+    .sort((a, b) => b.descontoAplicado - a.descontoAplicado);
+
+  // O cupom so entra se o operador pedir pelo codigo. Aplicar sozinho o "melhor
+  // da base" anunciaria um desconto que ele nao escolheu.
+  let cupom = null, avisoCupom = null;
+  const codigo = String(req.body?.cupom || '').trim();
+  if (codigo) {
+    const reg = cupomPorCodigo(loja, codigo);
+    if (!reg)                    avisoCupom = 'cupom ' + codigo + ' nao esta na base de ' + loja;
+    else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
+    else {
+      const desconto = calcularDesconto(reg, p.preco);
+      if (desconto > 0) cupom = { reg, desconto, citado: true };
+      else avisoCupom = 'cupom ' + codigo + ' nao se aplica a este preco'
+        + (reg.minimo != null ? ' (minimo R$ ' + reg.minimo + ')' : '');
+    }
+  }
+
+  const vars = varsDoProduto(p, cupom);
+  vars.vendas       = p.vendas || '';
+  vars.codigo_busca = p.codigoBusca || '';
+  if (req.body?.gatilho) vars.gatilho = String(req.body.gatilho);
+
+  res.json({
+    ok: true,
+    loja,
+    produto: {
+      titulo: p.titulo || '', marca: p.marca || '', link: p.link || link,
+      imagemUrl: p.imagemUrl || null, preco: p.preco, precoDe: p.precoDe || null,
+      desconto: p.desconto || 0, disponivel: p.disponivel !== false,
+      vendedor: p.vendedor || null, nota: p.nota || null, avaliacoes: p.avaliacoes || null,
+      asin: p.asin || null, codigoBusca: p.codigoBusca || null,
+    },
+    cupom: cupom ? { codigo: cupom.reg.codigo, tipo: cupom.reg.tipo, valor: cupom.reg.valor,
+                     minimo: cupom.reg.minimo, limite: cupom.reg.limite,
+                     desconto: cupom.desconto } : null,
+    avisoCupom,
+    precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+    cupons,
+    // Mensagem pelo mesmo template da loja que o radar usa, para a oferta montada
+    // a mao sair no formato identico ao das automaticas.
+    mensagem: renderTemplate(templateDaLoja(loja)?.corpo || '', vars),
+    avisos: resultados.filter(r => r.descartadoPor).map(r => r.descartadoPor),
+  });
 });
 
 // Cola um link Shopee e ve a mensagem que sairia, sem enfileirar nem publicar.
