@@ -4123,10 +4123,13 @@ app.delete('/templates/:loja', (req, res) => {
 app.post('/cupons/sync-ml', async (req, res) => {
   if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
   try {
-    const ativos = await lerCuponsAtivosMl();
+    const { cupons: ativos, totalDeclarado } = await lerCuponsAtivosMl();
     if (!ativos.length) {
       return res.json({ ok:false, erro:'nenhum cupom lido — sessao pode ter caido', ativos:0 });
     }
+    // Leitura parcial (a pagina carrega parte por JS): atualiza o que leu, mas
+    // NAO desativa nada. Desligar cupom que continua valendo custa vendas.
+    const leituraCompleta = !totalDeclarado || ativos.length >= totalDeclarado;
     const vivos = new Set(ativos.map(c => c.codigo.toUpperCase()));
     const atualizados = [], criados = [], desativados = [];
 
@@ -4144,7 +4147,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
     }
 
     // Cupom do ML que a base tem mas o painel nao lista mais: saiu do ar.
-    if (req.body?.desativarAusentes !== false) {
+    if (req.body?.desativarAusentes !== false && leituraCompleta) {
       for (const reg of listarCuponsBase()) {
         if (reg.loja !== 'Mercado Livre' || reg.ativo === false) continue;
         if (vivos.has(String(reg.codigo).toUpperCase())) continue;
@@ -4154,7 +4157,12 @@ app.post('/cupons/sync-ml', async (req, res) => {
     }
     console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
       + criados.length + ' novo(s), ' + desativados.length + ' desativado(s).');
-    res.json({ ok:true, lidos:ativos.length, atualizados, criados, desativados });
+    res.json({
+      ok:true, lidos:ativos.length, totalDeclarado, leituraCompleta,
+      atualizados, criados, desativados,
+      aviso: leituraCompleta ? null
+        : 'leitura parcial (' + ativos.length + ' de ' + totalDeclarado + ') — nada foi desativado',
+    });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
