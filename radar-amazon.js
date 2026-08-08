@@ -38,6 +38,10 @@ const CFG_PADRAO = {
   // fila CDV (8h-21h) no codigo; virou config porque cupom e oferta tem ritmos
   // diferentes e quem decide isso e o operador, nao o deploy.
   janelaCupom: { inicio: '08:00', fim: '21:00', dias: 'todos', intervaloSeg: 90 },
+  // Turnos fixos de qual numero dispara o TSP. Vazio ou inativo = tudo pela
+  // conta principal (comportamento historico). Fora de qualquer turno tambem
+  // cai na principal: a mensagem nunca deixa de sair por causa da escala.
+  turnosTsp: { ativo: false, turnos: [] },
 };
 
 let _cfg = { ...CFG_PADRAO };
@@ -154,6 +158,45 @@ export function dentroDaJanelaCupom(quando = new Date()) {
     : (agora >= inicio || agora < fim);
   if (!dentro) return { ok: false, motivo: `fora da janela ${j.inicio}-${j.fim} SP` };
   return { ok: true, motivo: 'dentro da janela' };
+}
+
+// ── ESCALA DE NUMEROS DO TSP ──────────────────────────────────────────────
+// Turnos fixos por faixa de horario. A rotacao existe para o padrao de disparo
+// nao ficar concentrado num numero so; por isso alterna em blocos, e nao a cada
+// mensagem — duas mensagens seguidas no mesmo grupo saindo de numeros
+// diferentes chama mais atencao do que uma sequencia coerente.
+
+export function turnosTsp() {
+  const t = _cfg.turnosTsp || {};
+  return { ativo: !!t.ativo, turnos: Array.isArray(t.turnos) ? t.turnos : [] };
+}
+
+export function salvarTurnosTsp(dados = {}) {
+  const atual = turnosTsp();
+  const lista = (Array.isArray(dados.turnos) ? dados.turnos : atual.turnos).map(t => {
+    if (paraMinutos(t.inicio, null) === null) throw new Error('turno com horario inicial invalido: ' + t.inicio);
+    if (paraMinutos(t.fim, null) === null)    throw new Error('turno com horario final invalido: ' + t.fim);
+    if (!t.conta) throw new Error('turno sem conta definida');
+    return { inicio: String(t.inicio), fim: String(t.fim), conta: String(t.conta) };
+  });
+  const nova = { ativo: dados.ativo !== undefined ? !!dados.ativo : atual.ativo, turnos: lista };
+  salvarRadarConfig({ turnosTsp: nova });
+  return nova;
+}
+
+/** Qual conta dispara agora. Sempre devolve algo — 'principal' e o fallback. */
+export function contaDoTurno(quando = new Date()) {
+  const { ativo, turnos } = turnosTsp();
+  if (!ativo || !turnos.length) return 'principal';
+  const agora = minutosAgoraSP(quando);
+  for (const t of turnos) {
+    const ini = paraMinutos(t.inicio, 0);
+    const fim = paraMinutos(t.fim, 24 * 60);
+    // Turno que vira a meia-noite (22:00-06:00) e um bloco unico partido em dois.
+    const dentro = ini <= fim ? (agora >= ini && agora < fim) : (agora >= ini || agora < fim);
+    if (dentro) return t.conta;
+  }
+  return 'principal';
 }
 
 export function listarMonitor() { return _cfg.monitor || {}; }
