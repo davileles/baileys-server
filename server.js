@@ -138,6 +138,7 @@ setTimeout(() => {
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
   processarTextoMagalu, ehLinkMagalu, converterLinkMagalu, lojaMagalu,
+  resolverLinhaVitrineMagalu, montarOfertasMagaluVitrine, ttlPrecoMagalu,
 } from './radar-magalu.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -4479,6 +4480,8 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
   } else if (item.loja === 'Mercado Livre') {
     if (!tokenAffOk()) return { ok:false, motivo:'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
     montado = await montarOfertasMlVitrine([item], codigoCupom);
+  } else if (item.loja === 'Magazine Luiza') {
+    montado = await montarOfertasMagaluVitrine([item], codigoCupom);
   } else {
     montado = await montarOfertasVitrine([asin], codigoCupom);
   }
@@ -4489,12 +4492,14 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
   const oferta = {
     id: gerarId(), origem:'lista',
     tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
-                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
     mensagemFormatada: o.mensagem,
     dadosExtraidos: {
       loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
       precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
       cupom:o.cupom, precoFinal:o.precoFinal,
+      precoDeReferencia: !!o.precoDeReferencia,
     },
     imagens: [],
   };
@@ -4703,7 +4708,9 @@ app.post('/listas/:id/cancelar', (req, res) => {
 // ── VITRINE ──────────────────────────────────────────────────────────────────
 app.get('/vitrine', (req, res) => {
   const itens = listarVitrine();
-  res.json({ ok:true, total: itens.length, itens });
+  // O painel precisa do TTL para avisar quando o preco da Magalu venceu — a
+  // unica loja em que o preco nao e reconsultado no disparo.
+  res.json({ ok:true, total: itens.length, itens, ttlPrecoMagalu: ttlPrecoMagalu() });
 });
 
 // Recebe o texto colado (um link por linha) e cadastra o que conseguir resolver.
@@ -4752,6 +4759,15 @@ app.post('/vitrine', async (req, res) => {
         }), jaExistia: jaTinha });
         continue;
       }
+      // Magazine Luiza: link vira link de afiliado por transformacao de URL, sem
+      // rede. Preco vem da propria linha porque nao ha fonte para consultar.
+      if (ehLinkMagalu(linha)) {
+        const rmg = await resolverLinhaVitrineMagalu(linha);
+        if (!rmg || rmg.erro) { erros.push({ linha, erro: rmg?.erro || 'falhou' }); continue; }
+        const jaTinhaMg = !!itemVitrine(rmg.asin);
+        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom }), jaExistia: jaTinhaMg });
+        continue;
+      }
       // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
       // e gerado no disparo — por isso nao passa pelo resolvedor da Amazon.
       if (ehLinkMl(linha)) {
@@ -4790,8 +4806,10 @@ app.post('/vitrine/disparar', async (req, res) => {
   const itens = asins.map(a => itemVitrine(a)).filter(Boolean);
   const daShopee = itens.filter(i => i.loja === 'Shopee');
   const daMl     = itens.filter(i => i.loja === 'Mercado Livre');
+  const daMagalu = itens.filter(i => i.loja === 'Magazine Luiza');
   const daAmazon = asins.filter(a =>
-    !daShopee.some(s => s.asin === a) && !daMl.some(m => m.asin === a));
+    !daShopee.some(s => s.asin === a) && !daMl.some(m => m.asin === a)
+    && !daMagalu.some(g => g.asin === a));
 
   let montado = { prontos: [], descartados: [] };
   if (daAmazon.length) {
@@ -4799,6 +4817,14 @@ app.post('/vitrine/disparar', async (req, res) => {
       const m = await montarOfertasVitrine(daAmazon, req.body?.cupom || null);
       montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
     } catch (e) { return res.status(500).json({ ok:false, erro:'falha na API da Amazon: ' + e.message }); }
+  }
+  if (daMagalu.length) {
+    try {
+      const m = await montarOfertasMagaluVitrine(daMagalu, req.body?.cupom || null);
+      montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+    } catch (e) {
+      daMagalu.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Magazine Luiza: ' + e.message }));
+    }
   }
   if (daMl.length) {
     if (!tokenAffOk()) {
@@ -4830,12 +4856,14 @@ app.post('/vitrine/disparar', async (req, res) => {
     const oferta = {
       id: gerarId(), origem:'vitrine',
       tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
-                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
       mensagemFormatada: o.mensagem,
       dadosExtraidos: {
         loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
         precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
         cupom:o.cupom, precoFinal:o.precoFinal,
+        precoDeReferencia: !!o.precoDeReferencia,
       },
       imagens: [],
     };
