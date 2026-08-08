@@ -3013,7 +3013,10 @@ async function processarRadarMarketplace(jid, texto) {
     // apontar para grupo de cliente exige voltar para 'off' no Railway.
     // Uma oferta so chega aqui depois de passar por TODOS os filtros: preco
     // confirmado pela API, em estoque, desconto acima do minimo e fora do dedup.
-    if (AUTO_ENVIO_OFERTA === 'on') {
+    // Excecao: precoDeReferencia marca oferta cujo preco veio do TEXTO do grupo
+    // e nao de fonte verificavel (caso da Magalu). Anunciar valor nao conferido
+    // sem revisao humana ja produziu 'De/Por' inexistente — essas vao para a fila.
+    if (AUTO_ENVIO_OFERTA === 'on' && !oferta.dadosExtraidos.precoDeReferencia) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
         oferta.status = 'enviado';
@@ -3034,7 +3037,9 @@ async function processarRadarMarketplace(jid, texto) {
 
     filaPendentes.unshift(oferta);
     salvarFila();
-    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)');
+    const _motivoFila = (AUTO_ENVIO_OFERTA === 'on' && oferta.dadosExtraidos.precoDeReferencia)
+      ? ' — preco nao verificado, exige aprovacao manual' : '';
+    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)' + _motivoFila);
   }
 }
 
