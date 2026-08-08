@@ -12,7 +12,7 @@ import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
-import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync } from 'fs/promises';
+import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync } from 'fs/promises';
 import { join } from 'path';
 import QRCode from 'qrcode';
 
@@ -3494,6 +3494,44 @@ app.get('/contas/:id/qr', async (req, res) => {
   if (!c.conectando && !c.sock) conectarConta(id).catch(()=>{});
   if (!c.qr) return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR de ' + id + '...</h2></body></html>');
   res.send('<html><head><title>QR ' + id + '</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Parear conta: ' + id + '</h2><img src="' + c.qr + '" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+});
+
+// Remove uma conta secundaria: desvincula o dispositivo no WhatsApp, apaga as
+// credenciais e tira a conta da escala. Sem isso, um pareamento que deu errado
+// fica cadastrado para sempre e ainda aparece como opcao de turno — e um turno
+// apontando para conta morta cai no fallback em silencio, dando a impressao de
+// que a escala funciona.
+app.delete('/contas/:id', async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'a conta principal nao pode ser removida aqui' });
+  if (!/^[a-z0-9_-]{2,24}$/i.test(id)) return res.status(400).json({ ok:false, erro:'apelido invalido' });
+
+  const c = contasExtras.get(id);
+  let desvinculou = false;
+  if (c) {
+    clearTimeout(c.timer);
+    if (c.sock) {
+      // logout() desvincula o aparelho na lista de dispositivos conectados.
+      // Sessao ja quebrada costuma falhar aqui — nesse caso so encerra o socket,
+      // e o dispositivo orfao pode ser removido pelo proprio celular.
+      try { await c.sock.logout(); desvinculou = true; }
+      catch (e) { try { c.sock.end(new Error('conta removida')); } catch(_) {} }
+    }
+    contasExtras.delete(id);
+  }
+
+  try { await rmAsync(CONTAS_DIR + '/' + id, { recursive: true, force: true }); }
+  catch (e) { return res.status(500).json({ ok:false, erro:'nao apagou as credenciais: ' + e.message }); }
+
+  // Turnos que apontavam para ela sairiam do ar sem aviso: melhor removê-los.
+  const escala = turnosTsp();
+  const restantes = escala.turnos.filter(t => t.conta !== id);
+  let turnosRemovidos = escala.turnos.length - restantes.length;
+  if (turnosRemovidos) salvarTurnosTsp({ ativo: escala.ativo, turnos: restantes });
+
+  console.log('[CONTA:' + id + '] removida' + (desvinculou ? ' (dispositivo desvinculado)' : '')
+    + (turnosRemovidos ? ' — ' + turnosRemovidos + ' turno(s) descartado(s)' : '') + '.');
+  res.json({ ok:true, desvinculou, turnosRemovidos });
 });
 
 // Compara os grupos das duas contas. Um numero que nao esta num grupo de destino
