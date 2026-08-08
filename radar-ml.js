@@ -484,7 +484,8 @@ export function normalizarMl(it) {
 
 // ── PIPELINE ──────────────────────────────────────────────────────────────
 
-import { melhorCupom, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
+import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
+         calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
 
 export function formatarOfertaMl(p, opcoes = {}) {
   const tpl = opcoes.template || templateDaLoja('Mercado Livre');
@@ -866,4 +867,164 @@ export function validadeDeTexto(txt, agora = new Date()) {
     return fim(d);
   }
   return null;
+}
+
+
+// ── VITRINE — MERCADO LIVRE ───────────────────────────────────────────────
+// Mesmo contrato da vitrine da Amazon e da Shopee: no cadastro guardamos so o
+// identificador (MLB), o nome e a URL canonica. Preco, estoque e link de
+// afiliado sao resolvidos no instante do disparo, porque preco salvo envelhece
+// e anunciar preco que nao existe mais e o erro que este pipeline evita.
+
+/** Nome legivel a partir do slug da URL, sem gastar rede no cadastro. */
+function nomeDoSlugMl(url) {
+  try {
+    const caminho = decodeURIComponent(new URL(url).pathname);
+    // /espumante-...-750ml/p/MLB18308612   (pagina de catalogo)
+    // /MLB-1234567890-nome-do-produto-_JM  (anuncio)
+    let m = caminho.match(/^\/([^\/]+)\/p\/MLB/i);
+    if (!m) m = caminho.match(/^\/MLB-?\d{6,}-(.+?)(?:-_JM)?\/?$/i);
+    if (!m) return '';
+    return m[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  } catch (e) { return ''; }
+}
+
+/**
+ * Resolve uma linha colada pelo operador na vitrine. Aceita "nome | link" ou so
+ * o link, em qualquer formato do ML: /p/ de catalogo, /MLB-.../ de anuncio,
+ * encurtado (meli.la) ou perfil social de outro afiliado.
+ */
+export async function resolverLinhaVitrineMl(linha) {
+  const bruto = String(linha || '').trim();
+  if (!bruto) return null;
+
+  let nomeManual = '', url = bruto;
+  const sep = bruto.match(/^(.*?)\s*[|;]\s*(https?:\/\/\S+)$/);
+  if (sep) { nomeManual = sep[1].trim(); url = sep[2].trim(); }
+  else {
+    const m = bruto.match(new RegExp(REGEX_URL_ML.source, 'i'));
+    if (!m) return { erro: 'sem link do Mercado Livre', linha: bruto };
+    url = m[0].replace(/[)\]}.,;!]+$/, '');
+  }
+
+  let alvo = url;
+  if (!idDeUrl(alvo)) {
+    try { alvo = await resolverEncurtadorMl(alvo); }
+    catch (e) { return { erro: 'encurtador nao respondeu: ' + e.message, linha: bruto }; }
+  }
+
+  // Link de afiliado de terceiro abre o perfil social do divulgador, nao o
+  // produto — o item certo esta no botao "Ir para produto".
+  if (/\/social\//i.test(alvo)) {
+    try {
+      const prod = await produtoDePerfilSocial(alvo);
+      if (!prod) return { erro: 'perfil social sem produto identificavel', linha: bruto };
+      alvo = prod.url;
+      if (!nomeManual && prod.titulo) nomeManual = prod.titulo;
+    } catch (e) { return { erro: 'perfil social: ' + e.message, linha: bruto }; }
+  }
+
+  const id = idDeUrl(alvo);
+  if (!id) return { erro: 'nao foi possivel identificar o produto', linha: bruto };
+
+  // Tracking colado pelo navegador (?pdp_filters, #position) nao identifica o
+  // produto e quebra o casamento com a origin_url que o painel devolve.
+  const canonica = urlCanonicaMl(alvo);
+
+  // Titulo real da pagina. Se o cookie estiver fora, cai no slug em vez de
+  // recusar o cadastro: o disparo tenta de novo e reporta o erro la.
+  let titulo = '';
+  try { titulo = (await buscarDadosProdutoMl(canonica))?.titulo || ''; }
+  catch (e) { console.warn('[ML] Vitrine — sem titulo da pagina:', e.message); }
+
+  const nome = nomeManual || titulo || nomeDoSlugMl(canonica) || nomeDoSlugMl(url) || ('Produto ' + id);
+  return { asin: id, nome, url: canonica, loja: 'Mercado Livre' };
+}
+
+const NOME_PROVISORIO_ML = /^Produto MLB\d+$/;
+
+/**
+ * Monta as mensagens da vitrine para itens do ML no momento do disparo: gera o
+ * link de afiliado, le preco e estoque da pagina agora, aplica o cupom (o
+ * informado no disparo vence o vinculado ao produto) e renderiza o template.
+ * Nada e enviado aqui — devolve { prontos, descartados }.
+ */
+export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
+  const prontos = [], descartados = [];
+
+  for (const salvo of itens) {
+    const url = urlCanonicaMl(salvo.url || ('https://www.mercadolivre.com.br/p/' + salvo.asin));
+
+    let links;
+    try { links = await gerarLinksAfiliadoMl([url]); }
+    catch (e) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'painel de afiliados: ' + e.message });
+      continue;
+    }
+    const r = links.get(url) || links.get(salvo.asin) || links.get(idDeUrl(url)) || { erro: 'sem resposta do painel' };
+    if (r.erro) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: r.erro }); continue; }
+
+    let dados;
+    try { dados = await buscarDadosProdutoMl(url); }
+    catch (e) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'dados do produto: ' + e.message });
+      continue;
+    }
+
+    const p = {
+      asin: salvo.asin, id: salvo.asin,
+      titulo: dados.titulo || salvo.nome || '',
+      marca: dados.marca || '',
+      imagemUrl: dados.imagem,
+      link: r.link,                 // meli.la curto, com atribuicao
+      linkLongo: r.linkLongo,
+      codigoBusca: r.codigoBusca,
+      preco: dados.preco,
+      precoTexto: dados.preco ? 'R$ ' + dados.preco.toFixed(2).replace('.', ',') : null,
+      precoDe: dados.precoDe,
+      precoDeTexto: dados.precoDe ? 'R$ ' + dados.precoDe.toFixed(2).replace('.', ',') : null,
+      desconto: (dados.precoDe && dados.preco && dados.precoDe > dados.preco)
+        ? Math.round((1 - dados.preco / dados.precoDe) * 100) : 0,
+      disponivel: dados.disponivel,
+      vendedor: dados.vendedor,
+      nota: dados.nota, avaliacoes: dados.avaliacoes,
+      vendas: null, dealTermina: null, ehDeal: false,
+      loja: 'Mercado Livre',
+    };
+
+    let nome = salvo.nome || p.titulo;
+    if (NOME_PROVISORIO_ML.test(nome) && p.titulo) nome = p.titulo;
+
+    if (!p.preco)      { descartados.push({ asin: salvo.asin, nome, motivo: 'sem preco na pagina' }); continue; }
+    if (!p.disponivel) { descartados.push({ asin: salvo.asin, nome, motivo: 'produto pausado ou sem estoque' }); continue; }
+
+    // Cupom do disparo vence o vinculado; sem nenhum dos dois, vai sem cupom.
+    const codigo = codigoCupom || salvo.cupom || null;
+    let cupom = null, avisoCupom = null;
+    // 'auto': o melhor cupom do ML vigente que atenda o preco deste produto.
+    if (codigo === 'auto') {
+      const m = melhorCupomAplicavel('Mercado Livre', p.preco);
+      if (m) cupom = { reg: m.reg, desconto: m.desconto, citado: true };
+      else avisoCupom = 'nenhum cupom do Mercado Livre vigente se aplica a este preco';
+    } else if (codigo) {
+      const reg = cupomPorCodigo('Mercado Livre', codigo);
+      if (!reg)                    avisoCupom = 'cupom ' + codigo + ' nao esta na base (Mercado Livre)';
+      else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
+      else {
+        const desconto = calcularDesconto(reg, p.preco);
+        if (desconto > 0) cupom = { reg, desconto, citado: true };
+        else avisoCupom = 'cupom ' + codigo + ' nao se aplica a este preco';
+      }
+    }
+
+    prontos.push({
+      asin: salvo.asin, nome, produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+      avisoCupom,
+      precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      mensagem: formatarOfertaMl(p, { cupom }),
+    });
+    await new Promise(r2 => setTimeout(r2, 400));
+  }
+  return { prontos, descartados };
 }
