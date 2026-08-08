@@ -257,7 +257,15 @@ export async function buscarDadosProdutoMl(url) {
   const mDe = html.match(/"original_price"\s*:\s*([\d.]+)/) ||
               html.match(/andes-money-amount--previous[\s\S]{0,220}?andes-money-amount__fraction[^>]*>([\d.]+)/);
   let precoDe = mDe ? Number(String(mDe[1]).replace(/\./g, '')) : null;
-  if (precoDe && preco && precoDe <= preco) precoDe = null;
+
+  // Sanidade: a pagina traz varios blocos de preco (recomendados, parcelamento,
+  // outros anuncios) e o regex pode pegar o valor errado. Um "de" so e crivel
+  // entre o preco atual e 5x ele — acima disso o desconto sairia absurdo e a
+  // mensagem anunciaria algo como "100% de desconto".
+  if (precoDe && preco && (precoDe <= preco || precoDe > preco * 5)) {
+    if (precoDe > preco * 5) console.warn('[ML] precoDe implausivel (' + precoDe + ' vs ' + preco + ') — descartado');
+    precoDe = null;
+  }
 
   const disponivel = !/OutOfStock|Sem estoque|Publicação pausada/i.test(
     (oferta?.availability || '') + html.slice(0, 60000));
