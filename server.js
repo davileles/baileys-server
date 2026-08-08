@@ -714,6 +714,18 @@ function salvarAgendamentos() {
 
 carregarAgendamentos();
 
+// Envio de um agendamento simples. Existe separado do setInterval porque montar
+// o link preview e assincrono (baixa a thumbnail) e o loop nao pode esperar.
+// Falha ao montar o card nao cancela o envio: a mensagem sai sem preview.
+async function despacharAgendamento(ag, grupoId) {
+  let lp = null;
+  if (ag.preview?.link) {
+    try { lp = await montarLinkPreviewManual(ag.preview); }
+    catch (e) { console.warn('[AGEND] Nao montou o preview de #' + ag.id + ':', e.message); }
+  }
+  return enviarMensagem(grupoId, lp ? { text: ag.mensagem, linkPreview: lp } : { text: ag.mensagem });
+}
+
 setInterval(() => {
   const agora = Date.now();
   const prontos = agendamentos.filter(a => a.status === 'aguardando' && a.dispararEm <= agora);
@@ -726,7 +738,10 @@ setInterval(() => {
     if (isEmissao && !ag.direto) {
       enfileirarEnvio(ag.ofertaId ?? ('ag-'+ag.id), ag.mensagem, grupoId, ag.dados || null);
     } else {
-      enviarMensagem(grupoId, { text: ag.mensagem })
+      // A thumbnail e baixada agora, na hora do disparo, e nao no agendamento:
+      // guardar bytes no agendamentos.json inflaria o arquivo e ainda entregaria
+      // uma foto velha se a loja trocasse a imagem do anuncio no meio do caminho.
+      despacharAgendamento(ag, grupoId)
         .then(() => { ag.status = 'enviado'; salvarAgendamentos(); })
         .catch(e  => { ag.status = 'erro';   salvarAgendamentos(); console.error('[AGEND] Erro envio:', e.message); });
     }
@@ -3830,7 +3845,9 @@ app.post('/enviar', async (req, res) => {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
     const id = gerarId();
-    agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto, criadoEm: new Date().toISOString() });
+    agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto,
+                        preview: preview?.link ? preview : null,
+                        criadoEm: new Date().toISOString() });
     salvarAgendamentos();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
     return res.json({ ok:true, agendado:true, id, horario });
