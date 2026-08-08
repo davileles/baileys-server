@@ -14,7 +14,8 @@
 // de dados confiavel, basta preencher buscarDadosMagalu() e o resto continua.
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { melhorCupom, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
+import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
+         calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 
@@ -187,4 +188,157 @@ export async function processarTextoMagalu(texto) {
     });
   }
   return saida;
+}
+
+
+// ── VITRINE — MAGAZINE LUIZA ──────────────────────────────────────────────
+// A vitrine das outras lojas guarda so o identificador e consulta o preco no
+// disparo. Aqui isso e impossivel: nao ha API de afiliado e a pagina responde
+// 403 a IP de datacenter. O preco entao e informado pelo operador no cadastro e
+// fica com data. No disparo o preco nao e reconferido — o que da para fazer e
+// recusar preco velho, que e o risco real de uma vitrine (produto cadastrado
+// hoje e disparado quando sai um cupom, semanas depois).
+
+// Horas que um preco informado a mao continua valendo. Fora do codigo para o
+// operador poder afrouxar ou apertar sem deploy.
+export function ttlPrecoMagalu() {
+  const h = Number(process.env.MAGALU_PRECO_TTL_H);
+  return isFinite(h) && h > 0 ? h : 24;
+}
+
+/** Le "R$ 1.234,56", "1234,56" ou "1234.56" de um pedaco de texto. */
+function precosDaLinha(resto) {
+  const achados = [...String(resto).matchAll(/R?\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:[.,]\d{2})?)/gi)]
+    .map(m => {
+      const bruto = m[1];
+      // 1.234,56 -> 1234.56 | 1234,56 -> 1234.56 | 1234.56 fica como esta
+      const n = bruto.includes(',')
+        ? Number(bruto.replace(/\./g, '').replace(',', '.'))
+        : Number(bruto);
+      return n;
+    })
+    .filter(v => isFinite(v) && v > 0);
+  if (!achados.length) return { preco: null, precoDe: null };
+  const preco = Math.min(...achados);
+  const maior = Math.max(...achados);
+  return { preco, precoDe: maior > preco ? maior : null };
+}
+
+/**
+ * Resolve uma linha da vitrine para a Magalu. Formato aceito, em qualquer ordem
+ * dos campos que nao sao o link:
+ *   https://...                         (so o link — entra sem preco)
+ *   Nome do produto | https://... | 1299,00
+ *   https://... | 1299,00 | 1899,00     (o maior vira o "de")
+ */
+export async function resolverLinhaVitrineMagalu(linha) {
+  const bruto = String(linha || '').trim();
+  if (!bruto) return null;
+
+  const m = bruto.match(new RegExp(REGEX_URL_MAGALU.source, 'i'));
+  if (!m) return { erro: 'sem link da Magazine Luiza', linha: bruto };
+  const url = m[0].replace(/[)\]}.,;!]+$/, '');
+
+  // Tudo que nao e o link vira candidato a nome e preco.
+  const resto = bruto.replace(m[0], ' ');
+  const { preco, precoDe } = precosDaLinha(resto);
+
+  let conv;
+  try { conv = await converterLinkMagalu(url); }
+  catch (e) { return { erro: 'falha ao converter o link: ' + e.message, linha: bruto }; }
+  if (!conv) return { erro: 'link sem codigo de produto (nao da para gerar link de afiliado)', linha: bruto };
+
+  // Nome: o que sobrou depois de tirar link, precos e separadores. Sem isso,
+  // cai no slug da URL, que ja e legivel.
+  let nome = resto
+    .replace(/R?\$?\s*\d{1,3}(?:\.\d{3})*,\d{2}/gi, ' ')
+    .replace(/R\$\s*\d+(?:[.,]\d{2})?/gi, ' ')
+    .replace(/[|;]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+  if (!nome) nome = (conv.partes.slug || '').replace(/[-_]+/g, ' ').trim().slice(0, 140);
+  if (!nome) nome = 'Produto ' + conv.partes.codigo;
+
+  return {
+    asin: 'MAGALU-' + conv.partes.codigo,
+    nome,
+    url: conv.link,               // ja e o link da nossa loja no Magazine Voce
+    loja: 'Magazine Luiza',
+    preco: preco ?? null,
+    precoDe: precoDe ?? null,
+  };
+}
+
+/**
+ * Monta as mensagens da vitrine para itens da Magalu. Sem fonte para reconsultar
+ * preco, o que se faz aqui e barrar o que nao pode ir ao ar: item sem preco e
+ * item com preco vencido. As ofertas saem marcadas com precoDeReferencia.
+ */
+export async function montarOfertasMagaluVitrine(itens, codigoCupom = null) {
+  const prontos = [], descartados = [];
+  const ttlMs = ttlPrecoMagalu() * 3600 * 1000;
+
+  for (const salvo of itens) {
+    if (!salvo.preco) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome,
+        motivo: 'sem preco informado — a Magalu nao tem consulta automatica, edite o preco na vitrine' });
+      continue;
+    }
+    const idade = salvo.precoEm ? Date.now() - new Date(salvo.precoEm).getTime() : Infinity;
+    if (idade > ttlMs) {
+      const horas = isFinite(idade) ? Math.round(idade / 3600000) : null;
+      descartados.push({ asin: salvo.asin, nome: salvo.nome,
+        motivo: 'preco informado ha ' + (horas != null ? horas + 'h' : 'tempo desconhecido')
+              + ' (limite ' + ttlPrecoMagalu() + 'h) — reconfirme o preco antes de disparar' });
+      continue;
+    }
+
+    const preco = Number(salvo.preco);
+    const precoDe = salvo.precoDe && salvo.precoDe > preco ? Number(salvo.precoDe) : null;
+
+    const p = {
+      asin: salvo.asin,
+      codigo: String(salvo.asin).replace(/^MAGALU-/, ''),
+      titulo: salvo.nome || '',
+      preco, precoDe,
+      precoTexto: 'R$ ' + preco.toFixed(2).replace('.', ','),
+      precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
+      desconto: precoDe ? Math.round((1 - preco / precoDe) * 100) : 0,
+      disponivel: true,          // sem fonte para conferir estoque
+      link: salvo.url,
+      imagemUrl: null,
+      vendedor: null, marca: '', nota: null, avaliacoes: null,
+      dealTermina: null, ehDeal: false,
+      loja: 'Magazine Luiza',
+      precoDeReferencia: true,
+    };
+
+    const codigo = codigoCupom || salvo.cupom || null;
+    let cupom = null, avisoCupom = null;
+    if (codigo === 'auto') {
+      const mc = melhorCupomAplicavel('Magazine Luiza', preco);
+      if (mc) cupom = { reg: mc.reg, desconto: mc.desconto, citado: true };
+      else avisoCupom = 'nenhum cupom da Magazine Luiza vigente se aplica a este preco';
+    } else if (codigo) {
+      const reg = cupomPorCodigo('Magazine Luiza', codigo);
+      if (!reg)                    avisoCupom = 'cupom ' + codigo + ' nao esta na base (Magazine Luiza)';
+      else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
+      else {
+        const desconto = calcularDesconto(reg, preco);
+        if (desconto > 0) cupom = { reg, desconto, citado: true };
+        else avisoCupom = 'cupom ' + codigo + ' nao se aplica a este preco';
+      }
+    }
+
+    prontos.push({
+      asin: salvo.asin, nome: salvo.nome || p.titulo, produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+      avisoCupom,
+      precoFinal: cupom ? Math.max(0, preco - cupom.desconto) : preco,
+      precoDeReferencia: true,
+      mensagem: formatarOfertaMagalu(p, { cupom }),
+    });
+  }
+  return { prontos, descartados };
 }
