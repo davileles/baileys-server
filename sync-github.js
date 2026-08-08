@@ -30,6 +30,7 @@ export const ARQUIVOS_SINCRONIZADOS = {
   'cupons_base.json': PASTA + '/cupons_base.json',
   'vitrine.json':     PASTA + '/vitrine.json',
   'templates.json':   PASTA + '/templates.json',
+  'listas.json':      PASTA + '/listas.json',
   'radar_config.json':PASTA + '/radar_config.json',
   'grupos_censo_hist.json': PASTA + '/grupos_censo_hist.json',
   // Ledger de entradas/saidas. O PUT aceita arquivo grande, mas a leitura via
