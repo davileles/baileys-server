@@ -60,6 +60,7 @@ import {
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
+  resolverLinhaVitrineMl, montarOfertasMlVitrine,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -4475,6 +4476,9 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) return { ok:false, motivo:'Shopee nao configurada' };
     montado = await montarOfertasShopeeVitrine([item], codigoCupom);
+  } else if (item.loja === 'Mercado Livre') {
+    if (!tokenAffOk()) return { ok:false, motivo:'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
+    montado = await montarOfertasMlVitrine([item], codigoCupom);
   } else {
     montado = await montarOfertasVitrine([asin], codigoCupom);
   }
@@ -4484,7 +4488,8 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
 
   const oferta = {
     id: gerarId(), origem:'lista',
-    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
     mensagemFormatada: o.mensagem,
     dadosExtraidos: {
       loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
@@ -4747,6 +4752,16 @@ app.post('/vitrine', async (req, res) => {
         }), jaExistia: jaTinha });
         continue;
       }
+      // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
+      // e gerado no disparo — por isso nao passa pelo resolvedor da Amazon.
+      if (ehLinkMl(linha)) {
+        if (!tokenAffOk()) { erros.push({ linha, erro: 'Mercado Livre nao configurado (ML_AFF_TOKEN)' }); continue; }
+        const rml = await resolverLinhaVitrineMl(linha);
+        if (!rml || rml.erro) { erros.push({ linha, erro: rml?.erro || 'falhou' }); continue; }
+        const jaTinhaMl = !!itemVitrine(rml.asin);
+        salvos.push({ ...salvarItemVitrine({ ...rml, cupom }), jaExistia: jaTinhaMl });
+        continue;
+      }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
@@ -4774,7 +4789,9 @@ app.post('/vitrine/disparar', async (req, res) => {
   // Cada loja tem sua API: separa antes de consultar e junta os resultados.
   const itens = asins.map(a => itemVitrine(a)).filter(Boolean);
   const daShopee = itens.filter(i => i.loja === 'Shopee');
-  const daAmazon = asins.filter(a => !daShopee.some(s => s.asin === a));
+  const daMl     = itens.filter(i => i.loja === 'Mercado Livre');
+  const daAmazon = asins.filter(a =>
+    !daShopee.some(s => s.asin === a) && !daMl.some(m => m.asin === a));
 
   let montado = { prontos: [], descartados: [] };
   if (daAmazon.length) {
@@ -4782,6 +4799,18 @@ app.post('/vitrine/disparar', async (req, res) => {
       const m = await montarOfertasVitrine(daAmazon, req.body?.cupom || null);
       montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
     } catch (e) { return res.status(500).json({ ok:false, erro:'falha na API da Amazon: ' + e.message }); }
+  }
+  if (daMl.length) {
+    if (!tokenAffOk()) {
+      daMl.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Mercado Livre nao configurado' }));
+    } else {
+      try {
+        const m = await montarOfertasMlVitrine(daMl, req.body?.cupom || null);
+        montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+      } catch (e) {
+        daMl.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Mercado Livre: ' + e.message }));
+      }
+    }
   }
   if (daShopee.length) {
     if (!credenciaisShopeeOk()) {
@@ -4800,7 +4829,8 @@ app.post('/vitrine/disparar', async (req, res) => {
   for (const o of montado.prontos) {
     const oferta = {
       id: gerarId(), origem:'vitrine',
-      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
       mensagemFormatada: o.mensagem,
       dadosExtraidos: {
         loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
