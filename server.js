@@ -44,7 +44,7 @@ import {
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
   normalizarShopee, credenciaisShopeeOk, montarOfertasShopeeVitrine,
-  validarAtribuicao,
+  validarAtribuicao, resolverEncurtadorShopee,
 } from './radar-shopee.js';
 
 // ── RADAR MERCADO LIVRE ───────────────────────────────────────────────────────
@@ -4683,8 +4683,24 @@ app.post('/vitrine', async (req, res) => {
         if (!credenciaisShopeeOk()) { erros.push({ linha, erro: 'Shopee não configurada no Railway' }); continue; }
         const nomeManual = (linha.match(/^(.*?)\s*[|;]\s*https?:\/\//) || [])[1];
         const ids = await extrairIdsShopee(linha);
-        if (!ids.length) { erros.push({ linha, erro: 'não foi possível identificar o produto Shopee' }); continue; }
+        if (!ids.length) {
+          // Sem o destino do encurtador o erro nao ensina nada: pode ser link de
+          // loja, de campanha, expirado ou formato novo. Mostra onde ele parou.
+          let destino = '';
+          try { destino = await resolverEncurtadorShopee(linha); } catch {}
+          const curto = destino ? destino.split('?')[0].slice(0, 90) : '';
+          erros.push({ linha, erro: 'não é link de produto Shopee'
+            + (curto ? ' — o link leva para ' + curto : ' e o encurtador não respondeu') });
+          continue;
+        }
         const node = await buscarProdutoShopee(ids[0]);
+        // Sem nome da API e sem nome manual, o produto entraria como "Produto
+        // 123456" e o disparo sairia com titulo inutil. Melhor recusar aqui.
+        if (!node && !(nomeManual || '').trim()) {
+          erros.push({ linha, erro: 'produto ' + ids[0].itemId
+            + ' fora do catálogo de afiliados (sem comissão ou indisponível)' });
+          continue;
+        }
         const chave = 'SHOPEE-' + ids[0].shopId + '-' + ids[0].itemId;
         const jaTinha = !!itemVitrine(chave);
         salvos.push({ ...salvarItemVitrine({
