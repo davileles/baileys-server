@@ -3358,6 +3358,12 @@ async function conectar() {
         }
       }
     });
+    // Entradas e saidas de membros: evento que o WhatsApp ja mandava e o socket
+    // descartava. Nao gera nenhuma requisicao — so escuta.
+    sock.ev.on('group-participants.update', (u) => {
+      try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author); }
+      catch(e) { console.error('[MEMBROS] Erro no handler:', e.message); }
+    });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       // Diagnostico: registra o evento CRU, antes de qualquer filtro. Sem isso
       // nao da para distinguir "socket nao recebe nada" de "recebe e descarta".
@@ -5197,6 +5203,126 @@ app.get('/grupos/censo', async (req, res) => {
     proximaMedicao: '06:00 (SP)',
     total: lista.reduce((s, g) => s + (g.membros || 0), 0),
     grupos: lista,
+  });
+});
+
+// ── LEDGER DE ENTRADAS E SAIDAS DE MEMBROS ───────────────────────────────────
+// O WhatsApp ja entrega o evento de entrada/saida para todo participante do
+// grupo: o socket recebia e descartava. Aqui so passamos a gravar. E 100%
+// passivo — nenhuma consulta extra ao servidor do WhatsApp, entao nao muda o
+// perfil de risco da conta.
+//
+// Uso previsto: tempo de permanencia por pessoa (entrada -> saida) para medir
+// retencao e LTV por grupo. Guarda o numero (sem nome, sem foto) porque sem ele
+// nao da para cruzar com a base de membros.
+const MEMBROS_LOG_ARQ  = 'grupos_membros_log.json';
+const MEMBROS_LOG_FILE = SESSAO_DIR + '/' + MEMBROS_LOG_ARQ;
+const MEMBROS_LOG_MAX  = 200000;
+let _membrosLog = { eventos: [] };
+let _membrosLogTimer = null;
+
+(function carregarMembrosLog() {
+  try {
+    if (existsSync(MEMBROS_LOG_FILE)) _membrosLog = JSON.parse(readFileSync(MEMBROS_LOG_FILE, 'utf-8'));
+    if (!_membrosLog?.eventos) _membrosLog = { eventos: [] };
+    console.log('[MEMBROS] ' + _membrosLog.eventos.length + ' evento(s) no ledger.');
+  } catch(e) { console.warn('[MEMBROS] Falha ao ler ledger:', e.message); _membrosLog = { eventos: [] }; }
+})();
+
+// Debounce na gravacao: uma entrada em massa (link divulgado) gera dezenas de
+// eventos em segundos, e gravar a cada um seria desperdicio de I/O e de commit.
+function salvarMembrosLog() {
+  if (_membrosLogTimer) return;
+  _membrosLogTimer = setTimeout(() => {
+    _membrosLogTimer = null;
+    try {
+      if (_membrosLog.eventos.length > MEMBROS_LOG_MAX)
+        _membrosLog.eventos = _membrosLog.eventos.slice(-MEMBROS_LOG_MAX);
+      writeFileSync(MEMBROS_LOG_FILE, JSON.stringify(_membrosLog), 'utf-8');
+      agendarPush(MEMBROS_LOG_ARQ);
+    } catch(e) { console.error('[MEMBROS] Falha ao gravar ledger:', e.message); }
+  }, 5000);
+}
+
+function _soNumero(jid) { return String(jid || '').split(':')[0].split('@')[0]; }
+
+// Quem ja estava no grupo antes deste registro existir nao tem data de entrada:
+// o WhatsApp nao expoe isso. A saida dessa pessoa fica marcada com
+// entradaDesconhecida para nao contaminar a media de permanencia.
+function _temEntrada(grupo, numero) {
+  for (let i = _membrosLog.eventos.length - 1; i >= 0; i--) {
+    const e = _membrosLog.eventos[i];
+    if (e.g === grupo && e.n === numero && e.a === 'add') return true;
+  }
+  return false;
+}
+
+function registrarMovimentoMembros(grupo, participantes, acao, autor) {
+  const destinos = new Set(radarDestinos());
+  if (!destinos.has(grupo)) return;              // so grupos de destino
+  if (acao !== 'add' && acao !== 'remove') return;
+  const ts = new Date().toISOString();
+  for (const p of (participantes || [])) {
+    const n = _soNumero(p);
+    if (!n) continue;
+    const ev = { ts, g: grupo, n, a: acao };
+    if (autor && _soNumero(autor) !== n) ev.por = _soNumero(autor);
+    if (acao === 'remove' && !_temEntrada(grupo, n)) ev.entradaDesconhecida = true;
+    _membrosLog.eventos.push(ev);
+  }
+  salvarMembrosLog();
+  console.log('[MEMBROS] ' + acao + ' — ' + (participantes || []).length + ' em '
+    + (NOMES_GRUPOS.get(grupo) || grupo));
+}
+
+// GET /grupos/membros/eventos?jid=&dias=30&limite=500 — leitura crua do ledger.
+app.get('/grupos/membros/eventos', (req, res) => {
+  const jid = String(req.query.jid || '').trim();
+  const dias = Math.max(parseInt(req.query.dias || '30', 10) || 30, 1);
+  const limite = Math.min(Math.max(parseInt(req.query.limite || '500', 10) || 500, 1), 5000);
+  const corte = Date.now() - dias * 86400000;
+  const eventos = _membrosLog.eventos
+    .filter(e => (!jid || e.g === jid) && new Date(e.ts).getTime() >= corte)
+    .slice(-limite)
+    .map(e => ({ em: e.ts, jid: e.g, grupo: NOMES_GRUPOS.get(e.g) || null, numero: e.n,
+                 acao: e.a, entradaDesconhecida: !!e.entradaDesconhecida }));
+  res.json({ ok:true, total: eventos.length, totalNoLedger: _membrosLog.eventos.length, eventos });
+});
+
+// GET /grupos/membros/permanencia?jid= — pareia entrada com saida e devolve o
+// tempo de permanencia de quem ja saiu, mais o resumo de entradas/saidas.
+app.get('/grupos/membros/permanencia', (req, res) => {
+  const jid = String(req.query.jid || '').trim();
+  const abertos = new Map();     // "grupo|numero" -> ts de entrada
+  const ciclos = [];
+  let entradas = 0, saidas = 0, saidasSemEntrada = 0;
+
+  for (const e of _membrosLog.eventos) {
+    if (jid && e.g !== jid) continue;
+    const chave = e.g + '|' + e.n;
+    if (e.a === 'add') { abertos.set(chave, e.ts); entradas++; continue; }
+    saidas++;
+    const entrou = abertos.get(chave);
+    if (!entrou) { saidasSemEntrada++; continue; }
+    abertos.delete(chave);
+    ciclos.push({
+      jid: e.g, grupo: NOMES_GRUPOS.get(e.g) || null, numero: e.n,
+      entrou, saiu: e.ts,
+      dias: +((new Date(e.ts) - new Date(entrou)) / 86400000).toFixed(2),
+    });
+  }
+
+  const media = ciclos.length ? +(ciclos.reduce((s, c) => s + c.dias, 0) / ciclos.length).toFixed(1) : null;
+  const ordenados = ciclos.map(c => c.dias).sort((a, b) => a - b);
+  const mediana = ordenados.length ? ordenados[Math.floor(ordenados.length / 2)] : null;
+  res.json({
+    ok: true,
+    entradas, saidas, saidasSemEntrada,
+    aindaDentro: abertos.size,
+    ciclosCompletos: ciclos.length,
+    permanenciaMediaDias: media,
+    permanenciaMedianaDias: mediana,
+    ciclos: ciclos.slice(-1000),
   });
 });
 
