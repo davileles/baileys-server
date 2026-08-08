@@ -4355,8 +4355,10 @@ app.post('/monitor/:jid', (req, res) => {
   try {
     const cfg = salvarMonitor(req.params.jid, req.body || {});
     if (!cfg) return res.status(400).json({ ok:false, erro:'jid invalido' });
+    const faixas = (cfg.janelas || [{ inicio: cfg.inicio, fim: cfg.fim }])
+      .map(j => j.inicio + '-' + j.fim).join(', ');
     console.log('[MONITOR] ' + req.params.jid.split('@')[0] + ' — ' + (cfg.lojas.join('+') || 'nenhuma loja')
-      + ' ' + cfg.inicio + '-' + cfg.fim + ' (' + cfg.dias + ')' + (cfg.ativo ? '' : ' [inativo]'));
+      + ' ' + faixas + ' (' + cfg.dias + ')' + (cfg.ativo ? '' : ' [inativo]'));
     res.json({ ok:true, cfg, estadoAgora: podeCapturar(req.params.jid, cfg.lojas[0] || 'Amazon') });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
