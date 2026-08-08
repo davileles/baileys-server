@@ -480,6 +480,60 @@ export function formatarOfertaMl(p, opcoes = {}) {
   return renderTemplate(tpl?.corpo || '', vars);
 }
 
+/**
+ * Links de afiliado de terceiros (meli.la -> /social/{tag}) nao apontam para o
+ * produto: abrem o perfil social do divulgador, com o item compartilhado no topo
+ * e uma lista de recomendados embaixo. O produto certo esta no botao "Ir para
+ * produto" — link literal, sem criptografia.
+ *
+ * Nao usamos o primeiro MLB do HTML: os primeiros que aparecem sao dos blocos de
+ * recomendacao, e pegar qualquer um mandaria o cliente para o produto errado.
+ */
+export async function produtoDePerfilSocial(urlSocial) {
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+  const res = await fetch(urlSocial, {
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!res.ok) throw new Error('perfil social respondeu HTTP ' + res.status);
+  const html = await res.text();
+
+  // Ancora principal: o titulo declarado pelo proprio ML para a pagina.
+  const tituloAlvo = (html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']+)/i) || [])[1] || null;
+
+  // O link do botao "Ir para produto". Aceita as duas formas de URL de item.
+  const candidatos = [...html.matchAll(/href=["']([^"']*\/(?:MLB-\d{6,}[^"'?]*|p\/MLB\d{6,})[^"']*)["']/gi)]
+    .map(m => m[1]);
+  if (!candidatos.length) return null;
+
+  // Prefere o candidato cujo slug bate com o og:title — evita pegar um item dos
+  // blocos "Quem viu este produto tambem comprou".
+  let escolhido = candidatos[0];
+  if (tituloAlvo) {
+    const chave = tituloAlvo.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const pedacos = chave.split('-').filter(t => t.length > 3);
+    let melhorNota = -1;
+    for (const c of candidatos) {
+      const alvo = c.toLowerCase();
+      const nota = pedacos.reduce((n, t) => n + (alvo.includes(t) ? 1 : 0), 0);
+      if (nota > melhorNota) { melhorNota = nota; escolhido = c; }
+    }
+    // Nenhum candidato parecido com o titulo: melhor nao arriscar.
+    if (melhorNota <= 0) return null;
+  }
+
+  const url = escolhido.startsWith('http') ? escolhido : 'https://www.mercadolivre.com.br' + escolhido;
+  return { url: url.split('?')[0], titulo: tituloAlvo };
+}
+
 export async function processarTextoMl(texto) {
   // URLs completas, nao so o MLB: o createLink recebe a URL de origem.
   const urls = [...new Set(String(texto || '').match(REGEX_URL_ML) || [])]
@@ -489,9 +543,22 @@ export async function processarTextoMl(texto) {
   // Encurtador precisa virar URL canonica antes de ir para o painel.
   const canonicas = [];
   for (const u of urls) {
-    if (idDeUrl(u)) { canonicas.push(u); continue; }
-    try { canonicas.push(await resolverEncurtadorMl(u)); }
-    catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); }
+    let alvo = u;
+    if (!idDeUrl(alvo)) {
+      try { alvo = await resolverEncurtadorMl(alvo); }
+      catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); continue; }
+    }
+    // Caiu num perfil social de outro afiliado: extrai o produto do topo.
+    if (/\/social\//i.test(alvo)) {
+      try {
+        const prod = await produtoDePerfilSocial(alvo);
+        if (!prod) { console.warn('[ML] Perfil social sem produto identificavel:', u); continue; }
+        console.log('[ML] Perfil social -> produto: ' + prod.titulo);
+        alvo = prod.url;
+      } catch (e) { console.warn('[ML] Falha no perfil social:', e.message); continue; }
+    }
+    if (idDeUrl(alvo)) canonicas.push(alvo);
+    else console.warn('[ML] Sem MLB apos resolver:', u);
   }
   if (!canonicas.length) return [];
 
