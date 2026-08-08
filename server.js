@@ -74,6 +74,35 @@ async function avisarTokenMlCaiu(motivo) {
   } catch (e) { console.error('[ML-AFF] Falha ao avisar operador:', e.message); }
 }
 
+// Sincroniza os cupons do ML de hora em hora. Cupom esgotado que continua ativo
+// na base faz o radar anunciar preco que nao se aplica no checkout.
+async function sincronizarCuponsMlAgendado() {
+  if (!tokenAffOk()) return;
+  try {
+    const r = await fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/cupons/sync-ml', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      signal: AbortSignal.timeout(120000),
+    });
+    const d = await r.json();
+    if (!d.ok) { console.warn('[CUPONS-ML] Sync agendado falhou:', d.erro); return; }
+    console.log('[CUPONS-ML] Sync agendado — ' + (d.atualizados || []).length + ' atualizado(s), '
+      + (d.criados || []).length + ' novo(s), ' + (d.desativados || []).length + ' desativado(s)'
+      + (d.leituraCompleta ? '' : ' [leitura parcial]') + '.');
+
+    // Cupom que saiu do ar e noticia operacional: o operador pode estar contando
+    // com ele para as ofertas do dia.
+    if ((d.desativados || []).length) {
+      await enviarMensagem(GRUPOS['operador'], {
+        text: '🎫 *Cupons do Mercado Livre desativados*\n\n'
+            + d.desativados.map(c => '• ' + c).join('\n')
+            + '\n\nSaíram da sua lista de cupons ativos no ML.'
+      }).catch(() => {});
+    }
+  } catch (e) { console.warn('[CUPONS-ML] Sync agendado — erro:', e.message); }
+}
+setInterval(sincronizarCuponsMlAgendado, 60 * 60 * 1000);
+setTimeout(sincronizarCuponsMlAgendado, 120000);   // primeira passada apos o boot
+
 // Verifica no boot e a cada 30 min. Frequencia alta de proposito: o custo de
 // uma chamada e irrelevante perto de descobrir tarde que o radar parou.
 setInterval(() => {
