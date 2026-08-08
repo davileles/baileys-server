@@ -4961,6 +4961,87 @@ app.get('/grupos', async (req, res) => {
   }
 });
 
+// ── DISTRIBUIDOR DE ENTRADAS: metadados e convite de grupo ────────────────────
+// Consumido pelo gerenciador de links do proxy CDV (/g/<slug>). Ele precisa de
+// duas coisas que so o Baileys sabe: quantas pessoas ja estao no grupo (para
+// parar de mandar gente quando encher) e o link de convite atual.
+const _ggMetaCache    = new Map();   // jid -> { ts, nome, membros, souAdmin }
+const _ggConviteCache = new Map();   // jid -> { ts, url }
+const GG_META_TTL_MS    = 60 * 1000;
+const GG_CONVITE_TTL_MS = 60 * 60 * 1000;
+
+function _ggMeuNumero() {
+  const id = sock?.user?.id || '';
+  return String(id).split(':')[0].split('@')[0];
+}
+
+async function _ggInfoGrupo(jid, forcar) {
+  const c = _ggMetaCache.get(jid);
+  if (!forcar && c && (Date.now() - c.ts) < GG_META_TTL_MS) return c;
+  const md = await sock.groupMetadata(jid);
+  const eu = _ggMeuNumero();
+  const meu = (md.participants || []).find(p =>
+    String(p.id || '').split(':')[0].split('@')[0] === eu);
+  const info = {
+    ts: Date.now(),
+    nome: md.subject || '(sem nome)',
+    membros: (md.participants || []).length,
+    souAdmin: !!(meu && meu.admin),
+  };
+  _ggMetaCache.set(jid, info);
+  NOMES_GRUPOS.set(jid, info.nome);
+  return info;
+}
+
+// Lote: o proxy manda todos os jids de um link de uma vez. Erro em um grupo nao
+// derruba os outros — o distribuidor segue usando a ultima contagem conhecida.
+app.get('/grupos/info', async (req, res) => {
+  const jids = String(req.query.jids || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!jids.length) return res.status(400).json({ ok:false, erro:'informe ?jids=jid1,jid2' });
+  if (!sock || !conectado) {
+    const ok = await aguardarSock(15000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
+  const forcar = req.query.refresh === '1';
+  const grupos = [];
+  for (const jid of jids.slice(0, 60)) {
+    try {
+      const i = await _ggInfoGrupo(jid, forcar);
+      grupos.push({ jid, nome:i.nome, membros:i.membros, souAdmin:i.souAdmin });
+    } catch (e) {
+      grupos.push({ jid, nome: NOMES_GRUPOS.get(jid) || null, membros: null, erro: e.message });
+    }
+  }
+  res.json({ ok:true, grupos });
+});
+
+// groupInviteCode exige que o numero conectado seja ADMIN do grupo.
+app.get('/grupos/convite', async (req, res) => {
+  const jid = String(req.query.jid || '').trim();
+  if (!jid.endsWith('@g.us')) return res.status(400).json({ ok:false, erro:'informe ?jid=<id>@g.us' });
+  if (!sock || !conectado) {
+    const ok = await aguardarSock(15000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
+  const forcar = req.query.refresh === '1';
+  const c = _ggConviteCache.get(jid);
+  if (!forcar && c && (Date.now() - c.ts) < GG_CONVITE_TTL_MS) {
+    return res.json({ ok:true, jid, url:c.url, doCache:true });
+  }
+  try {
+    const code = await sock.groupInviteCode(jid);
+    const url  = 'https://chat.whatsapp.com/' + code;
+    _ggConviteCache.set(jid, { ts: Date.now(), url });
+    res.json({ ok:true, jid, url });
+  } catch (e) {
+    const bruto = e?.message || String(e);
+    const erro = /forbidden|not-authorized|401|403/i.test(bruto)
+      ? 'sem permissao — o numero conectado precisa ser ADMIN deste grupo'
+      : bruto;
+    res.status(500).json({ ok:false, jid, erro });
+  }
+});
+
 // ── HUBLA WEBHOOK ─────────────────────────────────────────────────────────────
 
 const MENSAGEM_BOAS_VINDAS = (nome) => `Olá, ${nome}! Seja muito bem-vindo ao Clube do Viajante Premium! ✈️
