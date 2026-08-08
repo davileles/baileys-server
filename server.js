@@ -5064,6 +5064,117 @@ app.get('/grupos/convite', async (req, res) => {
   }
 });
 
+// ── CENSO DE MEMBROS DOS GRUPOS DE DESTINO ───────────────────────────────────
+// Fotografia diaria de quantas pessoas ha em cada grupo marcado como destino.
+// Roda as 06:00 (SP) e fica gravada em disco: a leitura do painel e instantanea
+// e nao depende de consultar 12+ grupos no WhatsApp a cada abertura da aba.
+const CENSO_FILE = SESSAO_DIR + '/grupos_censo.json';
+let _censo = { atualizadoEm: null, grupos: [] };
+let _censoRodando = false;
+
+function _censoDia(iso) {
+  if (!iso) return null;
+  try { return new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date(iso)); }
+  catch(_) { return null; }
+}
+
+(function carregarCenso() {
+  try {
+    if (existsSync(CENSO_FILE)) _censo = JSON.parse(readFileSync(CENSO_FILE, 'utf-8'));
+  } catch(e) { console.warn('[CENSO] Falha ao ler censo salvo:', e.message); }
+})();
+
+function salvarCenso() {
+  try { writeFileSync(CENSO_FILE, JSON.stringify(_censo, null, 2), 'utf-8'); }
+  catch(e) { console.error('[CENSO] Falha ao gravar censo:', e.message); }
+}
+
+// Grupo que falhar mantem a ultima contagem conhecida em vez de sumir da lista:
+// um erro pontual de metadata nao pode zerar o historico do grupo.
+async function recensearGrupos() {
+  if (_censoRodando) return _censo;
+  if (!sock || !conectado) {
+    const ok = await aguardarSock(20000);
+    if (!ok) throw new Error('WhatsApp nao conectado.');
+  }
+  _censoRodando = true;
+  try {
+    const destinos = radarDestinos();
+    const anteriores = new Map((_censo.grupos || []).map(g => [g.jid, g]));
+    const grupos = [];
+    for (const jid of destinos) {
+      const ant = anteriores.get(jid);
+      try {
+        const i = await _ggInfoGrupo(jid, true);
+        grupos.push({
+          jid, nome: i.nome, membros: i.membros,
+          variacao: (ant && typeof ant.membros === 'number') ? i.membros - ant.membros : null,
+          medidoEm: new Date().toISOString(),
+        });
+        await new Promise(r => setTimeout(r, 800));
+      } catch(e) {
+        grupos.push({
+          jid, nome: NOMES_GRUPOS.get(jid) || ant?.nome || null,
+          membros: ant?.membros ?? null, variacao: null,
+          medidoEm: ant?.medidoEm || null, erro: e.message,
+        });
+      }
+    }
+    _censo = { atualizadoEm: new Date().toISOString(), grupos };
+    salvarCenso();
+    const total = grupos.reduce((s, g) => s + (g.membros || 0), 0);
+    console.log('[CENSO] ' + grupos.length + ' grupo(s) de destino — ' + total + ' membro(s) no total.');
+    return _censo;
+  } finally { _censoRodando = false; }
+}
+
+// Agendador das 06:00 (SP). Checa de minuto em minuto e guarda o dia ja medido,
+// entao um restart do container no meio da manha nao dispara o censo de novo.
+let _censoUltimoDia = _censoDia(_censo.atualizadoEm);
+setInterval(() => {
+  if (horaSP() !== 6) return;
+  const dia = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date());
+  if (_censoUltimoDia === dia) return;
+  _censoUltimoDia = dia;
+  recensearGrupos().catch(e => {
+    console.error('[CENSO] Falha no censo das 6h:', e.message);
+    _censoUltimoDia = null;   // libera nova tentativa ainda dentro da hora
+  });
+}, 60 * 1000);
+
+// GET /grupos/censo — leitura do painel. Nunca consulta o WhatsApp: devolve a
+// ultima fotografia. ?refresh=1 forca uma nova medicao na hora.
+app.get('/grupos/censo', async (req, res) => {
+  if (req.query.refresh === '1') {
+    try { await recensearGrupos(); }
+    catch(e) { return res.status(503).json({ ok:false, erro:e.message, atualizadoEm:_censo.atualizadoEm, grupos:_censo.grupos, total:_censo.grupos.reduce((s,g)=>s+(g.membros||0),0) }); }
+  }
+  const destinos = new Set(radarDestinos());
+  // So grupos que continuam marcados como destino: se o papel foi retirado, o
+  // grupo sai da lista sem precisar de um novo censo.
+  const grupos = (_censo.grupos || []).filter(g => destinos.has(g.jid));
+  const faltando = radarDestinos().filter(j => !grupos.some(g => g.jid === j))
+    .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null, membros:null, variacao:null, medidoEm:null }));
+  const lista = [...grupos, ...faltando];
+  res.json({
+    ok: true,
+    atualizadoEm: _censo.atualizadoEm,
+    proximaMedicao: '06:00 (SP)',
+    total: lista.reduce((s, g) => s + (g.membros || 0), 0),
+    grupos: lista,
+  });
+});
+
+// POST /grupos/censo/atualizar — mede agora, sob demanda do painel.
+app.post('/grupos/censo/atualizar', async (req, res) => {
+  try {
+    const c = await recensearGrupos();
+    const destinos = new Set(radarDestinos());
+    const lista = (c.grupos || []).filter(g => destinos.has(g.jid));
+    res.json({ ok:true, atualizadoEm:c.atualizadoEm, total: lista.reduce((s,g)=>s+(g.membros||0),0), grupos: lista });
+  } catch(e) { res.status(503).json({ ok:false, erro:e.message }); }
+});
+
 // ── HUBLA WEBHOOK ─────────────────────────────────────────────────────────────
 
 const MENSAGEM_BOAS_VINDAS = (nome) => `Olá, ${nome}! Seja muito bem-vindo ao Clube do Viajante Premium! ✈️
