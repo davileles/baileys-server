@@ -642,11 +642,38 @@ export async function processarTextoMl(texto) {
 
 const URL_CUPONS_ML = 'https://www.mercadolivre.com.br/cupons/active';
 
+/**
+ * Ativa um cupom na conta, como o botao "Inserir codigo" da pagina de cupons.
+ * Cupom capturado num grupo so vale nas suas compras depois de ativado.
+ */
+export async function ativarCupomMl(codigo) {
+  const r = await chamarAff('https://www.mercadolivre.com.br/cupons/api/input-code', {
+    method: 'POST',
+    body: JSON.stringify({ code: String(codigo || '').trim().toUpperCase() }),
+    headers: {
+      'Origin': 'https://www.mercadolivre.com.br',
+      'Referer': 'https://www.mercadolivre.com.br/cupons',
+      'x-requested-with': 'XMLHttpRequest',
+    },
+  });
+  const msg = r.corpo?.responseMessage || {};
+  const texto = msg.text || '';
+  return {
+    codigo,
+    ok: msg.type === 'success',
+    // "ja foi adicionado" nao e falha: o cupom esta ativo, e o que importa.
+    jaTinha: /já foi adicionad/i.test(texto),
+    invalido: /Confira se o cupom/i.test(texto),
+    mensagem: texto,
+    status: r.status,
+  };
+}
+
 /** Le a pagina e devolve os cupons ativos do Mercado Livre. */
-export async function lerCuponsAtivosMl() {
+export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
-  const res = await fetch(URL_CUPONS_ML, {
+  const res = await fetch(url, {
     headers: {
       'Cookie': cookie,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
@@ -694,4 +721,41 @@ export async function lerCuponsAtivosMl() {
   // leitura parcial e pior do que nao sincronizar.
   const mTotal = texto.match(/(\d+)\s+Cupons/);
   return { cupons: [...porCodigo.values()], totalDeclarado: mTotal ? Number(mTotal[1]) : null };
+}
+
+/**
+ * A pagina de cupons carrega parte dos cards por JS, entao uma leitura so
+ * devolve incompleto. Os filtros da propria pagina servem de paginacao: cada um
+ * traz um recorte, e a uniao cobre o total.
+ */
+const FILTROS_CUPONS_ML = [
+  'https://www.mercadolivre.com.br/cupons/active',
+  'https://www.mercadolivre.com.br/cupons/filter?about_to_expire=true',
+  'https://www.mercadolivre.com.br/cupons/filter?most_used=true',
+  'https://www.mercadolivre.com.br/cupons/filter?news=true',
+];
+
+export async function lerTodosCuponsMl() {
+  const porCodigo = new Map();
+  let totalDeclarado = null;
+  const fontes = [];
+
+  for (const url of FILTROS_CUPONS_ML) {
+    try {
+      const r = await lerCuponsAtivosMl(url);
+      if (r.totalDeclarado && (!totalDeclarado || r.totalDeclarado > totalDeclarado)) {
+        totalDeclarado = r.totalDeclarado;
+      }
+      for (const c of r.cupons) {
+        const ant = porCodigo.get(c.codigo);
+        // Mantem a versao mais informativa (com minimo/limite/expiracao).
+        if (!ant || (c.minimo != null && ant.minimo == null) || (c.expiraEm && !ant.expiraEm)) {
+          porCodigo.set(c.codigo, c);
+        }
+      }
+      fontes.push({ url, lidos: r.cupons.length });
+    } catch (e) { fontes.push({ url, erro: e.message }); }
+    await new Promise(r => setTimeout(r, 600));
+  }
+  return { cupons: [...porCodigo.values()], totalDeclarado, fontes };
 }
