@@ -3479,7 +3479,10 @@ app.get('/contas', (req, res) => {
 app.post('/contas/:id/conectar', async (req, res) => {
   const id = String(req.params.id || '').trim();
   if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'use /reconectar para a conta principal' });
-  if (!/^[a-z0-9_-]{2,24}$/i.test(id)) return res.status(400).json({ ok:false, erro:'id invalido (a-z, 0-9, - e _)' });
+  if (!/^[a-z0-9_-]{2,24}$/i.test(id)) {
+    return res.status(400).json({ ok:false,
+      erro: 'apelido invalido: use de 2 a 24 caracteres, so letras sem acento, numeros, - e _' });
+  }
   conectarConta(id).catch(()=>{});
   res.json({ ok:true, mensagem:'Conectando. Abra /contas/' + id + '/qr para parear.' });
 });
