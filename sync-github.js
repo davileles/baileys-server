@@ -32,6 +32,7 @@ export const ARQUIVOS_SINCRONIZADOS = {
   'templates.json':   PASTA + '/templates.json',
   'listas.json':      PASTA + '/listas.json',
   'radar_config.json':PASTA + '/radar_config.json',
+  'config_tsp.json':  PASTA + '/config_tsp.json',
   'grupos_censo_hist.json': PASTA + '/grupos_censo_hist.json',
   // Ledger de entradas/saidas. O PUT aceita arquivo grande, mas a leitura via
   // Contents API para de devolver o conteudo acima de ~1MB: passando disso o
