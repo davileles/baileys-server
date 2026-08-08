@@ -31,6 +31,7 @@ export const ARQUIVOS_SINCRONIZADOS = {
   'vitrine.json':     PASTA + '/vitrine.json',
   'templates.json':   PASTA + '/templates.json',
   'radar_config.json':PASTA + '/radar_config.json',
+  'grupos_censo_hist.json': PASTA + '/grupos_censo_hist.json',
 };
 
 const _shas = new Map();      // caminho no repo -> sha do ultimo commit conhecido
