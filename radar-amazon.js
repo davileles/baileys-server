@@ -1178,7 +1178,8 @@ export async function resolverLinhaVitrine(linha) {
   if (sep) { nomeManual = sep[1].trim(); url = sep[2].trim(); }
   else {
     const m = bruto.match(REGEX_URL_AMAZON);
-    if (!m) return { erro: 'sem link da Amazon', linha: bruto };
+    if (!m) return { erro: 'link nao reconhecido — a vitrine aceita Amazon, '
+                          + 'Mercado Livre, Shopee e Magazine Luiza', linha: bruto };
     url = m[0].replace(/[)\]}.,;!]+$/, '');
     REGEX_URL_AMAZON.lastIndex = 0;
   }
@@ -1225,6 +1226,14 @@ export function salvarItemVitrine(item) {
     shopId: item.shopId || anterior?.shopId || null,
     itemId: item.itemId || anterior?.itemId || null,
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
+    // Magazine Luiza nao tem API de afiliado nem leitura de pagina a partir do
+    // Railway (403 em IP de datacenter), entao e a unica loja em que o preco nao
+    // pode ser consultado no disparo — ele e informado pelo operador. Guardar o
+    // instante permite recusar um preco velho em vez de anunciar valor que sumiu.
+    preco: item.preco !== undefined ? (item.preco ?? null) : (anterior?.preco ?? null),
+    precoDe: item.precoDe !== undefined ? (item.precoDe ?? null) : (anterior?.precoDe ?? null),
+    precoEm: (item.preco !== undefined && item.preco != null)
+      ? new Date().toISOString() : (anterior?.precoEm || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
     ultimoDisparo: anterior?.ultimoDisparo || null,
