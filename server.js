@@ -48,7 +48,7 @@ import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
-  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl,
+  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -4123,62 +4123,66 @@ app.delete('/templates/:loja', (req, res) => {
 app.post('/cupons/sync-ml', async (req, res) => {
   if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
   try {
-    const { cupons: ativos, totalDeclarado, fontes } = await lerTodosCuponsMl();
-    if (!ativos.length) {
-      return res.json({ ok:false, erro:'nenhum cupom lido — sessao pode ter caido', ativos:0 });
+    const { cupons: naPagina, totalDeclarado, semCodigo, fontes } = await lerTodosCuponsMl();
+    if (!naPagina.length) {
+      return res.json({ ok:false, erro:'nenhum cupom lido — sessao pode ter caido' });
     }
-    // Leitura parcial (a pagina carrega parte por JS): atualiza o que leu, mas
-    // NAO desativa nada. Desligar cupom que continua valendo custa vendas.
-    const leituraCompleta = !totalDeclarado || ativos.length >= totalDeclarado;
-    const vivos = new Set(ativos.map(c => c.codigo.toUpperCase()));
-    const atualizados = [], criados = [], desativados = [];
 
-    for (const c of ativos) {
-      const chave = 'mercadolivre:' + c.codigo.toLowerCase();
-      const campos = { tipo:c.tipo, valor:c.valor, minimo:c.minimo, limite:c.limite, ativo:true };
-      if (c.expiraEm) campos.validadeAte = c.expiraEm;
-      const reg = atualizarCupomBase(chave, campos);
-      if (reg) atualizados.push({ codigo:c.codigo, expiraEm:c.expiraEm, esgotando:c.esgotando });
-      else {
-        registrarCupomBase({ loja:'Mercado Livre', ...c });
-        if (c.expiraEm) atualizarCupomBase(chave, { validadeAte: c.expiraEm });
+    // Leitura completa = todos os cards do ML foram vistos, somando os que tem
+    // codigo e os que nao tem (esses nunca entram na base, mas contam no total).
+    const vistos = naPagina.length + (semCodigo || 0);
+    const leituraCompleta = !totalDeclarado || vistos >= totalDeclarado;
+
+    const mapaPagina = new Map(naPagina.map(c => [c.codigo.toUpperCase(), c]));
+    const atualizados = [], desativados = [], criados = [], semMudanca = [];
+
+    // Percorre a NOSSA base e procura cada cupom na pagina — nao o contrario.
+    // Assim os cards sem codigo digitavel deixam de ser um caso especial.
+    for (const reg of listarCuponsBase()) {
+      if (reg.loja !== 'Mercado Livre') continue;
+      const naTela = mapaPagina.get(String(reg.codigo).toUpperCase());
+
+      if (!naTela) {
+        if (!leituraCompleta) { semMudanca.push(reg.codigo); continue; }
+        if (reg.ativo === false) continue;
+        atualizarCupomBase(reg.chave, { ativo:false });
+        desativados.push(reg.codigo);
+        continue;
+      }
+
+      const campos = { tipo:naTela.tipo, valor:naTela.valor,
+                       minimo:naTela.minimo, limite:naTela.limite, ativo:true };
+      // Validade real: contador tem prioridade sobre o texto ("quarta-feira").
+      const validade = naTela.expiraEm || validadeDeTexto(naTela.venceTexto);
+      if (validade) campos.validadeAte = validade;
+      atualizarCupomBase(reg.chave, campos);
+      atualizados.push({ codigo:reg.codigo, valor:naTela.valor, minimo:naTela.minimo,
+                         limite:naTela.limite, validadeAte:validade || null,
+                         esgotando:naTela.esgotando });
+    }
+
+    // Cupom que o ML lista e a base ainda nao tem.
+    if (req.body?.criarNovos !== false) {
+      const naBase = new Set(listarCuponsBase()
+        .filter(r => r.loja === 'Mercado Livre')
+        .map(r => String(r.codigo).toUpperCase()));
+      for (const c of naPagina) {
+        if (naBase.has(c.codigo.toUpperCase())) continue;
+        const reg = registrarCupomBase({ loja:'Mercado Livre', ...c });
+        const validade = c.expiraEm || validadeDeTexto(c.venceTexto);
+        if (validade && reg) atualizarCupomBase(reg.chave, { validadeAte: validade });
         criados.push(c.codigo);
       }
     }
 
-    // Cupom do ML que a base tem mas o painel nao lista mais: saiu do ar.
-    if (req.body?.desativarAusentes !== false && leituraCompleta) {
-      for (const reg of listarCuponsBase()) {
-        if (reg.loja !== 'Mercado Livre' || reg.ativo === false) continue;
-        if (vivos.has(String(reg.codigo).toUpperCase())) continue;
-        atualizarCupomBase(reg.chave, { ativo:false });
-        desativados.push(reg.codigo);
-      }
-    }
     console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
-      + criados.length + ' novo(s), ' + desativados.length + ' desativado(s).');
-    res.json({
-      ok:true, lidos:ativos.length, totalDeclarado, leituraCompleta, fontes,
-      atualizados, criados, desativados,
-      aviso: leituraCompleta ? null
-        : 'leitura parcial (' + ativos.length + ' de ' + totalDeclarado + ') — nada foi desativado',
-    });
-  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
-});
+      + criados.length + ' novo(s), ' + desativados.length + ' desativado(s)'
+      + (leituraCompleta ? '' : ' [leitura parcial: nada desativado]') + '.');
 
-// Ativa um cupom na conta do ML (equivale ao botao "Inserir codigo").
-app.post('/cupons/ativar-ml', async (req, res) => {
-  if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
-  const codigos = Array.isArray(req.body?.codigos) ? req.body.codigos
-                : (req.body?.codigo ? [req.body.codigo] : []);
-  if (!codigos.length) return res.status(400).json({ ok:false, erro:'informe codigo ou codigos[]' });
-  const resultados = [];
-  for (const c of codigos) {
-    try { resultados.push(await ativarCupomMl(c)); }
-    catch (e) { resultados.push({ codigo:c, ok:false, mensagem:e.message }); }
-    await new Promise(r => setTimeout(r, 800));
-  }
-  res.json({ ok:true, resultados });
+    res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
+               fontes, atualizados, criados, desativados,
+               naoAvaliados: leituraCompleta ? [] : semMudanca });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // ── BASE DE CUPONS ───────────────────────────────────────────────────────────
