@@ -48,7 +48,7 @@ import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
-  chavesCookieAff,
+  chavesCookieAff, lerCuponsAtivosMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -4115,6 +4115,47 @@ app.delete('/templates/:loja', (req, res) => {
     return res.status(400).json({ ok:false, erro:'Template nao encontrado, ou e o padrao (que nao pode ser removido).' });
   }
   res.json({ ok:true });
+});
+
+// Sincroniza a base com a pagina "Meus cupons" do ML: corrige valores, grava a
+// expiracao real quando o ML informa, e desativa o que saiu do ar. Sem isto a
+// validade e so o TTL de 24h, que e chute.
+app.post('/cupons/sync-ml', async (req, res) => {
+  if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
+  try {
+    const ativos = await lerCuponsAtivosMl();
+    if (!ativos.length) {
+      return res.json({ ok:false, erro:'nenhum cupom lido — sessao pode ter caido', ativos:0 });
+    }
+    const vivos = new Set(ativos.map(c => c.codigo.toUpperCase()));
+    const atualizados = [], criados = [], desativados = [];
+
+    for (const c of ativos) {
+      const chave = 'mercadolivre:' + c.codigo.toLowerCase();
+      const campos = { tipo:c.tipo, valor:c.valor, minimo:c.minimo, limite:c.limite, ativo:true };
+      if (c.expiraEm) campos.validadeAte = c.expiraEm;
+      const reg = atualizarCupomBase(chave, campos);
+      if (reg) atualizados.push({ codigo:c.codigo, expiraEm:c.expiraEm, esgotando:c.esgotando });
+      else {
+        registrarCupomBase({ loja:'Mercado Livre', ...c });
+        if (c.expiraEm) atualizarCupomBase(chave, { validadeAte: c.expiraEm });
+        criados.push(c.codigo);
+      }
+    }
+
+    // Cupom do ML que a base tem mas o painel nao lista mais: saiu do ar.
+    if (req.body?.desativarAusentes !== false) {
+      for (const reg of listarCuponsBase()) {
+        if (reg.loja !== 'Mercado Livre' || reg.ativo === false) continue;
+        if (vivos.has(String(reg.codigo).toUpperCase())) continue;
+        atualizarCupomBase(reg.chave, { ativo:false });
+        desativados.push(reg.codigo);
+      }
+    }
+    console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
+      + criados.length + ' novo(s), ' + desativados.length + ' desativado(s).');
+    res.json({ ok:true, lidos:ativos.length, atualizados, criados, desativados });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // ── BASE DE CUPONS ───────────────────────────────────────────────────────────
