@@ -768,6 +768,9 @@ const FILTROS_CUPONS_ML = [
 export async function lerTodosCuponsMl() {
   const porCodigo = new Map();
   let totalDeclarado = null;
+  // Cards sem codigo digitavel nao entram na base, mas contam para saber se a
+  // leitura da pagina veio inteira.
+  let semCodigo = 0;
   const fontes = [];
 
   for (const url of FILTROS_CUPONS_ML) {
@@ -776,7 +779,10 @@ export async function lerTodosCuponsMl() {
       // So a pagina /active declara o total DOS SEUS cupons; as de filtro
       // mostram o contador do catalogo inteiro do ML (milhares), que nao serve
       // de referencia para saber se a leitura veio completa.
-      if (url.endsWith('/cupons/active') && r.totalDeclarado) totalDeclarado = r.totalDeclarado;
+      if (url.endsWith('/cupons/active')) {
+        if (r.totalDeclarado) totalDeclarado = r.totalDeclarado;
+        semCodigo = r.semCodigo || 0;
+      }
       for (const c of r.cupons) {
         const ant = porCodigo.get(c.codigo);
         // Mantem a versao mais informativa (com minimo/limite/expiracao).
@@ -788,7 +794,7 @@ export async function lerTodosCuponsMl() {
     } catch (e) { fontes.push({ url, erro: e.message }); }
     await new Promise(r => setTimeout(r, 600));
   }
-  return { cupons: [...porCodigo.values()], totalDeclarado, fontes };
+  return { cupons: [...porCodigo.values()], semCodigo, totalDeclarado, fontes };
 }
 
 
