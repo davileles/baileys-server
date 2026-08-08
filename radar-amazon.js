@@ -17,6 +17,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { agendarPush } from './sync-github.js';
+import { rodapeOferta } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
 const RADAR_CFG_PATH  = SESSAO_DIR + '/radar_config.json';
@@ -888,21 +889,26 @@ export function formatarOfertaAmazon(p, opcoes = {}) {
 
 const TEMPLATES_PATH = SESSAO_DIR + '/templates.json';
 
-const TEMPLATE_PADRAO = [
-  '*{{titulo_curto}}*',
-  '',
-  'De: ~R$ {{preco_de}}~',
-  'Por: R$ {{preco}}',
-  '',
-  '\uD83C\uDFAB *CUPOM* {{cupom}}',
-  '\u26A0\uFE0F *IMPORTANTE* {{alerta}}',
-  '',
-  '\uD83D\uDED2 *LOJA* {{loja_upper}}',
-  '',
-  '\uD83D\uDD17 *LINK* {{link}}',
-  '',
-  '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`',
-].join('\n');
+// Funcao (nao const): o rodape vem da config editavel pelo painel, entao a
+// semente do template padrao de um operador novo ja nasce com o convite DELE.
+function templatePadrao() {
+  const linhas = [
+    '*{{titulo_curto}}*',
+    '',
+    'De: ~R$ {{preco_de}}~',
+    'Por: R$ {{preco}}',
+    '',
+    '\uD83C\uDFAB *CUPOM* {{cupom}}',
+    '\u26A0\uFE0F *IMPORTANTE* {{alerta}}',
+    '',
+    '\uD83D\uDED2 *LOJA* {{loja_upper}}',
+    '',
+    '\uD83D\uDD17 *LINK* {{link}}',
+  ];
+  const r = rodapeOferta();
+  if (r) linhas.push('', r);
+  return linhas.join('\n');
+}
 
 // Corpo da versao anterior, que exigia {{#var}}...{{/var}}. Serve so para
 // reconhecer o padrao nao editado e migra-lo para a sintaxe simples — template
@@ -929,11 +935,11 @@ export function carregarTemplates() {
   } catch (e) { console.log('[TPL] Erro ao carregar templates:', e.message); _templates = {}; }
   // Semeia o padrao na primeira execucao para o operador ter de onde partir.
   if (!_templates._padrao) {
-    _templates._padrao = { nome: 'Padrão', corpo: TEMPLATE_PADRAO, usarLinkPreview: true,
+    _templates._padrao = { nome: 'Padrão', corpo: templatePadrao(), usarLinkPreview: true,
                            atualizadoEm: new Date().toISOString() };
     salvarTemplates();
   } else if ((_templates._padrao.corpo || '').trim() === TEMPLATE_PADRAO_LEGADO.trim()) {
-    _templates._padrao.corpo = TEMPLATE_PADRAO;
+    _templates._padrao.corpo = templatePadrao();
     _templates._padrao.atualizadoEm = new Date().toISOString();
     salvarTemplates();
     console.log('[TPL] Padrao migrado para a sintaxe sem condicionais.');
