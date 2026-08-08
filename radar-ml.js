@@ -743,9 +743,10 @@ export async function lerTodosCuponsMl() {
   for (const url of FILTROS_CUPONS_ML) {
     try {
       const r = await lerCuponsAtivosMl(url);
-      if (r.totalDeclarado && (!totalDeclarado || r.totalDeclarado > totalDeclarado)) {
-        totalDeclarado = r.totalDeclarado;
-      }
+      // So a pagina /active declara o total DOS SEUS cupons; as de filtro
+      // mostram o contador do catalogo inteiro do ML (milhares), que nao serve
+      // de referencia para saber se a leitura veio completa.
+      if (url.endsWith('/cupons/active') && r.totalDeclarado) totalDeclarado = r.totalDeclarado;
       for (const c of r.cupons) {
         const ant = porCodigo.get(c.codigo);
         // Mantem a versao mais informativa (com minimo/limite/expiracao).
