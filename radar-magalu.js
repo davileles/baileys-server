@@ -145,6 +145,18 @@ export async function processarTextoMagalu(texto) {
     vistos.add(conv.partes.codigo);
 
     const { preco, precoDe } = precoDoTexto(texto);
+
+    // A Magalu entra no radar so por causa do link, entao anuncio de CUPOM cai
+    // aqui junto com oferta de produto. Sem preco de lista o template acaba
+    // usando o proprio preco como valor riscado e inventa um 'De/Por' que nao
+    // existe no checkout. Nesses casos e melhor nao publicar nada.
+    const ehAnuncioDeCupom = /(^|\s)cupom|cupons/i.test(tituloDoTexto(texto, conv.partes.slug));
+    if (ehAnuncioDeCupom && !precoDe) {
+      saida.push({ produto: { loja: 'Magazine Luiza' },
+                   descartadoPor: 'anúncio de cupom sem preço de produto (De/Por seria inventado)' });
+      continue;
+    }
+
     const p = {
       asin: conv.partes.codigo,
       codigo: conv.partes.codigo,
