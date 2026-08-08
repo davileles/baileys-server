@@ -1457,7 +1457,11 @@ function montarLinkPreview(oferta, mensagem) {
   const img = (oferta.imagens || [])[0];
   if (img?.imagemBase64) {
     const buf = Buffer.from(img.imagemBase64, 'base64');
-    if (buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
+    // Precisa ser JPEG de verdade: um buffer webp (padrao do Mercado Livre)
+    // rotulado como jpegThumbnail faz o cliente descartar o card inteiro.
+    const ehJpeg = buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+    if (!ehJpeg) console.log('[MKT] Thumbnail nao e JPEG (' + (img.mime || 'mime desconhecido') + ') — preview sem imagem.');
+    else if (buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
     else console.log('[MKT] Thumbnail de ' + buf.length + ' bytes acima do limite — preview sem imagem.');
   }
   return preview;
@@ -2713,18 +2717,36 @@ const _TIPOS_IGNORADOS = new Set(['protocolMessage','reactionMessage','pollUpdat
 // (que e a fonte da verdade de preco e estoque — nunca o texto do grupo) e
 // enfileira em filaPendentes com tipoConteudo 'oferta_amazon'. A partir dai
 // segue exatamente o mesmo caminho de aprovacao dos cupons TSP.
+// O Mercado Livre publica as imagens de produto em WebP, e o WhatsApp so
+// decodifica JPEG no jpegThumbnail do link preview — webp cru faz o card nao
+// renderizar (por isso Shopee/Amazon tinham preview e o ML nao). O CDN serve o
+// mesmo asset em .jpg trocando a extensao; o sufixo -O (~28KB) cabe folgado no
+// limite de 100KB, enquanto o -F em 2X passa de 100KB e seria descartado.
+function variantesImagemProduto(url) {
+  const lista = [];
+  if (/mlstatic\.com/i.test(url) && /\.webp(\?|$)/i.test(url)) {
+    const jpg = url.replace(/\.webp(\?|$)/i, '.jpg$1');
+    lista.push(jpg.replace(/D_NQ_NP_2X_/i, 'D_NQ_NP_').replace(/-F\.jpg/i, '-O.jpg'));
+    lista.push(jpg);
+  }
+  lista.push(url);
+  return [...new Set(lista)];
+}
+
 async function baixarImagemProduto(url) {
   if (!url) return null;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!res.ok) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > 4 * 1024 * 1024) return null;
-    return { imagemBase64: buf.toString('base64'), mime: res.headers.get('content-type') || 'image/jpeg' };
-  } catch (e) {
-    console.warn('[MKT] Nao baixou a imagem do produto:', e.message);
-    return null;
+  for (const alvo of variantesImagemProduto(url)) {
+    try {
+      const res = await fetch(alvo, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) continue;
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > 4 * 1024 * 1024) continue;
+      return { imagemBase64: buf.toString('base64'), mime: res.headers.get('content-type') || 'image/jpeg' };
+    } catch (e) {
+      console.warn('[MKT] Nao baixou a imagem do produto (' + alvo + '):', e.message);
+    }
   }
+  return null;
 }
 
 async function processarRadarMarketplace(jid, texto) {
