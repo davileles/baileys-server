@@ -701,11 +701,14 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
   // cupom fantasma chamado "CASA".
   const re = /Cupom ativado de (?:(\d+)% OFF|R\$\s?([\d.,]+) OFF)\s+([^]{0,60}?)(?=Em produtos|Sem compra|Compra mínima|Cupom ativado de|$)/g;
   const achados = [];
+  let semCodigo = 0;
   for (const m of texto.matchAll(re)) {
     const rotulo = (m[3] || '').trim();
 
     // Sem codigo digitavel: descricao em linguagem natural ("em Itens para Casa").
-    if (/^(em|para|de)\s/i.test(rotulo) || !rotulo) continue;
+    // Nao entram na base (nao ha o que digitar), mas contam para conferir se a
+    // leitura da pagina veio inteira.
+    if (/^(em|para|de)\s/i.test(rotulo) || !rotulo) { semCodigo++; continue; }
 
     // Com "com"/"COM" o codigo vem depois; sem ele, o rotulo inteiro e o codigo.
     const mCom = rotulo.match(/\bcom\s+(.+)$/i);
@@ -743,7 +746,11 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
   }
 
   const mTotal = texto.match(/(\d+)\s+Cupons/);
-  return { cupons: [...porCodigo.values()], totalDeclarado: mTotal ? Number(mTotal[1]) : null };
+  return {
+    cupons: [...porCodigo.values()],
+    semCodigo,
+    totalDeclarado: mTotal ? Number(mTotal[1]) : null,
+  };
 }
 
 /**
@@ -782,4 +789,56 @@ export async function lerTodosCuponsMl() {
     await new Promise(r => setTimeout(r, 600));
   }
   return { cupons: [...porCodigo.values()], totalDeclarado, fontes };
+}
+
+
+// ── VALIDADE ──────────────────────────────────────────────────────────────
+// A pagina informa o vencimento em linguagem natural. Converter em data
+// absoluta troca o TTL de 24h (chute) pela validade real do ML.
+
+const DIAS_SEMANA = ['domingo','segunda','terça','quarta','quinta','sexta','sábado'];
+const MESES = ['janeiro','fevereiro','março','abril','maio','junho','julho',
+               'agosto','setembro','outubro','novembro','dezembro'];
+
+function semAcento(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+/**
+ * "quarta-feira" -> proxima quarta, 23:59 (SP)
+ * "1 de setembro" -> 01/09 do ano corrente (ou do proximo, se ja passou)
+ * "hoje" / "amanhã" -> obvio
+ */
+export function validadeDeTexto(txt, agora = new Date()) {
+  if (!txt) return null;
+  const t = semAcento(txt).trim();
+
+  // Fim do dia no fuso de Sao Paulo (UTC-3), nao no do servidor — o Railway roda
+  // em UTC e um cupom expiraria 3h antes do que deveria.
+  const fim = (d) => { d.setUTCHours(23 + 3, 59, 0, 0); return d.toISOString(); };
+
+  if (/^hoje/.test(t))   return fim(new Date(agora));
+  if (/^amanha/.test(t)) { const d = new Date(agora); d.setDate(d.getDate() + 1); return fim(d); }
+
+  const mData = t.match(/(\d{1,2})\s+de\s+([a-z]+)/);
+  if (mData) {
+    const mes = MESES.findIndex(m => semAcento(m).startsWith(mData[2].slice(0, 4)));
+    if (mes >= 0) {
+      const d = new Date(agora.getFullYear(), mes, Number(mData[1]));
+      // Data ja passada significa ano que vem.
+      if (d.getTime() < agora.getTime() - 86400e3) d.setFullYear(d.getFullYear() + 1);
+      return fim(d);
+    }
+  }
+
+  const idx = DIAS_SEMANA.findIndex(d => t.startsWith(semAcento(d).slice(0, 5)));
+  if (idx >= 0) {
+    const d = new Date(agora);
+    // Mesmo dia da semana significa daqui a 7 dias, nao hoje.
+    let delta = (idx - d.getDay() + 7) % 7;
+    if (delta === 0) delta = 7;
+    d.setDate(d.getDate() + delta);
+    return fim(d);
+  }
+  return null;
 }
