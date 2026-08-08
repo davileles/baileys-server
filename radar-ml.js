@@ -202,6 +202,101 @@ export function comTagAfiliado(url) {
   } catch (e) { return url; }
 }
 
+// ── PRODUTOS VIA PAINEL DE AFILIADOS ──────────────────────────────────────
+// A API publica (api.mercadolibre.com/items) devolve 403 para itens de
+// terceiros. Com o cookie de sessao, porem, a pagina do produto abre normal —
+// e o ML publica os dados em JSON-LD, que e um contrato estavel o suficiente.
+
+const REGEX_LD_JSON = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+
+function extrairLdProduto(html) {
+  for (const m of html.matchAll(REGEX_LD_JSON)) {
+    try {
+      const dado = JSON.parse(m[1].trim());
+      const lista = Array.isArray(dado) ? dado : [dado];
+      for (const d of lista) {
+        if (d && (d['@type'] === 'Product' || d['@type'] === 'ProductGroup')) return d;
+      }
+    } catch (e) { /* bloco malformado: segue para o proximo */ }
+  }
+  return null;
+}
+
+function metaConteudo(html, prop) {
+  const m = html.match(new RegExp('<meta[^>]+(?:property|name)=["\']' + prop + '["\'][^>]*content=["\']([^"\']+)', 'i'));
+  return m ? m[1] : null;
+}
+
+/** Busca a pagina do produto com o cookie e extrai o que der. */
+export async function buscarDadosProdutoMl(url) {
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+  const res = await fetch(url, {
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!res.ok) throw new Error('pagina do produto respondeu HTTP ' + res.status);
+  const html = await res.text();
+
+  const ld = extrairLdProduto(html);
+  const oferta = ld?.offers
+    ? (Array.isArray(ld.offers) ? ld.offers[0] : ld.offers)
+    : null;
+
+  const preco = Number(oferta?.price ?? oferta?.lowPrice) || null;
+  const titulo = ld?.name || metaConteudo(html, 'og:title') || null;
+  const imagem = (Array.isArray(ld?.image) ? ld.image[0] : ld?.image) || metaConteudo(html, 'og:image') || null;
+
+  // O "de" nao vem no JSON-LD; sai do bloco de preco original da pagina.
+  const mDe = html.match(/"original_price"\s*:\s*([\d.]+)/) ||
+              html.match(/andes-money-amount--previous[\s\S]{0,220}?andes-money-amount__fraction[^>]*>([\d.]+)/);
+  let precoDe = mDe ? Number(String(mDe[1]).replace(/\./g, '')) : null;
+  if (precoDe && preco && precoDe <= preco) precoDe = null;
+
+  const disponivel = !/OutOfStock|Sem estoque|Publicação pausada/i.test(
+    (oferta?.availability || '') + html.slice(0, 60000));
+
+  return {
+    titulo, preco, precoDe, imagem, disponivel,
+    marca: ld?.brand?.name || '',
+    nota: Number(ld?.aggregateRating?.ratingValue) || null,
+    avaliacoes: Number(ld?.aggregateRating?.reviewCount) || null,
+    vendedor: oferta?.seller?.name || null,
+    achouLd: !!ld,
+  };
+}
+
+/**
+ * Gera links de afiliado em lote pelo painel. Uma chamada resolve varias URLs.
+ * error_code 111 = produto fora do programa (nao e falha nossa).
+ */
+export async function gerarLinksAfiliadoMl(urls) {
+  const tag = tagMl();
+  if (!tag) throw new Error('ML_TAG nao configurado');
+  const r = await chamarAff('https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink', {
+    method: 'POST',
+    body: JSON.stringify({ urls, tag }),
+    headers: {
+      'Origin': 'https://www.mercadolivre.com.br',
+      'Referer': 'https://www.mercadolivre.com.br/afiliados/linkbuilder',
+    },
+  });
+  if (!r.ok || typeof r.corpo !== 'object') throw new Error('createLink respondeu HTTP ' + r.status);
+  const mapa = new Map();
+  for (const u of (r.corpo.urls || [])) {
+    mapa.set(u.origin_url, u.created
+      ? { link: u.short_url, linkLongo: u.long_url, codigoBusca: u.regex }
+      : { erro: u.message || ('error_code ' + u.error_code) });
+  }
+  return mapa;
+}
+
 // ── PRODUTOS ──────────────────────────────────────────────────────────────
 
 // ── TOKEN DO PAINEL DE AFILIADOS ──────────────────────────────────────────
@@ -381,27 +476,72 @@ export function formatarOfertaMl(p, opcoes = {}) {
   const tpl = opcoes.template || templateDaLoja('Mercado Livre');
   const vars = varsDoProduto(p, opcoes.cupom || null);
   vars.vendas = p.vendas || '';
+  vars.codigo_busca = p.codigoBusca || '';
   return renderTemplate(tpl?.corpo || '', vars);
 }
 
 export async function processarTextoMl(texto) {
-  const ids = await extrairIdsMl(texto);
-  if (!ids.length) return [];
+  // URLs completas, nao so o MLB: o createLink recebe a URL de origem.
+  const urls = [...new Set(String(texto || '').match(REGEX_URL_ML) || [])]
+    .map(u => u.replace(/[)\]}.,;!]+$/, ''));
+  if (!urls.length) return [];
+
+  // Encurtador precisa virar URL canonica antes de ir para o painel.
+  const canonicas = [];
+  for (const u of urls) {
+    if (idDeUrl(u)) { canonicas.push(u); continue; }
+    try { canonicas.push(await resolverEncurtadorMl(u)); }
+    catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); }
+  }
+  if (!canonicas.length) return [];
+
+  let links;
+  try { links = await gerarLinksAfiliadoMl(canonicas); }
+  catch (e) {
+    console.error('[ML] createLink falhou:', e.message);
+    return canonicas.map(u => ({ produto: { loja: 'Mercado Livre', link: u },
+                                 descartadoPor: 'painel de afiliados: ' + e.message }));
+  }
 
   const saida = [];
-  for (const id of ids) {
-    let it;
-    try { it = await buscarProdutoMl(id); }
-    catch (e) {
-      console.error('[ML] Falha ao consultar ' + id + ':', e.message);
-      // Erro de API precisa aparecer no teste, senao o resultado vazio nao
-      // distingue "link nao reconhecido" de "consulta rejeitada".
-      saida.push({ produto: { id, loja: 'Mercado Livre' }, descartadoPor: 'API: ' + e.message });
+  for (const url of canonicas) {
+    const r = links.get(url) || { erro: 'sem resposta do painel' };
+    if (r.erro) {
+      saida.push({ produto: { loja: 'Mercado Livre', titulo: url, link: url },
+                   descartadoPor: r.erro });
       continue;
     }
 
-    const p = normalizarMl(it);
-    if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
+    let dados;
+    try { dados = await buscarDadosProdutoMl(url); }
+    catch (e) {
+      saida.push({ produto: { loja: 'Mercado Livre', link: r.link },
+                   descartadoPor: 'dados do produto: ' + e.message });
+      continue;
+    }
+
+    const p = {
+      asin: idDeUrl(url) || r.link, id: idDeUrl(url),
+      titulo: dados.titulo || '',
+      marca: dados.marca || '',
+      imagemUrl: dados.imagem,
+      link: r.link,                 // meli.la curto, com atribuicao
+      linkLongo: r.linkLongo,
+      codigoBusca: r.codigoBusca,   // ex: DAVILE-QLJD
+      preco: dados.preco,
+      precoTexto: dados.preco ? 'R$ ' + dados.preco.toFixed(2).replace('.', ',') : null,
+      precoDe: dados.precoDe,
+      precoDeTexto: dados.precoDe ? 'R$ ' + dados.precoDe.toFixed(2).replace('.', ',') : null,
+      desconto: (dados.precoDe && dados.preco && dados.precoDe > dados.preco)
+        ? Math.round((1 - dados.preco / dados.precoDe) * 100) : 0,
+      disponivel: dados.disponivel,
+      vendedor: dados.vendedor,
+      nota: dados.nota, avaliacoes: dados.avaliacoes,
+      dealTermina: null, ehDeal: false,
+      loja: 'Mercado Livre',
+    };
+
+    if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço na página' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto pausado ou sem estoque' }); continue; }
 
     const cupom = melhorCupom('Mercado Livre', p.preco, texto);
@@ -414,7 +554,7 @@ export async function processarTextoMl(texto) {
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaMl(p, { cupom }),
     });
-    if (ids.length > 1) await new Promise(r => setTimeout(r, 300));
+    await new Promise(r2 => setTimeout(r2, 400));
   }
   return saida;
 }
