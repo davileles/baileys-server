@@ -519,6 +519,25 @@ export function calcularDesconto(reg, preco) {
   return d > 0 ? Math.round(d * 100) / 100 : 0;
 }
 
+/**
+ * Melhor cupom vigente da loja que REALMENTE se aplica a este preco.
+ *
+ * Diferente de melhorCupom(), que so age quando a mensagem original citou cupom:
+ * aqui quem pediu foi o operador, ao marcar a lista como "cupom automatico".
+ * Entre varios aplicaveis vence o de maior desconto em reais.
+ */
+export function melhorCupomAplicavel(loja, preco) {
+  const alvo = normalizarTexto(loja);
+  let melhor = null, melhorDesc = 0;
+  for (const reg of Object.values(_cupons)) {
+    if (!cupomVigente(reg)) continue;
+    if (normalizarTexto(reg.loja) !== alvo) continue;
+    const d = calcularDesconto(reg, preco);
+    if (d > melhorDesc) { melhor = reg; melhorDesc = d; }
+  }
+  return melhor ? { reg: melhor, desconto: melhorDesc } : null;
+}
+
 /** Busca um cupom da base pelo par (loja, codigo). Usado pela vitrine. */
 export function cupomPorCodigo(loja, codigo) {
   const k = chaveCupom(loja, codigo);
@@ -1240,7 +1259,14 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
     // Cupom do disparo vence o vinculado; sem nenhum dos dois, vai sem cupom.
     const codigo = codigoCupom || salvo?.cupom || null;
     let cupom = null, avisoCupom = null;
-    if (codigo) {
+    // 'auto': escolhe sozinho o melhor cupom da loja que atenda o preco deste
+    // produto — um cupom de R$10 acima de R$40 entra num produto de R$50 e nao
+    // entra num de R$30, produto a produto.
+    if (codigo === 'auto') {
+      const m = melhorCupomAplicavel(p.loja, p.preco);
+      if (m) cupom = { reg: m.reg, desconto: m.desconto, citado: true };
+      else avisoCupom = 'nenhum cupom vigente se aplica a R$ ' + brl(p.preco);
+    } else if (codigo) {
       const reg = cupomPorCodigo(p.loja, codigo);
       if (!reg)                   avisoCupom = 'cupom ' + codigo + ' não está na base';
       else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
@@ -1270,3 +1296,95 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
 }
 
 carregarVitrine();
+
+// ── LISTAS DE REENVIO ───────────────────────────────────────────────────────
+// Conjunto nomeado de produtos da vitrine que o operador dispara de tempos em
+// tempos (produtos que ele sabe que vendem). O disparo NAO e uma rajada: sai um
+// produto por vez, com o intervalo que a lista define, para nao inundar o grupo.
+const LISTAS_PATH = SESSAO_DIR + '/listas.json';
+let _listas = {};
+
+export function carregarListas() {
+  try { if (existsSync(LISTAS_PATH)) _listas = JSON.parse(readFileSync(LISTAS_PATH, 'utf-8')); }
+  catch (e) { console.log('[LISTAS] Erro ao carregar:', e.message); _listas = {}; }
+  return _listas;
+}
+function salvarListas() {
+  try { writeFileSync(LISTAS_PATH, JSON.stringify(_listas, null, 2), 'utf-8');
+    agendarPush('listas.json'); }
+  catch (e) { console.log('[LISTAS] Erro ao salvar:', e.message); }
+}
+
+export function listarListas() {
+  return Object.values(_listas).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
+}
+export function listaPorId(id) { return _listas[id] || null; }
+
+export function salvarLista(dados = {}) {
+  const id = dados.id || ('L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  const ant = _listas[id] || {};
+
+  const produtos = Array.isArray(dados.produtos)
+    ? [...new Set(dados.produtos.filter(Boolean))]
+    : (ant.produtos || []);
+
+  // Intervalo minimo de 1 min: abaixo disso o disparo vira rajada, que e
+  // exatamente o padrao que faz o WhatsApp marcar a conta como automacao.
+  const intervalo = dados.intervaloMin !== undefined
+    ? Math.min(Math.max(Number(dados.intervaloMin) || 1, 1), 720)
+    : (ant.intervaloMin || 20);
+
+  const modo = ['auto', 'fixo', 'nenhum'].includes(dados.cupomModo)
+    ? dados.cupomModo : (ant.cupomModo || 'auto');
+
+  const ag = dados.agenda !== undefined ? (dados.agenda || {}) : (ant.agenda || {});
+  const agenda = {
+    ativo: !!ag.ativo,
+    diasSemana: Array.isArray(ag.diasSemana)
+      ? ag.diasSemana.map(Number).filter(d => d >= 0 && d <= 6) : [],
+    hora: /^([01]\d|2[0-3]):([0-5]\d)$/.test(String(ag.hora || '')) ? ag.hora : '09:00',
+  };
+
+  _listas[id] = {
+    id,
+    nome: dados.nome !== undefined ? String(dados.nome).trim() : (ant.nome || 'Lista sem nome'),
+    produtos,
+    intervaloMin: intervalo,
+    cupomModo: modo,
+    cupomCodigo: modo === 'fixo'
+      ? String(dados.cupomCodigo || ant.cupomCodigo || '').trim().toUpperCase() : null,
+    agenda,
+    ativo: dados.ativo !== undefined ? !!dados.ativo : (ant.ativo !== false),
+    execucao: ant.execucao || null,
+    ultimoDisparo: ant.ultimoDisparo || null,
+    criadoEm: ant.criadoEm || new Date().toISOString(),
+    atualizadoEm: new Date().toISOString(),
+  };
+  salvarListas();
+  return _listas[id];
+}
+
+export function removerLista(id) {
+  if (!_listas[id]) return false;
+  delete _listas[id];
+  salvarListas();
+  return true;
+}
+
+/** Grava o andamento do disparo. Persistido para sobreviver a restart do container. */
+export function atualizarExecucaoLista(id, execucao) {
+  if (!_listas[id]) return null;
+  _listas[id].execucao = execucao;
+  if (execucao === null) _listas[id].ultimoDisparo = new Date().toISOString();
+  salvarListas();
+  return _listas[id];
+}
+
+/** Codigo de cupom a passar para o montador, conforme o modo da lista. */
+export function cupomDaLista(lista) {
+  if (!lista || lista.cupomModo === 'nenhum') return null;
+  if (lista.cupomModo === 'fixo') return lista.cupomCodigo || null;
+  return 'auto';
+}
+
+carregarListas();
