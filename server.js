@@ -1534,39 +1534,49 @@ function mensagemParaGrupoCupons(msg) {
   return msg + '\n\n' + RODAPE_TSP_CUPONS;
 }
 
-// Envia um cupom para o grupo TSP principal e a copia (com rodape trocado)
-// para o grupo so-cupons. Falha no grupo so-cupons NAO derruba o envio
-// principal: loga e avisa o operador.
+// Envia um cupom para TODOS os grupos de destino configurados (radarDestinos).
+// O grupo so-cupons recebe a versao com o rodape de convite cruzado; os demais
+// recebem a mensagem original. Falha isolada em um grupo NAO derruba os outros:
+// loga, segue para o proximo e avisa o operador ao final.
 async function enviarCupomParaGrupos(mensagem, imagem) {
-  // Mesma conta nos dois grupos: o cupom e a copia dele saem juntos, e alternar
-  // no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
+  // Mesma conta em todos os grupos: o cupom e as copias dele saem juntos, e
+  // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
   const op = { conta: contaDoTurno() };
-  if (imagem?.imagemBase64) {
-    await enviarMensagem(GRUPOS['tsp'], {
-      image: Buffer.from(imagem.imagemBase64, 'base64'),
-      caption: mensagem,
-      mimetype: imagem.mime || 'image/jpeg',
-    }, 0, op);
-  } else {
-    await enviarMensagem(GRUPOS['tsp'], { text: mensagem }, 0, op);
-  }
-  try {
-    const msgCupons = mensagemParaGrupoCupons(mensagem);
-    if (imagem?.imagemBase64) {
-      await enviarMensagem(GRUPOS['tsp_cupons'], {
-        image: Buffer.from(imagem.imagemBase64, 'base64'),
-        caption: msgCupons,
-        mimetype: imagem.mime || 'image/jpeg',
-      }, 0, op);
-    } else {
-      await enviarMensagem(GRUPOS['tsp_cupons'], { text: msgCupons }, 0, op);
-    }
-  } catch(e) {
-    console.error('[CUPONS] Falha ao enviar para o grupo so-cupons:', e.message);
+  const destinos = radarDestinos();
+  const alvos = [...new Set([...(destinos.length ? destinos : []), GRUPOS['tsp_cupons']])];
+  const enviados = [], falhas = [];
+
+  for (const jid of alvos) {
+    // Rodape cruzado so no grupo exclusivo de cupons.
+    const texto = jid === GRUPOS['tsp_cupons'] ? mensagemParaGrupoCupons(mensagem) : mensagem;
     try {
-      await enviarMensagem(GRUPOS.operador, { text: '*Falha ao enviar cupom no grupo so-cupons* \u26a0\ufe0f\n\n' + e.message });
+      if (imagem?.imagemBase64) {
+        await enviarMensagem(jid, {
+          image: Buffer.from(imagem.imagemBase64, 'base64'),
+          caption: texto,
+          mimetype: imagem.mime || 'image/jpeg',
+        }, 0, op);
+      } else {
+        await enviarMensagem(jid, { text: texto }, 0, op);
+      }
+      enviados.push(jid);
+      // Espacamento entre grupos: mesmo padrao das ofertas do radar, evita
+      // rajada identica em varios grupos no mesmo segundo.
+      if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+    } catch(e) {
+      console.error('[CUPONS] Falha ao enviar em ' + jid + ':', e.message);
+      falhas.push({ jid, erro: e.message });
+    }
+  }
+
+  if (!enviados.length) throw new Error('Nenhum grupo recebeu o cupom.');
+  if (falhas.length) {
+    try {
+      await enviarMensagem(GRUPOS.operador, { text: '*Cupom nao entregue em ' + falhas.length + ' grupo(s)* \u26a0\ufe0f\n\n'
+        + falhas.map(f => (NOMES_GRUPOS.get(f.jid) || f.jid) + ': ' + f.erro).join('\n') });
     } catch(_) {}
   }
+  return { enviados, falhas };
 }
 
 // Envia uma oferta de marketplace para os grupos marcados como 'destino' no
@@ -1867,8 +1877,15 @@ const TG_API_ID   = parseInt(process.env.TG_API_ID   || '0');
 const TG_API_HASH = process.env.TG_API_HASH || '';
 const TG_SESSION_PATH = SESSAO_DIR + '/telegram_session.txt';
 const TG_CANAIS_MONITORADOS = (process.env.TG_GRUPO || '@juaocupons,@canaldetestetsp').split(',').map(s => s.trim().replace('@','').toLowerCase());
-// Blacklist: channelIds numéricos ou substrings de title/username a ignorar (separados por vírgula)
-const TG_CANAIS_IGNORADOS_RAW = (process.env.TG_CANAIS_IGNORADOS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+// Blacklist: channelIds numéricos ou substrings de title/username a ignorar (separados por vírgula).
+// TG_CANAIS_IGNORADOS_BASE fica no código para canais que nunca devem ser capturados,
+// independente do que esteja configurado no Railway. O modo de captura é GERAL
+// (aceita qualquer chat da conta), então só a blacklist impede a captura.
+const TG_CANAIS_IGNORADOS_BASE = ['bugmundodasmilhas'];
+const TG_CANAIS_IGNORADOS_RAW = [...new Set([
+  ...TG_CANAIS_IGNORADOS_BASE,
+  ...(process.env.TG_CANAIS_IGNORADOS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+])];
 
 let tgClient = null;
 let tgConectado = false;
