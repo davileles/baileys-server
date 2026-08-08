@@ -1294,20 +1294,22 @@ function formatarCupomTSP(dados) {
   const minimo = (dados.minimo === null || dados.minimo === undefined) ? null : Number(dados.minimo);
   const temMin = minimo !== null && minimo > 0;
   const limite = dados.limite || null;
+  // Teto do PRODUTO ("15% em produtos de ate R$700"), que nao e o teto do
+  // desconto. Tratar um como o outro anuncia o cupom para uma faixa de preco em
+  // que ele nao vale — o pior erro possivel numa mensagem de cupom.
+  const maximo = dados.maximo || null;
   const codigo = dados.codigo || null;
   const isPct  = tipo === 'pct';
   const tipoStr = isPct ? '%' : ' reais';
 
-  let validade;
-  if (isPct && limite) {
-    validade = temMin
-      ? `Válido em compras acima de R$ ${minimo} com limite de R$ ${limite} de desconto.`
-      : `Válido sem valor mínimo de compra, com limite de R$ ${limite} de desconto.`;
-  } else {
-    validade = temMin
-      ? `Válido em compras acima de R$ ${minimo}.`
-      : `Válido sem valor mínimo de compra.`;
-  }
+  const partes = [];
+  if (temMin) partes.push(`em compras acima de R$ ${minimo}`);
+  if (maximo) partes.push(`em produtos de até R$ ${maximo}`);
+  if (isPct && limite) partes.push(`com limite de R$ ${limite} de desconto`);
+
+  const validade = partes.length
+    ? 'Válido ' + partes.join(', ') + '.'
+    : 'Válido sem valor mínimo de compra.';
 
   let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*\n\n`;
   msg += validade + '\n\n';
@@ -1315,9 +1317,17 @@ function formatarCupomTSP(dados) {
 
   if (codigo) msg += `\n\n🏷️ *CUPOM* ${codigo.toUpperCase()}`;
 
+  // Com teto de desconto, a compra "ideal" e aquela em que o percentual bate
+  // exatamente no teto. Com teto de PRODUTO, o desconto maximo e simplesmente o
+  // percentual sobre esse teto — sao contas diferentes e a mensagem tem de dizer
+  // qual delas esta mostrando.
   if (isPct && limite) {
     const ideal = Math.ceil(100 * Number(limite) / Number(valor));
-    msg += `\n\n⚠️ *IMPORTANTE* Ideal para compras de até R$ ${ideal}.\n\n`;
+    const tetoIdeal = maximo ? Math.min(ideal, Number(maximo)) : ideal;
+    msg += `\n\n⚠️ *IMPORTANTE* Ideal para compras de até R$ ${tetoIdeal}.\n\n`;
+  } else if (isPct && maximo) {
+    const economia = Math.floor(Number(maximo) * Number(valor) / 100);
+    msg += `\n\n⚠️ *IMPORTANTE* Só vale para produtos de até R$ ${maximo} — economia máxima de R$ ${economia}.\n\n`;
   } else {
     msg += '\n\n';
   }
@@ -1389,7 +1399,8 @@ Campos:
   "tipo": "pct" | "reais",
   "valor": número (ex: 10, 30, 15),
   "minimo": número | null (valor mínimo de compra; use null se a mensagem NÃO informar mínimo),
-  "limite": número | null (limite máximo de desconto em R$, só para tipo "pct"),
+  "maximo": número | null (preço máximo do produto/pedido para o cupom valer; null se não informado),
+  "limite": número | null (limite máximo de DESCONTO em R$, só para tipo "pct"),
   "codigo": "CUPOM123" | null,
   "multiplos": [ {valor, minimo, codigo, tipo} ] | null (quando há múltiplos cupons na mesma mensagem),
   "observacao": "texto livre" | null
@@ -1405,7 +1416,14 @@ Regras:
 - Em "multiplos", cada item DEVE ter seu próprio campo "tipo" ("pct" ou "reais") — não herde o tipo do cupom principal
 - Para múltiplos cupons na mesma mensagem (ex: 20% OFF em TVs + 15% OFF em Celulares), use "multiplos" com um item por cupom
 - Valores devem ser números puros sem símbolo (ex: 20 para 20%, 30 para R$30)
-- "minimo": use null quando a mensagem não informar valor mínimo de compra. Use 0 SOMENTE se a mensagem disser explicitamente que não há mínimo ("sem valor mínimo", "sem mínimo"). Nunca chute um valor.`;
+- "minimo": use null quando a mensagem não informar valor mínimo de compra. Use 0 SOMENTE se a mensagem disser explicitamente que não há mínimo ("sem valor mínimo", "sem mínimo"). Nunca chute um valor.
+- ATENÇÃO — "limite" e "maximo" são coisas DIFERENTES e confundi-los inverte o sentido do cupom:
+  • "limite" = teto do DESCONTO. Frases: "15% OFF até R$60 de desconto", "desconto máximo de R$60", "limitado a R$60".
+  • "maximo" = teto do PREÇO DO PRODUTO ou do pedido que pode usar o cupom. Frases: "15% OFF em produtos de até R$700", "em compras de até R$700", "válido para itens até R$700", "para produtos abaixo de R$700".
+  • Exemplo: "15% OFF em produtos de até R$700" → {"valor":15,"tipo":"pct","maximo":700,"limite":null}. NUNCA {"limite":700}.
+  • Exemplo: "15% OFF, desconto máximo de R$60, mínimo R$79" → {"valor":15,"tipo":"pct","minimo":79,"limite":60,"maximo":null}.
+  • Na dúvida entre os dois, olhe se o valor se refere ao que o cliente ECONOMIZA (limite) ou ao que ele COMPRA (maximo).
+- Em "multiplos", cada item pode ter seu próprio "minimo", "maximo" e "limite".`;
 
   return await chamarClaude(system, [{ type:'text', text: texto }], 500);
 }
@@ -1497,8 +1515,14 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
     return { auto:false, motivo:'minimo nao informado (regra de aplicacao incompleta)' };
   if (Number(cupom.minimo) < 0)           return { auto:false, motivo:'minimo invalido' };
 
-  if (cupom.tipo === 'pct' && !(Number(cupom.limite) > 0))
-    return { auto:false, motivo:'cupom percentual sem limite de desconto' };
+  // Percentual precisa de ALGUM teto declarado: ou o do desconto ('limite') ou o
+  // do produto elegivel ('maximo'). Sem nenhum dos dois a regra de aplicacao
+  // esta incompleta e o cupom nao pode sair sozinho.
+  if (cupom.tipo === 'pct' && !(Number(cupom.limite) > 0) && !(Number(cupom.maximo) > 0))
+    return { auto:false, motivo:'cupom percentual sem teto de desconto nem de produto' };
+  if (cupom.maximo != null && cupom.minimo != null && Number(cupom.maximo) > 0
+      && Number(cupom.maximo) < Number(cupom.minimo))
+    return { auto:false, motivo:'maximo menor que o minimo (extracao inconsistente)' };
 
   // Validacao cruzada contra o texto original
   const ondeStr = tinhaMultiplos ? 'no bloco deste cupom' : 'no texto original';
@@ -1507,6 +1531,8 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
     return { auto:false, motivo:'minimo nao confere '+ondeStr };
   if (cupom.limite && !numeroNoTexto(t, cupom.limite))
     return { auto:false, motivo:'limite nao confere '+ondeStr };
+  if (cupom.maximo && !numeroNoTexto(t, cupom.maximo))
+    return { auto:false, motivo:'maximo nao confere '+ondeStr };
   if (!t.toLowerCase().includes(String(cupom.codigo).toLowerCase()))
     return { auto:false, motivo:'codigo nao aparece '+ondeStr };
 
@@ -1777,7 +1803,7 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
 
     const tinhaMultiplos = !!campos.multiplos?.length;
     const lista = tinhaMultiplos
-      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo ?? null, codigo: m.codigo ?? campos.codigo, tipo: m.tipo ?? campos.tipo, limite: m.limite ?? campos.limite ?? null, multiplos: null }))
+      ? campos.multiplos.map(m => ({ ...campos, valor: m.valor, minimo: m.minimo ?? null, codigo: m.codigo ?? campos.codigo, tipo: m.tipo ?? campos.tipo, limite: m.limite ?? campos.limite ?? null, maximo: m.maximo ?? campos.maximo ?? null, multiplos: null }))
       : [campos];
     const codigosLista = lista.map(x => x.codigo).filter(Boolean);
 
@@ -5139,7 +5165,7 @@ app.post('/mkt/montar', async (req, res) => {
   const cupons = listarCuponsBase()
     .filter(cp => cupomVigente(cp) && chaveLojaSimples(cp.loja) === chaveLojaSimples(loja))
     .map(cp => ({ codigo:cp.codigo, tipo:cp.tipo, valor:cp.valor, minimo:cp.minimo,
-                  limite:cp.limite, validadeAte:cp.validadeAte,
+                  maximo:cp.maximo, limite:cp.limite, validadeAte:cp.validadeAte,
                   descontoAplicado: calcularDesconto(cp, p.preco) }))
     .filter(cp => cp.descontoAplicado > 0)
     .sort((a, b) => b.descontoAplicado - a.descontoAplicado);
@@ -5176,7 +5202,7 @@ app.post('/mkt/montar', async (req, res) => {
       asin: p.asin || null, codigoBusca: p.codigoBusca || null,
     },
     cupom: cupom ? { codigo: cupom.reg.codigo, tipo: cupom.reg.tipo, valor: cupom.reg.valor,
-                     minimo: cupom.reg.minimo, limite: cupom.reg.limite,
+                     minimo: cupom.reg.minimo, maximo: cupom.reg.maximo, limite: cupom.reg.limite,
                      desconto: cupom.desconto } : null,
     avisoCupom,
     precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
