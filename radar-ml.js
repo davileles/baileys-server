@@ -633,3 +633,61 @@ export async function processarTextoMl(texto) {
   }
   return saida;
 }
+
+
+// ── SINCRONIZACAO DE CUPONS ────────────────────────────────────────────────
+// A pagina "Meus cupons" do ML lista os cupons ativos da conta com valor,
+// minimo, teto e — quando esta perto de acabar — um contador de expiracao.
+// E a unica fonte real de validade: melhor que o TTL de 24h, que e chute.
+
+const URL_CUPONS_ML = 'https://www.mercadolivre.com.br/cupons/active';
+
+/** Le a pagina e devolve os cupons ativos do Mercado Livre. */
+export async function lerCuponsAtivosMl() {
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+  const res = await fetch(URL_CUPONS_ML, {
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!res.ok) throw new Error('pagina de cupons respondeu HTTP ' + res.status);
+  const html = await res.text();
+
+  // Trabalha sobre o texto visivel aproximado: as classes do ML mudam com
+  // frequencia, mas os rotulos ("Compra minima", "Limite de") sao estaveis.
+  const texto = html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&').replace(/\s+/g, ' ');
+
+  const re = /Cupom ativado de (?:(\d+)% OFF|R\$\s?([\d.,]+) OFF) com ([A-Z0-9]{4,25})(.{0,260}?)(?=Cupom ativado de |$)/g;
+  const achados = [];
+  for (const m of texto.matchAll(re)) {
+    const trecho = m[4] || '';
+    const hhmmss = (trecho.match(/Encerra em (\d{1,2}):(\d{2}):(\d{2})/) || null);
+    achados.push({
+      codigo: m[3],
+      tipo: m[1] ? 'pct' : 'reais',
+      valor: Number(String(m[1] || m[2]).replace(/\./g, '').replace(',', '.')),
+      minimo: Number((trecho.match(/Compra mínima R\$\s?([\d.]+)/) || [])[1]) || null,
+      limite: Number((trecho.match(/Limite de R\$\s?([\d.]+)/) || [])[1]) || null,
+      // Contador -> validade absoluta. So aparece nas ultimas horas.
+      expiraEm: hhmmss
+        ? new Date(Date.now() + ((+hhmmss[1]) * 3600 + (+hhmmss[2]) * 60 + (+hhmmss[3])) * 1000).toISOString()
+        : null,
+      esgotando: /Está esgotando/.test(trecho),
+    });
+  }
+  // A pagina repete o cupom no cabecalho do card: fica com a ocorrencia que
+  // tem minimo/limite preenchidos.
+  const porCodigo = new Map();
+  for (const c of achados) {
+    const ant = porCodigo.get(c.codigo);
+    if (!ant || (c.minimo != null && ant.minimo == null)) porCodigo.set(c.codigo, c);
+  }
+  return [...porCodigo.values()];
+}
