@@ -19,7 +19,7 @@
 import { createHash } from 'crypto';
 import {
   melhorCupom, cupomPorCodigo, cupomVigente, calcularDesconto,
-  templateDaLoja, renderTemplate, varsDoProduto,
+  templateDaLoja, renderTemplate, varsDoProduto, melhorCupomAplicavel,
 } from './radar-amazon.js';
 
 const API_URL = 'https://open-api.affiliate.shopee.com.br/graphql';
@@ -364,7 +364,12 @@ export async function montarOfertasShopeeVitrine(itens, codigoCupom = null) {
 
     const codigo = codigoCupom || salvo.cupom || null;
     let cupom = null, avisoCupom = null;
-    if (codigo) {
+    // 'auto': o melhor cupom Shopee vigente que atenda o preco deste produto.
+    if (codigo === 'auto') {
+      const m = melhorCupomAplicavel('Shopee', p.preco);
+      if (m) cupom = { reg: m.reg, desconto: m.desconto, citado: true };
+      else avisoCupom = 'nenhum cupom Shopee vigente se aplica a este preço';
+    } else if (codigo) {
       const reg = cupomPorCodigo('Shopee', codigo);
       if (!reg)                    avisoCupom = 'cupom ' + codigo + ' não está na base (Shopee)';
       else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
