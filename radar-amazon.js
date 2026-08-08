@@ -1337,9 +1337,14 @@ export function salvarLista(dados = {}) {
   const modo = ['auto', 'fixo', 'nenhum'].includes(dados.cupomModo)
     ? dados.cupomModo : (ant.cupomModo || 'auto');
 
+  // Envio unico: a lista existe apenas para carregar a fila deste disparo e some
+  // sozinha quando a fila termina. Nao aceita agendamento — nao ha o que
+  // reagendar numa lista que nao vai existir amanha.
+  const efemera = dados.efemera !== undefined ? !!dados.efemera : !!ant.efemera;
+
   const ag = dados.agenda !== undefined ? (dados.agenda || {}) : (ant.agenda || {});
   const agenda = {
-    ativo: !!ag.ativo,
+    ativo: !efemera && !!ag.ativo,
     diasSemana: Array.isArray(ag.diasSemana)
       ? ag.diasSemana.map(Number).filter(d => d >= 0 && d <= 6) : [],
     hora: /^([01]\d|2[0-3]):([0-5]\d)$/.test(String(ag.hora || '')) ? ag.hora : '09:00',
@@ -1349,6 +1354,7 @@ export function salvarLista(dados = {}) {
     id,
     nome: dados.nome !== undefined ? String(dados.nome).trim() : (ant.nome || 'Lista sem nome'),
     produtos,
+    efemera,
     intervaloMin: intervalo,
     cupomModo: modo,
     cupomCodigo: modo === 'fixo'
