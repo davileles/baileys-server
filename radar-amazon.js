@@ -907,7 +907,10 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto esgotado' }); continue; }
-    if (p.desconto < (_cfg.descontoMinimo ?? 5) && !p.ehDeal) {
+    // ignorarMinimo: montagem manual pelo gerador. Quando o operador cola o
+    // link ele ja decidiu que quer aquele produto — o piso de desconto existe
+    // para o radar automatico, que escolhe sozinho o que divulgar.
+    if (p.desconto < (_cfg.descontoMinimo ?? 5) && !p.ehDeal && !opcoes.ignorarMinimo) {
       saida.push({ produto: p, descartadoPor: 'desconto de ' + p.desconto + '% abaixo do mínimo' });
       continue;
     }
