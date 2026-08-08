@@ -4323,6 +4323,12 @@ app.get('/ml/aff/status', async (req, res) => {
 
 app.get('/ml/aff/inspecionar', (req, res) => res.json({ ok:true, ...inspecionarTokenAff() }));
 
+// Le uma URL de cupons e devolve o que o parser extrai — para comparar variantes.
+app.get('/cupons/ler-ml', async (req, res) => {
+  try { res.json(await lerCuponsAtivosMl(req.query.url || undefined)); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 // Sonda POST do painel de afiliados, para testar payloads do createLink.
 app.post('/ml/aff/sonda', async (req, res) => {
   const { url, body } = req.body || {};
