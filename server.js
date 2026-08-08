@@ -36,7 +36,7 @@ import {
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
-  baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso,
+  baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
 } from './sync-github.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
@@ -5069,7 +5069,14 @@ app.get('/grupos/convite', async (req, res) => {
 // Roda as 06:00 (SP) e fica gravada em disco: a leitura do painel e instantanea
 // e nao depende de consultar 12+ grupos no WhatsApp a cada abertura da aba.
 const CENSO_FILE = SESSAO_DIR + '/grupos_censo.json';
+// Serie historica: uma linha por dia (SP), para o grafico de evolucao. Vive num
+// arquivo separado porque e append-only e sobe para o GitHub — o censo do dia
+// pode ser reescrito varias vezes, a serie nao.
+const CENSO_HIST_ARQ  = 'grupos_censo_hist.json';
+const CENSO_HIST_FILE = SESSAO_DIR + '/' + CENSO_HIST_ARQ;
+const CENSO_HIST_DIAS = 400;
 let _censo = { atualizadoEm: null, grupos: [] };
+let _censoHist = { dias: {} };
 let _censoRodando = false;
 
 function _censoDia(iso) {
@@ -5087,6 +5094,33 @@ function _censoDia(iso) {
 function salvarCenso() {
   try { writeFileSync(CENSO_FILE, JSON.stringify(_censo, null, 2), 'utf-8'); }
   catch(e) { console.error('[CENSO] Falha ao gravar censo:', e.message); }
+}
+
+(function carregarCensoHist() {
+  try {
+    if (existsSync(CENSO_HIST_FILE)) _censoHist = JSON.parse(readFileSync(CENSO_HIST_FILE, 'utf-8'));
+    if (!_censoHist || typeof _censoHist !== 'object' || !_censoHist.dias) _censoHist = { dias: {} };
+  } catch(e) { console.warn('[CENSO] Falha ao ler historico:', e.message); _censoHist = { dias: {} }; }
+})();
+
+// Uma medicao por dia: rodar o censo duas vezes no mesmo dia sobrescreve o
+// ponto em vez de criar um segundo, senao o grafico ganharia degraus falsos.
+function registrarHistoricoCenso(grupos) {
+  const dia = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date());
+  const porGrupo = {};
+  for (const g of grupos) if (typeof g.membros === 'number') porGrupo[g.jid] = g.membros;
+  _censoHist.dias[dia] = {
+    total: Object.values(porGrupo).reduce((s, n) => s + n, 0),
+    grupos: porGrupo,
+    medidoEm: new Date().toISOString(),
+  };
+  // Poda: mantem pouco mais de um ano de serie.
+  const chaves = Object.keys(_censoHist.dias).sort();
+  while (chaves.length > CENSO_HIST_DIAS) delete _censoHist.dias[chaves.shift()];
+  try {
+    writeFileSync(CENSO_HIST_FILE, JSON.stringify(_censoHist, null, 2), 'utf-8');
+    agendarPush(CENSO_HIST_ARQ);
+  } catch(e) { console.error('[CENSO] Falha ao gravar historico:', e.message); }
 }
 
 // Grupo que falhar mantem a ultima contagem conhecida em vez de sumir da lista:
@@ -5122,6 +5156,7 @@ async function recensearGrupos() {
     }
     _censo = { atualizadoEm: new Date().toISOString(), grupos };
     salvarCenso();
+    registrarHistoricoCenso(grupos);
     const total = grupos.reduce((s, g) => s + (g.membros || 0), 0);
     console.log('[CENSO] ' + grupos.length + ' grupo(s) de destino — ' + total + ' membro(s) no total.');
     return _censo;
@@ -5162,6 +5197,27 @@ app.get('/grupos/censo', async (req, res) => {
     proximaMedicao: '06:00 (SP)',
     total: lista.reduce((s, g) => s + (g.membros || 0), 0),
     grupos: lista,
+  });
+});
+
+// GET /grupos/censo/historico?dias=90 — serie diaria para o grafico de evolucao.
+// Devolve o total do dia e a contagem por grupo, so dos grupos que ainda sao
+// destino (grupo removido do papel some do grafico junto com a lista).
+app.get('/grupos/censo/historico', (req, res) => {
+  const dias = Math.min(Math.max(parseInt(req.query.dias || '90', 10) || 90, 2), CENSO_HIST_DIAS);
+  const destinos = radarDestinos();
+  const chaves = Object.keys(_censoHist.dias || {}).sort().slice(-dias);
+  const serie = chaves.map(d => {
+    const reg = _censoHist.dias[d] || {};
+    const porGrupo = reg.grupos || {};
+    const total = destinos.reduce((s, j) => s + (porGrupo[j] || 0), 0);
+    return { dia: d, total, grupos: Object.fromEntries(destinos.map(j => [j, porGrupo[j] ?? null])) };
+  });
+  res.json({
+    ok: true,
+    dias: serie.length,
+    grupos: destinos.map(j => ({ jid: j, nome: NOMES_GRUPOS.get(j) || null })),
+    serie,
   });
 });
 
