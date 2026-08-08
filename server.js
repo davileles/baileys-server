@@ -98,6 +98,17 @@ async function sincronizarCuponsMlAgendado() {
             + '\n\nSaíram da sua lista de cupons ativos no ML.'
       }).catch(() => {});
     }
+
+    // Sem estar ativado na conta, o ML nao informa validade nem esgotamento —
+    // o cupom fica fora do monitoramento ate ser adicionado.
+    if ((d.pendentesAtivacao || []).length) {
+      await enviarMensagem(GRUPOS['operador'], {
+        text: '➕ *Ative estes cupons no Mercado Livre*\n\n'
+            + d.pendentesAtivacao.map(c => '• ' + c).join('\n')
+            + '\n\nEles estão na base mas não na sua conta, então não dá para '
+            + 'saber quando expiram. Cole em: mercadolivre.com.br/cupons → Inserir código.'
+      }).catch(() => {});
+    }
   } catch (e) { console.warn('[CUPONS-ML] Sync agendado — erro:', e.message); }
 }
 setInterval(sincronizarCuponsMlAgendado, 60 * 60 * 1000);
@@ -4164,6 +4175,8 @@ app.post('/cupons/sync-ml', async (req, res) => {
 
     const mapaPagina = new Map(naPagina.map(c => [c.codigo.toUpperCase(), c]));
     const atualizados = [], desativados = [], criados = [], semMudanca = [];
+    // Cupons da base que o ML nao lista: provavelmente falta ativar na conta.
+    const pendentesAtivacao = [];
 
     // Percorre a NOSSA base e procura cada cupom na pagina — nao o contrario.
     // Assim os cards sem codigo digitavel deixam de ser um caso especial.
@@ -4174,13 +4187,23 @@ app.post('/cupons/sync-ml', async (req, res) => {
       if (!naTela) {
         if (!leituraCompleta) { semMudanca.push(reg.codigo); continue; }
         if (reg.ativo === false) continue;
+
+        // Cupom capturado do Telegram ainda NAO ativado na conta do ML nunca
+        // aparece em "Meus cupons". Desativar por ausencia mataria justamente os
+        // cupons novos — o oposto do que o sync existe para fazer. So desativa
+        // quem ja foi visto na conta ao menos uma vez.
+        if (!reg.confirmadoNoMl) {
+          pendentesAtivacao.push(reg.codigo);
+          continue;
+        }
         atualizarCupomBase(reg.chave, { ativo:false });
         desativados.push(reg.codigo);
         continue;
       }
 
       const campos = { tipo:naTela.tipo, valor:naTela.valor,
-                       minimo:naTela.minimo, limite:naTela.limite, ativo:true };
+                       minimo:naTela.minimo, limite:naTela.limite, ativo:true,
+                       confirmadoNoMl:true };
       // Validade real: contador tem prioridade sobre o texto ("quarta-feira").
       const validade = naTela.expiraEm || validadeDeTexto(naTela.venceTexto);
       if (validade) campos.validadeAte = validade;
@@ -4209,7 +4232,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
       + (leituraCompleta ? '' : ' [leitura parcial: nada desativado]') + '.');
 
     res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
-               fontes, atualizados, criados, desativados,
+               fontes, atualizados, criados, desativados, pendentesAtivacao,
                naoAvaliados: leituraCompleta ? [] : semMudanca });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
