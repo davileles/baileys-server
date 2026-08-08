@@ -689,5 +689,9 @@ export async function lerCuponsAtivosMl() {
     const ant = porCodigo.get(c.codigo);
     if (!ant || (c.minimo != null && ant.minimo == null)) porCodigo.set(c.codigo, c);
   }
-  return [...porCodigo.values()];
+  // A pagina declara quantos cupons existem ("13 Cupons"). Guardamos isso para
+  // o chamador saber se a leitura veio completa — desativar cupom bom por
+  // leitura parcial e pior do que nao sincronizar.
+  const mTotal = texto.match(/(\d+)\s+Cupons/);
+  return { cupons: [...porCodigo.values()], totalDeclarado: mTotal ? Number(mTotal[1]) : null };
 }
