@@ -3970,19 +3970,25 @@ app.post('/painel/mesclar', (req, res) => {
 });
 
 app.post('/painel/limpar', (req, res) => {
-  const { confirmar, tipoConteudo } = req.body;
+  const { confirmar, tipoConteudo, tiposConteudo } = req.body;
   if (confirmar!=='sim') return res.status(400).json({ ok:false, erro:'Envie { "confirmar": "sim" } para confirmar.' });
-  // tipoConteudo opcional: limpa apenas pendentes daquele tipo (ex.: 'cupom_tsp'
-  // vindo do painel Tudo Sobre Promos), preservando as emissoes CDV da fila.
-  // Sem tipoConteudo mantem o comportamento antigo: limpa todos os pendentes.
+  // Filtro opcional de tipo, para o painel TSP nunca limpar as emissoes CDV.
+  // Aceita lista (tiposConteudo) alem da string antiga: a fila do painel mostra
+  // cupons E ofertas de marketplace, e limpar so 'cupom_tsp' deixava as ofertas
+  // na tela — o botao parecia nao fazer nada.
+  const tipos = tiposConteudo
+    ? (Array.isArray(tiposConteudo) ? tiposConteudo : [tiposConteudo])
+    : (tipoConteudo ? [tipoConteudo] : null);
   let removidos = 0;
   filaPendentes.forEach(o => {
     if (o.status !== 'pendente') return;
-    if (tipoConteudo && o.tipoConteudo !== tipoConteudo) return;
+    if (tipos && !tipos.includes(o.tipoConteudo)) return;
     o.status = 'rejeitado';
     removidos++;
   });
   salvarFila();
+  console.log('[FILA] Limpeza manual — ' + removidos + ' item(ns) rejeitado(s)'
+    + (tipos ? ' (tipos: ' + tipos.join(', ') + ')' : ' (todos os pendentes)') + '.');
   res.json({ ok:true, removidos });
 });
 
