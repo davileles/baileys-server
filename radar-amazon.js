@@ -203,6 +203,48 @@ export function listarMonitor() { return _cfg.monitor || {}; }
 
 export function monitorDoGrupo(jid) { return (_cfg.monitor || {})[jid] || null; }
 
+// Um grupo pode ter VARIAS janelas de captura no mesmo dia (ex: 08:00-08:30,
+// 11:00-11:30, 12:30-14:00). Serve para espalhar o volume de mensagens em vez
+// de despejar tudo num bloco continuo, que faz gente sair do grupo.
+// O par inicio/fim antigo continua aceito na entrada e sempre sai preenchido na
+// saida (primeira janela), para nada que le o formato velho quebrar.
+const HORA_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+function normalizarJanelas(dados, anterior) {
+  let brutas = null;
+  if (Array.isArray(dados.janelas)) brutas = dados.janelas;
+  else if (dados.inicio !== undefined || dados.fim !== undefined)
+    brutas = [{ inicio: dados.inicio, fim: dados.fim }];
+  else brutas = anterior.janelas
+    || (anterior.inicio ? [{ inicio: anterior.inicio, fim: anterior.fim }] : null);
+
+  const limpas = [];
+  for (const j of (brutas || [])) {
+    const ini = String(j?.inicio ?? '').trim();
+    const fim = String(j?.fim ?? '').trim();
+    if (!HORA_RE.test(ini) || !HORA_RE.test(fim)) continue;
+    if (ini === fim) continue;                       // janela de duracao zero
+    limpas.push({ inicio: ini, fim });
+  }
+  if (!limpas.length) limpas.push({ inicio: '00:00', fim: '23:59' });
+
+  // Ordena e funde sobreposicoes: duas janelas encavaladas viram uma so, para o
+  // painel nao mostrar faixa duplicada. Janela que vira a meia-noite fica fora
+  // da fusao, porque nao e comparavel na mesma reta de minutos.
+  const min = h => paraMinutos(h, 0);
+  const viram = limpas.filter(j => min(j.inicio) > min(j.fim));
+  const retas = limpas.filter(j => min(j.inicio) <= min(j.fim))
+    .sort((a, b) => min(a.inicio) - min(b.inicio));
+  const fundidas = [];
+  for (const j of retas) {
+    const ultima = fundidas[fundidas.length - 1];
+    if (ultima && min(j.inicio) <= min(ultima.fim)) {
+      if (min(j.fim) > min(ultima.fim)) ultima.fim = j.fim;
+    } else fundidas.push({ ...j });
+  }
+  return [...fundidas, ...viram].slice(0, 12);
+}
+
 export function salvarMonitor(jid, dados = {}) {
   if (!jid) return null;
   if (!_cfg.monitor) _cfg.monitor = {};
@@ -212,17 +254,28 @@ export function salvarMonitor(jid, dados = {}) {
     ? dados.lojas.filter(l => LOJAS_MONITORAVEIS.includes(l))
     : (anterior.lojas || []);
 
+  const janelas = normalizarJanelas(dados, anterior);
+
   _cfg.monitor[jid] = {
     jid,
     lojas,
-    inicio: dados.inicio !== undefined ? String(dados.inicio) : (anterior.inicio || '00:00'),
-    fim:    dados.fim    !== undefined ? String(dados.fim)    : (anterior.fim    || '23:59'),
+    janelas,
+    // Espelho da primeira janela: compatibilidade com leitores do formato antigo.
+    inicio: janelas[0].inicio,
+    fim:    janelas[0].fim,
     dias:   dados.dias === 'uteis' ? 'uteis' : (dados.dias === 'todos' ? 'todos' : (anterior.dias || 'todos')),
     ativo:  dados.ativo !== undefined ? !!dados.ativo : (anterior.ativo !== false),
     atualizadoEm: new Date().toISOString(),
   };
   salvarRadarConfig({ monitor: _cfg.monitor });
   return _cfg.monitor[jid];
+}
+
+// Cadastro salvo antes das multiplas janelas so tem inicio/fim: le como uma
+// janela unica em vez de exigir migracao do arquivo.
+export function janelasDoMonitor(cfg) {
+  if (Array.isArray(cfg?.janelas) && cfg.janelas.length) return cfg.janelas;
+  return [{ inicio: cfg?.inicio || '00:00', fim: cfg?.fim || '23:59' }];
 }
 
 export function removerMonitor(jid) {
@@ -249,14 +302,18 @@ export function podeCapturar(jid, loja, quando = new Date()) {
     return { ok: false, motivo: 'fora dos dias uteis' };
   }
 
-  const agora  = minutosAgoraSP(quando);
-  const inicio = paraMinutos(cfg.inicio, 0);
-  const fim    = paraMinutos(cfg.fim, 23 * 60 + 59);
-  if (agora < inicio || agora > fim) {
-    return { ok: false, motivo: 'fora da janela ' + cfg.inicio + '-' + cfg.fim + ' (agora ' +
-      String(Math.floor(agora / 60)).padStart(2, '0') + ':' + String(agora % 60).padStart(2, '0') + ' SP)' };
+  const agora   = minutosAgoraSP(quando);
+  const janelas = janelasDoMonitor(cfg);
+  for (const j of janelas) {
+    const ini = paraMinutos(j.inicio, 0);
+    const fim = paraMinutos(j.fim, 23 * 60 + 59);
+    // Janela que vira a meia-noite (22:00-02:00) e um bloco unico partido em dois.
+    const dentro = ini <= fim ? (agora >= ini && agora <= fim) : (agora >= ini || agora <= fim);
+    if (dentro) return { ok: true, motivo: 'dentro da janela ' + j.inicio + '-' + j.fim };
   }
-  return { ok: true, motivo: 'dentro da janela' };
+  const hhmm = String(Math.floor(agora / 60)).padStart(2, '0') + ':' + String(agora % 60).padStart(2, '0');
+  return { ok: false, motivo: 'fora das janelas ' +
+    janelas.map(j => j.inicio + '-' + j.fim).join(', ') + ' (agora ' + hhmm + ' SP)' };
 }
 
 /**
@@ -269,7 +326,7 @@ export function semearMonitorDasFontes() {
   let novos = 0;
   for (const jid of fontes) {
     if (monitorDoGrupo(jid)) continue;
-    salvarMonitor(jid, { lojas: [...LOJAS_MONITORAVEIS], inicio: '00:00', fim: '23:59', dias: 'todos', ativo: true });
+    salvarMonitor(jid, { lojas: [...LOJAS_MONITORAVEIS], janelas: [{ inicio: '00:00', fim: '23:59' }], dias: 'todos', ativo: true });
     novos++;
   }
   if (novos) console.log('[MONITOR] ' + novos + ' grupo(s) fonte receberam cadastro inicial (todas as lojas, 24h).');
