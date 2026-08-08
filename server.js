@@ -4257,6 +4257,23 @@ app.get('/ml/aff/status', async (req, res) => {
 
 app.get('/ml/aff/inspecionar', (req, res) => res.json({ ok:true, ...inspecionarTokenAff() }));
 
+// Sonda POST do painel de afiliados, para testar payloads do createLink.
+app.post('/ml/aff/sonda', async (req, res) => {
+  const { url, body } = req.body || {};
+  if (!url) return res.status(400).json({ ok:false, erro:'informe url e body' });
+  try {
+    res.json(await chamarAff(url, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+      headers: {
+        'Origin': 'https://www.mercadolivre.com.br',
+        'Referer': 'https://www.mercadolivre.com.br/afiliados/linkbuilder',
+        'x-requested-with': 'XMLHttpRequest',
+      },
+    }));
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 // Sonda do painel de afiliados: descobre quais endpoints o token abre.
 app.get('/ml/aff/sonda', async (req, res) => {
   if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
