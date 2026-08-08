@@ -29,6 +29,7 @@ import {
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
+  listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
@@ -4366,6 +4367,204 @@ app.post('/monitor/:jid', (req, res) => {
 app.delete('/monitor/:jid', (req, res) => {
   if (!removerMonitor(req.params.jid)) return res.status(404).json({ ok:false, erro:'sem cadastro para este grupo' });
   res.json({ ok:true });
+});
+
+// ── LISTAS DE REENVIO ────────────────────────────────────────────────────────
+// Uma lista dispara um produto por vez, com o intervalo configurado. Nao da para
+// fazer isso dentro do request HTTP (30 produtos x 20 min = 10 horas), entao o
+// endpoint so abre a execucao e um worker toca a fila. O andamento fica gravado
+// no proprio registro da lista, sobrevivendo a restart do container.
+
+// Monta e envia UM produto. Isolada porque e usada pelo worker e pelo disparo
+// avulso, e o preco tem de ser sempre consultado no instante do envio.
+async function dispararProdutoDaLista(asin, codigoCupom) {
+  const item = itemVitrine(asin);
+  if (!item) return { ok:false, motivo:'produto nao esta mais na vitrine' };
+
+  let montado;
+  if (item.loja === 'Shopee') {
+    if (!credenciaisShopeeOk()) return { ok:false, motivo:'Shopee nao configurada' };
+    montado = await montarOfertasShopeeVitrine([item], codigoCupom);
+  } else {
+    montado = await montarOfertasVitrine([asin], codigoCupom);
+  }
+
+  const o = montado.prontos[0];
+  if (!o) return { ok:false, motivo: montado.descartados[0]?.motivo || 'produto descartado' };
+
+  const oferta = {
+    id: gerarId(), origem:'lista',
+    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+    mensagemFormatada: o.mensagem,
+    dadosExtraidos: {
+      loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
+      precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
+      cupom:o.cupom, precoFinal:o.precoFinal,
+    },
+    imagens: [],
+  };
+  try {
+    const img = await baixarImagemProduto(o.produto.imagemUrl);
+    if (img) oferta.imagens = [img];
+  } catch (e) {}
+
+  const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta);
+  marcarDisparo(asin);
+  return { ok:true, nome:o.nome, grupos:r.enviados.length, cupom:o.cupom?.codigo || null,
+           aviso:o.avisoCupom || null, preco:o.produto.preco };
+}
+
+function iniciarExecucaoLista(lista) {
+  return atualizarExecucaoLista(lista.id, {
+    iniciadaEm: new Date().toISOString(),
+    indice: 0,
+    proximoEm: Date.now(),          // primeiro sai na hora
+    pausada: false,
+    enviados: [], falhas: [], pulados: [],
+  });
+}
+
+// Worker: acorda a cada 15s e envia o proximo produto de cada lista cuja hora
+// chegou. Uma lista por vez dentro do tick — se duas vencerem juntas, a segunda
+// espera o proximo ciclo, evitando dois envios no mesmo segundo.
+let _listaWorkerRodando = false;
+setInterval(async () => {
+  if (_listaWorkerRodando) return;
+  const pendentes = listarListas().filter(l =>
+    l.execucao && !l.execucao.pausada && l.execucao.proximoEm <= Date.now());
+  if (!pendentes.length) return;
+
+  _listaWorkerRodando = true;
+  try {
+    const lista = pendentes[0];
+    const ex = lista.execucao;
+    const asin = lista.produtos[ex.indice];
+
+    if (asin === undefined) {                       // fim da fila
+      console.log('[LISTA] "' + lista.nome + '" concluida — ' + ex.enviados.length
+        + ' enviado(s), ' + ex.falhas.length + ' falha(s), ' + ex.pulados.length + ' pulado(s).');
+      try {
+        await enviarMensagem(GRUPOS.operador, { text: '*Lista concluida: ' + lista.nome + '*\n\n'
+          + ex.enviados.length + ' enviado(s)\n' + ex.falhas.length + ' falha(s)\n'
+          + ex.pulados.length + ' pulado(s) (sem preco, esgotado ou fora da base)' });
+      } catch(_) {}
+      atualizarExecucaoLista(lista.id, null);
+      return;
+    }
+
+    if (!conectado || !sock) {
+      // Sem WhatsApp nao adianta consumir a fila: adia sem gastar o item.
+      ex.proximoEm = Date.now() + 60000;
+      atualizarExecucaoLista(lista.id, ex);
+      return;
+    }
+
+    try {
+      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista));
+      if (r.ok) ex.enviados.push({ asin, nome:r.nome, cupom:r.cupom, em:new Date().toISOString() });
+      else      ex.pulados.push({ asin, motivo:r.motivo, em:new Date().toISOString() });
+    } catch (e) {
+      ex.falhas.push({ asin, erro:e.message, em:new Date().toISOString() });
+    }
+
+    ex.indice += 1;
+    ex.proximoEm = Date.now() + lista.intervaloMin * 60000;
+    atualizarExecucaoLista(lista.id, ex);
+    console.log('[LISTA] "' + lista.nome + '" — item ' + ex.indice + '/' + lista.produtos.length
+      + ', proximo em ' + lista.intervaloMin + ' min.');
+  } catch (e) {
+    console.error('[LISTA] Erro no worker:', e.message);
+  } finally { _listaWorkerRodando = false; }
+}, 15000);
+
+// Agendador: dispara a lista no dia da semana e hora marcados. Guarda o dia ja
+// disparado para restart do container nao repetir a lista no mesmo dia.
+const _listaDiaDisparado = new Map();
+setInterval(() => {
+  const agora = new Date();
+  const hhmm = new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour:'2-digit', minute:'2-digit', hour12:false }).format(agora);
+  const dia  = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(agora);
+  // Dia da semana no fuso de SP (0=domingo), nao no fuso do container.
+  const diaSemana = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].indexOf(
+    new Intl.DateTimeFormat('en-US', { timeZone: TZ_SP, weekday: 'short' }).format(agora));
+
+  for (const lista of listarListas()) {
+    if (!lista.ativo || !lista.agenda?.ativo || lista.execucao) continue;
+    if (!lista.produtos?.length) continue;
+    if (!lista.agenda.diasSemana.includes(diaSemana)) continue;
+    if (lista.agenda.hora !== hhmm) continue;
+    if (_listaDiaDisparado.get(lista.id) === dia) continue;
+    _listaDiaDisparado.set(lista.id, dia);
+    iniciarExecucaoLista(lista);
+    console.log('[LISTA] "' + lista.nome + '" iniciada pela agenda (' + hhmm + ' SP, '
+      + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo).');
+  }
+}, 30000);
+
+app.get('/listas', (req, res) => {
+  const listas = listarListas().map(l => ({
+    ...l,
+    // Nome do produto resolvido aqui: o painel nao deve ter que cruzar com a vitrine.
+    itens: (l.produtos || []).map(a => ({ asin:a, nome: itemVitrine(a)?.nome || a,
+                                          loja: itemVitrine(a)?.loja || null,
+                                          sumiu: !itemVitrine(a) })),
+    restantes: l.execucao ? Math.max(0, l.produtos.length - l.execucao.indice) : null,
+  }));
+  res.json({ ok:true, total: listas.length, listas,
+             agoraSP: new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()) });
+});
+
+app.post('/listas', (req, res) => {
+  try { res.json({ ok:true, lista: salvarLista(req.body || {}) }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.delete('/listas/:id', (req, res) => {
+  if (!removerLista(req.params.id)) return res.status(404).json({ ok:false, erro:'lista nao encontrada' });
+  res.json({ ok:true });
+});
+
+// Comeca a execucao agora. Nao envia nada de forma sincrona: o primeiro item sai
+// no proximo tick do worker (ate 15s), e o restante conforme o intervalo.
+app.post('/listas/:id/disparar', async (req, res) => {
+  const lista = listaPorId(req.params.id);
+  if (!lista) return res.status(404).json({ ok:false, erro:'lista nao encontrada' });
+  if (lista.execucao) return res.status(409).json({ ok:false, erro:'esta lista ja esta em disparo' });
+  if (!lista.produtos?.length) return res.status(400).json({ ok:false, erro:'lista sem produtos' });
+  if (!conectado || !sock) {
+    const ok = await aguardarSock(10000);
+    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  }
+  const atualizada = iniciarExecucaoLista(lista);
+  const minutos = (lista.produtos.length - 1) * lista.intervaloMin;
+  console.log('[LISTA] "' + lista.nome + '" iniciada manualmente — ' + lista.produtos.length
+    + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
+  res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos });
+});
+
+// Pausar/retomar/cancelar no meio: lista longa pode precisar parar (grupo
+// reclamando, cupom que caiu, preco errado).
+app.post('/listas/:id/pausar', (req, res) => {
+  const lista = listaPorId(req.params.id);
+  if (!lista?.execucao) return res.status(400).json({ ok:false, erro:'lista nao esta em disparo' });
+  lista.execucao.pausada = true;
+  res.json({ ok:true, lista: atualizarExecucaoLista(lista.id, lista.execucao) });
+});
+
+app.post('/listas/:id/retomar', (req, res) => {
+  const lista = listaPorId(req.params.id);
+  if (!lista?.execucao) return res.status(400).json({ ok:false, erro:'lista nao esta em disparo' });
+  lista.execucao.pausada = false;
+  lista.execucao.proximoEm = Date.now();
+  res.json({ ok:true, lista: atualizarExecucaoLista(lista.id, lista.execucao) });
+});
+
+app.post('/listas/:id/cancelar', (req, res) => {
+  const lista = listaPorId(req.params.id);
+  if (!lista?.execucao) return res.status(400).json({ ok:false, erro:'lista nao esta em disparo' });
+  const parcial = lista.execucao;
+  atualizarExecucaoLista(lista.id, null);
+  res.json({ ok:true, enviados: parcial.enviados.length, restantes: lista.produtos.length - parcial.indice });
 });
 
 // ── VITRINE ──────────────────────────────────────────────────────────────────
