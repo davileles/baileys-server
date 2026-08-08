@@ -48,7 +48,7 @@ import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
-  chavesCookieAff, lerCuponsAtivosMl,
+  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -4123,7 +4123,7 @@ app.delete('/templates/:loja', (req, res) => {
 app.post('/cupons/sync-ml', async (req, res) => {
   if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
   try {
-    const { cupons: ativos, totalDeclarado } = await lerCuponsAtivosMl();
+    const { cupons: ativos, totalDeclarado, fontes } = await lerTodosCuponsMl();
     if (!ativos.length) {
       return res.json({ ok:false, erro:'nenhum cupom lido — sessao pode ter caido', ativos:0 });
     }
@@ -4158,12 +4158,27 @@ app.post('/cupons/sync-ml', async (req, res) => {
     console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
       + criados.length + ' novo(s), ' + desativados.length + ' desativado(s).');
     res.json({
-      ok:true, lidos:ativos.length, totalDeclarado, leituraCompleta,
+      ok:true, lidos:ativos.length, totalDeclarado, leituraCompleta, fontes,
       atualizados, criados, desativados,
       aviso: leituraCompleta ? null
         : 'leitura parcial (' + ativos.length + ' de ' + totalDeclarado + ') — nada foi desativado',
     });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Ativa um cupom na conta do ML (equivale ao botao "Inserir codigo").
+app.post('/cupons/ativar-ml', async (req, res) => {
+  if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
+  const codigos = Array.isArray(req.body?.codigos) ? req.body.codigos
+                : (req.body?.codigo ? [req.body.codigo] : []);
+  if (!codigos.length) return res.status(400).json({ ok:false, erro:'informe codigo ou codigos[]' });
+  const resultados = [];
+  for (const c of codigos) {
+    try { resultados.push(await ativarCupomMl(c)); }
+    catch (e) { resultados.push({ codigo:c, ok:false, mensagem:e.message }); }
+    await new Promise(r => setTimeout(r, 800));
+  }
+  res.json({ ok:true, resultados });
 });
 
 // ── BASE DE CUPONS ───────────────────────────────────────────────────────────
