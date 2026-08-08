@@ -691,34 +691,54 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
   const texto = html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&').replace(/\s+/g, ' ');
 
-  const re = /Cupom ativado de (?:(\d+)% OFF|R\$\s?([\d.,]+) OFF) com ([A-Z0-9]{4,25})(.{0,260}?)(?=Cupom ativado de |$)/g;
+  // O rotulo varia mais do que parece:
+  //   "25% OFF com OFFPARACASA"      -> codigo em minusculo no "com"
+  //   "18% OFF COM HORADOCUPOM"      -> "COM" maiusculo
+  //   "18% OFF INTERNACIONAL"        -> codigo sem a palavra "com"
+  //   "25% OFF em Itens para Casa"   -> SEM codigo: ativa por clique, nao por texto
+  // Os dois primeiros formatos dao o codigo direto; o terceiro exige tratar a
+  // ultima palavra como codigo; o quarto precisa ser ignorado, senao viraria um
+  // cupom fantasma chamado "CASA".
+  const re = /Cupom ativado de (?:(\d+)% OFF|R\$\s?([\d.,]+) OFF)\s+([^]{0,60}?)(?=Em produtos|Sem compra|Compra mínima|$)/g;
   const achados = [];
   for (const m of texto.matchAll(re)) {
-    const trecho = m[4] || '';
-    const hhmmss = (trecho.match(/Encerra em (\d{1,2}):(\d{2}):(\d{2})/) || null);
+    const rotulo = (m[3] || '').trim();
+
+    // Sem codigo digitavel: descricao em linguagem natural ("em Itens para Casa").
+    if (/^(em|para|de)\s/i.test(rotulo) || !rotulo) continue;
+
+    // Com "com"/"COM" o codigo vem depois; sem ele, o rotulo inteiro e o codigo.
+    const mCom = rotulo.match(/\bcom\s+(.+)$/i);
+    const bruto = (mCom ? mCom[1] : rotulo).trim();
+    const codigo = bruto.replace(/\s+/g, '').toUpperCase();
+    if (!/^[A-Z0-9]{4,30}$/.test(codigo)) continue;
+
+    // O restante do card, para minimo/limite/validade.
+    const pos = texto.indexOf(m[0]);
+    const trecho = texto.slice(pos, pos + 320);
+    const hhmmss = trecho.match(/Encerra em (\d{1,2}):(\d{2}):(\d{2})/);
+
     achados.push({
-      codigo: m[3],
+      codigo,
       tipo: m[1] ? 'pct' : 'reais',
       valor: Number(String(m[1] || m[2]).replace(/\./g, '').replace(',', '.')),
-      minimo: Number((trecho.match(/Compra mínima R\$\s?([\d.]+)/) || [])[1]) || null,
+      minimo: /Sem compra mínima/i.test(trecho) ? 0
+            : (Number((trecho.match(/Compra mínima R\$\s?([\d.]+)/) || [])[1]) || null),
       limite: Number((trecho.match(/Limite de R\$\s?([\d.]+)/) || [])[1]) || null,
-      // Contador -> validade absoluta. So aparece nas ultimas horas.
       expiraEm: hhmmss
         ? new Date(Date.now() + ((+hhmmss[1]) * 3600 + (+hhmmss[2]) * 60 + (+hhmmss[3])) * 1000).toISOString()
         : null,
+      venceTexto: (trecho.match(/Vence (?:em )?([^L]{2,24}?)(?=Conferir|Aplicar|Está|$)/) || [])[1]?.trim() || null,
       esgotando: /Está esgotando/.test(trecho),
     });
   }
-  // A pagina repete o cupom no cabecalho do card: fica com a ocorrencia que
-  // tem minimo/limite preenchidos.
+
   const porCodigo = new Map();
   for (const c of achados) {
     const ant = porCodigo.get(c.codigo);
     if (!ant || (c.minimo != null && ant.minimo == null)) porCodigo.set(c.codigo, c);
   }
-  // A pagina declara quantos cupons existem ("13 Cupons"). Guardamos isso para
-  // o chamador saber se a leitura veio completa — desativar cupom bom por
-  // leitura parcial e pior do que nao sincronizar.
+
   const mTotal = texto.match(/(\d+)\s+Cupons/);
   return { cupons: [...porCodigo.values()], totalDeclarado: mTotal ? Number(mTotal[1]) : null };
 }
