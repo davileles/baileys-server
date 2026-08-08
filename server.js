@@ -1278,6 +1278,9 @@ Regras:
 // continua indo para fila) | 'on' (envia direto quando passa em todos os gates).
 // Default 'sombra': ligar em producao exige acao explicita no Railway.
 const AUTO_ENVIO_MODO       = (process.env.AUTO_ENVIO_CUPOM || 'sombra').toLowerCase();
+// Ofertas de marketplace (Amazon/Shopee/ML/Magalu). Diferente dos cupons, aqui
+// nao ha modo 'sombra': ou vai direto, ou vai para a fila.
+const AUTO_ENVIO_OFERTA     = (process.env.AUTO_ENVIO_OFERTA || 'off').toLowerCase();
 const AUTO_ENVIO_INTERVALO  = 90 * 1000; // intervalo minimo entre auto-envios
 const AUTO_ENVIO_TEXTO_MIN  = 20;        // texto curto demais = info provavelmente na imagem
 const AUTO_ENVIO_MAX_ESPERA = 30 * 60 * 1000; // agendado ha mais que isso = cupom provavelmente vencido, vira aprovacao manual
@@ -2817,6 +2820,30 @@ async function processarRadarMarketplace(jid, texto) {
       timestamp: new Date().toISOString(),
     };
 
+    // AUTO_ENVIO_OFERTA: 'off' (tudo para a fila, padrao) | 'on' (dispara direto
+    // nos destinos). Existe para validar o fluxo completo com grupo de teste;
+    // apontar para grupo de cliente exige voltar para 'off' no Railway.
+    // Uma oferta so chega aqui depois de passar por TODOS os filtros: preco
+    // confirmado pela API, em estoque, desconto acima do minimo e fora do dedup.
+    if (AUTO_ENVIO_OFERTA === 'on') {
+      try {
+        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
+        oferta.status = 'enviado';
+        oferta.enviadoEm = new Date().toISOString();
+        oferta.gruposEnviados = r.enviados;
+        // Continua entrando na fila, agora como historico: alimenta o painel e
+        // preserva o rastro de tudo que saiu.
+        filaPendentes.unshift(oferta);
+        salvarFila();
+        console.log('[MKT] Oferta #' + oferta.id + ' ENVIADA direto — ' + p.asin
+          + ' R$ ' + p.preco + ' -> ' + r.enviados.length + ' grupo(s)');
+        continue;
+      } catch (e) {
+        // Falhou o envio: cai para a fila em vez de perder a oferta.
+        console.error('[MKT] Auto-envio falhou (' + e.message + ') — indo para a fila.');
+      }
+    }
+
     filaPendentes.unshift(oferta);
     salvarFila();
     console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)');
@@ -3923,6 +3950,8 @@ app.get('/mkt/config', (req, res) => {
     destinos: radarDestinos(),
     credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
     credenciaisShopeeOk: credenciaisShopeeOk(),
+    autoEnvioOferta: AUTO_ENVIO_OFERTA,
+    autoEnvioCupom: AUTO_ENVIO_MODO,
   });
 });
 
