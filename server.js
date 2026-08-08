@@ -40,6 +40,13 @@ import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
 } from './sync-github.js';
 
+// ── CONFIG DA OPERACAO TSP (editavel pelo painel) ─────────────────────────────
+import {
+  carregarConfigTsp, configTsp, salvarConfigTsp,
+  linksTsp, rodapeCupom, rodapeGrupoCupons,
+  grupoTspPadrao, grupoTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
+} from './config-tsp.js';
+
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
@@ -151,6 +158,7 @@ const baileysLogger = pino({ level: 'silent' });
   try {
     const r = await baixarDoGitHub();
     if (r.baixados) {
+      carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
@@ -163,16 +171,19 @@ process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtExcepti
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
 
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
+// Os grupos do TSP (padrao, so-cupons e operador) vem da config editavel pelo
+// painel (aba Configuracoes) — getters para toda leitura ver o valor atual.
+// Os grupos do CDV seguem fixos: pertencem a outra operacao, fora deste painel.
 const GRUPOS = {
-  tsp:         '120363424721106736@g.us',
+  get tsp()        { return grupoTspPadrao(); },
   // Grupo exclusivo de cupons — recebe copia de todo cupom_tsp com rodape
   // convidando para o grupo de ofertas (convite cruzado).
-  tsp_cupons:  '120363410183381243@g.us',
+  get tsp_cupons() { return grupoTspCupons(); },
   cdv_ofertas: '120363170138704529@g.us',
   cdv_emissao: '120363172490263905@g.us',
   // Grupo interno do operador — avisos operacionais que NAO vao para clientes
   // (novo cupom capturado, falha de coleta, etc).
-  operador:    '120363409136599326@g.us',
+  get operador()   { return grupoOperadorTsp(); },
 };
 const GRUPOS_MONITORADOS      = [
   '120363430801699326@g.us',
@@ -1266,14 +1277,10 @@ function precoForaDaCurva(pontos, hist180, tipoVoo) {
 }
 
 // ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
-const LINKS_TSP = {
-  'Amazon':        'https://amzn.to/4dFRSzy',
-  'Mercado Livre': 'https://meli.la/2xystLt',
-  'Shopee_sem':    'https://s.shopee.com.br/9fHPmP3QZF',
-  'Shopee_com':    'https://s.shopee.com.br/30kdYeLY0W',
-  'Magazine Luiza':'https://magazineluiza.onelink.me/589508454/3jdc7bbv',
-  'Zé Delivery':   'https://ze.onelink.me/qZhP/p8z09c1x',
-};
+// Os links agora vem da config editavel pelo painel (aba Configuracoes). O
+// Proxy mantem a leitura LINKS_TSP['Loja'] usada em todo o arquivo, sempre
+// refletindo o valor atual — sem restart apos salvar.
+const LINKS_TSP = new Proxy({}, { get: (_alvo, chave) => linksTsp()[chave] });
 
 // A IA devolve a loja como "Zé Delivery", "Ze Delivery", "zedelivery" ou
 // "Outro: Zé Delivery" dependendo de como o texto original escreveu. Uma unica
@@ -1344,7 +1351,8 @@ function formatarCupomTSP(dados) {
 
   if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
 
-  msg += '\n\n`Convide seus amigos para entrar aqui no grupo: https://chat.whatsapp.com/HK7NL13BdPXKJPAGtvTKKg`';
+  const rc = rodapeCupom();
+  if (rc) msg += '\n\n' + rc;
   return msg;
 }
 
@@ -1551,14 +1559,19 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
 
 // Rodape usado na copia enviada ao grupo so-cupons: em vez de convidar para o
 // proprio grupo, faz o convite cruzado para o grupo de ofertas.
-const RODAPE_TSP_CUPONS = '`Entre no grupo de ofertas: https://chat.whatsapp.com/C7ed3Z1tYIb980POo9MqF8?s=cl&p=i&ilr=4`';
-
-// Troca o rodape padrao do TSP pelo convite cruzado. Se o operador tiver
-// editado/removido o rodape na fila, apenas anexa o novo ao final.
+// Troca o rodape padrao do TSP pelo convite cruzado (ambos configuraveis na
+// aba Configuracoes). Tenta primeiro o rodape de cupom exato da config — cobre
+// textos customizados que o regex generico nao reconhece — e mantem o regex
+// historico como rede para mensagens antigas na fila. Se o operador tiver
+// editado/removido o rodape, apenas anexa o novo ao final.
 function mensagemParaGrupoCupons(msg) {
+  const cruzado = rodapeGrupoCupons();
+  if (!cruzado) return msg;
+  const atual = rodapeCupom();
+  if (atual && msg.includes(atual)) return msg.replace(atual, cruzado);
   const rodapeTsp = /`Convide seus amigos para entrar aqui no grupo:[^`]*`/;
-  if (rodapeTsp.test(msg)) return msg.replace(rodapeTsp, RODAPE_TSP_CUPONS);
-  return msg + '\n\n' + RODAPE_TSP_CUPONS;
+  if (rodapeTsp.test(msg)) return msg.replace(rodapeTsp, cruzado);
+  return msg + '\n\n' + cruzado;
 }
 
 // Envia um cupom para TODOS os grupos de destino configurados (radarDestinos).
@@ -1909,10 +1922,15 @@ const TG_CANAIS_MONITORADOS = (process.env.TG_GRUPO || '@juaocupons,@canaldetest
 // independente do que esteja configurado no Railway. O modo de captura é GERAL
 // (aceita qualquer chat da conta), então só a blacklist impede a captura.
 const TG_CANAIS_IGNORADOS_BASE = ['bugmundodasmilhas'];
-const TG_CANAIS_IGNORADOS_RAW = [...new Set([
-  ...TG_CANAIS_IGNORADOS_BASE,
-  ...(process.env.TG_CANAIS_IGNORADOS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
-])];
+// Funcao (nao const) para a lista da aba Configuracoes valer na hora, sem
+// restart. Env e base do codigo continuam somando — nunca substituindo.
+function TG_CANAIS_IGNORADOS_RAW() {
+  return [...new Set([
+    ...TG_CANAIS_IGNORADOS_BASE,
+    ...(process.env.TG_CANAIS_IGNORADOS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean),
+    ...tgIgnoradosConfig(),
+  ])];
+}
 
 let tgClient = null;
 let tgConectado = false;
@@ -1991,7 +2009,7 @@ async function iniciarTelegram() {
 
   // Resolver blacklist para channelIds numéricos
   const _ignoradosIds = new Set();
-  for (const termo of TG_CANAIS_IGNORADOS_RAW) {
+  for (const termo of TG_CANAIS_IGNORADOS_RAW()) {
     if (/^\d+$/.test(termo)) { _ignoradosIds.add(termo); continue; } // já é um ID
     try {
       const ent = await tgClient.getInputEntity(termo).catch(() => null);
@@ -1999,7 +2017,7 @@ async function iniciarTelegram() {
       if (cid) { _ignoradosIds.add(cid); console.log(`[TG] Blacklist resolvido "${termo}" → channelId=${cid}`); }
     } catch(e) { /* termo será comparado por título em runtime */ }
   }
-  console.log(`[TG] Conectado! Modo: captura geral | Blacklist: ${TG_CANAIS_IGNORADOS_RAW.join(', ') || 'nenhum'}`);
+  console.log(`[TG] Conectado! Modo: captura geral | Blacklist: ${TG_CANAIS_IGNORADOS_RAW().join(', ') || 'nenhum'}`);
 
   // ── KEEPALIVE: mantém sessão ativa para o servidor TG continuar entregando updates ──
   // Sem isso, sessões inativas perdem updates de canais broadcast após alguns minutos
@@ -2031,7 +2049,7 @@ async function iniciarTelegram() {
           _ultimosMsgIds[cid] = msg.id;
           // Verificar blacklist
           const bloqueado = _ignoradosIds.has(cid) ||
-            TG_CANAIS_IGNORADOS_RAW.some(t => canal.includes(t));
+            TG_CANAIS_IGNORADOS_RAW().some(t => canal.includes(t));
           if (bloqueado) continue;
           // Checar deduplicação — evita reprocessar msg já capturada pelo NewMessage
           const dedupKeyPolling = `${cid}:${msg.id}`;
@@ -2059,7 +2077,7 @@ async function iniciarTelegram() {
 
       // Verificar blacklist: por channelId numérico OU substring de title/username
       const bloqueadoPorId   = peerChannelId && _ignoradosIds.has(peerChannelId);
-      const bloqueadoPorNome = TG_CANAIS_IGNORADOS_RAW.some(t => username.includes(t) || title.includes(t));
+      const bloqueadoPorNome = TG_CANAIS_IGNORADOS_RAW().some(t => username.includes(t) || title.includes(t));
       if (bloqueadoPorId || bloqueadoPorNome) {
         console.log(`[TG] BLOQUEADO (blacklist) channelId=${peerChannelId} username="${username}" title="${title}"`);
         return;
@@ -2881,6 +2899,7 @@ const PRESERVAR_NO_RESET = new Set([
   'telegram_session.txt',   // sessao do Telegram (independente do WhatsApp)
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
+  'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
@@ -4372,6 +4391,21 @@ app.post('/mkt/config', (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// ── CONFIG DA OPERACAO (aba Configuracoes do painel Gestao TSP) ──────────────
+app.get('/config-tsp', (req, res) => {
+  res.json({ ok: true, config: configTsp() });
+});
+
+app.post('/config-tsp', (req, res) => {
+  try {
+    const cfg = salvarConfigTsp(req.body || {});
+    console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
+    res.json({ ok: true, config: cfg });
+  } catch (e) {
+    res.status(400).json({ ok: false, erro: e.message });
+  }
+});
+
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
 app.get('/sync', async (req, res) => {
   const base = estadoSync();
@@ -4388,6 +4422,7 @@ app.post('/sync/pull', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
   try {
     const r = await baixarDoGitHub();
+    carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
