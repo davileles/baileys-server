@@ -47,6 +47,14 @@ import {
   grupoTspPadrao, grupoTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
 } from './config-tsp.js';
 
+// ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
+import {
+  credenciaisAwinOk, carregarProgramasAwin, atualizarProgramasAwin,
+  listarProgramasAwin, programaAwinPorLoja, programaAwinPorUrl, linkAwinDaLoja,
+  gerarLinkAwin, quotaLinkAwin, buscarOfertasAwin, normalizarOfertaAwin,
+  estadoAwin,
+} from './radar-awin.js';
+
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
@@ -169,6 +177,14 @@ const baileysLogger = pino({ level: 'silent' });
 })();
 
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
+// Boot da Awin: catalogo do disco (instantaneo) e refresh diario em segundo
+// plano. Sem credenciais o modulo fica inerte — nada mais no server muda.
+carregarProgramasAwin();
+if (credenciaisAwinOk()) {
+  atualizarProgramasAwin().catch(e => console.log('[AWIN] Falha ao atualizar catalogo:', e.message));
+  setInterval(() => atualizarProgramasAwin().catch(() => {}), 24 * 60 * 60 * 1000).unref?.();
+}
+
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
 
@@ -1357,6 +1373,11 @@ function formatarCupomTSP(dados) {
   else if (loja === 'Shopee')   url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
   else if (isMagalu)            url = LINKS_TSP['Magazine Luiza'];
   else if (ehZeDelivery(loja))  url = LINKS_TSP['Zé Delivery'];
+  // Fora das lojas com link fixo, a Awin cobre qualquer anunciante afiliado.
+  // Usa o clickThroughUrl do programa: e sincrono, nao faz rede e nao consome
+  // a quota diaria de shortlinks. Um link ja resolvido em dados.urlAfiliado
+  // (caso da propria Offers API) tem prioridade sobre tudo.
+  if (!url) url = dados.urlAfiliado || linkAwinDaLoja(loja) || '';
 
   if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
 
@@ -1470,7 +1491,8 @@ function lojaComLink(loja, codigo) {
   if (loja === 'Shopee')        return !!codigo && !!LINKS_TSP['Shopee_com'];
   if (/magazine\s*luiza|magalu/.test(norm)) return !!LINKS_TSP['Magazine Luiza'];
   if (ehZeDelivery(loja))       return !!LINKS_TSP['Zé Delivery'];
-  return false;
+  // Loja da rede Awin: o link sai do proprio catalogo de programas afiliados.
+  return !!linkAwinDaLoja(loja);
 }
 
 // Confere se um numero extraido pela IA aparece de fato no texto original.
@@ -4435,6 +4457,89 @@ app.post('/sync/pull', async (req, res) => {
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
+// A Awin nao e uma loja: e uma rede com dezenas de anunciantes sob o mesmo
+// token. E o que permite publicar cupom de loja que nao seja uma das quatro
+// grandes sem perder a comissao.
+app.get('/awin/estado', async (req, res) => {
+  const base = estadoAwin();
+  if (!base.configurado) return res.json({ ok:true, ...base });
+  let quota = null;
+  try { quota = await quotaLinkAwin(); } catch (e) { quota = { erro: e.message }; }
+  res.json({ ok:true, ...base, quota });
+});
+
+app.get('/awin/programas', (req, res) => {
+  const busca = String(req.query.q || '').trim().toLowerCase();
+  let lista = listarProgramasAwin();
+  if (busca) lista = lista.filter(p => (p.name || '').toLowerCase().includes(busca));
+  lista.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt-BR'));
+  res.json({ ok:true, total: lista.length, programas: lista });
+});
+
+app.post('/awin/programas/atualizar', async (req, res) => {
+  try { res.json({ ok:true, total: (await atualizarProgramasAwin(true)).length }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Diagnostico: dado um nome de loja ou um link, mostra que programa responde.
+app.get('/awin/resolver', (req, res) => {
+  const loja = String(req.query.loja || '').trim();
+  const url  = String(req.query.url || '').trim();
+  const p = url ? programaAwinPorUrl(url) : (loja ? programaAwinPorLoja(loja) : null);
+  if (!p) return res.json({ ok:false, erro:'nenhum programa afiliado para essa loja/link.' });
+  res.json({ ok:true, advertiserId:p.id, nome:p.name, link:p.clickThroughUrl });
+});
+
+// Deeplink para uma URL especifica. O clickref viaja ate o relatorio de
+// transacoes — e por ele que se descobre depois qual disparo gerou a venda.
+app.post('/awin/link', async (req, res) => {
+  try {
+    const r = await gerarLinkAwin({
+      url: req.body?.url,
+      advertiserId: req.body?.advertiserId || null,
+      clickref: req.body?.clickref || '',
+      encurtar: req.body?.encurtar !== false,
+    });
+    res.json({ ok:true, ...r });
+  } catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+
+app.get('/awin/ofertas', async (req, res) => {
+  try {
+    const brutas = await buscarOfertasAwin({
+      tipo:   req.query.tipo   || 'voucher',
+      status: req.query.status || 'active',
+      atualizadoDesde: req.query.desde || null,
+    });
+    res.json({ ok:true, total: brutas.length, ofertas: brutas.map(normalizarOfertaAwin) });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Importa os vouchers ativos para a base de cupons. NAO dispara nada: so
+// popula a base que a vitrine e o gerador ja consomem. Diferente da captura do
+// Telegram, aqui a validade e a real do anunciante (endDate), nao um TTL fixo.
+app.post('/awin/cupons/importar', async (req, res) => {
+  try {
+    const brutas = await buscarOfertasAwin({ tipo:'voucher', status: req.body?.status || 'active' });
+    const importados = [], ignorados = [];
+    for (const bruta of brutas) {
+      const c = normalizarOfertaAwin(bruta);
+      if (!c.codigo)            { ignorados.push({ loja:c.loja, motivo:'sem codigo' }); continue; }
+      if (!c.tipo || !c.valor)  { ignorados.push({ loja:c.loja, codigo:c.codigo, motivo:'valor/tipo nao identificado no titulo' }); continue; }
+      const reg = registrarCupomBase({
+        loja: c.loja, codigo: c.codigo, tipo: c.tipo, valor: c.valor,
+        minimo: c.minimo, limite: c.limite, maximo: c.maximo,
+        validadeAte: c.validadeAte,
+        observacao: 'Awin' + (c.atribuivel ? ' (atribuivel)' : '') + (c.exclusivo ? ' (exclusivo)' : ''),
+      });
+      if (reg) importados.push({ loja:reg.loja, codigo:reg.codigo, valor:reg.valor, tipo:reg.tipo, validadeAte:reg.validadeAte });
+    }
+    console.log('[AWIN] Importacao de cupons — ' + importados.length + ' ok, ' + ignorados.length + ' ignorado(s).');
+    res.json({ ok:true, total: brutas.length, importados, ignorados });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // ── MONITORAMENTO POR GRUPO ──────────────────────────────────────────────────
