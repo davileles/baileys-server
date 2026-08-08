@@ -32,6 +32,11 @@ export const ARQUIVOS_SINCRONIZADOS = {
   'templates.json':   PASTA + '/templates.json',
   'radar_config.json':PASTA + '/radar_config.json',
   'grupos_censo_hist.json': PASTA + '/grupos_censo_hist.json',
+  // Ledger de entradas/saidas. O PUT aceita arquivo grande, mas a leitura via
+  // Contents API para de devolver o conteudo acima de ~1MB: passando disso o
+  // push continua, so a restauracao automatica no boot deixa de funcionar
+  // (o local e mantido, nao corrompido). Perto do limite, virar shard por ano.
+  'grupos_membros_log.json': PASTA + '/grupos_membros_log.json',
 };
 
 const _shas = new Map();      // caminho no repo -> sha do ultimo commit conhecido
