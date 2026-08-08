@@ -5210,8 +5210,14 @@ app.get('/grupos/censo/historico', (req, res) => {
   const serie = chaves.map(d => {
     const reg = _censoHist.dias[d] || {};
     const porGrupo = reg.grupos || {};
-    const total = destinos.reduce((s, j) => s + (porGrupo[j] || 0), 0);
-    return { dia: d, total, grupos: Object.fromEntries(destinos.map(j => [j, porGrupo[j] ?? null])) };
+    // Ponto agregado (historico antigo) nao tem quebra por grupo: usa o total
+    // que veio na importacao, senao a linha cairia para zero no inicio da serie.
+    const total = reg.totalManual ? (reg.total || 0)
+                                  : destinos.reduce((s, j) => s + (porGrupo[j] || 0), 0);
+    return {
+      dia: d, total, agregado: !!reg.totalManual,
+      grupos: Object.fromEntries(destinos.map(j => [j, porGrupo[j] ?? null])),
+    };
   });
   res.json({
     ok: true,
@@ -5237,13 +5243,27 @@ app.post('/grupos/censo/importar', (req, res) => {
   for (const [jid, nome] of NOMES_GRUPOS) porNome.set(norm(nome), jid);
   for (const g of (_censo.grupos || [])) if (g.nome) porNome.set(norm(g.nome), g.jid);
 
-  let gravados = 0, ignorados = 0, invalidos = 0;
+  let gravados = 0, ignorados = 0, invalidos = 0, agregados = 0;
   const semGrupo = new Set(), dias = new Set();
 
   for (const r of registros) {
     const dia = String(r?.dia || '').trim();
-    const membros = Number(r?.membros);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia) || !Number.isFinite(membros) || membros < 0) { invalidos++; continue; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia)) { invalidos++; continue; }
+
+    // Registro agregado: historico antigo em que so existe o total do dia, sem
+    // quebra por grupo. Fica marcado com totalManual para o grafico usar esse
+    // numero em vez de somar grupos que nao existem naquele ponto da serie.
+    const ehAgregado = r.jid == null && r.nome == null;
+    const valor = Number(ehAgregado ? (r.total ?? r.membros) : r.membros);
+    if (!Number.isFinite(valor) || valor < 0) { invalidos++; continue; }
+
+    if (ehAgregado) {
+      const reg = _censoHist.dias[dia];
+      if (reg && !reg.totalManual && !sobrescrever) { ignorados++; continue; }
+      _censoHist.dias[dia] = { total: Math.round(valor), grupos: (reg?.grupos || {}), totalManual: true, importado: true };
+      agregados++; gravados++;
+      continue;                       // total agregado nao entra no recalculo
+    }
 
     const jid = String(r.jid || '').endsWith('@g.us') ? r.jid : porNome.get(norm(r.nome));
     if (!jid) { semGrupo.add(r.nome || r.jid || '(vazio)'); invalidos++; continue; }
@@ -5251,14 +5271,17 @@ app.post('/grupos/censo/importar', (req, res) => {
     if (!_censoHist.dias[dia]) _censoHist.dias[dia] = { total: 0, grupos: {}, importado: true };
     const reg = _censoHist.dias[dia];
     if (reg.grupos[jid] != null && !sobrescrever) { ignorados++; continue; }
-    reg.grupos[jid] = Math.round(membros);
+    reg.grupos[jid] = Math.round(valor);
     gravados++; dias.add(dia);
   }
 
   // Total recalculado em todos os dias tocados: importar um grupo novo num dia
-  // antigo muda a soma daquele dia.
-  for (const d of dias)
-    _censoHist.dias[d].total = Object.values(_censoHist.dias[d].grupos).reduce((s, n) => s + n, 0);
+  // antigo muda a soma daquele dia. Dia detalhado deixa de ser agregado.
+  for (const d of dias) {
+    const reg = _censoHist.dias[d];
+    reg.total = Object.values(reg.grupos).reduce((s, n) => s + n, 0);
+    delete reg.totalManual;
+  }
 
   const chaves = Object.keys(_censoHist.dias).sort();
   while (chaves.length > CENSO_HIST_DIAS) delete _censoHist.dias[chaves.shift()];
@@ -5270,7 +5293,7 @@ app.post('/grupos/censo/importar', (req, res) => {
 
   console.log('[CENSO] Importacao — ' + gravados + ' ponto(s) em ' + dias.size + ' dia(s).');
   res.json({
-    ok: true, gravados, ignorados, invalidos,
+    ok: true, gravados, agregados, ignorados, invalidos,
     dias: dias.size, totalDiasNaSerie: Object.keys(_censoHist.dias).length,
     gruposNaoResolvidos: [...semGrupo],
   });
