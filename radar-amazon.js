@@ -919,7 +919,12 @@ export function renderTemplate(corpo, vars) {
 /** Variaveis disponiveis no template, a partir do produto ja normalizado. */
 export function varsDoProduto(p, cupom) {
   const precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
-  const riscado = cupom ? (p.precoDe || p.preco) : p.precoDe;
+  // Com cupom e sem preco de lista, o preco cheio faz as vezes de valor riscado
+  // — legitimo quando ele veio de fonte verificavel. Se veio do texto do grupo
+  // (precoDeReferencia), o 'De' seria um numero que ninguem confirmou, entao fica vazio.
+  const riscado = cupom
+    ? (p.precoDe || (p.precoDeReferencia ? null : p.preco))
+    : p.precoDe;
   const descTotal = (riscado && riscado > precoFinal)
     ? Math.round((1 - precoFinal / riscado) * 100)
     : p.desconto;
