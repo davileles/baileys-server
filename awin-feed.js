@@ -39,7 +39,17 @@ export function credenciaisFeedOk() { return !!process.env.AWIN_FEED_APIKEY; }
 
 function apikey()      { return String(process.env.AWIN_FEED_APIKEY || '').trim(); }
 function publisherId() { return String(process.env.AWIN_PUBLISHER_ID || '').trim(); }
-function ttlFeedMs()   { const h = Number(process.env.AWIN_FEED_TTL_H); return (isFinite(h) && h > 0 ? h : 12) * 3600 * 1000; }
+// TTL vem da config do painel quando definido; a env fica como valor inicial.
+let _ttlFeedHoras = null;
+export function definirTtlFeedHoras(h) {
+  const v = Number(h);
+  if (isFinite(v) && v > 0) _ttlFeedHoras = v;
+}
+function ttlFeedMs() {
+  if (_ttlFeedHoras) return _ttlFeedHoras * 3600 * 1000;
+  const h = Number(process.env.AWIN_FEED_TTL_H);
+  return (isFinite(h) && h > 0 ? h : 12) * 3600 * 1000;
+}
 
 function urlFeedList() {
   return 'https://ui.awin.com/productdata-darwin-download/publisher/'
