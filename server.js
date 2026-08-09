@@ -5098,13 +5098,13 @@ app.post('/vitrine', async (req, res) => {
           nome: (nomeManual || '').trim() || node?.productName || ('Produto ' + ids[0].itemId),
           url: node?.offerLink || node?.productLink || linha.trim(),
           cupom,
-        }), jaExistia: jaTinha });
+        }), jaExistia: jaTinha, linha });
         continue;
       }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
-      salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha });
+      salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha, linha });
     } catch (e) { erros.push({ linha, erro: e.message }); }
   }
   console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s).');
