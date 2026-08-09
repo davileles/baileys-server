@@ -58,6 +58,17 @@ const CFG_TSP_PADRAO = {
     // captura. Complementa (nao substitui) a env TG_CANAIS_IGNORADOS.
     canaisIgnorados: ['bugmundodasmilhas'],
   },
+  // Credenciais dos programas de afiliado, editaveis pelo painel. Vazio =
+  // continua valendo a variavel de ambiente do Railway (comportamento
+  // historico). Preenchido = injetado em process.env no boot e a cada save,
+  // entao os radares (que leem env na hora da chamada) usam sem refactor.
+  // NUNCA sao devolvidas em claro pelo GET /config-tsp — so estado mascarado.
+  credenciais: {
+    AMZ_CLIENT_ID: '', AMZ_CLIENT_SECRET: '', AMZ_PARTNER_TAG: '',
+    ML_CLIENT_ID: '', ML_CLIENT_SECRET: '', ML_AFF_TOKEN: '',
+    SHOPEE_APP_ID: '', SHOPEE_SECRET: '',
+    MAGALU_LOJA: '',
+  },
 };
 
 // Merge raso por secao: cada bloco do padrao e preenchido com o que veio do
@@ -78,10 +89,25 @@ function estruturar(bruto) {
 
 let _cfg = estruturar({});
 
+// Injeta as credenciais preenchidas em process.env. Config vazia preserva a
+// env original do Railway — a config so ADICIONA/SUBSTITUI, nunca apaga o que
+// veio do ambiente (limpar no painel volta a valer a env, se houver).
+const _ENV_ORIGINAL = {};
+function aplicarCredenciaisEnv() {
+  for (const [k, v] of Object.entries(_cfg.credenciais || {})) {
+    if (!(k in _ENV_ORIGINAL)) _ENV_ORIGINAL[k] = process.env[k] || '';
+    const val = String(v || '').trim();
+    if (val) process.env[k] = val;
+    else if (_ENV_ORIGINAL[k]) process.env[k] = _ENV_ORIGINAL[k];
+    else delete process.env[k];
+  }
+}
+
 export function carregarConfigTsp() {
   try {
     if (existsSync(CFG_TSP_PATH)) {
       _cfg = estruturar(JSON.parse(readFileSync(CFG_TSP_PATH, 'utf-8')));
+      aplicarCredenciaisEnv();
       console.log('[CFG-TSP] Configuracao da operacao carregada.');
     } else {
       _cfg = estruturar({});
@@ -98,12 +124,23 @@ export function configTsp() { return _cfg; }
 const RE_JID_GRUPO = /^\d{5,}@g\.us$/;
 
 export function salvarConfigTsp(parcial = {}) {
+  // Credenciais: campo vazio no POST significa "manter o que ja esta salvo"
+  // (o painel nunca recebe o valor em claro para reenviar). O literal
+  // '__limpar__' apaga a credencial salva e volta a valer a env, se houver.
+  const cred = { ...(_cfg.credenciais || {}) };
+  for (const [k, v] of Object.entries(parcial.credenciais || {})) {
+    if (!(k in CFG_TSP_PADRAO.credenciais)) continue;
+    const val = String(v == null ? '' : v).trim();
+    if (val === '__limpar__') cred[k] = '';
+    else if (val) cred[k] = val;
+  }
   const novo = estruturar({
     branding: { ..._cfg.branding, ...(parcial.branding || {}) },
     afiliados:{ ..._cfg.afiliados, ...(parcial.afiliados || {}) },
     rodapes:  { ..._cfg.rodapes,   ...(parcial.rodapes   || {}) },
     grupos:   { ..._cfg.grupos,    ...(parcial.grupos    || {}) },
     telegram: { ..._cfg.telegram,  ...(parcial.telegram  || {}) },
+    credenciais: cred,
   });
   // Grupos especiais: um JID invalido aqui quebra fallback de envio e avisos
   // do operador de forma silenciosa — melhor recusar a gravacao.
@@ -121,11 +158,35 @@ export function salvarConfigTsp(parcial = {}) {
     }
   }
   _cfg = novo;
+  aplicarCredenciaisEnv();
   try {
     writeFileSync(CFG_TSP_PATH, JSON.stringify(_cfg, null, 2), 'utf-8');
     agendarPush('config_tsp.json');
   } catch (e) { console.log('[CFG-TSP] Erro ao salvar config:', e.message); }
   return _cfg;
+}
+
+// Copia da config SEM as credenciais — e o que os endpoints publicos devolvem.
+export function configTspPublico() {
+  const { credenciais, ...resto } = _cfg;
+  return JSON.parse(JSON.stringify(resto));
+}
+
+// Estado mascarado por credencial: se esta definida, de onde veio (painel ou
+// ambiente do Railway) e os ultimos 4 caracteres para o operador reconhecer.
+export function credenciaisEstado() {
+  const out = {};
+  for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
+    const doPainel = String((_cfg.credenciais || {})[k] || '').trim();
+    const doAmb    = doPainel ? '' : String(_ENV_ORIGINAL[k] !== undefined ? _ENV_ORIGINAL[k] : (process.env[k] || '')).trim();
+    const valor    = doPainel || doAmb;
+    out[k] = {
+      definido: !!valor,
+      origem: doPainel ? 'painel' : (doAmb ? 'ambiente' : null),
+      final: valor ? valor.slice(-4) : '',
+    };
+  }
+  return out;
 }
 
 // ── Acessores usados pelo restante do servidor ───────────────────────────────
