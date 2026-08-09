@@ -67,6 +67,10 @@ const CFG_TSP_PADRAO = {
     ML_CLIENT_ID: '', ML_CLIENT_SECRET: '', ML_AFF_TOKEN: '',
     SHOPEE_APP_ID: '', SHOPEE_SECRET: '',
     MAGALU_LOJA: '',
+    // Awin e rede, nao loja: um par de credenciais cobre dezenas de
+    // anunciantes. E o que da link de afiliado a cupom de loja fora das
+    // quatro grandes — sem isso o cupom sai sem comissao.
+    AWIN_TOKEN: '', AWIN_PUBLISHER_ID: '',
   },
 };
 
