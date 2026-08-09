@@ -32,12 +32,13 @@ export const FONTE_API    = 'api';
 export const FONTE_LDJSON = 'ldjson';
 export const FONTE_ESTADO = 'estado';
 export const FONTE_DOM    = 'dom';
+export const FONTE_FEED   = 'feed';
 export const FONTE_MANUAL = 'manual';
 export const FONTE_TEXTO  = 'texto';
 
 // Fontes cuja origem e verificavel. As demais (manual/texto) continuam
 // marcando a oferta com precoDeReferencia — o painel avisa o operador.
-const FONTES_VERIFICADAS = new Set([FONTE_API, FONTE_LDJSON, FONTE_ESTADO, FONTE_DOM]);
+const FONTES_VERIFICADAS = new Set([FONTE_API, FONTE_FEED, FONTE_LDJSON, FONTE_ESTADO, FONTE_DOM]);
 
 export function fonteVerificada(fonte) {
   return FONTES_VERIFICADAS.has(String(fonte || ''));
@@ -182,15 +183,41 @@ const CHAVES_ESTADO = [
   'original_price', 'originalPrice', 'regular_amount', 'regularPrice',
   'list_price', 'listPrice', 'previous_price', 'previousPrice',
   'price_before', 'priceBefore', 'strikethrough_price', 'strikethroughPrice',
+  // Nomes que aparecem nas lojas da rede Awin (VTEX, Magento, Shopify e afins).
+  'oldPrice', 'old_price', 'priceFrom', 'price_from', 'fromPrice',
+  'specialPrice', 'special_price', 'rrp', 'rrp_price', 'msrp',
+  'comparePrice', 'compare_at_price', 'ListPrice', 'PriceWithoutDiscount',
+];
+
+// Marcacoes semanticas do proprio HTML, fora do JSON embutido. Ficam junto do
+// extrator de estado porque a origem e a mesma pagina.
+const REGEX_MICRODADOS = [
+  /itemprop=["'](?:listPrice|highPrice)["'][^>]*content=["']([\d.,]+)/i,
+  /data-field=["']specialPrice["'][^>]*>\s*R\$\s*([\d.,]+)/i,
+  /data-(?:old|list|regular)-price=["']([\d.,]+)/i,
 ];
 
 /** Varre o JSON embutido na pagina atras do preco cheio. */
+/**
+ * Um valor cru pode chegar como numero de JSON (33.61) ou como texto de
+ * exibicao ("1.299,90"). A virgula e o que distingue os dois.
+ */
+function numeroCru(bruto) {
+  const t = String(bruto || '').replace(/[.,]+$/, '');
+  if (!t) return null;
+  return t.includes(',') ? numeroBr(t) : numeroJson(t);
+}
+
 export function precoDeDoEstado(html) {
   const texto = String(html || '');
   for (const chave of CHAVES_ESTADO) {
-    const re = new RegExp('"' + chave + '"\\s*:\\s*"?(\\d+(?:\\.\\d+)?)"?', 'i');
+    const m = texto.match(new RegExp('"' + chave + '"\\s*:\\s*"?([\\d.,]{1,16})', 'i'));
+    const v = m ? numeroCru(m[1]) : null;
+    if (v) return v;
+  }
+  for (const re of REGEX_MICRODADOS) {
     const m = texto.match(re);
-    const v = m ? numeroJson(m[1]) : null;
+    const v = m ? numeroCru(m[1]) : null;
     if (v) return v;
   }
   return null;
