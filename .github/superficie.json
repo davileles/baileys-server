@@ -2,7 +2,7 @@
   "limiarRemocao": 150,
   "arquivos": {
     "server.js": {
-      "minLinhas": 5717,
+      "minLinhas": 6010,
       "obrigatorio": [
         "app.delete('/agendamentos/:id'",
         "app.delete('/contas/:id'",
@@ -15,6 +15,11 @@
         "app.delete('/vitrine/:asin'",
         "app.get('/'",
         "app.get('/agendamentos'",
+        "app.get('/awin/cupons/estado'",
+        "app.get('/awin/estado'",
+        "app.get('/awin/ofertas'",
+        "app.get('/awin/programas'",
+        "app.get('/awin/resolver'",
         "app.get('/config-tsp'",
         "app.get('/contas'",
         "app.get('/contas/:id/grupos'",
@@ -61,6 +66,10 @@
         "app.get('/tg-auth'",
         "app.get('/vitrine'",
         "app.post('/api/claude'",
+        "app.post('/awin/cupons/importar'",
+        "app.post('/awin/cupons/poll'",
+        "app.post('/awin/link'",
+        "app.post('/awin/programas/atualizar'",
         "app.post('/backfill-passagens'",
         "app.post('/config-tsp'",
         "app.post('/contas/:id/conectar'",
@@ -269,7 +278,7 @@
       ]
     },
     "config-tsp.js": {
-      "minLinhas": 237,
+      "minLinhas": 241,
       "obrigatorio": [
         "export function carregarConfigTsp",
         "export function configTsp",
