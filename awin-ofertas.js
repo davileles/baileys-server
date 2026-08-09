@@ -37,11 +37,16 @@ function padraoDaConfig() {
     minPct:            n(process.env.AWIN_OFERTAS_MIN_PCT, 60),
     minPreco:          n(process.env.AWIN_OFERTAS_MIN_PRECO, 100),
     maxPreco:          Number(process.env.AWIN_OFERTAS_MAX_PRECO) || null,
-    maxDia:            n(process.env.AWIN_OFERTAS_MAX_DIA, 6),
-    maxRodada:         n(process.env.AWIN_OFERTAS_MAX_RODADA, 2),
-    maxLojaDia:        n(process.env.AWIN_OFERTAS_MAX_LOJA_DIA, 2),
+    maxDia:            n(process.env.AWIN_OFERTAS_MAX_DIA, 24),
+    maxRodada:         n(process.env.AWIN_OFERTAS_MAX_RODADA, 1),
+    maxLojaDia:        n(process.env.AWIN_OFERTAS_MAX_LOJA_DIA, 4),
     repetirDias:       n(process.env.AWIN_OFERTAS_REPETIR_DIAS, 30),
-    intervaloHoras:    n(process.env.AWIN_VARREDURA_H, 6),
+    // Publicacao de meia em meia hora; varredura dos feeds a cada 6h.
+    intervaloMin:      n(process.env.AWIN_OFERTAS_INTERVALO_MIN, 30),
+    varreduraMin:      n(process.env.AWIN_VARREDURA_MIN, 360),
+    horaInicio:        process.env.AWIN_OFERTAS_INICIO || '08:00',
+    horaFim:           process.env.AWIN_OFERTAS_FIM    || '20:00',
+    candidatoTtlHoras: n(process.env.AWIN_CANDIDATO_TTL_H, 12),
     maxFeedsPorRodada: n(process.env.AWIN_OFERTAS_MAX_FEEDS, 6),
     lojas: String(process.env.AWIN_OFERTAS_LOJAS || '').split(',').map(s => s.trim()).filter(Boolean),
     // Cupons da Offers API: mesmo lugar, para a Awin ter uma config so.
@@ -67,8 +72,9 @@ export function configOfertasAwin() {
 // minPct de 5 encheria a fila com "promocao" de 5%.
 const LIMITES = {
   minPct: [1, 99], minPreco: [0, 100000], maxPreco: [0, 1000000],
-  maxDia: [0, 50], maxRodada: [0, 20], maxLojaDia: [0, 20],
-  repetirDias: [1, 365], intervaloHoras: [1, 168], maxFeedsPorRodada: [1, 60],
+  maxDia: [0, 100], maxRodada: [0, 20], maxLojaDia: [0, 40],
+  repetirDias: [1, 365], intervaloMin: [5, 1440], varreduraMin: [30, 10080],
+  candidatoTtlHoras: [1, 168], maxFeedsPorRodada: [1, 60],
   cupomPollMin: [5, 1440], precoTtlHoras: [1, 720], feedTtlHoras: [1, 168],
 };
 
@@ -89,6 +95,16 @@ export function salvarConfigOfertasAwin(dados = {}) {
     const v = String(dados[campo]).toLowerCase();
     if (!['off', 'fila', 'on'].includes(v)) throw new Error(campo + ' deve ser off, fila ou on');
     nova[campo] = v;
+  }
+  for (const campo of ['horaInicio', 'horaFim']) {
+    if (dados[campo] === undefined) continue;
+    const v = String(dados[campo]).trim();
+    // Horario invalido cairia no padrao silenciosamente e o operador nunca
+    // saberia por que a janela nao mudou.
+    if (!/^\d{1,2}:\d{2}$/.test(v)) throw new Error(campo + ' deve estar no formato HH:MM');
+    const [h, m] = v.split(':').map(Number);
+    if (h > 23 || m > 59) throw new Error(campo + ' tem horario invalido');
+    nova[campo] = v.padStart(5, '0');
   }
   if (dados.lojas !== undefined) {
     nova.lojas = (Array.isArray(dados.lojas) ? dados.lojas : String(dados.lojas).split(','))
@@ -150,77 +166,165 @@ export function usoDeHoje() {
   return { total, porLoja };
 }
 
-// Rotacao entre lojas: sem isso, a loja com mais desconto (sempre a mesma)
-// consumiria a cota diaria inteira e as outras nunca apareceriam.
-let _ponteiroLoja = 0;
+// ── FILA DE CANDIDATOS ───────────────────────────────────────────────────────
+// Varrer os feeds e caro: o da Dafiti sozinho tem 308 mil linhas. Fazer isso a
+// cada publicacao (de meia em meia hora) seria desperdicio puro. As duas etapas
+// ficam separadas: a varredura roda de poucas em poucas horas e enche uma fila
+// rankeada; a publicacao so tira o proximo da fila.
+
+const CANDIDATOS_PATH = './sessao/awin_candidatos.json';
+let _candidatos = [];
+let _candidatosEm = 0;
+let _ponteiroLoja = 0;   // rotacao entre lojas a cada varredura
+
+export function carregarCandidatosAwin() {
+  try {
+    if (existsSync(CANDIDATOS_PATH)) {
+      const b = JSON.parse(readFileSync(CANDIDATOS_PATH, 'utf-8'));
+      _candidatos = Array.isArray(b.lista) ? b.lista : [];
+      _candidatosEm = Number(b.em) || 0;
+    }
+  } catch { _candidatos = []; }
+  return _candidatos;
+}
+
+function salvarCandidatos() {
+  try {
+    if (!existsSync('./sessao')) mkdirSync('./sessao', { recursive: true });
+    writeFileSync(CANDIDATOS_PATH, JSON.stringify({ em: _candidatosEm, lista: _candidatos }));
+  } catch (e) { console.log('[AWIN-OFERTAS] Falha ao gravar candidatos:', e.message); }
+}
+
+export function estadoCandidatos() {
+  const cfg = configOfertasAwin();
+  const porLoja = {};
+  for (const c of _candidatos) porLoja[c.loja] = (porLoja[c.loja] || 0) + 1;
+  return {
+    total: _candidatos.length,
+    porLoja,
+    coletadoEm: _candidatosEm ? new Date(_candidatosEm).toISOString() : null,
+    idadeHoras: _candidatosEm ? Math.round((Date.now() - _candidatosEm) / 360000) / 10 : null,
+    validadeHoras: cfg.candidatoTtlHoras,
+  };
+}
 
 /**
- * Varre os feeds e devolve o que PODE ser ofertado hoje, ja dentro da cota.
- * Nao envia nada — quem envia e o server, que ainda aplica janela de horario,
- * espacamento e (se configurado) aprovacao manual.
+ * Varre uma fatia dos feeds e reabastece a fila de candidatos.
+ * Nao envia nada e nao consome cota — so descobre o que existe.
  */
-export async function buscarOfertasDosFeeds({ simular = false } = {}) {
+export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
   if (!credenciaisFeedOk()) return { ok: false, erro: 'AWIN_FEED_APIKEY nao configurada' };
   const cfg = configOfertasAwin();
-  const uso = usoDeHoje();
 
-  // Duas cotas, nao uma: o teto do dia impede excesso e o teto da RODADA impede
-  // que o dia inteiro saia numa rajada de poucos minutos logo na primeira
-  // varredura, deixando o grupo mudo o resto do dia.
-  const vagasTotal = Math.min(
-    Math.max(0, cfg.maxDia - uso.total),
-    cfg.maxRodada > 0 ? cfg.maxRodada : cfg.maxDia,
-  );
-  if (!simular && vagasTotal <= 0) {
-    return { ok: true, cota: 'esgotada', usoHoje: uso, candidatos: [] };
-  }
-
-  // Lojas a varrer: as configuradas, ou todas as que tem feed ativo.
-  const ids = cfg.lojas.length
-    ? cfg.lojas.map(Number).filter(Boolean)
-    : listarAnunciantesComFeed();
+  const ids = cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : listarAnunciantesComFeed();
   if (!ids.length) return { ok: false, erro: 'nenhum feed ativo — atualize a lista de feeds' };
 
-  // Fatia da rodada, girando o ponto de partida a cada execucao.
+  // Fatia rotativa: varrer 50 feeds de uma vez estouraria o tempo da rodada, e
+  // sem rotacao as ultimas lojas da lista nunca seriam olhadas.
   const quantos = Math.min(cfg.maxFeedsPorRodada, ids.length);
   const fatia = [];
   for (let i = 0; i < quantos; i++) fatia.push(ids[(_ponteiroLoja + i) % ids.length]);
   _ponteiroLoja = (_ponteiroLoja + quantos) % ids.length;
 
-  const candidatos = [], porLojaExaminada = [];
+  const examinadas = [];
+  const novos = [];
   for (const id of fatia) {
     let achados = [];
     try {
       achados = await varrerFeedComDesconto(id, {
-        minPct: cfg.minPct, minPreco: cfg.minPreco, maxPreco: cfg.maxPreco, limite: 100,
+        minPct: cfg.minPct, minPreco: cfg.minPreco, maxPreco: cfg.maxPreco, limite: 60,
       });
     } catch (e) { console.log('[AWIN-OFERTAS] Falha na loja ' + id + ': ' + e.message); continue; }
 
-    const nome = achados[0]?.anunciante || String(id);
-    const novos = achados.filter(p => !jaOfertado(nome + '|' + p.chave, cfg.repetirDias));
-    porLojaExaminada.push({ loja: nome, encontrados: achados.length, novos: novos.length });
-
-    // Teto por loja: impede que uma unica loja tome a cota do dia inteira.
-    const jaHoje = uso.porLoja[nome] || 0;
-    const vagasLoja = Math.max(0, cfg.maxLojaDia - jaHoje);
-    for (const p of novos.slice(0, simular ? cfg.maxLojaDia : vagasLoja)) {
-      candidatos.push({ ...p, loja: nome, chaveHistorico: nome + '|' + p.chave });
-    }
+    const nomeCru = achados[0]?.anunciante || String(id);
+    const loja = nomeCru.replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const aproveitados = achados
+      .filter(p => !jaOfertado(loja + '|' + p.chave, cfg.repetirDias))
+      .map(p => ({ ...p, loja, chaveHistorico: loja + '|' + p.chave }));
+    examinadas.push({ loja, encontrados: achados.length, novos: aproveitados.length });
+    novos.push(...aproveitados);
   }
 
-  // Ranking final e corte pela cota do dia.
-  candidatos.sort((a, b) => (b.desconto - a.desconto) || (b.preco - a.preco));
-  const selecionados = candidatos.slice(0, simular ? cfg.maxDia : vagasTotal);
+  // Junta com o que ja havia, sem duplicar, e mantem os melhores no topo.
+  const porChave = new Map();
+  if (!forcar) for (const c of _candidatos) porChave.set(c.chaveHistorico, c);
+  for (const c of novos) porChave.set(c.chaveHistorico, c);
+
+  _candidatos = [...porChave.values()]
+    .filter(c => !jaOfertado(c.chaveHistorico, cfg.repetirDias))
+    .sort((a, b) => (b.desconto - a.desconto) || (b.preco - a.preco))
+    .slice(0, 500);
+  _candidatosEm = Date.now();
+  salvarCandidatos();
+
+  console.log('[AWIN-OFERTAS] Varredura — ' + examinadas.length + ' loja(s), fila com '
+    + _candidatos.length + ' candidato(s).');
+  return { ok: true, examinadas, naFila: _candidatos.length };
+}
+
+/** Vagas disponiveis agora, considerando cota do dia, da rodada e da loja. */
+export function vagasAgora() {
+  const cfg = configOfertasAwin();
+  const uso = usoDeHoje();
+  const doDia = Math.max(0, cfg.maxDia - uso.total);
+  const daRodada = cfg.maxRodada > 0 ? cfg.maxRodada : cfg.maxDia;
+  return { cfg, uso, vagas: Math.min(doDia, daRodada) };
+}
+
+/** Janela de publicacao propria da Awin — independente da janela dos cupons. */
+export function dentroDaJanelaAwin(quando = new Date()) {
+  const cfg = configOfertasAwin();
+  const emSp = new Date(quando.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo' }));
+  const minutos = emSp.getHours() * 60 + emSp.getMinutes();
+  const paraMin = (hhmm, padrao) => {
+    const m = String(hhmm || '').match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) return padrao;
+    return Number(m[1]) * 60 + Number(m[2]);
+  };
+  const ini = paraMin(cfg.horaInicio, 8 * 60);
+  const fim = paraMin(cfg.horaFim, 20 * 60);
+  if (minutos < ini || minutos >= fim) {
+    return { ok: false, motivo: 'fora da janela de ofertas (' + cfg.horaInicio + '-' + cfg.horaFim + ')' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Retira da fila os proximos candidatos publicaveis agora.
+ * `simular` nao remove nada da fila nem gasta cota.
+ */
+export function proximosCandidatos({ simular = false } = {}) {
+  const { cfg, uso, vagas } = vagasAgora();
+  if (!simular && vagas <= 0) return { vagas: 0, escolhidos: [], motivo: 'cota do dia esgotada' };
+
+  // Candidato velho tem preco velho: melhor deixar vencer e esperar a proxima
+  // varredura do que anunciar valor que ja mudou na loja.
+  const limite = Date.now() - cfg.candidatoTtlHoras * 3600 * 1000;
+  if (_candidatosEm && _candidatosEm < limite) {
+    return { vagas, escolhidos: [], motivo: 'fila vencida — aguardando nova varredura' };
+  }
+
+  const escolhidos = [];
+  const usadosLoja = { ...uso.porLoja };
+  const quantos = simular ? (cfg.maxRodada || 1) : vagas;
+
+  for (const c of _candidatos) {
+    if (escolhidos.length >= quantos) break;
+    if ((usadosLoja[c.loja] || 0) >= cfg.maxLojaDia) continue;
+    if (jaOfertado(c.chaveHistorico, cfg.repetirDias)) continue;
+    escolhidos.push(c);
+    usadosLoja[c.loja] = (usadosLoja[c.loja] || 0) + 1;
+  }
+
+  if (!simular && escolhidos.length) {
+    const fora = new Set(escolhidos.map(c => c.chaveHistorico));
+    _candidatos = _candidatos.filter(c => !fora.has(c.chaveHistorico));
+    salvarCandidatos();
+  }
 
   return {
-    ok: true,
-    config: cfg,
-    usoHoje: uso,
-    vagasTotal,
-    lojasExaminadas: porLojaExaminada,
-    maxDia: cfg.maxDia,
-    maxRodada: cfg.maxRodada,
-    candidatos: selecionados,
-    descartadosPorCota: Math.max(0, candidatos.length - selecionados.length),
+    vagas, escolhidos,
+    motivo: escolhidos.length ? null
+      : (_candidatos.length ? 'nenhum candidato dentro do limite por loja' : 'fila vazia'),
   };
 }
