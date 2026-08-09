@@ -53,6 +53,7 @@ import {
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
   carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant, tenantContexto,
+  tokenDaReq, tenantPorEmail, tenantPorId, criarTenant, atualizarTenant,
 } from './tenants.js';
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
@@ -367,12 +368,20 @@ app.use(express.json({ limit: '50mb' }));
 // tenant padrao — comportamento identico ao anterior. Nas proximas fases a
 // origem passa a ser o token de sessao do login, e os modulos de dados leem
 // req.tenantId em vez de estado global.
-app.use((req, _res, next) => {
-  const t = resolverTenant(req);
-  req.tenantId = t ? t.id : TENANT_PADRAO;
+app.use((req, res, next) => {
+  // Fase 2.5: token do login por e-mail decide o operador. Sem token = raiz
+  // (superficie publica historica). Token invalido/expirado = 401 — jamais
+  // cair na raiz, para sessao vencida nao operar dados de outro.
+  const tk = tokenDaReq(req);
+  if (tk === false) {
+    return res.status(401).json({ ok:false, erro:'Sessao invalida ou expirada — faca login novamente.' });
+  }
+  const t = tk ? tenantPorEmail(tk.email) : tenantPorId(TENANT_PADRAO);
+  if (!t) return res.status(403).json({ ok:false, erro:'E-mail sem operador ativo no registro.' });
+  req.tenantId = t.id;
+  req.autenticado = !!tk;
   // Contexto assincrono: tudo que a requisicao tocar (mesmo apos awaits)
-  // enxerga o estado DESTE operador nos modulos de dados. Pipelines e workers
-  // fora de requisicao seguem no tenant padrao ate as fases 2.3/2.4.
+  // enxerga o estado DESTE operador nos modulos de dados.
   comContextoTenant(req.tenantId, next);
 });
 
@@ -2355,6 +2364,98 @@ iniciarTelegram().catch(err => {
   tgAuthState = 'erro';
 });
 
+// ── TELEGRAM POR OPERADOR (fase 2.4b) ────────────────────────────────────────
+// Cada operador conecta a PROPRIA conta do Telegram (app api_id/api_hash da
+// plataforma, compartilhado). A captura roda no contexto do dono da sessao:
+// config, links, fila, auto-envio e WhatsApp — tudo dele, com o isolamento de
+// envio da fase 2.4a garantindo que nada sai pelo numero de outro.
+const tgTenants = new Map();
+function tgEstadoTenant(id) {
+  if (!tgTenants.has(id)) tgTenants.set(id, {
+    id, client: null, conectado: false, authState: null, conta: null,
+    resolve: null, reject: null, erro: null, iniciando: false,
+  });
+  return tgTenants.get(id);
+}
+function tgSessionPathTenant(id) {
+  const dir = SESSAO_DIR + '/tenants/' + id;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return dir + '/telegram_session.txt';
+}
+
+async function iniciarTelegramTenant(tenantId) {
+  const st = tgEstadoTenant(tenantId);
+  if (st.iniciando || st.conectado) return st;
+  if (!TG_API_ID || !TG_API_HASH) { st.erro = 'app Telegram da plataforma nao configurado'; return st; }
+  st.iniciando = true; st.erro = null;
+  try {
+    const p = tgSessionPathTenant(tenantId);
+    const session = new StringSession(existsSync(p) ? readFileSync(p, 'utf-8').trim() : '');
+    const client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
+      connectionRetries: 5, receiveUpdates: true, floodSleepThreshold: 60,
+    });
+    st.client = client;
+    await client.start({
+      phoneNumber: () => new Promise((res, rej) => { st.authState = 'aguardando_telefone'; st.resolve = res; st.reject = rej; }),
+      phoneCode:   () => new Promise((res, rej) => { st.authState = 'aguardando_codigo';   st.resolve = res; st.reject = rej; }),
+      password:    () => new Promise((res, rej) => { st.authState = 'aguardando_senha';    st.resolve = res; st.reject = rej; }),
+      onError: (e) => { st.authState = 'erro'; st.erro = e.message; },
+    });
+    writeFileSync(p, client.session.save(), 'utf-8');
+    st.conectado = true; st.authState = 'ok';
+    st.conta = await client.getMe()
+      .then(u => ({ id: u.id?.toString(), username: u.username || null, phone: u.phone || null }))
+      .catch(() => null);
+    try { await client.getDialogs({ limit: 500 }); } catch {}
+    setInterval(async () => { try { await client.invoke(new Api.updates.GetState()); } catch {} }, 30000);
+
+    const vistos = new Map();
+    client.addEventHandler(async (event) => {
+      try {
+        const msg = event.message; if (!msg) return;
+        const texto = msg.message || ''; if (!texto.trim()) return;
+        const peerId = msg.peerId;
+        const cid = (peerId?.channelId ?? peerId?.chatId ?? peerId?.userId)?.toString();
+        const ent = await client.getEntity(peerId).catch(() => null);
+        const username = (ent?.username || '').toLowerCase();
+        const title    = (ent?.title    || '').toLowerCase();
+        // Blacklist do OPERADOR (config dele) + base do codigo.
+        const bloq = [...new Set([...TG_CANAIS_IGNORADOS_BASE, ...tgIgnoradosConfig(tenantId)])];
+        if (bloq.some(t => (/^\d+$/.test(t) && t === cid) || (t && (username.includes(t) || title.includes(t))))) return;
+        const k = cid + ':' + msg.id;
+        const agora = Date.now();
+        for (const [kk, ts] of vistos) if (agora - ts > 10 * 60 * 1000) vistos.delete(kk);
+        if (vistos.has(k)) return;
+        vistos.set(k, agora);
+        let imagemBase64 = null;
+        if (msg.media) {
+          try { const b = await client.downloadMedia(msg, {}); if (b) imagemBase64 = b.toString('base64'); } catch {}
+        }
+        console.log('[TG:' + tenantId + '] captura de "' + (username || title) + '": ' + texto.slice(0, 60));
+        await comContextoTenant(tenantId, () => processarMensagemTelegram(texto, username || title, imagemBase64));
+      } catch (e) { console.error('[TG:' + tenantId + '] erro no handler:', e.message); }
+    }, new NewMessage({}));
+    console.log('[TG:' + tenantId + '] conectado.');
+  } catch (e) {
+    st.erro = e.message; st.authState = 'erro';
+    console.error('[TG:' + tenantId + '] falha:', e.message);
+  }
+  st.iniciando = false;
+  return st;
+}
+
+// Boot: religa os operadores que ja tem sessao salva (15s apos subir, para o
+// resto do servidor estar de pe).
+setTimeout(() => {
+  for (const t of listarTenants()) {
+    if (t.id === TENANT_PADRAO || t.ativo === false) continue;
+    try {
+      const p = SESSAO_DIR + '/tenants/' + t.id + '/telegram_session.txt';
+      if (existsSync(p) && readFileSync(p, 'utf-8').trim()) iniciarTelegramTenant(t.id).catch(() => {});
+    } catch {}
+  }
+}, 15000);
+
 // ── GRUPOS COM REGRAS ESPECIAIS DE EXTRAÇÃO ───────────────────────────────────
 const GRUPO_APENAS_IMAGEM = '120363430801699326@g.us';
 const GRUPO_EXECUTIVA     = '120363410708080270@g.us';
@@ -3765,6 +3866,79 @@ async function conectar() {
 const PAINEL_CSS = `*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#0d0d0d;color:#f0f0f0;min-height:100vh}header{background:#111;border-bottom:1px solid #222;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}header h1{font-size:18px;color:#ffa500}header .nav a{color:#aaa;text-decoration:none;margin-left:16px;font-size:14px}header .nav a:hover{color:#ffa500}.container{max-width:960px;margin:0 auto;padding:24px 16px}.badge{background:#ffa500;color:#000;font-size:11px;font-weight:700;padding:2px 7px;border-radius:10px;margin-left:6px}.empty{text-align:center;color:#555;padding:60px 0;font-size:15px}.card{background:#161616;border:1px solid #222;border-radius:12px;margin-bottom:16px;overflow:hidden}.card-header{padding:12px 16px;background:#1a1a1a;border-bottom:1px solid #222;display:flex;align-items:center;gap:8px;font-size:13px;color:#aaa;flex-wrap:wrap}.card-header .id{color:#ffa500;font-weight:700;font-size:14px}.tag{background:#252525;padding:2px 8px;border-radius:6px;font-size:11px}.tag-iv{background:#1a2e1a;color:#22c55e}.tag-ida{background:#1a1f2e;color:#60a5fa}.tag-exec{background:#2e1a2e;color:#c084fc}.tag-eco{background:#1a2020;color:#67e8f9}.tag-tsp{background:#2e1a00;color:#ffa500}.card-body{display:grid;grid-template-columns:1fr 1fr}.col{padding:16px}.col+.col{border-left:1px solid #222}.col-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#444;margin-bottom:10px}.imgs-grid{display:flex;flex-wrap:wrap;gap:8px}.imgs-grid img{width:calc(50% - 4px);min-width:120px;border-radius:8px;object-fit:cover}.imgs-grid img:only-child{width:100%}.texto-orig{font-size:13px;color:#888;white-space:pre-wrap;word-break:break-word;margin-top:8px}.edit-area{width:100%;background:#0d0d0d;color:#f0f0f0;border:1px solid #2a2a2a;border-radius:8px;padding:12px;font-size:13px;font-family:inherit;line-height:1.7;resize:vertical;min-height:200px}.edit-area:focus{outline:none;border-color:#444}.card-footer{padding:12px 16px;border-top:1px solid #1a1a1a;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{padding:8px 20px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}.btn:hover{opacity:.8}.btn-ap{background:#22c55e;color:#000}.btn-rej{background:#333;color:#aaa}.ok-ap{color:#22c55e;font-size:13px}.ok-rej{color:#555;font-size:13px}.buffer-bar{background:#1a1400;border:1px solid #3a2e00;border-radius:8px;padding:10px 16px;font-size:13px;color:#ffa500;margin-bottom:16px}.sep{color:#333;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:28px 0 12px}.tg-bar{background:#0d1a2e;border:1px solid #1a3a5e;border-radius:8px;padding:10px 16px;font-size:13px;margin-bottom:16px;display:flex;align-items:center;gap:8px}.tg-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}.tg-dot-on{background:#22c55e}.tg-dot-off{background:#555}.tg-dot-wait{background:#ffa500}@media(max-width:600px){.card-body{grid-template-columns:1fr}.col+.col{border-left:none;border-top:1px solid #1a1a1a}.imgs-grid img{width:100%}}`;
 
 // ── ROTAS ─────────────────────────────────────────────────────────────────────
+
+// ── TELEGRAM DO OPERADOR (fase 2.4b) — API JSON para o painel ────────────────
+app.get('/tg/estado', (req, res) => {
+  if (req.tenantId === TENANT_PADRAO) {
+    return res.json({ ok:true, tenant:'tsp', conectado: tgConectado, authState: tgAuthState, conta: tgConta });
+  }
+  const st = tgEstadoTenant(req.tenantId);
+  res.json({ ok:true, tenant: req.tenantId, conectado: st.conectado, authState: st.authState, conta: st.conta, erro: st.erro });
+});
+
+app.post('/tg/conectar', (req, res) => {
+  if (req.tenantId === TENANT_PADRAO) {
+    return res.status(400).json({ ok:false, erro:'a conexao da operacao padrao usa /tg-auth' });
+  }
+  iniciarTelegramTenant(req.tenantId).catch(() => {});
+  res.json({ ok:true, mensagem:'Conectando — acompanhe /tg/estado e responda em /tg/auth quando pedir telefone/codigo.' });
+});
+
+app.post('/tg/auth', (req, res) => {
+  const valor = String(req.body?.valor || '').trim();
+  if (!valor) return res.status(400).json({ ok:false, erro:'valor vazio' });
+  if (req.tenantId === TENANT_PADRAO) {
+    if (!tgAuthResolve) return res.status(400).json({ ok:false, erro:'nenhuma autenticacao em andamento' });
+    tgAuthResolve(valor); tgAuthResolve = null; tgAuthReject = null;
+    return res.json({ ok:true });
+  }
+  const st = tgEstadoTenant(req.tenantId);
+  if (!st.resolve) return res.status(400).json({ ok:false, erro:'nenhuma autenticacao em andamento — chame /tg/conectar' });
+  const r = st.resolve; st.resolve = null; st.reject = null; st.authState = 'processando';
+  r(valor);
+  res.json({ ok:true });
+});
+
+app.delete('/tg/sessao', async (req, res) => {
+  if (req.tenantId === TENANT_PADRAO) {
+    return res.status(400).json({ ok:false, erro:'a sessao da operacao padrao nao e removida por aqui' });
+  }
+  const st = tgTenants.get(req.tenantId);
+  try { if (st?.client) await st.client.disconnect(); } catch {}
+  tgTenants.delete(req.tenantId);
+  try {
+    const p = SESSAO_DIR + '/tenants/' + req.tenantId + '/telegram_session.txt';
+    if (existsSync(p)) unlinkSync(p);
+  } catch {}
+  res.json({ ok:true });
+});
+
+// ── ADMINISTRACAO DO REGISTRO (fase 2.5) ─────────────────────────────────────
+// So a operacao padrao AUTENTICADA (token valido de e-mail da raiz) gerencia
+// operadores. A superficie publica sem token continua so com a leitura mascarada.
+function ehAdminRaiz(req) { return req.tenantId === TENANT_PADRAO && req.autenticado === true; }
+
+app.get('/tenants/admin', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'somente o administrador autenticado' });
+  res.json({ ok:true, tenants: listarTenants() });
+});
+
+app.post('/tenants', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'somente o administrador autenticado' });
+  try {
+    const t = criarTenant(req.body || {});
+    console.log('[TENANTS] Operador "' + t.id + '" criado pelo painel.');
+    res.json({ ok:true, tenant: t });
+  } catch (e) { res.status(400).json({ ok:false, erro: e.message }); }
+});
+
+app.patch('/tenants/:id', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'somente o administrador autenticado' });
+  try {
+    const t = atualizarTenant(String(req.params.id || ''), req.body || {});
+    res.json({ ok:true, tenant: t });
+  } catch (e) { res.status(400).json({ ok:false, erro: e.message }); }
+});
 
 app.get('/tg-auth', (req, res) => {
   const estado = tgAuthState;
