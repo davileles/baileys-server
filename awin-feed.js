@@ -27,8 +27,8 @@ const LISTA_PATH  = './sessao/awin_feedlist.json';
 // vazia em vez de erro, entao da para pedir o conjunto todo sempre.
 const COLUNAS = [
   'aw_deep_link', 'aw_image_url', 'merchant_product_id', 'product_name',
-  'merchant_deep_link', 'search_price', 'store_price', 'rrp_price', 'base_price',
-  'in_stock', 'brand_name',
+  'merchant_deep_link', 'search_price', 'product_price_old', 'store_price',
+  'rrp_price', 'base_price', 'in_stock', 'brand_name',
 ];
 
 let _lista = [];          // feeds ativos
@@ -70,7 +70,9 @@ function partirLinhaCsv(linha) {
   return campos;
 }
 
-function paraNumero(v) {
+// Os feeds misturam "144.99" e "144.99 BRL" na mesma coluna — sem tirar o
+// sufixo, Number() devolve NaN e o produto some do resultado.
+export function paraNumero(v) {
   if (!v) return null;
   const n = Number(String(v).replace(/[^\d.,-]/g, '').replace(',', '.'));
   return isFinite(n) && n > 0 ? n : null;
@@ -133,6 +135,10 @@ export async function atualizarFeedList(forcar = false) {
   } catch (e) { console.log('[AWIN-FEED] Falha ao gravar lista:', e.message); }
   console.log('[AWIN-FEED] Lista atualizada — ' + _lista.length + ' feed(s) ativo(s).');
   return _lista;
+}
+
+export function listarAnunciantesComFeed() {
+  return [..._porAnunciante.keys()];
 }
 
 export function feedsDoAnunciante(advertiserId) {
@@ -233,30 +239,43 @@ export async function buscarProdutoNoFeed(advertiserId, urlProduto) {
  * Traduz a linha do feed para o formato de produto do TSP.
  *
  * Preco e a parte delicada: a Awin nao impoe semantica igual para todo mundo.
- * Ha loja em que 'search_price' e o preco atual e ha loja (Centauro, por
- * exemplo) em que ele e o preco de lista e o promocional vai em 'base_price'.
- * Em vez de confiar num campo fixo, pega o menor como "por" e o maior como
- * "de" — o que da certo nas duas convencoes. A protecao contra preco unitario
- * (R$/kg em mercado) e a razao minima: diferenca acima de 70% e descartada em
- * vez de virar uma oferta boa demais para ser verdade.
+ *
+ * Quando a loja preenche 'product_price_old' (30 dos 62 feeds BR), a leitura e
+ * direta: 'search_price' e o preco atual e 'product_price_old' o de lista.
+ *
+ * Sem esse campo, sobra adivinhar — e ha loja (Centauro) em que 'search_price'
+ * e o preco de LISTA e o promocional vai em 'base_price', invertendo a
+ * convencao. Nesse caso pega o menor como "por" e o maior como "de", que
+ * acerta nos dois arranjos. A protecao contra preco unitario (R$/kg em
+ * mercado) e a razao minima: diferenca acima de 70% e descartada em vez de
+ * virar uma oferta boa demais para ser verdade.
  */
-function normalizarLinhaFeed(l, feed) {
-  const candidatos = [
-    paraNumero(l.search_price), paraNumero(l.store_price),
-    paraNumero(l.rrp_price), paraNumero(l.base_price),
-  ].filter(Boolean);
-  if (!candidatos.length) return null;
+export function normalizarLinhaFeed(l, feed) {
+  const atual  = paraNumero(l.search_price);
+  const antigo = paraNumero(l.product_price_old);
 
-  const menor = Math.min(...candidatos);
-  const maior = Math.max(...candidatos);
-  const preco   = menor;
-  const precoDe = (maior > menor && menor / maior >= 0.3) ? maior : null;
+  let preco = null, precoDe = null;
+  if (atual && antigo) {
+    preco   = Math.min(atual, antigo);
+    precoDe = Math.max(atual, antigo) > preco ? Math.max(atual, antigo) : null;
+  } else {
+    const candidatos = [
+      atual, paraNumero(l.store_price), paraNumero(l.rrp_price), paraNumero(l.base_price),
+    ].filter(Boolean);
+    if (!candidatos.length) return null;
+    const menor = Math.min(...candidatos);
+    const maior = Math.max(...candidatos);
+    preco   = menor;
+    precoDe = (maior > menor && menor / maior >= 0.3) ? maior : null;
+  }
+  if (!preco) return null;
 
   return {
     titulo: l.product_name || null,
     imagem: l.aw_image_url || null,
     preco,
     precoDe,
+    desconto: precoDe ? Math.round((1 - preco / precoDe) * 100) : 0,
     marca: l.brand_name || '',
     // in_stock vazio nao e o mesmo que zero: so o "0" explicito significa fora
     // de estoque, senao produto de feed sem a coluna seria sempre descartado.
@@ -268,6 +287,62 @@ function normalizarLinhaFeed(l, feed) {
     feedId: feed?.fid || null,
     feedAtualizadoEm: feed?.atualizadoEm || null,
   };
+}
+
+/**
+ * Varre um feed inteiro atras de produtos com desconto, ja deduplicados.
+ *
+ * Loja de moda repete a MESMA peca uma vez por tamanho e cor — o feed da Dafiti
+ * tem 308 mil linhas para um catalogo muito menor. Sem deduplicar por nome e
+ * preco, uma unica camiseta viraria seis ofertas identicas no grupo.
+ */
+export async function varrerFeedComDesconto(advertiserId, {
+  minPct = 60, minPreco = 100, maxPreco = null, limite = 200,
+} = {}) {
+  const feeds = feedsDoAnunciante(advertiserId);
+  if (!feeds.length) return [];
+  const feed = feeds[0];
+
+  let caminho;
+  try { caminho = await garantirFeedEmDisco(feed.fid); }
+  catch (e) { console.log('[AWIN-FEED] ' + e.message); return []; }
+
+  const rl = createInterface({ input: createReadStream(caminho).pipe(createGunzip()), crlfDelay: Infinity });
+  const vistos = new Set();
+  const achados = [];
+  let cab = null;
+
+  try {
+    for await (const linha of rl) {
+      if (!linha.trim()) continue;
+      if (!cab) { cab = partirLinhaCsv(linha).map(c => c.trim()); continue; }
+      const campos = partirLinhaCsv(linha);
+      const o = {}; cab.forEach((c, i) => { o[c] = campos[i] ?? ''; });
+      if (String(o.in_stock).trim() === '0') continue;
+
+      const p = normalizarLinhaFeed(o, feed);
+      if (!p || !p.precoDe || p.desconto < minPct) continue;
+      if (p.preco < minPreco) continue;
+      if (maxPreco && p.preco > maxPreco) continue;
+
+      // Alem de tamanho, a mesma peca aparece uma vez por COR ("Tenis Colcci
+      // Marrom" e "... Preto"). Tirar a cor do fim do nome junta as variantes
+      // em uma oferta so.
+      const chave = String(p.titulo || '').toLowerCase()
+        .replace(/\s+/g, ' ').trim()
+        .replace(/\b(preto|preta|branco|branca|azul|vermelho|vermelha|verde|amarelo|amarela|rosa|cinza|bege|marrom|roxo|roxa|laranja|dourado|dourada|prata|nude|vinho|caramelo|off white|multicolorido)\b\s*$/, '')
+        .trim() + '|' + p.preco.toFixed(2);
+      if (vistos.has(chave)) continue;
+      vistos.add(chave);
+
+      achados.push({ ...p, anunciante: feed.anunciante, advertiserId: Number(advertiserId), chave });
+    }
+  } finally { rl.close(); }
+
+  // Melhores primeiro: a cota diaria vai cortar a lista, entao o que sobra tem
+  // de ser o topo, nao o comeco do arquivo.
+  achados.sort((a, b) => (b.desconto - a.desconto) || (b.preco - a.preco));
+  return achados.slice(0, limite);
 }
 
 /** Primeiras linhas de um feed, para conferir na mao qual coluna traz o preco. */
