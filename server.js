@@ -53,6 +53,7 @@ import {
   listarProgramasAwin, programaAwinPorLoja, programaAwinPorUrl, linkAwinDaLoja,
   gerarLinkAwin, quotaLinkAwin, buscarOfertasAwin, normalizarOfertaAwin,
   estadoAwin, ehLinkAwin, processarTextoAwin, limparUrlAwin, extrairProdutoAwin,
+  resolverLinhaVitrineAwin, montarOfertasAwinVitrine, ttlPrecoAwin,
 } from './radar-awin.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
@@ -4800,6 +4801,8 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
     montado = await montarOfertasMlVitrine([item], codigoCupom);
   } else if (item.loja === 'Magazine Luiza') {
     montado = await montarOfertasMagaluVitrine([item], codigoCupom);
+  } else if (String(item.asin).startsWith('AWIN-')) {
+    montado = await montarOfertasAwinVitrine([item], codigoCupom);
   } else {
     montado = await montarOfertasVitrine([asin], codigoCupom);
   }
@@ -4811,7 +4814,8 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
     id: gerarId(), origem:'lista',
     tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
                 : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
-                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu'
+                : String(o.asin || '').startsWith('AWIN-') ? 'oferta_awin' : 'oferta_amazon',
     mensagemFormatada: o.mensagem,
     dadosExtraidos: {
       loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
@@ -5096,6 +5100,16 @@ app.post('/vitrine', async (req, res) => {
         salvos.push({ ...salvarItemVitrine({ ...rml, cupom }), jaExistia: jaTinhaMl });
         continue;
       }
+      // Rede Awin: qualquer anunciante afiliado. Vem antes do fallback da
+      // Amazon, que so deve receber o que nenhuma outra loja reconheceu.
+      if (ehLinkAwin(linha)) {
+        const raw = await resolverLinhaVitrineAwin(linha);
+        if (!raw || raw.erro) { erros.push({ linha, erro: raw?.erro || 'falhou' }); continue; }
+        const jaTinhaAw = !!itemVitrine(raw.asin);
+        salvos.push({ ...salvarItemVitrine({ ...raw, cupom }), jaExistia: jaTinhaAw,
+          aviso: raw.precoManual ? 'preco informado a mao — a loja bloqueou a leitura automatica' : null });
+        continue;
+      }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
@@ -5175,7 +5189,8 @@ app.post('/vitrine/disparar', async (req, res) => {
       id: gerarId(), origem:'vitrine',
       tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
                 : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
-                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu'
+                : String(o.asin || '').startsWith('AWIN-') ? 'oferta_awin' : 'oferta_amazon',
       mensagemFormatada: o.mensagem,
       dadosExtraidos: {
         loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
