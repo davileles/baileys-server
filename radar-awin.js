@@ -353,6 +353,7 @@ import {
   melhorCupomAplicavel, cupomPorCodigo, cupomVigente, calcularDesconto,
 } from './radar-amazon.js';
 import { createHash } from 'crypto';
+import { credenciaisFeedOk, buscarProdutoNoFeed } from './awin-feed.js';
 
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
   + 'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
@@ -412,8 +413,31 @@ function produtoJsonLd(html) {
   return null;
 }
 
-/** Le a pagina do produto e devolve o que conseguiu extrair (nunca inventa). */
-export async function extrairProdutoAwin(url) {
+/**
+ * Dados do produto. A pagina da loja e a fonte primaria — e o preco que o
+ * cliente vai ver no checkout. So quando ela nao responde (403 de datacenter) ou
+ * nao expoe preco legivel e que entra o product feed, que vem marcado com
+ * fonte:'feed' para a mensagem sair como preco de referencia.
+ */
+export async function extrairProdutoAwin(url, advertiserId = null) {
+  const daPagina = await lerPaginaProduto(url);
+  if (daPagina.preco) return daPagina;
+
+  if (advertiserId && credenciaisFeedOk()) {
+    try {
+      const doFeed = await buscarProdutoNoFeed(advertiserId, url);
+      if (doFeed?.preco) {
+        console.log('[AWIN] Preco de ' + url.slice(0, 60) + ' veio do feed (pagina: '
+          + (daPagina.erro || 'sem preco') + ').');
+        return { ...doFeed, titulo: doFeed.titulo || daPagina.titulo,
+                 imagem: doFeed.imagem || daPagina.imagem };
+      }
+    } catch (e) { console.log('[AWIN-FEED] Falha na consulta:', e.message); }
+  }
+  return daPagina;
+}
+
+async function lerPaginaProduto(url) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 20000);
   let html;
@@ -480,15 +504,19 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
     vistos.add(url);
 
     const loja = String(prog.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
-    const dados = await extrairProdutoAwin(url);
+    const dados = await extrairProdutoAwin(url, prog.id);
 
-    let link = null;
-    try {
-      const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref });
-      link = l.shortUrl || l.url;
-    } catch (e) {
-      link = deeplinkAwin(prog.id, url, clickref);
-      console.log('[AWIN] Deeplink manual para ' + loja + ': ' + e.message);
+    // O feed ja traz o link de afiliado pronto: usar o dele poupa uma chamada e
+    // a quota diaria de shortlinks.
+    let link = dados.linkAfiliado || null;
+    if (!link) {
+      try {
+        const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref });
+        link = l.shortUrl || l.url;
+      } catch (e) {
+        link = deeplinkAwin(prog.id, url, clickref);
+        console.log('[AWIN] Deeplink manual para ' + loja + ': ' + e.message);
+      }
     }
 
     if (dados.erro || !dados.preco) {
@@ -517,6 +545,8 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
       vendedor: null, marca: dados.marca || '', nota: null, avaliacoes: null,
       dealTermina: null, ehDeal: false,
       loja,
+      // Preco de feed pode estar algumas horas atras do site.
+      precoDeReferencia: dados.fonte === 'feed',
     };
 
     const cupom = melhorCupom(loja, p.preco, texto);
@@ -525,6 +555,7 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
       cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto,
                        citado: cupom.citado, generico: !!cupom.generico } : null,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      precoDeReferencia: dados.fonte === 'feed',
       mensagem: formatarOfertaAwin(p, { cupom }),
     });
   }
@@ -576,15 +607,17 @@ export async function resolverLinhaVitrineAwin(linha) {
     .replace(/R\$\s*\d+(?:[.,]\d{2})?/gi, ' ')
     .replace(/[|;]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
 
-  // Leitura da pagina: se der, ja entra com nome e preco reais.
-  const lido = await extrairProdutoAwin(urlProduto);
+  // Pagina primeiro, feed como plano B.
+  const lido = await extrairProdutoAwin(urlProduto, prog.id);
 
-  let link;
-  try {
-    const l = await gerarLinkAwin({ url: urlProduto, advertiserId: prog.id });
-    link = l.shortUrl || l.url;
-  } catch (e) {
-    link = deeplinkAwin(prog.id, urlProduto);
+  let link = lido.linkAfiliado || null;
+  if (!link) {
+    try {
+      const l = await gerarLinkAwin({ url: urlProduto, advertiserId: prog.id });
+      link = l.shortUrl || l.url;
+    } catch (e) {
+      link = deeplinkAwin(prog.id, urlProduto);
+    }
   }
 
   const nome = nomeManual || lido.titulo || (loja + ' — produto');
@@ -611,11 +644,13 @@ export async function montarOfertasAwinVitrine(itens, codigoCupom = null) {
 
   for (const salvo of itens) {
     const loja = salvo.loja || 'Awin';
-    const lido = salvo.urlProduto ? await extrairProdutoAwin(salvo.urlProduto) : { erro: 'sem url de produto' };
+    const lido = salvo.urlProduto
+      ? await extrairProdutoAwin(salvo.urlProduto, salvo.advertiserId)
+      : { erro: 'sem url de produto' };
 
     let preco = lido.preco || null;
     let precoDe = lido.precoDe || null;
-    let precoDeReferencia = false;
+    let precoDeReferencia = lido.fonte === 'feed';
 
     if (!preco) {
       // Leitura falhou: cai para o preco do cadastro, mas so dentro do prazo —
