@@ -19,7 +19,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { varrerFeedComDesconto, listarAnunciantesComFeed, credenciaisFeedOk } from './awin-feed.js';
+import {
+  varrerFeedComDesconto, listarAnunciantesComFeed, credenciaisFeedOk, atualizarFeedList,
+} from './awin-feed.js';
 
 const OFERTADOS_PATH = './sessao/awin_ofertados.json';
 const CONFIG_PATH    = './sessao/awin_config.json';
@@ -216,8 +218,21 @@ export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
   if (!credenciaisFeedOk()) return { ok: false, erro: 'AWIN_FEED_APIKEY nao configurada' };
   const cfg = configOfertasAwin();
 
-  const ids = cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : listarAnunciantesComFeed();
-  if (!ids.length) return { ok: false, erro: 'nenhum feed ativo — atualize a lista de feeds' };
+  // A lista de feeds so e baixada no boot. Credencial colada pelo painel depois
+  // disso deixava o indice vazio e a varredura falhava pedindo uma "atualizacao"
+  // que o operador nao tinha como disparar — agora ela se resolve sozinha.
+  let ids = cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : listarAnunciantesComFeed();
+  if (!ids.length) {
+    try {
+      await atualizarFeedList(true);
+      ids = cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : listarAnunciantesComFeed();
+    } catch (e) {
+      return { ok: false, erro: 'nao foi possivel baixar a lista de feeds: ' + e.message };
+    }
+  }
+  if (!ids.length) {
+    return { ok: false, erro: 'a Awin nao devolveu nenhum catalogo para esta conta — confira a API key dos feeds' };
+  }
 
   // Fatia rotativa: varrer 50 feeds de uma vez estouraria o tempo da rodada, e
   // sem rotacao as ultimas lojas da lista nunca seriam olhadas.
