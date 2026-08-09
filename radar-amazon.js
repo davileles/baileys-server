@@ -1426,6 +1426,15 @@ export function salvarItemVitrine(item) {
     // reconsultar o preco no instante do disparo.
     urlProduto: item.urlProduto || anterior?.urlProduto || null,
     advertiserId: item.advertiserId || anterior?.advertiserId || null,
+    // Preco de cadastro. Magalu e Awin usam isto como plano B quando a loja
+    // bloqueia a releitura no disparo — e o campo nunca era gravado, entao o
+    // plano B nunca existiu: o item era sempre descartado pedindo um preco que
+    // nao havia como informar. 'precoEm' data o valor para o TTL poder vencê-lo.
+    preco:   item.preco   !== undefined ? (item.preco   === null ? null : Number(item.preco))   : (anterior?.preco   ?? null),
+    precoDe: item.precoDe !== undefined ? (item.precoDe === null ? null : Number(item.precoDe)) : (anterior?.precoDe ?? null),
+    precoEm: item.preco !== undefined && item.preco !== null
+      ? (item.precoEm || new Date().toISOString())
+      : (anterior?.precoEm || null),
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
