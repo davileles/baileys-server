@@ -350,7 +350,9 @@ export function normalizarOfertaAwin(oferta) {
 
 import {
   templateDaLoja, renderTemplate, varsDoProduto, melhorCupom,
+  melhorCupomAplicavel, cupomPorCodigo, cupomVigente, calcularDesconto,
 } from './radar-amazon.js';
+import { createHash } from 'crypto';
 
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
   + 'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
@@ -527,4 +529,162 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
     });
   }
   return saida;
+}
+
+// ── VITRINE — REDE AWIN ──────────────────────────────────────────────────────
+// A vitrine guarda o produto e so consulta o preco na hora do disparo, para
+// nunca anunciar valor velho. Aqui isso e possivel na maioria das lojas (a
+// pagina e publica), mas nem sempre: quando a loja bloqueia leitura automatica
+// o preco informado no cadastro vale por um prazo, como na Magalu.
+
+/** Horas que um preco informado a mao continua valendo. */
+export function ttlPrecoAwin() {
+  const h = Number(process.env.AWIN_PRECO_TTL_H);
+  return isFinite(h) && h > 0 ? h : 24;
+}
+
+function precosDaLinha(texto) {
+  const achados = [...String(texto || '').matchAll(/R?\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[.,]\d{2})/gi)]
+    .map(m => paraNumero(m[1])).filter(Boolean);
+  if (!achados.length) return { preco: null, precoDe: null };
+  if (achados.length === 1) return { preco: achados[0], precoDe: null };
+  const ordenados = [...achados].sort((a, b) => a - b);
+  return { preco: ordenados[0], precoDe: ordenados[ordenados.length - 1] };
+}
+
+/**
+ * Cadastro na vitrine. Aceita "Nome do produto | https://... | R$ 99,90":
+ * nome e preco escritos a mao servem de rede de seguranca para as lojas que
+ * respondem 403 a leitura automatica.
+ */
+export async function resolverLinhaVitrineAwin(linha) {
+  const bruto = String(linha || '').trim();
+  if (!bruto) return null;
+
+  const m = bruto.match(/https?:\/\/[^\s|;]+/);
+  if (!m) return { erro: 'sem link', linha: bruto };
+  const urlProduto = limparUrlAwin(m[0].replace(/[)\]}.,;!]+$/, ''));
+
+  const prog = programaAwinPorUrl(urlProduto);
+  if (!prog) return { erro: 'loja nao esta entre os anunciantes afiliados da Awin', linha: bruto };
+  const loja = String(prog.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+
+  const resto = bruto.replace(m[0], ' ');
+  const manual = precosDaLinha(resto);
+  const nomeManual = resto
+    .replace(/R?\$?\s*\d{1,3}(?:\.\d{3})*,\d{2}/gi, ' ')
+    .replace(/R\$\s*\d+(?:[.,]\d{2})?/gi, ' ')
+    .replace(/[|;]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140);
+
+  // Leitura da pagina: se der, ja entra com nome e preco reais.
+  const lido = await extrairProdutoAwin(urlProduto);
+
+  let link;
+  try {
+    const l = await gerarLinkAwin({ url: urlProduto, advertiserId: prog.id });
+    link = l.shortUrl || l.url;
+  } catch (e) {
+    link = deeplinkAwin(prog.id, urlProduto);
+  }
+
+  const nome = nomeManual || lido.titulo || (loja + ' — produto');
+  const preco = lido.preco ?? manual.preco ?? null;
+
+  return {
+    asin: 'AWIN-' + prog.id + '-' + createHash('sha1').update(urlProduto).digest('hex').slice(0, 10),
+    nome,
+    url: link,
+    urlProduto,
+    advertiserId: prog.id,
+    loja,
+    preco,
+    precoDe: lido.precoDe ?? manual.precoDe ?? null,
+    // Avisa o painel quando o preco veio da linha, nao da loja.
+    precoManual: !lido.preco && manual.preco ? true : false,
+  };
+}
+
+/** Monta as mensagens do disparo, reconsultando o preco quando possivel. */
+export async function montarOfertasAwinVitrine(itens, codigoCupom = null) {
+  const prontos = [], descartados = [];
+  const ttlMs = ttlPrecoAwin() * 3600 * 1000;
+
+  for (const salvo of itens) {
+    const loja = salvo.loja || 'Awin';
+    const lido = salvo.urlProduto ? await extrairProdutoAwin(salvo.urlProduto) : { erro: 'sem url de produto' };
+
+    let preco = lido.preco || null;
+    let precoDe = lido.precoDe || null;
+    let precoDeReferencia = false;
+
+    if (!preco) {
+      // Leitura falhou: cai para o preco do cadastro, mas so dentro do prazo —
+      // anunciar preco vencido e o risco real de uma vitrine.
+      if (!salvo.preco) {
+        descartados.push({ asin: salvo.asin, nome: salvo.nome,
+          motivo: (lido.erro || 'a loja nao expoe o preco') + ' — informe o preco na vitrine' });
+        continue;
+      }
+      const idade = salvo.precoEm ? Date.now() - new Date(salvo.precoEm).getTime() : Infinity;
+      if (idade > ttlMs) {
+        const horas = isFinite(idade) ? Math.round(idade / 3600000) : null;
+        descartados.push({ asin: salvo.asin, nome: salvo.nome,
+          motivo: 'preco informado ha ' + (horas != null ? horas + 'h' : 'tempo desconhecido')
+                + ' (limite ' + ttlPrecoAwin() + 'h) e a loja bloqueou a releitura — reconfirme antes de disparar' });
+        continue;
+      }
+      preco = Number(salvo.preco);
+      precoDe = salvo.precoDe && salvo.precoDe > preco ? Number(salvo.precoDe) : null;
+      precoDeReferencia = true;
+    }
+
+    if (lido.disponivel === false) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'produto indisponivel na loja' });
+      continue;
+    }
+
+    const p = {
+      asin: salvo.asin,
+      codigo: salvo.urlProduto || salvo.asin,
+      titulo: salvo.nome || lido.titulo || '',
+      preco, precoDe,
+      precoTexto: 'R$ ' + preco.toFixed(2).replace('.', ','),
+      precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
+      desconto: precoDe && precoDe > preco ? Math.round((1 - preco / precoDe) * 100) : 0,
+      disponivel: true,
+      link: salvo.url,
+      imagemUrl: lido.imagem || null,
+      vendedor: null, marca: lido.marca || '', nota: null, avaliacoes: null,
+      dealTermina: null, ehDeal: false,
+      loja,
+      precoDeReferencia,
+    };
+
+    const codigo = codigoCupom || salvo.cupom || null;
+    let cupom = null, avisoCupom = null;
+    if (codigo === 'auto') {
+      const mc = melhorCupomAplicavel(loja, preco);
+      if (mc) cupom = { reg: mc.reg, desconto: mc.desconto, citado: true };
+      else avisoCupom = 'nenhum cupom de ' + loja + ' vigente se aplica a este preco';
+    } else if (codigo) {
+      const reg = cupomPorCodigo(loja, codigo);
+      if (!reg)                    avisoCupom = 'cupom ' + codigo + ' nao esta na base (' + loja + ')';
+      else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
+      else {
+        const desconto = calcularDesconto(reg, preco);
+        if (desconto > 0) cupom = { reg, desconto, citado: true };
+        else avisoCupom = 'cupom ' + codigo + ' nao se aplica a este preco';
+      }
+    }
+
+    prontos.push({
+      asin: salvo.asin, nome: salvo.nome || p.titulo, produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+      avisoCupom,
+      precoFinal: cupom ? Math.max(0, preco - cupom.desconto) : preco,
+      precoDeReferencia,
+      mensagem: formatarOfertaAwin(p, { cupom }),
+    });
+  }
+  return { prontos, descartados };
 }
