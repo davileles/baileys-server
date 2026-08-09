@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
-import { rodapeOferta, credencialTsp } from './config-tsp.js';
+import { rodapeOferta, rodapeCupom, credencialTsp } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -1012,6 +1012,37 @@ function templatePadrao() {
   return linhas.join('\n');
 }
 
+// Template das mensagens de CUPOM. Ate aqui o formato do cupom era codigo fixo
+// no server.js, entao o auto-envio do monitoramento e a aba Cupom do painel
+// tinham cada um a sua copia do mesmo layout — e elas divergiam. Agora as duas
+// renderizam ESTE corpo, editavel na aba Templates.
+//
+// O rodape faz parte do CORPO, como no template de oferta: o operador edita a
+// mensagem inteira num lugar so. O campo "Rodape dos CUPONS" da aba
+// Configuracoes e a semente deste corpo na primeira execucao.
+function templateCupomPadrao() {
+  const linhas = [
+    '`\uD83D\uDEA8 {{gatilho}}`',
+    '',
+    '*\uD83D\uDEA8 Cupom de {{valor_str}} - {{loja}}*',
+    '',
+    '{{validade}}',
+    '',
+    '\uD83D\uDED2 *LOJA* {{loja_upper}}',
+    '',
+    '\uD83C\uDFF7\uFE0F *CUPOM* {{codigo}}',
+    '',
+    '\u26A0\uFE0F *IMPORTANTE* {{importante}}',
+    '',
+    '\u26A0\uFE0F *IMPORTANTE* {{aviso}}',
+    '',
+    '\uD83D\uDD17 *RESGATE O CUPOM AQUI* {{link}}',
+  ];
+  const r = rodapeCupom(tenantAtual());
+  if (r) linhas.push('', r);
+  return linhas.join('\n');
+}
+
 // Corpo da versao anterior, que exigia {{#var}}...{{/var}}. Serve so para
 // reconhecer o padrao nao editado e migra-lo para a sintaxe simples — template
 // que o operador ja customizou nao e tocado.
@@ -1024,16 +1055,38 @@ const TEMPLATE_PADRAO_LEGADO = [
 ].join('\n');
 
 
+// Chaves reservadas: templates que nao pertencem a loja nenhuma. Sem este mapa
+// '_padrao' virava 'padrao' (o replace come o underline) e o template salvo
+// pelo painel ia parar num registro que nenhuma leitura consultava.
+//   _padrao  fallback das ofertas de marketplace
+//   _cupom   mensagem de cupom (auto-envio + aba Cupom)
+//   _awin    ofertas vindas da rede Awin, quando a loja nao tem template proprio
+const TPL_RESERVADOS = { padrao: '_padrao', cupom: '_cupom', awin: '_awin' };
+
 function chaveLoja(loja) {
-  return (loja || '')
+  const k = (loja || '')
     .toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9]/g, '') || '_padrao';
+  return TPL_RESERVADOS[k] || k;
 }
 
 export function carregarTemplates() {
   try {
     if (existsSync(cT('templates.json'))) E().templates = JSON.parse(readFileSync(cT('templates.json'), 'utf-8'));
   } catch (e) { console.log('[TPL] Erro ao carregar templates:', e.message); E().templates = {}; }
+  // Migracao do bug da chave: 'padrao' (sem underline) era onde o painel
+  // gravava, '_padrao' era o que o pipeline lia. Quem estiver mais novo vence —
+  // salvar no painel e nao ver efeito nenhum era o sintoma.
+  const orfao = E().templates.padrao;
+  if (orfao) {
+    const dPadrao = new Date(orfao.atualizadoEm || 0).getTime() || 0;
+    const dReal   = new Date((E().templates._padrao || {}).atualizadoEm || 0).getTime() || 0;
+    if (!E().templates._padrao || dPadrao > dReal) E().templates._padrao = orfao;
+    delete E().templates.padrao;
+    salvarTemplates();
+    console.log('[TPL] Chave orfa \'padrao\' migrada para \'_padrao\'.');
+  }
+
   // Semeia o padrao na primeira execucao para o operador ter de onde partir.
   if (!E().templates._padrao) {
     E().templates._padrao = { nome: 'Padrão', corpo: templatePadrao(), usarLinkPreview: true,
@@ -1044,6 +1097,18 @@ export function carregarTemplates() {
     E().templates._padrao.atualizadoEm = new Date().toISOString();
     salvarTemplates();
     console.log('[TPL] Padrao migrado para a sintaxe sem condicionais.');
+  }
+  // Cupom e Awin nascem com o layout que o codigo usava antes de virarem
+  // template, para ligar a novidade sem mudar nenhuma mensagem no ar.
+  if (!E().templates._cupom) {
+    E().templates._cupom = { nome: 'Cupom', corpo: templateCupomPadrao(), usarLinkPreview: false,
+                             atualizadoEm: new Date().toISOString() };
+    salvarTemplates();
+  }
+  if (!E().templates._awin) {
+    E().templates._awin = { nome: 'Awin', corpo: (E().templates._padrao.corpo || templatePadrao()),
+                            usarLinkPreview: true, atualizadoEm: new Date().toISOString() };
+    salvarTemplates();
   }
   console.log('[TPL] ' + Object.keys(E().templates).length + ' template(s) carregado(s).');
   return E().templates;
@@ -1059,6 +1124,22 @@ export function listarTemplates() { return E().templates; }
 
 export function templateDaLoja(loja) {
   return E().templates[chaveLoja(loja)] || E().templates._padrao;
+}
+
+/** Template proprio da loja, SEM cair no padrao. Quem precisa saber se a loja
+ *  tem layout dedicado (a Awin, para decidir entre o dela e o da loja). */
+export function templateProprioDaLoja(loja) {
+  return E().templates[chaveLoja(loja)] || null;
+}
+
+/** Corpo das mensagens de cupom. Sempre devolve algo renderizavel. */
+export function templateCupom() {
+  return E().templates._cupom || { nome: 'Cupom', corpo: templateCupomPadrao() };
+}
+
+/** Corpo das ofertas da rede Awin. Cai no padrao das ofertas se nao existir. */
+export function templateAwin() {
+  return E().templates._awin || E().templates._padrao || { nome: 'Awin', corpo: templatePadrao() };
 }
 
 export function salvarTemplate(loja, dados = {}) {
@@ -1171,6 +1252,23 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'avaliacao',     desc:'Nota média (ex: 4,5)' },
   { chave:'avaliacoes',    desc:'Quantidade de avaliações' },
   { chave:'asin',          desc:'Código ASIN do produto' },
+];
+
+/** Variaveis do template de CUPOM (a UI monta os botoes a partir daqui). */
+export const VARIAVEIS_CUPOM = [
+  { chave:'valor_str',  desc:'Desconto ja formatado — ex: "15%" ou "20 reais"' },
+  { chave:'valor',      desc:'Só o número do desconto' },
+  { chave:'loja',       desc:'Nome da loja' },
+  { chave:'loja_upper', desc:'Nome da loja em maiúsculas' },
+  { chave:'validade',   desc:'Frase das condições (mínimo, teto de produto, teto de desconto)' },
+  { chave:'codigo',     desc:'Código do cupom (vazio quando é cupom sem código)' },
+  { chave:'importante', desc:'Aviso calculado do teto — ex: "Ideal para compras de até R$ 400."' },
+  { chave:'aviso',      desc:'Observação livre digitada na aba Cupom' },
+  { chave:'gatilho',    desc:'Chamada opcional no topo da mensagem' },
+  { chave:'link',       desc:'Link de afiliado de resgate do cupom' },
+  { chave:'minimo',     desc:'Valor mínimo de compra, só o número' },
+  { chave:'maximo',     desc:'Teto de preço do produto elegível, só o número' },
+  { chave:'limite',     desc:'Teto de desconto em R$, só o número' },
 ];
 
 // ── PIPELINE ──────────────────────────────────────────────────────────────
