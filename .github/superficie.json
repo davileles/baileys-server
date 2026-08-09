@@ -235,6 +235,7 @@
         "export function cookieAff",
         "export function credenciaisMlOk",
         "export function ehLinkMl",
+        "export function estadoApiPrecosMl",
         "export function estadoMl",
         "export function formatarOfertaMl",
         "export function idDeUrl",
@@ -316,6 +317,21 @@
         "export function resolverTenant",
         "export function tenantPorEmail",
         "export function tenantPorId"
+      ]
+    },
+    "preco-de.js": {
+      "minLinhas": 220,
+      "obrigatorio": [
+        "export function descontoDeclaradoNoHtml",
+        "export function fonteVerificada",
+        "export function numeroBr",
+        "export function numeroJson",
+        "export function numeroPartes",
+        "export function precoDeDoDom",
+        "export function precoDeDoEstado",
+        "export function precoDeDoLd",
+        "export function resolverPrecoDe",
+        "export function validarPrecoDe"
       ]
     }
   }
