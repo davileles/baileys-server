@@ -52,7 +52,7 @@ import {
 
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
-  carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant,
+  carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant, tenantContexto,
 } from './tenants.js';
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
@@ -672,6 +672,33 @@ const CONTAS_DIR = SESSAO_DIR + '/contas';
 
 const contasExtras = new Map();
 
+// ── CONTAS POR OPERADOR (fase 2.4a) ──────────────────────────────────────────
+// A conta WhatsApp de um operador e uma conta secundaria com id interno
+// 't-<tenant>-<apelido>'. Os endpoints traduzem o apelido pelo tenant da
+// requisicao — o operador so enxerga o proprio apelido, e nao consegue
+// enderecar conta de outro. A operacao padrao segue sem prefixo: ids, pastas
+// de credenciais e escala historicos ficam intactos.
+const RE_CONTA_TENANT = /^t-([a-z0-9][a-z0-9-]{1,30})-([a-z0-9_-]{2,24})$/i;
+function contaIdDe(tenantId, apelido) {
+  return (!tenantId || tenantId === TENANT_PADRAO) ? apelido : 't-' + tenantId + '-' + apelido;
+}
+function tenantDaConta(id) {
+  const m = RE_CONTA_TENANT.exec(String(id || ''));
+  return m ? m[1].toLowerCase() : TENANT_PADRAO;
+}
+function apelidoDaConta(id) {
+  const m = RE_CONTA_TENANT.exec(String(id || ''));
+  return m ? m[2] : String(id || '');
+}
+function contaIdReq(req) { return contaIdDe(req.tenantId, String(req.params.id || '').trim()); }
+// Primeira conta conectada de um operador — o "numero dele" para envio.
+function contaConectadaDoTenant(tenantId) {
+  for (const c of contasExtras.values()) {
+    if (tenantDaConta(c.id) === tenantId && c.conectado && c.sock) return c.id;
+  }
+  return null;
+}
+
 function estadoConta(id) {
   if (!contasExtras.has(id)) {
     contasExtras.set(id, {
@@ -762,6 +789,21 @@ async function enviarPelaConta(id, destino, conteudo) {
 }
 
 async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
+  // ── Operador nao-padrao (fase 2.4a): envio SO pela conta DELE. O fallback
+  // para a principal (logo abaixo) vale apenas dentro da operacao padrao —
+  // cair nela aqui mandaria conteudo de um operador pelo numero de outro, a
+  // pior falha possivel do modelo hospedado. Sem conta conectada: falha alto.
+  const tidEnvio = tenantContexto() || TENANT_PADRAO;
+  if (tidEnvio !== TENANT_PADRAO) {
+    const pedida = (opcoes.conta && opcoes.conta !== 'principal')
+      ? contaIdDe(tidEnvio, apelidoDaConta(opcoes.conta)) : null;
+    const alvo = (pedida && contaDisponivel(pedida)) ? pedida : contaConectadaDoTenant(tidEnvio);
+    if (!alvo) {
+      throw new Error('WhatsApp do operador "' + tidEnvio + '" nao esta conectado — pareie uma conta na aba Conexao.');
+    }
+    return enviarPelaConta(alvo, destino, conteudo);
+  }
+
   // Conta escolhida pela escala de turnos. Falha ou indisponibilidade cai na
   // principal em vez de abortar: a mensagem sair pelo numero "errado" e menos
   // grave do que nao sair.
@@ -1959,6 +2001,7 @@ async function enfileirarCupomTSP(c, ctx = {}) {
     mensagemFormatada,
     dadosExtraidos: c,
     status: 'pendente',
+    tenant: tenantContexto() || TENANT_PADRAO,
   };
 
   // Verificar deduplicação: ignorar se o mesmo cupom já foi visto recentemente
@@ -3050,7 +3093,8 @@ async function processarBuffer(grupoId) {
         imagens: imagensFinal,
         mensagemFormatada: mensagemComHist,
         dadosExtraidos: emissao,
-        status: 'pendente'
+        status: 'pendente',
+        tenant: tenantContexto() || TENANT_PADRAO,
       };
       // Aguarda par ida/volta de buffer diferente (até 5 min)
       const parEsperando = await aguardarParIdaVolta(oferta, grupoId);
@@ -3318,6 +3362,7 @@ async function processarRadarMarketplace(jid, texto) {
       grupoOrigem: jid,
       grupoOrigemNome: (NOMES_GRUPOS.get(jid) || null),
       status: 'pendente',
+      tenant: tenantContexto() || TENANT_PADRAO,
       timestamp: new Date().toISOString(),
     };
 
@@ -3789,13 +3834,19 @@ app.get('/qr', (req, res) => {
 
 // ── CONTAS SECUNDARIAS ───────────────────────────────────────────────────────
 app.get('/contas', (req, res) => {
-  const extras = [...contasExtras.values()].map(c => ({
-    id: c.id, conectado: c.conectado, conectando: c.conectando,
-    qrDisponivel: !!c.qr, ultimoEnvio: c.ultimoEnvio, ultimoErro: c.ultimoErro,
-  }));
+  // Cada operador ve SO as proprias contas (pelo apelido, sem o prefixo
+  // interno). O socket principal e da operacao padrao — operador novo nao o ve.
+  const extras = [...contasExtras.values()]
+    .filter(c => tenantDaConta(c.id) === req.tenantId)
+    .map(c => ({
+      id: apelidoDaConta(c.id), conectado: c.conectado, conectando: c.conectando,
+      qrDisponivel: !!c.qr, ultimoEnvio: c.ultimoEnvio, ultimoErro: c.ultimoErro,
+    }));
   res.json({
     ok: true,
-    principal: { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual },
+    principal: req.tenantId === TENANT_PADRAO
+      ? { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual }
+      : null,
     extras,
     turnosTsp: turnosTsp(),
     contaAgora: contaDoTurno(),
@@ -3803,18 +3854,21 @@ app.get('/contas', (req, res) => {
 });
 
 app.post('/contas/:id/conectar', async (req, res) => {
-  const id = String(req.params.id || '').trim();
-  if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'use /reconectar para a conta principal' });
-  if (!/^[a-z0-9_-]{2,24}$/i.test(id)) {
+  const apelido = String(req.params.id || '').trim();
+  if (!/^[a-z0-9_-]{2,24}$/i.test(apelido)) {
     return res.status(400).json({ ok:false,
       erro: 'apelido invalido: use de 2 a 24 caracteres, so letras sem acento, numeros, - e _' });
   }
+  const id = contaIdDe(req.tenantId, apelido);
+  // 'principal' sem prefixo e o socket da operacao padrao; para um operador,
+  // 't-<id>-principal' e uma conta secundaria como outra qualquer.
+  if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'use /reconectar para a conta principal' });
   conectarConta(id).catch(()=>{});
-  res.json({ ok:true, mensagem:'Conectando. Abra /contas/' + id + '/qr para parear.' });
+  res.json({ ok:true, mensagem:'Conectando. Abra /contas/' + apelido + '/qr para parear.' });
 });
 
 app.get('/contas/:id/qr', async (req, res) => {
-  const id = String(req.params.id || '').trim();
+  const id = contaIdReq(req);
   // NAO usa estadoConta() aqui: ela CRIA a conta se nao existir. Como esta
   // pagina se auto-recarrega a cada 3-30s, uma aba esquecida aberta ressuscitava
   // a conta a cada refresh — inclusive depois de excluida pelo painel.
@@ -3834,9 +3888,10 @@ app.get('/contas/:id/qr', async (req, res) => {
 // apontando para conta morta cai no fallback em silencio, dando a impressao de
 // que a escala funciona.
 app.delete('/contas/:id', async (req, res) => {
-  const id = String(req.params.id || '').trim();
+  const apelido = String(req.params.id || '').trim();
+  if (!/^[a-z0-9_-]{2,24}$/i.test(apelido)) return res.status(400).json({ ok:false, erro:'apelido invalido' });
+  const id = contaIdDe(req.tenantId, apelido);
   if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'a conta principal nao pode ser removida aqui' });
-  if (!/^[a-z0-9_-]{2,24}$/i.test(id)) return res.status(400).json({ ok:false, erro:'apelido invalido' });
 
   const c = contasExtras.get(id);
   let desvinculou = false;
@@ -3860,7 +3915,7 @@ app.delete('/contas/:id', async (req, res) => {
 
   // Turnos que apontavam para ela sairiam do ar sem aviso: melhor removê-los.
   const escala = turnosTsp();
-  const restantes = escala.turnos.filter(t => t.conta !== id);
+  const restantes = escala.turnos.filter(t => t.conta !== apelidoDaConta(id));
   let turnosRemovidos = escala.turnos.length - restantes.length;
   if (turnosRemovidos) salvarTurnosTsp({ ativo: escala.ativo, turnos: restantes });
 
@@ -3872,7 +3927,7 @@ app.delete('/contas/:id', async (req, res) => {
 // Compara os grupos das duas contas. Um numero que nao esta num grupo de destino
 // falha o envio na hora do turno dele — melhor descobrir antes.
 app.get('/contas/:id/grupos', async (req, res) => {
-  const id = String(req.params.id || '').trim();
+  const id = contaIdReq(req);
   const c = contasExtras.get(id);
   if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
   try {
@@ -4874,7 +4929,7 @@ async function processarOfertasAwin({ simular = false } = {}) {
           precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
           precoDeReferencia: true,
         },
-        imagens: [], status: 'pendente', timestamp: new Date().toISOString(),
+        imagens: [], status: 'pendente', tenant: tenantContexto() || TENANT_PADRAO, timestamp: new Date().toISOString(),
       };
       try {
         const img = await baixarImagemProduto(p.imagemUrl);
