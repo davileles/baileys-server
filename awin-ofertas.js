@@ -277,6 +277,61 @@ export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
   return { ok: true, examinadas, naFila: _candidatos.length };
 }
 
+/**
+ * Fila inteira, ja ranqueada (desconto desc, depois preco desc), com o motivo
+ * de cada bloqueio anexado. O painel precisa VER a fila para o operador poder
+ * escolher — a simulacao mostra so o que sai na proxima rodada (maxRodada),
+ * o que dava a impressao de haver um candidato quando ha centenas.
+ *
+ * O bloqueio nao impede nada: escolha manual passa por cima das cotas. Ele
+ * existe para o operador saber que aquele item nao sairia sozinho hoje.
+ */
+export function candidatosRanqueados({ limite = 150 } = {}) {
+  const cfg = configOfertasAwin();
+  const uso = usoDeHoje();
+  const usados = { ...uso.porLoja };
+  const vencida = _candidatosEm
+    && (Date.now() - _candidatosEm) > cfg.candidatoTtlHoras * 3600 * 1000;
+
+  return _candidatos.slice(0, limite).map((c, i) => {
+    // Conta acumulada: o 5o item da Nike ja estoura um teto de 4/dia mesmo que
+    // nenhum tenha saido ainda, porque os anteriores da lista sairiam antes.
+    const noTeto = (usados[c.loja] || 0) >= cfg.maxLojaDia;
+    usados[c.loja] = (usados[c.loja] || 0) + 1;
+    return {
+      posicao: i + 1,
+      chaveHistorico: c.chaveHistorico,
+      loja: c.loja,
+      advertiserId: c.advertiserId,
+      titulo: c.titulo || '',
+      preco: c.preco,
+      precoDe: c.precoDe,
+      desconto: c.desconto,
+      imagem: c.imagem || null,
+      marca: c.marca || '',
+      urlLoja: c.urlLoja || '',
+      linkAfiliado: c.linkAfiliado || '',
+      bloqueio: vencida ? 'preço pode estar vencido — varra os catálogos'
+              : (noTeto ? 'loja já no teto de hoje (' + cfg.maxLojaDia + '/dia)' : null),
+    };
+  });
+}
+
+/**
+ * Tira candidatos da fila pelo chaveHistorico e devolve os retirados.
+ * Usado quando o operador manda o produto para a vitrine: sem isto o
+ * publicador automatico mandaria o mesmo item de novo por conta propria.
+ */
+export function retirarCandidatos(chaves = []) {
+  const fora = new Set(chaves);
+  const escolhidos = _candidatos.filter(c => fora.has(c.chaveHistorico));
+  if (escolhidos.length) {
+    _candidatos = _candidatos.filter(c => !fora.has(c.chaveHistorico));
+    salvarCandidatos();
+  }
+  return escolhidos;
+}
+
 /** Vagas disponiveis agora, considerando cota do dia, da rodada e da loja. */
 export function vagasAgora() {
   const cfg = configOfertasAwin();
