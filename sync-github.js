@@ -21,25 +21,27 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 
 const SESSAO_DIR = './sessao';
-const REPO = process.env.GITHUB_REPO_DADOS || 'davileles/cdv-tsp-dados';
-const PASTA = process.env.GITHUB_PASTA_DADOS || 'tsp';
+// Funcoes, nao constantes: o repositorio de dados pode ser trocado pelo painel
+// e precisa valer no proximo push, sem restart.
+function repoDados()  { return process.env.GITHUB_REPO_DADOS || 'davileles/cdv-tsp-dados'; }
+function pastaDados() { return process.env.GITHUB_PASTA_DADOS || 'tsp'; }
 const DEBOUNCE_MS = 10000;
 
 // Arquivos versionados. Chave = nome em ./sessao, valor = caminho no repo.
 export const ARQUIVOS_SINCRONIZADOS = {
-  'cupons_base.json': PASTA + '/cupons_base.json',
-  'vitrine.json':     PASTA + '/vitrine.json',
-  'templates.json':   PASTA + '/templates.json',
-  'listas.json':      PASTA + '/listas.json',
-  'radar_config.json':PASTA + '/radar_config.json',
-  'config_tsp.json':  PASTA + '/config_tsp.json',
-  'awin_config.json': PASTA + '/awin_config.json',
-  'grupos_censo_hist.json': PASTA + '/grupos_censo_hist.json',
+  'cupons_base.json': pastaDados() + '/cupons_base.json',
+  'vitrine.json':     pastaDados() + '/vitrine.json',
+  'templates.json':   pastaDados() + '/templates.json',
+  'listas.json':      pastaDados() + '/listas.json',
+  'radar_config.json':pastaDados() + '/radar_config.json',
+  'config_tsp.json':  pastaDados() + '/config_tsp.json',
+  'awin_config.json': pastaDados() + '/awin_config.json',
+  'grupos_censo_hist.json': pastaDados() + '/grupos_censo_hist.json',
   // Ledger de entradas/saidas. O PUT aceita arquivo grande, mas a leitura via
   // Contents API para de devolver o conteudo acima de ~1MB: passando disso o
   // push continua, so a restauracao automatica no boot deixa de funcionar
   // (o local e mantido, nao corrompido). Perto do limite, virar shard por ano.
-  'grupos_membros_log.json': PASTA + '/grupos_membros_log.json',
+  'grupos_membros_log.json': pastaDados() + '/grupos_membros_log.json',
 };
 
 const _shas = new Map();      // caminho no repo -> sha do ultimo commit conhecido
@@ -50,7 +52,7 @@ export function sincronizacaoAtiva() { return !!process.env.GITHUB_TOKEN; }
 export function estadoSync() {
   const t = process.env.GITHUB_TOKEN || '';
   return {
-    ativo: sincronizacaoAtiva(), repo: REPO, pasta: PASTA, ultimoErro: _ultimoErro,
+    ativo: sincronizacaoAtiva(), repo: repoDados(), pasta: pastaDados(), ultimoErro: _ultimoErro,
     arquivos: Object.keys(ARQUIVOS_SINCRONIZADOS),
     // Diagnostico sem vazar o segredo: so presenca, tamanho e prefixo. Variavel
     // adicionada no Railway so entra no processo apos o restart do container.
@@ -68,18 +70,18 @@ export function estadoSync() {
 export async function testarAcesso() {
   if (!sincronizacaoAtiva()) return { ok: false, erro: 'GITHUB_TOKEN ausente no processo.' };
   try {
-    const res = await fetch('https://api.github.com/repos/' + REPO, {
+    const res = await fetch('https://api.github.com/repos/' + repoDados(), {
       headers: { 'Authorization': 'Bearer ' + process.env.GITHUB_TOKEN, 'Accept': 'application/vnd.github+json' },
       signal: AbortSignal.timeout(15000),
     });
-    if (!res.ok) return { ok: false, erro: 'HTTP ' + res.status + ' ao ler ' + REPO };
+    if (!res.ok) return { ok: false, erro: 'HTTP ' + res.status + ' ao ler ' + repoDados() };
     const d = await res.json();
     return { ok: true, repo: d.full_name, privado: d.private, permissoes: d.permissions || null };
   } catch (e) { return { ok: false, erro: e.message }; }
 }
 
 async function api(caminho, opcoes = {}) {
-  const res = await fetch('https://api.github.com/repos/' + REPO + '/contents/' + caminho, {
+  const res = await fetch('https://api.github.com/repos/' + repoDados() + '/contents/' + caminho, {
     ...opcoes,
     headers: {
       'Authorization': 'Bearer ' + process.env.GITHUB_TOKEN,
@@ -154,7 +156,7 @@ async function enviar(local) {
     const d = await res.json();
     _shas.set(remoto, d.content?.sha);
     _ultimoErro = null;
-    console.log('[SYNC] ' + local + ' -> ' + REPO + '/' + remoto);
+    console.log('[SYNC] ' + local + ' -> ' + repoDados() + '/' + remoto);
   } catch (e) {
     _ultimoErro = local + ': ' + e.message;
     console.error('[SYNC] Falha ao enviar ' + local + ':', e.message);
