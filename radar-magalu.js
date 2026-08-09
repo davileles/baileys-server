@@ -14,6 +14,8 @@
 // de dados confiavel, basta preencher buscarDadosMagalu() e o resto continua.
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { credencialTsp } from './config-tsp.js';
+import { tenantContexto } from './tenants.js';
 import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
          calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
 import { resolverPrecoDe, FONTE_TEXTO, FONTE_MANUAL } from './preco-de.js';
@@ -22,7 +24,11 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 // Codigo da sua loja no Magazine Você. Sai do codigo para poder mudar sem deploy.
 export function lojaMagalu() {
-  return process.env.MAGALU_LOJA || 'magazinetudosobremilhas';
+  const daConfig = credencialTsp('MAGALU_LOJA');
+  if (daConfig) return daConfig;
+  // Fallback historico e SO da operacao original: tenant novo sem loja
+  // cadastrada fica com Magalu indisponivel, nunca com a loja de outro.
+  return (tenantContexto() || 'tsp') === 'tsp' ? 'magazinetudosobremilhas' : '';
 }
 
 // Dominios proprios da Magalu e encurtadores que os divulgadores usam.
