@@ -16,6 +16,7 @@
 
 import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
          calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
+import { resolverPrecoDe, FONTE_TEXTO, FONTE_MANUAL } from './preco-de.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 
@@ -103,7 +104,13 @@ function precoDoTexto(texto) {
   if (!achados.length) return { preco: null, precoDe: null };
   const preco = Math.min(...achados);
   const maior = Math.max(...achados);
-  return { preco, precoDe: maior > preco ? maior : null };
+  // Mesmas travas das demais lojas. A fonte e o texto do grupo, entao nao e
+  // verificada — a oferta segue marcada com precoDeReferencia.
+  const r = resolverPrecoDe({
+    preco, rotulo: 'Magalu texto',
+    candidatos: [{ fonte: FONTE_TEXTO, valor: maior > preco ? maior : null }],
+  });
+  return { preco, precoDe: r.precoDe, precoDeFonte: r.fonte };
 }
 
 function tituloDoTexto(texto, slug) {
@@ -145,7 +152,7 @@ export async function processarTextoMagalu(texto) {
     if (vistos.has(conv.partes.codigo)) continue;
     vistos.add(conv.partes.codigo);
 
-    const { preco, precoDe } = precoDoTexto(texto);
+    const { preco, precoDe, precoDeFonte } = precoDoTexto(texto);
 
     // A Magalu entra no radar so por causa do link, entao anuncio de CUPOM cai
     // aqui junto com oferta de produto. Sem preco de lista o template acaba
@@ -163,6 +170,7 @@ export async function processarTextoMagalu(texto) {
       codigo: conv.partes.codigo,
       titulo: tituloDoTexto(texto, conv.partes.slug),
       preco, precoDe,
+      precoDeFonte: precoDeFonte || null,
       precoTexto: preco ? 'R$ ' + preco.toFixed(2).replace('.', ',') : null,
       precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
       desconto: (preco && precoDe && precoDe > preco) ? Math.round((1 - preco / precoDe) * 100) : 0,
@@ -221,7 +229,11 @@ function precosDaLinha(resto) {
   if (!achados.length) return { preco: null, precoDe: null };
   const preco = Math.min(...achados);
   const maior = Math.max(...achados);
-  return { preco, precoDe: maior > preco ? maior : null };
+  const r = resolverPrecoDe({
+    preco, rotulo: 'Magalu vitrine',
+    candidatos: [{ fonte: FONTE_MANUAL, valor: maior > preco ? maior : null }],
+  });
+  return { preco, precoDe: r.precoDe };
 }
 
 /**
@@ -295,16 +307,21 @@ export async function montarOfertasMagaluVitrine(itens, codigoCupom = null) {
     }
 
     const preco = Number(salvo.preco);
-    const precoDe = salvo.precoDe && salvo.precoDe > preco ? Number(salvo.precoDe) : null;
+    const rDe = resolverPrecoDe({
+      preco, rotulo: 'Magalu ' + (salvo.asin || ''),
+      candidatos: [{ fonte: FONTE_MANUAL, valor: salvo.precoDe ?? null }],
+    });
+    const precoDe = rDe.precoDe;
 
     const p = {
       asin: salvo.asin,
       codigo: String(salvo.asin).replace(/^MAGALU-/, ''),
       titulo: salvo.nome || '',
       preco, precoDe,
+      precoDeFonte: rDe.fonte,
       precoTexto: 'R$ ' + preco.toFixed(2).replace('.', ','),
       precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
-      desconto: precoDe ? Math.round((1 - preco / precoDe) * 100) : 0,
+      desconto: rDe.desconto,
       disponivel: true,          // sem fonte para conferir estoque
       link: salvo.url,
       imagemUrl: null,
