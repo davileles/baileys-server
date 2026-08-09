@@ -4798,6 +4798,13 @@ app.get('/awin/ofertas/estado', (req, res) => {
   const rodadasNaJanela = Math.floor(minutosJanela / Math.max(1, c.intervaloMin));
   res.json({ ok:true, config: c, usoHoje: usoDeHoje(), varrendo: _varrendoAwin,
     fila: estadoCandidatos(), janela: dentroDaJanelaAwin(),
+    // As duas credenciais da Awin sao independentes e vem de lugares
+    // diferentes na interface deles. Sem dizer qual falta, o operador so
+    // descobre ao clicar em varrer e receber um erro seco.
+    credenciais: {
+      api:  credenciaisAwinOk(),   // AWIN_TOKEN + AWIN_PUBLISHER_ID
+      feed: credenciaisFeedOk(),   // AWIN_FEED_APIKEY (Toolbox > Create-a-Feed)
+    },
     rodadasNaJanela,
     tetoEfetivoDia: Math.min(c.maxDia, rodadasNaJanela * Math.max(1, c.maxRodada)) });
 });
