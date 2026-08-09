@@ -25,6 +25,10 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import {
+  resolverPrecoDe, precoDeDoEstado, precoDeDoDom, descontoDeclaradoNoHtml,
+  FONTE_LDJSON, FONTE_ESTADO, FONTE_DOM, FONTE_FEED, FONTE_MANUAL,
+} from './preco-de.js';
 
 const API = 'https://api.awin.com';
 const SESSAO_DIR   = './sessao';
@@ -405,7 +409,10 @@ function produtoJsonLd(html) {
         imagem: Array.isArray(it.image) ? it.image[0] : (it.image?.url || it.image || null),
         marca: typeof it.brand === 'object' ? it.brand?.name : it.brand,
         preco: paraNumero(of?.price ?? of?.lowPrice),
-        precoDe: paraNumero(of?.highPrice),
+        // highPrice de AggregateOffer com varias variacoes e o preco da versao
+        // mais cara, nao o preco cheio desta — usar como "De" inventa desconto.
+        precoDe: (/AggregateOffer/i.test(String(of?.['@type'] || '')) && Number(of?.offerCount) > 1)
+          ? null : paraNumero(of?.highPrice),
         disponivel: of?.availability ? !/OutOfStock|SoldOut/i.test(String(of.availability)) : true,
       };
     }
@@ -465,19 +472,24 @@ async function lerPaginaProduto(url) {
   }
   if (!preco) preco = paraNumero(metaConteudo(html, 'product:price:amount') || metaConteudo(html, 'og:price:amount'));
 
-  // Preco "de" nao tem padrao entre as lojas. Tenta os nomes mais comuns e,
-  // nao achando, fica null: melhor sem De/Por do que com um valor chutado.
-  let precoDe = ld.precoDe;
-  if (!precoDe) {
-    for (const re of [
-      /["'](?:listPrice|oldPrice|originalPrice|priceFrom|regularPrice|specialPrice)["']\s*:\s*["']?([\d.,]+)/i,
-      /itemprop=["'](?:listPrice|highPrice)["'][^>]*content=["']([\d.,]+)/i,
-      /data-field=["']specialPrice["'][^>]*>\s*R\$\s*([\d.,]+)/i,
-    ]) { const m = html.match(re); if (m) { precoDe = paraNumero(m[1]); break; } }
-  }
-  if (precoDe && preco && precoDe <= preco) precoDe = null;
+  // Preco "de" nao tem padrao entre as lojas da rede. A cascata unica tenta o
+  // JSON-LD, depois o JSON embutido/microdados e por fim o bloco riscado do
+  // DOM, conferindo cada candidata contra o preco atual e contra o percentual
+  // que a propria pagina anuncia. Nao achando nada, fica null: melhor sem
+  // De/Por do que com um valor chutado.
+  const resolvido = resolverPrecoDe({
+    preco,
+    descontoDeclarado: descontoDeclaradoNoHtml(html),
+    rotulo: 'Awin ' + url,
+    candidatos: [
+      { fonte: FONTE_LDJSON, valor: ld.precoDe ?? null },
+      { fonte: FONTE_ESTADO, valor: precoDeDoEstado(html) },
+      { fonte: FONTE_DOM,    valor: precoDeDoDom(html) },
+    ],
+  });
 
-  return { titulo, imagem, preco, precoDe, marca: ld.marca || '', disponivel: ld.disponivel !== false };
+  return { titulo, imagem, preco, precoDe: resolvido.precoDe, precoDeFonte: resolvido.fonte,
+           marca: ld.marca || '', disponivel: ld.disponivel !== false };
 }
 
 export function formatarOfertaAwin(p, opcoes = {}) {
@@ -535,6 +547,7 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
       titulo: dados.titulo || loja,
       preco: dados.preco,
       precoDe: dados.precoDe || null,
+      precoDeFonte: dados.precoDeFonte || (dados.fonte === 'feed' ? FONTE_FEED : null),
       precoTexto: 'R$ ' + dados.preco.toFixed(2).replace('.', ','),
       precoDeTexto: dados.precoDe ? 'R$ ' + dados.precoDe.toFixed(2).replace('.', ',') : null,
       desconto: (dados.precoDe && dados.precoDe > dados.preco)
@@ -675,7 +688,10 @@ export async function montarOfertasAwinVitrine(itens, codigoCupom = null) {
         continue;
       }
       preco = Number(salvo.preco);
-      precoDe = salvo.precoDe && salvo.precoDe > preco ? Number(salvo.precoDe) : null;
+      precoDe = resolverPrecoDe({
+        preco, rotulo: 'Awin ' + (salvo.asin || ''),
+        candidatos: [{ fonte: FONTE_MANUAL, valor: salvo.precoDe ?? null }],
+      }).precoDe;
       precoDeReferencia = true;
     }
 
@@ -689,6 +705,7 @@ export async function montarOfertasAwinVitrine(itens, codigoCupom = null) {
       codigo: salvo.urlProduto || salvo.asin,
       titulo: salvo.nome || lido.titulo || '',
       preco, precoDe,
+      precoDeFonte: lido.precoDeFonte || (precoDeReferencia ? FONTE_MANUAL : null),
       precoTexto: 'R$ ' + preco.toFixed(2).replace('.', ','),
       precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
       desconto: precoDe && precoDe > preco ? Math.round((1 - preco / precoDe) * 100) : 0,
