@@ -15,6 +15,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { agendarPush } from './sync-github.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const SESSAO_DIR   = './sessao';
 const TENANTS_PATH = SESSAO_DIR + '/tenants.json';
@@ -130,6 +131,16 @@ export function atualizarTenant(id, patch = {}) {
 export function resolverTenant(_req) {
   return tenantPorId(TENANT_PADRAO);
 }
+
+// ── Contexto de tenant por cadeia de execucao ────────────────────────────────
+// AsyncLocalStorage propaga o operador atraves de awaits: o middleware abre o
+// contexto na requisicao e todo o processamento dela (mesmo assincrono) enxerga
+// o mesmo tenant. Codigo fora de requisicao (pipelines de captura, workers)
+// roda sem contexto e os modulos caem no tenant padrao — exatamente a operacao
+// original, ate as fases 2.3/2.4 amarrarem cada pipeline ao seu operador.
+const _ctx = new AsyncLocalStorage();
+export function comContextoTenant(tenantId, fn) { return _ctx.run(tenantId, fn); }
+export function tenantContexto() { return _ctx.getStore() || null; }
 
 // Auto-carrega no import, como os demais modulos de dados.
 carregarTenants();
