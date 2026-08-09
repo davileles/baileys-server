@@ -47,6 +47,12 @@ import {
   grupoTspPadrao, grupoTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
 } from './config-tsp.js';
 
+// ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
+import {
+  carregarTenants, listarTenants, tenantPorId, tenantPorEmail,
+  criarTenant, atualizarTenant, resolverTenant, TENANT_PADRAO,
+} from './tenants.js';
+
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
@@ -158,7 +164,7 @@ const baileysLogger = pino({ level: 'silent' });
   try {
     const r = await baixarDoGitHub();
     if (r.baixados) {
-      carregarConfigTsp();
+      carregarTenants(); carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
@@ -306,6 +312,16 @@ const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+// Resolucao de operador por requisicao (fase 2.1). Hoje tudo resolve para o
+// tenant padrao — comportamento identico ao anterior. Nas proximas fases a
+// origem passa a ser o token de sessao do login, e os modulos de dados leem
+// req.tenantId em vez de estado global.
+app.use((req, _res, next) => {
+  const t = resolverTenant(req);
+  req.tenantId = t ? t.id : TENANT_PADRAO;
+  next();
+});
 
 let sock         = null;
 let conectado    = false;
@@ -2900,6 +2916,7 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
+  'tenants.json',           // registro dos operadores do modelo hospedado
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
@@ -4395,7 +4412,13 @@ app.post('/mkt/config', (req, res) => {
 // As credenciais NUNCA saem em claro por aqui: os endpoints do painel sao
 // publicos, entao o GET devolve apenas o estado mascarado de cada uma.
 app.get('/config-tsp', (req, res) => {
-  res.json({ ok: true, config: configTspPublico(), credenciais: credenciaisEstado() });
+  const t = tenantPorId(req.tenantId);
+  res.json({
+    ok: true,
+    tenant: t ? { id: t.id, nome: t.nome } : null,
+    config: configTspPublico(),
+    credenciais: credenciaisEstado(),
+  });
 });
 
 app.post('/config-tsp', (req, res) => {
@@ -4406,6 +4429,17 @@ app.post('/config-tsp', (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
+});
+
+// ── REGISTRO DE OPERADORES ───────────────────────────────────────────────────
+// Leitura publica MASCARADA: sem e-mails (endpoints do painel sao abertos; a
+// gestao completa do registro entra junto do login por operador, na fase 2.5).
+app.get('/tenants', (req, res) => {
+  res.json({
+    ok: true,
+    atual: req.tenantId,
+    tenants: listarTenants().map(t => ({ id: t.id, nome: t.nome, ativo: t.ativo, criadoEm: t.criadoEm })),
+  });
 });
 
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
@@ -4424,7 +4458,7 @@ app.post('/sync/pull', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
   try {
     const r = await baixarDoGitHub();
-    carregarConfigTsp();
+    carregarTenants(); carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
