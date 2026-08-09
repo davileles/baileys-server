@@ -320,7 +320,7 @@
       ]
     },
     "preco-de.js": {
-      "minLinhas": 220,
+      "minLinhas": 250,
       "obrigatorio": [
         "export function descontoDeclaradoNoHtml",
         "export function fonteVerificada",
