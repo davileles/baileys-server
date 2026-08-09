@@ -61,7 +61,9 @@ import {
 } from './awin-feed.js';
 import {
   configOfertasAwin, carregarConfigOfertasAwin, salvarConfigOfertasAwin,
-  carregarOfertadosAwin, marcarOfertado, usoDeHoje, buscarOfertasDosFeeds,
+  carregarOfertadosAwin, marcarOfertado, usoDeHoje,
+  carregarCandidatosAwin, reabastecerCandidatosAwin, estadoCandidatos,
+  proximosCandidatos, dentroDaJanelaAwin, vagasAgora,
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
@@ -4621,9 +4623,11 @@ app.post('/awin/cupons/importar', async (req, res) => {
 // virar spam nao e o filtro de percentual — e a cota: teto por dia, teto por
 // loja e bloqueio de repeticao, tudo aplicado em awin-ofertas.js. Aqui entram
 // as duas ultimas travas: janela de horario e espacamento entre envios.
-// Intervalo em funcao (nao const): mudar no painel passa a valer na proxima
-// rodada, sem redeploy.
-function awinVarreduraMs() { return Math.max(1, configOfertasAwin().intervaloHoras) * 3600 * 1000; }
+// Dois ritmos distintos: varrer os feeds e caro e roda de poucas em poucas
+// horas; publicar e barato e roda de meia em meia hora. Ambos em funcao (nao
+// const) para o painel mudar o ritmo sem redeploy.
+function awinVarreduraMs()  { return Math.max(5, configOfertasAwin().varreduraMin) * 60 * 1000; }
+function awinPublicacaoMs() { return Math.max(5, configOfertasAwin().intervaloMin) * 60 * 1000; }
 let _varrendoAwin = false;
 
 async function processarOfertasAwin({ simular = false } = {}) {
@@ -4633,14 +4637,16 @@ async function processarOfertasAwin({ simular = false } = {}) {
   _varrendoAwin = true;
 
   try {
-    const r = await buscarOfertasDosFeeds({ simular });
-    if (!r.ok) return r;
+    // Fora da janela nao ha o que fazer: a proxima rodada tenta de novo.
+    const janela = dentroDaJanelaAwin();
+    if (!simular && !janela.ok) return { ok:true, pulada: janela.motivo, fila: estadoCandidatos() };
 
-    const saida = { ok:true, simulacao: simular, modo: cfg.modo, usoHoje: r.usoHoje,
-      lojasExaminadas: r.lojasExaminadas, descartadosPorCota: r.descartadosPorCota,
+    const r = proximosCandidatos({ simular });
+    const saida = { ok:true, simulacao: simular, modo: cfg.modo, usoHoje: usoDeHoje(),
+      vagas: r.vagas, motivo: r.motivo, fila: estadoCandidatos(),
       enviadas: [], naFila: [], previa: [] };
 
-    for (const c of r.candidatos) {
+    for (const c of r.escolhidos) {
       const p = {
         asin: 'AWIN-' + c.advertiserId + '-feed',
         codigo: c.urlLoja || '',
@@ -4692,8 +4698,7 @@ async function processarOfertasAwin({ simular = false } = {}) {
       // proposito do historico e nao repetir o produto, nao contar envios.
       marcarOfertado(c.chaveHistorico);
 
-      const janela = dentroDaJanelaCupom();
-      if (cfg.modo === 'on' && janela.ok) {
+      if (cfg.modo === 'on') {
         try {
           const env = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
           oferta.status = 'enviado';
@@ -4702,16 +4707,15 @@ async function processarOfertasAwin({ simular = false } = {}) {
           filaPendentes.unshift(oferta); salvarFila();
           saida.enviadas.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
           console.log('[AWIN-OFERTAS] Enviada — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
-          // Espacamento: rajada de ofertas seguidas e o jeito mais rapido de
-          // fazer o grupo silenciar as notificacoes.
-          await new Promise(r2 => setTimeout(r2, intervaloAutoEnvioMs()));
+          // Espacamento so quando a rodada leva mais de uma: com maxRodada=1 o
+          // proprio intervalo entre rodadas ja e o espacamento.
+          if (r.escolhidos.length > 1) await new Promise(r2 => setTimeout(r2, intervaloAutoEnvioMs()));
           continue;
         } catch (e) {
           console.error('[AWIN-OFERTAS] Falha no envio, indo para a fila:', e.message);
         }
       }
 
-      if (cfg.modo === 'on' && !janela.ok) oferta.motivoFila = janela.motivo;
       filaPendentes.unshift(oferta); salvarFila();
       saida.naFila.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
       console.log('[AWIN-OFERTAS] Na fila — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
@@ -4728,22 +4732,55 @@ aplicarTtlsAwin();
 carregarOfertadosAwin();
 // Agendamento reprogramavel: cada rodada marca a proxima com o intervalo atual
 // da config, entao alterar no painel muda o ritmo sem reiniciar o container.
-let _timerVarredura = null;
-function agendarVarreduraAwin() {
-  if (_timerVarredura) clearTimeout(_timerVarredura);
+let _timerVarredura = null, _timerPublicacao = null;
+function agendarAwin() {
+  if (_timerVarredura)  clearTimeout(_timerVarredura);
+  if (_timerPublicacao) clearTimeout(_timerPublicacao);
   if (!credenciaisFeedOk() || configOfertasAwin().modo === 'off') return;
+
   _timerVarredura = setTimeout(async () => {
-    try { await processarOfertasAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
-    agendarVarreduraAwin();
+    try { await reabastecerCandidatosAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    agendarAwin();
   }, awinVarreduraMs());
   _timerVarredura.unref?.();
+
+  _timerPublicacao = setTimeout(async () => {
+    try { await processarOfertasAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    // Reagenda so a publicacao: a varredura tem ritmo proprio.
+    _timerPublicacao = null;
+    agendarPublicacaoAwin();
+  }, awinPublicacaoMs());
+  _timerPublicacao.unref?.();
 }
+function agendarPublicacaoAwin() {
+  if (_timerPublicacao) clearTimeout(_timerPublicacao);
+  if (!credenciaisFeedOk() || configOfertasAwin().modo === 'off') return;
+  _timerPublicacao = setTimeout(async () => {
+    try { await processarOfertasAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    agendarPublicacaoAwin();
+  }, awinPublicacaoMs());
+  _timerPublicacao.unref?.();
+}
+carregarCandidatosAwin();
 if (credenciaisFeedOk() && configOfertasAwin().modo !== 'off') {
   const c = configOfertasAwin();
-  agendarVarreduraAwin();
-  console.log('[AWIN-OFERTAS] Varredura ligada (modo ' + c.modo + ') — a cada '
-    + c.intervaloHoras + 'h, ate ' + c.maxRodada + ' por rodada e ' + c.maxDia + ' por dia.');
+  // Primeira varredura logo apos o boot: sem fila, nao ha o que publicar.
+  setTimeout(() => reabastecerCandidatosAwin().catch(() => {}), 90 * 1000);
+  agendarAwin();
+  console.log('[AWIN-OFERTAS] Ligada (modo ' + c.modo + ') — publica a cada '
+    + c.intervaloMin + 'min entre ' + c.horaInicio + ' e ' + c.horaFim
+    + ', ate ' + c.maxDia + '/dia; varredura a cada ' + (c.varreduraMin / 60) + 'h.');
 }
+
+// Varredura sob demanda: reabastece a fila sem publicar nada.
+app.post('/awin/ofertas/varredura', async (req, res) => {
+  const r = await reabastecerCandidatosAwin({ forcar: !!req.body?.forcar });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+app.get('/awin/ofertas/fila', (req, res) => {
+  res.json({ ok:true, ...estadoCandidatos(), ...vagasAgora(), janela: dentroDaJanelaAwin() });
+});
 
 // Simulacao: mostra exatamente o que sairia, sem enviar e sem gastar cota.
 app.post('/awin/ofertas/varrer', async (req, res) => {
@@ -4753,10 +4790,16 @@ app.post('/awin/ofertas/varrer', async (req, res) => {
 
 app.get('/awin/ofertas/estado', (req, res) => {
   const c = configOfertasAwin();
+  // Teto real do dia: a publicacao so acontece dentro da janela e entrega no
+  // maximo maxRodada por vez, entao o limite efetivo costuma ser menor que
+  // maxDia — e melhor mostrar a conta pronta do que deixar o operador supor.
+  const paraMin = h => { const m = String(h).match(/^(\d{1,2}):(\d{2})$/); return m ? +m[1]*60 + +m[2] : 0; };
+  const minutosJanela = Math.max(0, paraMin(c.horaFim) - paraMin(c.horaInicio));
+  const rodadasNaJanela = Math.floor(minutosJanela / Math.max(1, c.intervaloMin));
   res.json({ ok:true, config: c, usoHoje: usoDeHoje(), varrendo: _varrendoAwin,
-    // Teto real do dia: a rodada nunca entrega mais que maxRodada, entao o
-    // maximo efetivo e o menor entre a cota diaria e o que cabe nas rodadas.
-    tetoEfetivoDia: Math.min(c.maxDia, c.maxRodada * Math.floor(24 / Math.max(1, c.intervaloHoras))) });
+    fila: estadoCandidatos(), janela: dentroDaJanelaAwin(),
+    rodadasNaJanela,
+    tetoEfetivoDia: Math.min(c.maxDia, rodadasNaJanela * Math.max(1, c.maxRodada)) });
 });
 
 app.get('/awin/ofertas/config', (req, res) => res.json({ ok:true, config: configOfertasAwin() }));
@@ -4766,7 +4809,7 @@ app.post('/awin/ofertas/config', (req, res) => {
     const nova = salvarConfigOfertasAwin(req.body || {});
     aplicarTtlsAwin();
     agendarPush('awin_config.json');
-    agendarVarreduraAwin();   // ritmo novo passa a valer agora
+    agendarAwin();   // ritmo novo passa a valer agora
     res.json({ ok:true, config: nova });
   } catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
 });
