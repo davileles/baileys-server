@@ -58,8 +58,6 @@ const CFG_TSP_PADRAO = {
     // Mensagens de OFERTA (gerador manual, mensagem livre e semente do
     // template padrao de produto).
     oferta:      '`Convide seus amigos para entrar aqui no grupo:  https://chat.whatsapp.com/Ia5ZTqeTJdXHG5OT9LUwz8`',
-    // Copia enviada ao grupo so-cupons: convite cruzado para o grupo de ofertas.
-    grupoCupons: '`Entre no grupo de ofertas: https://chat.whatsapp.com/C7ed3Z1tYIb980POo9MqF8?s=cl&p=i&ilr=4`',
   },
   // Grupos especiais da operacao (JIDs de WhatsApp).
   //
@@ -127,6 +125,9 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   out.grupos.cupons = (Array.isArray(cup) ? cup : [cup])
     .map(x => String(x || '').trim()).filter(Boolean);
   delete out.grupos.padrao;
+  // Rodape de convite cruzado do grupo so-cupons: regra removida. Some do JSON
+  // gravado para nao ressuscitar se alguem reler a config antiga.
+  delete out.rodapes.grupoCupons;
   // Credencial nao preenchida fica string vazia, nunca undefined: o painel
   // precisa distinguir "nao configurado" de "campo inexistente".
   for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
@@ -257,7 +258,6 @@ export function linksTsp(tenantId) {
 
 export function rodapeCupom(tenantId)       { return (obter(tenantId).rodapes.cupom || '').trim(); }
 export function rodapeOferta(tenantId)      { return (obter(tenantId).rodapes.oferta || '').trim(); }
-export function rodapeGrupoCupons(tenantId) { return (obter(tenantId).rodapes.grupoCupons || '').trim(); }
 
 export function gruposTspCupons(tenantId)   { return (obter(tenantId).grupos.cupons || []).slice(); }
 export function grupoOperadorTsp(tenantId)  { return obter(tenantId).grupos.operador; }
