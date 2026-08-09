@@ -15,6 +15,11 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
+import {
+  resolverPrecoDe, precoDeDoLd, precoDeDoEstado, precoDeDoDom,
+  descontoDeclaradoNoHtml, numeroJson,
+  FONTE_API, FONTE_LDJSON, FONTE_ESTADO, FONTE_DOM,
+} from './preco-de.js';
 
 const SESSAO_DIR = './sessao';
 const TOKEN_PATH = SESSAO_DIR + '/ml_token.json';
@@ -227,6 +232,41 @@ function metaConteudo(html, prop) {
   return m ? m[1] : null;
 }
 
+// ── PRECO CHEIO PELA API OFICIAL ──────────────────────────────────────────
+// /items/{id}/prices e a fonte mais confiavel do valor riscado, mas responde
+// 403 para itens de terceiros dependendo do escopo autorizado do app. Em vez
+// de nunca tentar (era o caso ate aqui: o pipeline so raspava HTML) ou de
+// insistir a cada produto, tenta e se desliga sozinha depois de tres recusas
+// seguidas. Uma resposta boa religa o contador; o proximo boot zera tudo.
+let _apiPrecosFalhas = 0;
+const API_PRECOS_MAX_FALHAS = 3;
+
+export function estadoApiPrecosMl() {
+  return { ativa: _apiPrecosFalhas < API_PRECOS_MAX_FALHAS, falhasSeguidas: _apiPrecosFalhas };
+}
+
+async function precoDeApiMl(id) {
+  if (!id || !credenciaisMlOk()) return null;
+  if (_apiPrecosFalhas >= API_PRECOS_MAX_FALHAS) return null;
+  try {
+    const d = await apiMl('/items/' + encodeURIComponent(id) + '/prices');
+    _apiPrecosFalhas = 0;
+    const refs = [...(d?.reference_prices || []), ...(d?.prices || [])];
+    for (const r of refs) {
+      const tipo = String(r?.type || '').toLowerCase();
+      if (!/was_price|list_price|reference|original/.test(tipo)) continue;
+      const v = numeroJson(r?.amount ?? r?.regular_amount);
+      if (v) return v;
+    }
+    return null;
+  } catch (e) {
+    _apiPrecosFalhas++;
+    console.warn('[ML] Preco pela API indisponivel para ' + id + ' (' + e.message +
+                 ') — falha ' + _apiPrecosFalhas + '/' + API_PRECOS_MAX_FALHAS);
+    return null;
+  }
+}
+
 /** Busca a pagina do produto com o cookie e extrai o que der. */
 export async function buscarDadosProdutoMl(url) {
   const cookie = cookieAff();
@@ -253,25 +293,37 @@ export async function buscarDadosProdutoMl(url) {
   const titulo = ld?.name || metaConteudo(html, 'og:title') || null;
   const imagem = (Array.isArray(ld?.image) ? ld.image[0] : ld?.image) || metaConteudo(html, 'og:image') || null;
 
-  // O "de" nao vem no JSON-LD; sai do bloco de preco original da pagina.
-  const mDe = html.match(/"original_price"\s*:\s*([\d.]+)/) ||
-              html.match(/andes-money-amount--previous[\s\S]{0,220}?andes-money-amount__fraction[^>]*>([\d.]+)/);
-  let precoDe = mDe ? Number(String(mDe[1]).replace(/\./g, '')) : null;
-
-  // Sanidade: a pagina traz varios blocos de preco (recomendados, parcelamento,
-  // outros anuncios) e o regex pode pegar o valor errado. Um "de" so e crivel
-  // entre o preco atual e 5x ele — acima disso o desconto sairia absurdo e a
-  // mensagem anunciaria algo como "100% de desconto".
-  if (precoDe && preco && (precoDe <= preco || precoDe > preco * 5)) {
-    if (precoDe > preco * 5) console.warn('[ML] precoDe implausivel (' + precoDe + ' vs ' + preco + ') — descartado');
-    precoDe = null;
-  }
+  // O "de" passa pela cascata unica de fontes (preco-de.js): API oficial,
+  // JSON-LD, JSON embutido na pagina e, so como ultimo recurso, o bloco
+  // riscado do DOM. Cada candidata e conferida contra o preco atual e contra
+  // o percentual que a propria pagina anuncia ("28% OFF").
+  //
+  // O regex anterior lia "original_price": 33.61 e removia o ponto achando que
+  // era separador de milhar — virava 3361, a trava de 5x descartava e a oferta
+  // saia sem "De:" com o valor cheio a vista na pagina.
+  const idProduto = idDeUrl(url);
+  const descontoDeclarado = descontoDeclaradoNoHtml(html);
+  const resolvido = resolverPrecoDe({
+    preco,
+    descontoDeclarado,
+    rotulo: idProduto || 'ML',
+    candidatos: [
+      { fonte: FONTE_API,    valor: await precoDeApiMl(idProduto) },
+      { fonte: FONTE_LDJSON, valor: precoDeDoLd(ld) },
+      { fonte: FONTE_ESTADO, valor: precoDeDoEstado(html) },
+      { fonte: FONTE_DOM,    valor: precoDeDoDom(html) },
+    ],
+  });
+  const precoDe = resolvido.precoDe;
 
   const disponivel = !/OutOfStock|Sem estoque|Publicação pausada/i.test(
     (oferta?.availability || '') + html.slice(0, 60000));
 
   return {
     titulo, preco, precoDe, imagem, disponivel,
+    precoDeFonte: resolvido.fonte,
+    precoDeDescartes: resolvido.descartes,
+    descontoDeclarado,
     marca: ld?.brand?.name || '',
     nota: Number(ld?.aggregateRating?.ratingValue) || null,
     avaliacoes: Number(ld?.aggregateRating?.reviewCount) || null,
@@ -471,6 +523,7 @@ export function normalizarMl(it) {
     preco: isFinite(preco) ? preco : null,
     precoTexto: isFinite(preco) ? 'R$ ' + preco.toFixed(2).replace('.', ',') : null,
     precoDe: original,
+    precoDeFonte: original ? FONTE_API : null,
     precoDeTexto: original ? 'R$ ' + original.toFixed(2).replace('.', ',') : null,
     desconto,
     disponivel: it.status === 'active' && (it.available_quantity ?? 0) > 0,
@@ -626,6 +679,7 @@ export async function processarTextoMl(texto) {
       preco: dados.preco,
       precoTexto: dados.preco ? 'R$ ' + dados.preco.toFixed(2).replace('.', ',') : null,
       precoDe: dados.precoDe,
+      precoDeFonte: dados.precoDeFonte || null,
       precoDeTexto: dados.precoDe ? 'R$ ' + dados.precoDe.toFixed(2).replace('.', ',') : null,
       desconto: (dados.precoDe && dados.preco && dados.precoDe > dados.preco)
         ? Math.round((1 - dados.preco / dados.precoDe) * 100) : 0,
@@ -982,6 +1036,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
       preco: dados.preco,
       precoTexto: dados.preco ? 'R$ ' + dados.preco.toFixed(2).replace('.', ',') : null,
       precoDe: dados.precoDe,
+      precoDeFonte: dados.precoDeFonte || null,
       precoDeTexto: dados.precoDe ? 'R$ ' + dados.precoDe.toFixed(2).replace('.', ',') : null,
       desconto: (dados.precoDe && dados.preco && dados.precoDe > dados.preco)
         ? Math.round((1 - dados.preco / dados.precoDe) * 100) : 0,
