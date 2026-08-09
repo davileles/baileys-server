@@ -271,7 +271,9 @@ const GRUPOS_FILTRO_DATAS_MIN = {
 };
 
 const PORT          = process.env.PORT || 3001;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+// Funcao, nao const: a chave pode ser gravada pelo painel depois do boot e
+// precisa valer na proxima chamada, sem restart.
+function anthropicKey() { return process.env.ANTHROPIC_API_KEY; }
 const SESSAO_DIR    = './sessao';
 const UPLOAD_DIR    = './tmp-uploads';
 
@@ -1435,7 +1437,7 @@ async function chamarClaude(system, userContent, maxTokens) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_KEY,
+          'x-api-key': anthropicKey(),
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
