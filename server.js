@@ -4533,6 +4533,12 @@ app.post('/config-tsp', (req, res) => {
     }
     const cfg = salvarConfigTsp(corpo);
     console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
+    // Credencial nova so vale se os modulos rebuscarem o que depende dela: sem
+    // isso, colar a chave da Awin no painel nao carregava catalogo nenhum ate o
+    // proximo restart.
+    if (credenciaisAwinOk()) atualizarProgramasAwin(true).catch(() => {});
+    if (credenciaisFeedOk()) atualizarFeedList(true).catch(() => {});
+    agendarAwin();
     const saida = { ...cfg };
     delete saida.credenciais;
     res.json({ ok: true, config: saida, credenciais: estadoCredenciais() });
