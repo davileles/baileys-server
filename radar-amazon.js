@@ -16,6 +16,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { resolverPrecoDe, FONTE_API } from './preco-de.js';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
 import { rodapeOferta } from './config-tsp.js';
@@ -890,9 +891,15 @@ export function normalizar(item) {
   const l = escolherListing(item);
   const preco = l?.price?.money;
   const de    = l?.price?.savingBasis?.money;
-  const desconto = (de?.amount && preco?.amount)
-    ? Math.round((1 - preco.amount / de.amount) * 100)
-    : 0;
+  // O savingBasis e fonte oficial, mas passa pelas mesmas travas das outras
+  // lojas (maior que o preco, no maximo 5x, desconto ate 90%): listing com
+  // preco de tabela antigo ou errado nao vira "90% OFF" na mensagem.
+  const resolvido = resolverPrecoDe({
+    preco: preco?.amount ?? null,
+    rotulo: 'Amazon ' + (item.asin || ''),
+    candidatos: [{ fonte: FONTE_API, valor: de?.amount ?? null }],
+  });
+  const desconto = resolvido.desconto;
 
   return {
     asin: item.asin,
@@ -902,8 +909,9 @@ export function normalizar(item) {
     link: item.detailPageURL,          // ja vem com o partnerTag aplicado
     preco: preco?.amount ?? null,
     precoTexto: preco?.displayAmount || null,
-    precoDe: de?.amount ?? null,
-    precoDeTexto: de?.displayAmount || null,
+    precoDe: resolvido.precoDe,
+    precoDeFonte: resolvido.fonte,
+    precoDeTexto: resolvido.precoDe ? (de?.displayAmount || 'R$ ' + resolvido.precoDe.toFixed(2).replace('.', ',')) : null,
     desconto,
     disponivel: l?.availability?.type === 'IN_STOCK',
     vendedor: l?.merchantInfo?.name || null,
