@@ -334,3 +334,197 @@ export function normalizarOfertaAwin(oferta) {
     urlAfiliado: oferta?.urlTracking || null,
   };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PIPELINE DE PRODUTO — qualquer anunciante da rede
+//
+// As quatro lojas grandes tem API de afiliado propria. Os 80+ anunciantes da
+// Awin nao tem: o que existe e a pagina publica do produto. Este pipeline le os
+// dados estruturados que praticamente todo e-commerce ja publica (JSON-LD
+// schema.org, microdata e Open Graph) e monta a oferta com deeplink Awin.
+//
+// Limite conhecido: parte das lojas bloqueia requisicao vinda de datacenter
+// (403). Nesses casos o produto volta identificado, mas sem preco — cabe ao
+// operador informar, em vez de a mensagem sair com preco inventado.
+// ═══════════════════════════════════════════════════════════════════════════
+
+import {
+  templateDaLoja, renderTemplate, varsDoProduto, melhorCupom,
+} from './radar-amazon.js';
+
+const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+  + 'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+// Parametros de campanha de terceiros (Google Ads, Meta, e-mail) nao podem
+// viajar dentro do deeplink: alem de sujar o cache, disputam a atribuicao da
+// venda com o proprio link de afiliado.
+const PARAMS_LIXO = /^(utm_|gad_|gclid|gbraid|wbraid|fbclid|msclkid|epik|irclickid|cmpid|origin|_branch)/i;
+
+export function limparUrlAwin(url) {
+  try {
+    const u = new URL(String(url));
+    for (const k of [...u.searchParams.keys()]) if (PARAMS_LIXO.test(k)) u.searchParams.delete(k);
+    u.hash = '';
+    return u.toString();
+  } catch { return String(url || ''); }
+}
+
+function paraNumero(v) {
+  if (v === null || v === undefined) return null;
+  let s = String(v).replace(/[R$\s]/g, '');
+  if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (s.includes(',')) s = s.replace(',', '.');
+  const n = Number(s);
+  return isFinite(n) && n > 0 ? n : null;
+}
+
+function metaConteudo(html, prop) {
+  const re = new RegExp('<meta[^>]+(?:property|name)=["\']' + prop + '["\'][^>]+content=["\']([^"\']+)', 'i');
+  const m = html.match(re);
+  return m ? m[1].trim() : null;
+}
+
+/** Varre todos os blocos JSON-LD atras do primeiro objeto do tipo Product. */
+function produtoJsonLd(html) {
+  for (const bruto of html.match(/<script[^>]*application\/ld\+json[^>]*>[\s\S]*?<\/script>/gi) || []) {
+    const corpo = bruto.replace(/^[\s\S]*?>/, '').replace(/<\/script>$/i, '').trim();
+    let dado;
+    try { dado = JSON.parse(corpo); } catch { continue; }
+    const fila = Array.isArray(dado) ? [...dado] : [dado];
+    while (fila.length) {
+      const it = fila.shift();
+      if (!it || typeof it !== 'object') continue;
+      if (Array.isArray(it['@graph'])) fila.push(...it['@graph']);
+      if (!String(it['@type'] || '').includes('Product')) continue;
+      const of = Array.isArray(it.offers) ? it.offers[0] : it.offers;
+      return {
+        titulo: it.name || null,
+        imagem: Array.isArray(it.image) ? it.image[0] : (it.image?.url || it.image || null),
+        marca: typeof it.brand === 'object' ? it.brand?.name : it.brand,
+        preco: paraNumero(of?.price ?? of?.lowPrice),
+        precoDe: paraNumero(of?.highPrice),
+        disponivel: of?.availability ? !/OutOfStock|SoldOut/i.test(String(of.availability)) : true,
+      };
+    }
+  }
+  return null;
+}
+
+/** Le a pagina do produto e devolve o que conseguiu extrair (nunca inventa). */
+export async function extrairProdutoAwin(url) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 20000);
+  let html;
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': UA_MOBILE, 'Accept-Language': 'pt-BR,pt;q=0.9' },
+      redirect: 'follow', signal: ctrl.signal,
+    });
+    if (!res.ok) return { erro: 'a loja respondeu ' + res.status + ' (bloqueio de leitura automatica)' };
+    html = await res.text();
+  } catch (e) {
+    return { erro: 'falha ao abrir a pagina: ' + e.message };
+  } finally { clearTimeout(t); }
+
+  const ld = produtoJsonLd(html) || {};
+  const titulo = ld.titulo || metaConteudo(html, 'og:title')
+    || (html.match(/<title[^>]*>([^<]+)/i)?.[1] || '').trim() || null;
+  const imagem = ld.imagem || metaConteudo(html, 'og:image');
+
+  let preco = ld.preco;
+  if (!preco) {
+    const micro = html.match(/itemprop=["']price["'][^>]*content=["']([\d.,]+)/i)
+              || html.match(/content=["']([\d.,]+)["'][^>]*itemprop=["']price["']/i);
+    preco = paraNumero(micro?.[1]);
+  }
+  if (!preco) preco = paraNumero(metaConteudo(html, 'product:price:amount') || metaConteudo(html, 'og:price:amount'));
+
+  // Preco "de" nao tem padrao entre as lojas. Tenta os nomes mais comuns e,
+  // nao achando, fica null: melhor sem De/Por do que com um valor chutado.
+  let precoDe = ld.precoDe;
+  if (!precoDe) {
+    for (const re of [
+      /["'](?:listPrice|oldPrice|originalPrice|priceFrom|regularPrice|specialPrice)["']\s*:\s*["']?([\d.,]+)/i,
+      /itemprop=["'](?:listPrice|highPrice)["'][^>]*content=["']([\d.,]+)/i,
+      /data-field=["']specialPrice["'][^>]*>\s*R\$\s*([\d.,]+)/i,
+    ]) { const m = html.match(re); if (m) { precoDe = paraNumero(m[1]); break; } }
+  }
+  if (precoDe && preco && precoDe <= preco) precoDe = null;
+
+  return { titulo, imagem, preco, precoDe, marca: ld.marca || '', disponivel: ld.disponivel !== false };
+}
+
+export function formatarOfertaAwin(p, opcoes = {}) {
+  const tpl = opcoes.template || templateDaLoja(p.loja) || templateDaLoja('Amazon');
+  return renderTemplate(tpl?.corpo || '', varsDoProduto(p, opcoes.cupom || null));
+}
+
+/**
+ * Pipeline completo: texto com link de loja da rede -> oferta pronta.
+ * `clickref` viaja ate o relatorio de transacoes da Awin.
+ */
+export async function processarTextoAwin(texto, { clickref = '' } = {}) {
+  const urls = [...new Set(String(texto || '').match(/https?:\/\/[^\s<>"']+/g) || [])]
+    .map(u => u.replace(/[)\]}.,;!]+$/, ''));
+  const saida = [];
+  const vistos = new Set();
+
+  for (const bruta of urls) {
+    const prog = programaAwinPorUrl(bruta);
+    if (!prog) continue;
+
+    const url = limparUrlAwin(bruta);
+    if (vistos.has(url)) continue;
+    vistos.add(url);
+
+    const loja = String(prog.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const dados = await extrairProdutoAwin(url);
+
+    let link = null;
+    try {
+      const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref });
+      link = l.shortUrl || l.url;
+    } catch (e) {
+      link = deeplinkAwin(prog.id, url, clickref);
+      console.log('[AWIN] Deeplink manual para ' + loja + ': ' + e.message);
+    }
+
+    if (dados.erro || !dados.preco) {
+      // Loja reconhecida e link ja monetizado: o que falta e so o preco. Volta
+      // como descarte com o produto preenchido para o operador completar.
+      saida.push({
+        produto: { loja, titulo: dados.titulo || null, imagemUrl: dados.imagem || null, link, disponivel: true },
+        descartadoPor: dados.erro || 'a pagina nao expoe o preco em formato legivel — informe o preco manualmente',
+      });
+      continue;
+    }
+
+    const p = {
+      asin: null,
+      codigo: url,
+      titulo: dados.titulo || loja,
+      preco: dados.preco,
+      precoDe: dados.precoDe || null,
+      precoTexto: 'R$ ' + dados.preco.toFixed(2).replace('.', ','),
+      precoDeTexto: dados.precoDe ? 'R$ ' + dados.precoDe.toFixed(2).replace('.', ',') : null,
+      desconto: (dados.precoDe && dados.precoDe > dados.preco)
+        ? Math.round((1 - dados.preco / dados.precoDe) * 100) : 0,
+      disponivel: dados.disponivel,
+      link,
+      imagemUrl: dados.imagem || null,
+      vendedor: null, marca: dados.marca || '', nota: null, avaliacoes: null,
+      dealTermina: null, ehDeal: false,
+      loja,
+    };
+
+    const cupom = melhorCupom(loja, p.preco, texto);
+    saida.push({
+      produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto,
+                       citado: cupom.citado, generico: !!cupom.generico } : null,
+      precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      mensagem: formatarOfertaAwin(p, { cupom }),
+    });
+  }
+  return saida;
+}
