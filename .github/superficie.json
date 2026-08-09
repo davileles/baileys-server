@@ -18,6 +18,7 @@
         "app.get('/awin/cupons/estado'",
         "app.get('/awin/estado'",
         "app.get('/awin/ofertas'",
+        "app.get('/awin/ofertas/candidatos'",
         "app.get('/awin/programas'",
         "app.get('/awin/resolver'",
         "app.get('/config-tsp'",
@@ -69,6 +70,7 @@
         "app.post('/awin/cupons/importar'",
         "app.post('/awin/cupons/poll'",
         "app.post('/awin/link'",
+        "app.post('/awin/ofertas/cadastrar'",
         "app.post('/awin/programas/atualizar'",
         "app.post('/backfill-passagens'",
         "app.post('/config-tsp'",
@@ -137,6 +139,7 @@
         "export async function quotaLinkAwin",
         "export function carregarProgramasAwin",
         "export function chaveLojaAwin",
+        "export function chaveVitrineAwin",
         "export function credenciaisAwinOk",
         "export function deeplinkAwin",
         "export function ehLinkAwin",
@@ -334,6 +337,21 @@
         "export function precoDeDoLd",
         "export function resolverPrecoDe",
         "export function validarPrecoDe"
+      ]
+    },
+    "awin-ofertas.js": {
+      "minLinhas": 300,
+      "obrigatorio": [
+        "export async function reabastecerCandidatosAwin",
+        "export function candidatosRanqueados",
+        "export function configOfertasAwin",
+        "export function dentroDaJanelaAwin",
+        "export function estadoCandidatos",
+        "export function marcarOfertado",
+        "export function proximosCandidatos",
+        "export function retirarCandidatos",
+        "export function usoDeHoje",
+        "export function vagasAgora"
       ]
     }
   }
