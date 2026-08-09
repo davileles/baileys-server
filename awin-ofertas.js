@@ -22,22 +22,85 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { varrerFeedComDesconto, listarAnunciantesComFeed, credenciaisFeedOk } from './awin-feed.js';
 
 const OFERTADOS_PATH = './sessao/awin_ofertados.json';
+const CONFIG_PATH    = './sessao/awin_config.json';
 
 let _ofertados = {};   // chave (loja|produto) -> ISO do ultimo envio
+let _cfg = null;       // config gravada pelo painel (null = ainda nao lida)
 
-export function configOfertasAwin() {
+// Padrao usado quando nao ha nada gravado. As variaveis de ambiente continuam
+// valendo como valor inicial — o que o painel gravar passa a mandar, para o
+// operador poder calibrar sem redeploy.
+function padraoDaConfig() {
   const n = (v, padrao) => { const x = Number(v); return isFinite(x) && x >= 0 ? x : padrao; };
   return {
-    modo:          (process.env.AWIN_OFERTAS || 'off').toLowerCase(),  // off | fila | on
-    minPct:        n(process.env.AWIN_OFERTAS_MIN_PCT, 60),
-    minPreco:      n(process.env.AWIN_OFERTAS_MIN_PRECO, 100),
-    maxPreco:      Number(process.env.AWIN_OFERTAS_MAX_PRECO) || null,
-    maxDia:        n(process.env.AWIN_OFERTAS_MAX_DIA, 6),
-    maxLojaDia:    n(process.env.AWIN_OFERTAS_MAX_LOJA_DIA, 2),
-    repetirDias:   n(process.env.AWIN_OFERTAS_REPETIR_DIAS, 30),
-    lojas: String(process.env.AWIN_OFERTAS_LOJAS || '').split(',').map(s => s.trim()).filter(Boolean),
+    modo:              (process.env.AWIN_OFERTAS || 'off').toLowerCase(),  // off | fila | on
+    minPct:            n(process.env.AWIN_OFERTAS_MIN_PCT, 60),
+    minPreco:          n(process.env.AWIN_OFERTAS_MIN_PRECO, 100),
+    maxPreco:          Number(process.env.AWIN_OFERTAS_MAX_PRECO) || null,
+    maxDia:            n(process.env.AWIN_OFERTAS_MAX_DIA, 6),
+    maxRodada:         n(process.env.AWIN_OFERTAS_MAX_RODADA, 2),
+    maxLojaDia:        n(process.env.AWIN_OFERTAS_MAX_LOJA_DIA, 2),
+    repetirDias:       n(process.env.AWIN_OFERTAS_REPETIR_DIAS, 30),
+    intervaloHoras:    n(process.env.AWIN_VARREDURA_H, 6),
     maxFeedsPorRodada: n(process.env.AWIN_OFERTAS_MAX_FEEDS, 6),
+    lojas: String(process.env.AWIN_OFERTAS_LOJAS || '').split(',').map(s => s.trim()).filter(Boolean),
+    // Cupons da Offers API: mesmo lugar, para a Awin ter uma config so.
+    cupons:        (process.env.AWIN_CUPONS || 'off').toLowerCase(),       // off | fila | on
+    cupomPollMin:  n(process.env.AWIN_POLL_MIN, 20),
+    precoTtlHoras: n(process.env.AWIN_PRECO_TTL_H, 24),
+    feedTtlHoras:  n(process.env.AWIN_FEED_TTL_H, 12),
   };
+}
+
+export function carregarConfigOfertasAwin() {
+  try {
+    if (existsSync(CONFIG_PATH)) _cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf-8')) || {};
+  } catch (e) { console.log('[AWIN-OFERTAS] Erro ao ler config:', e.message); _cfg = {}; }
+  return configOfertasAwin();
+}
+
+export function configOfertasAwin() {
+  return { ...padraoDaConfig(), ...(_cfg || {}) };
+}
+
+// Faixas de validacao: um maxDia digitado como 600 no painel viraria spam, e um
+// minPct de 5 encheria a fila com "promocao" de 5%.
+const LIMITES = {
+  minPct: [1, 99], minPreco: [0, 100000], maxPreco: [0, 1000000],
+  maxDia: [0, 50], maxRodada: [0, 20], maxLojaDia: [0, 20],
+  repetirDias: [1, 365], intervaloHoras: [1, 168], maxFeedsPorRodada: [1, 60],
+  cupomPollMin: [5, 1440], precoTtlHoras: [1, 720], feedTtlHoras: [1, 168],
+};
+
+export function salvarConfigOfertasAwin(dados = {}) {
+  const atual = configOfertasAwin();
+  const nova = { ...atual };
+
+  for (const [campo, [min, max]] of Object.entries(LIMITES)) {
+    if (dados[campo] === undefined) continue;
+    if (dados[campo] === null && campo === 'maxPreco') { nova.maxPreco = null; continue; }
+    const v = Number(dados[campo]);
+    if (!isFinite(v)) throw new Error(campo + ' precisa ser numero');
+    if (v < min || v > max) throw new Error(campo + ' fora da faixa permitida (' + min + '-' + max + ')');
+    nova[campo] = v;
+  }
+  for (const campo of ['modo', 'cupons']) {
+    if (dados[campo] === undefined) continue;
+    const v = String(dados[campo]).toLowerCase();
+    if (!['off', 'fila', 'on'].includes(v)) throw new Error(campo + ' deve ser off, fila ou on');
+    nova[campo] = v;
+  }
+  if (dados.lojas !== undefined) {
+    nova.lojas = (Array.isArray(dados.lojas) ? dados.lojas : String(dados.lojas).split(','))
+      .map(x => String(x).trim()).filter(Boolean);
+  }
+
+  _cfg = nova;
+  try {
+    if (!existsSync('./sessao')) mkdirSync('./sessao', { recursive: true });
+    writeFileSync(CONFIG_PATH, JSON.stringify(nova, null, 2));
+  } catch (e) { console.log('[AWIN-OFERTAS] Falha ao gravar config:', e.message); }
+  return nova;
 }
 
 export function carregarOfertadosAwin() {
@@ -101,7 +164,13 @@ export async function buscarOfertasDosFeeds({ simular = false } = {}) {
   const cfg = configOfertasAwin();
   const uso = usoDeHoje();
 
-  const vagasTotal = Math.max(0, cfg.maxDia - uso.total);
+  // Duas cotas, nao uma: o teto do dia impede excesso e o teto da RODADA impede
+  // que o dia inteiro saia numa rajada de poucos minutos logo na primeira
+  // varredura, deixando o grupo mudo o resto do dia.
+  const vagasTotal = Math.min(
+    Math.max(0, cfg.maxDia - uso.total),
+    cfg.maxRodada > 0 ? cfg.maxRodada : cfg.maxDia,
+  );
   if (!simular && vagasTotal <= 0) {
     return { ok: true, cota: 'esgotada', usoHoje: uso, candidatos: [] };
   }
@@ -149,6 +218,8 @@ export async function buscarOfertasDosFeeds({ simular = false } = {}) {
     usoHoje: uso,
     vagasTotal,
     lojasExaminadas: porLojaExaminada,
+    maxDia: cfg.maxDia,
+    maxRodada: cfg.maxRodada,
     candidatos: selecionados,
     descartadosPorCota: Math.max(0, candidatos.length - selecionados.length),
   };
