@@ -34,6 +34,7 @@ import {
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
+  recarregarRadarTenants,
 } from './radar-amazon.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -48,6 +49,11 @@ import {
   gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
   estadoCredenciais, aplicarCredenciais,
 } from './config-tsp.js';
+
+// ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
+import {
+  carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant,
+} from './tenants.js';
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
 import {
@@ -191,8 +197,9 @@ const baileysLogger = pino({ level: 'silent' });
   try {
     const r = await baixarDoGitHub();
     if (r.baixados) {
-      carregarConfigTsp();
+      carregarTenants(); carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
+      recarregarRadarTenants();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
     }
@@ -355,6 +362,19 @@ const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+// Resolucao de operador por requisicao (fase 2.1). Hoje tudo resolve para o
+// tenant padrao — comportamento identico ao anterior. Nas proximas fases a
+// origem passa a ser o token de sessao do login, e os modulos de dados leem
+// req.tenantId em vez de estado global.
+app.use((req, _res, next) => {
+  const t = resolverTenant(req);
+  req.tenantId = t ? t.id : TENANT_PADRAO;
+  // Contexto assincrono: tudo que a requisicao tocar (mesmo apos awaits)
+  // enxerga o estado DESTE operador nos modulos de dados. Pipelines e workers
+  // fora de requisicao seguem no tenant padrao ate as fases 2.3/2.4.
+  comContextoTenant(req.tenantId, next);
+});
 
 let sock         = null;
 let conectado    = false;
@@ -3008,6 +3028,7 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
+  'tenants.json',           // registro dos operadores do modelo hospedado
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
@@ -4559,9 +4580,15 @@ app.get('/config-tsp', (req, res) => {
   // A config sai SEM os valores das credenciais: quem abre o painel ve o que
   // esta configurado, nao o segredo em si. O painel recebe so o estado
   // (preenchida, origem, ultimos 4 caracteres).
-  const cfg = { ...configTsp() };
+  const cfg = { ...configTsp(req.tenantId) };
   delete cfg.credenciais;
-  res.json({ ok: true, config: cfg, credenciais: estadoCredenciais() });
+  const t = listarTenants().find(x => x.id === req.tenantId) || null;
+  res.json({
+    ok: true,
+    tenant: t ? { id: t.id, nome: t.nome } : null,
+    config: cfg,
+    credenciais: estadoCredenciais(req.tenantId),
+  });
 });
 
 app.post('/config-tsp', (req, res) => {
@@ -4578,20 +4605,33 @@ app.post('/config-tsp', (req, res) => {
       }
       corpo.credenciais = limpas;
     }
-    const cfg = salvarConfigTsp(corpo);
-    console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
+    const cfg = salvarConfigTsp(corpo, req.tenantId);
+    console.log('[CFG-TSP] Configuracao atualizada pelo painel (' + req.tenantId + ').');
     // Credencial nova so vale se os modulos rebuscarem o que depende dela: sem
     // isso, colar a chave da Awin no painel nao carregava catalogo nenhum ate o
     // proximo restart.
-    if (credenciaisAwinOk()) atualizarProgramasAwin(true).catch(() => {});
-    if (credenciaisFeedOk()) atualizarFeedList(true).catch(() => {});
-    agendarAwin();
+    if (req.tenantId === TENANT_PADRAO) {
+      if (credenciaisAwinOk()) atualizarProgramasAwin(true).catch(() => {});
+      if (credenciaisFeedOk()) atualizarFeedList(true).catch(() => {});
+      agendarAwin();
+    }
     const saida = { ...cfg };
     delete saida.credenciais;
     res.json({ ok: true, config: saida, credenciais: estadoCredenciais() });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
+});
+
+// ── REGISTRO DE OPERADORES ───────────────────────────────────────────────────
+// Leitura publica MASCARADA: sem e-mails (endpoints do painel sao abertos; a
+// gestao completa do registro entra junto do login por operador, na fase 2.5).
+app.get('/tenants', (req, res) => {
+  res.json({
+    ok: true,
+    atual: req.tenantId,
+    tenants: listarTenants().map(t => ({ id: t.id, nome: t.nome, ativo: t.ativo, criadoEm: t.criadoEm })),
+  });
 });
 
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
@@ -4610,8 +4650,9 @@ app.post('/sync/pull', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
   try {
     const r = await baixarDoGitHub();
-    carregarConfigTsp();
+    carregarTenants(); carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
+    recarregarRadarTenants();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
