@@ -64,6 +64,7 @@ import {
   gerarLinkAwin, quotaLinkAwin, buscarOfertasAwin, normalizarOfertaAwin,
   estadoAwin, ehLinkAwin, processarTextoAwin, limparUrlAwin, extrairProdutoAwin,
   resolverLinhaVitrineAwin, montarOfertasAwinVitrine, ttlPrecoAwin,
+  chaveVitrineAwin, deeplinkAwin,
 } from './radar-awin.js';
 import {
   credenciaisFeedOk, carregarFeedListDoDisco, atualizarFeedList,
@@ -74,6 +75,7 @@ import {
   carregarOfertadosAwin, marcarOfertado, usoDeHoje,
   carregarCandidatosAwin, reabastecerCandidatosAwin, estadoCandidatos,
   proximosCandidatos, dentroDaJanelaAwin, vagasAgora,
+  candidatosRanqueados, retirarCandidatos,
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
@@ -5214,6 +5216,66 @@ app.post('/awin/ofertas/varredura', async (req, res) => {
 
 app.get('/awin/ofertas/fila', (req, res) => {
   res.json({ ok:true, ...estadoCandidatos(), ...vagasAgora(), janela: dentroDaJanelaAwin() });
+});
+
+// A fila inteira, ranqueada, para o operador escolher na aba Vitrine. Traz o
+// melhor cupom da base que se aplica a cada preco — e a informacao que decide
+// se vale a pena disparar aquele item agora.
+app.get('/awin/ofertas/candidatos', (req, res) => {
+  const limite = Math.min(300, Math.max(1, Number(req.query.limite) || 150));
+  const lista = candidatosRanqueados({ limite }).map(c => {
+    const mc = melhorCupomAplicavel(c.loja, c.preco);
+    return { ...c, cupom: mc ? { codigo: mc.reg.codigo, desconto: mc.desconto } : null,
+             precoFinal: mc ? Math.max(0, c.preco - mc.desconto) : c.preco };
+  });
+  res.json({ ok:true, itens: lista, ...estadoCandidatos(), ...vagasAgora(),
+             janela: dentroDaJanelaAwin() });
+});
+
+// Manda os escolhidos para a BASE DE PRODUTOS da vitrine. Dali eles seguem o
+// mesmo caminho de qualquer outro produto: so cadastrar, disparo unico ou lista
+// salva. Nada e enviado aqui.
+//
+// A escolha manual passa por cima das cotas de propósito — o teto por dia e por
+// loja existe para segurar o robo, nao o operador. Mas o produto sai da fila de
+// candidatos e entra no historico de ofertados, senao o publicador automatico
+// mandaria o mesmo item por conta propria depois.
+app.post('/awin/ofertas/cadastrar', (req, res) => {
+  try {
+    const chaves = Array.isArray(req.body?.chaves) ? req.body.chaves : [];
+    if (!chaves.length) return res.status(400).json({ ok:false, erro:'nenhum produto selecionado' });
+    if (chaves.length > 60) return res.status(400).json({ ok:false, erro:'máximo de 60 produtos por vez' });
+
+    const cupom = req.body?.cupom || null;
+    const escolhidos = retirarCandidatos(chaves);
+    if (!escolhidos.length) {
+      return res.status(400).json({ ok:false,
+        erro:'os produtos não estão mais na fila — atualize a lista (a varredura pode tê-la renovado)' });
+    }
+
+    const salvos = [];
+    for (const c of escolhidos) {
+      const asin = chaveVitrineAwin(c.advertiserId, c.urlLoja);
+      const jaTinha = !!itemVitrine(asin);
+      salvos.push({ ...salvarItemVitrine({
+        asin, loja: c.loja,
+        nome: (c.titulo || (c.loja + ' — produto')).slice(0, 140),
+        // 'url' e o link de afiliado que vai na mensagem; 'urlProduto' e a
+        // pagina da loja, que permite reconsultar o preco no disparo.
+        url: c.linkAfiliado || deeplinkAwin(c.advertiserId, c.urlLoja),
+        urlProduto: c.urlLoja,
+        advertiserId: c.advertiserId,
+        // Preco do feed serve de plano B se a loja bloquear a leitura na hora
+        // do disparo. Datado agora, para o TTL poder vence-lo.
+        preco: c.preco, precoDe: c.precoDe,
+        cupom,
+      }), jaExistia: jaTinha });
+      marcarOfertado(c.chaveHistorico);
+    }
+
+    console.log('[AWIN-OFERTAS] ' + salvos.length + ' candidato(s) enviados para a vitrine.');
+    res.json({ ok:true, salvos, naFila: estadoCandidatos().total });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // Simulacao: mostra exatamente o que sairia, sem enviar e sem gastar cota.
