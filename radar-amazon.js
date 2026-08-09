@@ -1320,6 +1320,11 @@ export function salvarItemVitrine(item) {
     // como o ASIN — os dois precisam sobreviver no cadastro.
     shopId: item.shopId || anterior?.shopId || null,
     itemId: item.itemId || anterior?.itemId || null,
+    // Awin: o item guarda DOIS enderecos — 'url' e o link de afiliado que vai na
+    // mensagem e 'urlProduto' e a pagina original da loja, que e o que permite
+    // reconsultar o preco no instante do disparo.
+    urlProduto: item.urlProduto || anterior?.urlProduto || null,
+    advertiserId: item.advertiserId || anterior?.advertiserId || null,
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
