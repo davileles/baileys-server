@@ -353,7 +353,8 @@ export function normalizarOfertaAwin(oferta) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 import {
-  templateDaLoja, renderTemplate, varsDoProduto, melhorCupom,
+  templateDaLoja, templateProprioDaLoja, templateAwin,
+  renderTemplate, varsDoProduto, melhorCupom,
   melhorCupomAplicavel, cupomPorCodigo, cupomVigente, calcularDesconto,
 } from './radar-amazon.js';
 import { createHash } from 'crypto';
@@ -492,8 +493,12 @@ async function lerPaginaProduto(url) {
            marca: ld.marca || '', disponivel: ld.disponivel !== false };
 }
 
+// Ordem de precedencia do layout: template da propria loja (quando o operador
+// criou um para ela) -> template 'Awin' -> padrao das ofertas. Antes caia
+// direto no padrao, entao nao havia como dar um formato proprio ao que vem da
+// rede sem mexer no formato de TODAS as ofertas.
 export function formatarOfertaAwin(p, opcoes = {}) {
-  const tpl = opcoes.template || templateDaLoja(p.loja) || templateDaLoja('Amazon');
+  const tpl = opcoes.template || templateProprioDaLoja(p.loja) || templateAwin();
   return renderTemplate(tpl?.corpo || '', varsDoProduto(p, opcoes.cupom || null));
 }
 
