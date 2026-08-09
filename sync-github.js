@@ -27,22 +27,56 @@ function repoDados()  { return process.env.GITHUB_REPO_DADOS || 'davileles/cdv-t
 function pastaDados() { return process.env.GITHUB_PASTA_DADOS || 'tsp'; }
 const DEBOUNCE_MS = 10000;
 
-// Arquivos versionados. Chave = nome em ./sessao, valor = caminho no repo.
-export const ARQUIVOS_SINCRONIZADOS = {
-  'cupons_base.json': pastaDados() + '/cupons_base.json',
-  'vitrine.json':     pastaDados() + '/vitrine.json',
-  'templates.json':   pastaDados() + '/templates.json',
-  'listas.json':      pastaDados() + '/listas.json',
-  'radar_config.json':pastaDados() + '/radar_config.json',
-  'config_tsp.json':  pastaDados() + '/config_tsp.json',
-  'awin_config.json': pastaDados() + '/awin_config.json',
-  'grupos_censo_hist.json': pastaDados() + '/grupos_censo_hist.json',
+// Nomes de arquivo versionaveis. Na raiz de ./sessao pertencem ao tenant
+// padrao (operacao original — layout historico, sem migracao); em
+// ./sessao/tenants/<id>/ pertencem ao operador <id> e vao para
+// <pasta>/tenants/<id>/ no repo. `agendarPush` aceita os dois formatos:
+// 'config_tsp.json' ou 'tenants/acme/config_tsp.json'.
+export const NOMES_SINCRONIZAVEIS = new Set([
+  'cupons_base.json',
+  'vitrine.json',
+  'templates.json',
+  'listas.json',
+  'radar_config.json',
+  'config_tsp.json',
+  'awin_config.json',
+  'tenants.json',            // global: registro de operadores (so na raiz)
+  'grupos_censo_hist.json',
   // Ledger de entradas/saidas. O PUT aceita arquivo grande, mas a leitura via
   // Contents API para de devolver o conteudo acima de ~1MB: passando disso o
   // push continua, so a restauracao automatica no boot deixa de funcionar
   // (o local e mantido, nao corrompido). Perto do limite, virar shard por ano.
-  'grupos_membros_log.json': pastaDados() + '/grupos_membros_log.json',
-};
+  'grupos_membros_log.json',
+]);
+
+// Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
+export const ARQUIVOS_SINCRONIZADOS = Object.fromEntries(
+  [...NOMES_SINCRONIZAVEIS].map(n => [n, pastaDados() + '/' + n]));
+
+// Caminho relativo valido: nome permitido na raiz, ou tenants/<id>/<nome>.
+// Recusa qualquer coisa fora disso — este modulo escreve em disco e no repo,
+// entao a validacao do caminho e inegociavel.
+const RE_TENANT_SEG = /^[a-z0-9][a-z0-9-]{1,30}$/;
+function caminhoValido(local) {
+  const partes = String(local || '').split('/');
+  if (partes.length === 1) return NOMES_SINCRONIZAVEIS.has(partes[0]);
+  return partes.length === 3 && partes[0] === 'tenants'
+      && RE_TENANT_SEG.test(partes[1])
+      && NOMES_SINCRONIZAVEIS.has(partes[2])
+      && partes[2] !== 'tenants.json';
+}
+// Dinamico de proposito: o repositorio/pasta podem mudar pelo painel.
+function remotoDe(local) { return pastaDados() + '/' + local; }
+
+// Ids de operadores alem do padrao, lidos de sessao/tenants.json. Leitura
+// direta do disco (sem importar tenants.js) para nao criar ciclo de modulos.
+function _idsTenantsDoDisco() {
+  try {
+    const reg = JSON.parse(readFileSync(SESSAO_DIR + '/tenants.json', 'utf-8'));
+    return (reg.tenants || []).map(t => String(t.id || '').toLowerCase())
+      .filter(id => RE_TENANT_SEG.test(id) && id !== 'tsp');
+  } catch { return []; }
+}
 
 const _shas = new Map();      // caminho no repo -> sha do ultimo commit conhecido
 const _timers = new Map();    // arquivo -> timer de debounce
@@ -107,18 +141,31 @@ export async function baixarDoGitHub() {
   if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
 
   let baixados = 0; const ausentes = [], erros = [];
-  for (const [local, remoto] of Object.entries(ARQUIVOS_SINCRONIZADOS)) {
+  async function baixarUm(local) {
     try {
-      const res = await api(remoto);
-      if (res.status === 404) { ausentes.push(local); continue; }
-      if (!res.ok) { erros.push(local + ': HTTP ' + res.status); continue; }
+      const res = await api(remotoDe(local));
+      if (res.status === 404) { ausentes.push(local); return; }
+      if (!res.ok) { erros.push(local + ': HTTP ' + res.status); return; }
       const dados = await res.json();
-      _shas.set(remoto, dados.sha);
+      _shas.set(remotoDe(local), dados.sha);
       const conteudo = Buffer.from(dados.content, 'base64').toString('utf-8');
       JSON.parse(conteudo);                       // nao sobrescreve o local com lixo
-      writeFileSync(SESSAO_DIR + '/' + local, conteudo, 'utf-8');
+      const destino = SESSAO_DIR + '/' + local;
+      const dir = destino.slice(0, destino.lastIndexOf('/'));
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(destino, conteudo, 'utf-8');
       baixados++;
     } catch (e) { erros.push(local + ': ' + e.message); }
+  }
+  // 1) Raiz — dados do tenant padrao + registro de operadores. O registro desce
+  // junto desta leva, entao a enumeracao abaixo ja enxerga operadores novos.
+  for (const local of NOMES_SINCRONIZAVEIS) await baixarUm(local);
+  // 2) Pastas dos demais operadores.
+  for (const id of _idsTenantsDoDisco()) {
+    for (const nome of NOMES_SINCRONIZAVEIS) {
+      if (nome === 'tenants.json') continue;
+      await baixarUm('tenants/' + id + '/' + nome);
+    }
   }
   console.log('[SYNC] Boot — ' + baixados + ' arquivo(s) do GitHub, ' + ausentes.length +
     ' ausente(s) no repo' + (erros.length ? ', ' + erros.length + ' erro(s): ' + erros.join('; ') : '') + '.');
@@ -126,9 +173,10 @@ export async function baixarDoGitHub() {
 }
 
 async function enviar(local) {
-  const remoto = ARQUIVOS_SINCRONIZADOS[local];
+  if (!caminhoValido(local)) return;
+  const remoto = remotoDe(local);
   const caminhoLocal = SESSAO_DIR + '/' + local;
-  if (!remoto || !existsSync(caminhoLocal)) return;
+  if (!existsSync(caminhoLocal)) return;
 
   try {
     const conteudo = readFileSync(caminhoLocal, 'utf-8');
@@ -168,7 +216,7 @@ async function enviar(local) {
  * o timer, entao uma rajada de gravacoes vira um unico commit.
  */
 export function agendarPush(local) {
-  if (!sincronizacaoAtiva() || !ARQUIVOS_SINCRONIZADOS[local]) return;
+  if (!sincronizacaoAtiva() || !caminhoValido(local)) return;
   if (_timers.has(local)) clearTimeout(_timers.get(local));
   _timers.set(local, setTimeout(() => {
     _timers.delete(local);
@@ -179,7 +227,13 @@ export function agendarPush(local) {
 /** Envia tudo imediatamente, ignorando o debounce. Usado pelo endpoint manual. */
 export async function pushImediato() {
   const feitos = [];
-  for (const local of Object.keys(ARQUIVOS_SINCRONIZADOS)) {
+  const alvos = [...NOMES_SINCRONIZAVEIS];
+  for (const id of _idsTenantsDoDisco()) {
+    for (const nome of NOMES_SINCRONIZAVEIS) {
+      if (nome !== 'tenants.json') alvos.push('tenants/' + id + '/' + nome);
+    }
+  }
+  for (const local of alvos) {
     if (_timers.has(local)) { clearTimeout(_timers.get(local)); _timers.delete(local); }
     await enviar(local);
     feitos.push(local);
