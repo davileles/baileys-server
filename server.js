@@ -27,7 +27,8 @@ import {
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
-  renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE,
+  templateCupom, templateAwin, templateProprioDaLoja,
+  renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE, VARIAVEIS_CUPOM,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
@@ -45,7 +46,7 @@ import {
 // ── CONFIG DA OPERACAO TSP (editavel pelo painel) ─────────────────────────────
 import {
   carregarConfigTsp, configTsp, salvarConfigTsp,
-  linksTsp, rodapeCupom, rodapeGrupoCupons,
+  linksTsp,
   gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
   estadoCredenciais, aplicarCredenciais,
 } from './config-tsp.js';
@@ -1419,7 +1420,27 @@ function nomeLojaExibicao(loja) {
   return String(loja || '').replace(/^outr[oa]s?\s*:\s*/i, '').trim();
 }
 
-function formatarCupomTSP(dados) {
+// Link de resgate do cupom. Lojas com link fixo na config saem daqui; o resto
+// cai na Awin, que cobre qualquer anunciante afiliado. Um link ja resolvido em
+// dados.urlAfiliado (caso da propria Offers API) tem prioridade sobre tudo.
+function linkDoCupomTSP(loja, codigo, dados = {}) {
+  const lojaNorm = loja.toLowerCase().replace(/^outro:\s*/, '').trim();
+  const isMagalu = /magazine\s*luiza|magalu/.test(lojaNorm);
+
+  let url = '';
+  if (loja === 'Amazon')             url = LINKS_TSP['Amazon'];
+  else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
+  else if (loja === 'Shopee')        url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
+  else if (isMagalu)                 url = LINKS_TSP['Magazine Luiza'];
+  else if (ehZeDelivery(loja))       url = LINKS_TSP['Zé Delivery'];
+  if (!url) url = dados.urlAfiliado || linkAwinDaLoja(loja) || '';
+  return url || '';
+}
+
+// Variaveis do template de cupom. Toda a regra de negocio (o que e teto de
+// desconto, o que e teto de produto, quando se pode afirmar "sem minimo") vive
+// AQUI — o template so escolhe onde cada frase aparece.
+function varsDoCupomTSP(dados) {
   const loja   = nomeLojaExibicao(dados.loja);
   const tipo   = dados.tipo   || 'reais';
   const valor  = dados.valor  || 0;
@@ -1450,47 +1471,46 @@ function formatarCupomTSP(dados) {
         ? 'Confira as condições de uso na página da loja.'
         : 'Válido sem valor mínimo de compra.');
 
-  let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*\n\n`;
-  msg += validade + '\n\n';
-  msg += `🛒 *LOJA* ${loja.toUpperCase()}`;
-
-  if (codigo) msg += `\n\n🏷️ *CUPOM* ${codigo.toUpperCase()}`;
-
   // Com teto de desconto, a compra "ideal" e aquela em que o percentual bate
   // exatamente no teto. Com teto de PRODUTO, o desconto maximo e simplesmente o
   // percentual sobre esse teto — sao contas diferentes e a mensagem tem de dizer
   // qual delas esta mostrando.
-  if (isPct && limite) {
+  let importante = '';
+  if (isPct && limite && Number(valor) > 0) {
     const ideal = Math.ceil(100 * Number(limite) / Number(valor));
     const tetoIdeal = maximo ? Math.min(ideal, Number(maximo)) : ideal;
-    msg += `\n\n⚠️ *IMPORTANTE* Ideal para compras de até R$ ${tetoIdeal}.\n\n`;
+    importante = `Ideal para compras de até R$ ${tetoIdeal}.`;
   } else if (isPct && maximo) {
     const economia = Math.floor(Number(maximo) * Number(valor) / 100);
-    msg += `\n\n⚠️ *IMPORTANTE* Só vale para produtos de até R$ ${maximo} — economia máxima de R$ ${economia}.\n\n`;
-  } else {
-    msg += '\n\n';
+    importante = `Só vale para produtos de até R$ ${maximo} — economia máxima de R$ ${economia}.`;
   }
 
-  const lojaNorm = loja.toLowerCase().replace(/^outro:\s*/, '').trim();
-  const isMagalu = /magazine\s*luiza|magalu/.test(lojaNorm);
+  return {
+    gatilho:    String(dados.gatilho || '').trim(),
+    loja,
+    loja_upper: loja.toUpperCase(),
+    valor:      String(valor),
+    valor_str:  `${valor}${tipoStr}`,
+    validade,
+    codigo:     codigo ? String(codigo).toUpperCase() : '',
+    importante,
+    aviso:      String(dados.aviso || dados.observacao || '').trim(),
+    link:       linkDoCupomTSP(loja, codigo, dados),
+    minimo:     temMin ? String(minimo) : '',
+    maximo:     maximo ? String(maximo) : '',
+    limite:     limite ? String(limite) : '',
+  };
+}
 
-  let url = '';
-  if (loja === 'Amazon')        url = LINKS_TSP['Amazon'];
-  else if (loja === 'Mercado Livre') url = LINKS_TSP['Mercado Livre'];
-  else if (loja === 'Shopee')   url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
-  else if (isMagalu)            url = LINKS_TSP['Magazine Luiza'];
-  else if (ehZeDelivery(loja))  url = LINKS_TSP['Zé Delivery'];
-  // Fora das lojas com link fixo, a Awin cobre qualquer anunciante afiliado.
-  // Usa o clickThroughUrl do programa: e sincrono, nao faz rede e nao consome
-  // a quota diaria de shortlinks. Um link ja resolvido em dados.urlAfiliado
-  // (caso da propria Offers API) tem prioridade sobre tudo.
-  if (!url) url = dados.urlAfiliado || linkAwinDaLoja(loja) || '';
-
-  if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
-
-  const rc = rodapeCupom();
-  if (rc) msg += '\n\n' + rc;
-  return msg;
+// O layout deixou de ser codigo e virou template editavel na aba Templates
+// (chave '_cupom'). O auto-envio do monitoramento e a aba Cupom do painel
+// renderizam O MESMO corpo — antes cada um tinha a sua copia do formato e elas
+// divergiam sem ninguem perceber.
+// O rodape faz parte do corpo do template (igual as ofertas) — nada e anexado
+// depois. Quem quiser mudar o convite edita o template, nao o codigo.
+function formatarCupomTSP(dados) {
+  const corpo = (templateCupom()?.corpo || '').trim();
+  return renderTemplate(corpo, varsDoCupomTSP(dados));
 }
 
 // Boot: reaplica links de afiliado nos cupons TSP que já estavam na fila.
@@ -1722,27 +1742,10 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   return { auto:true, motivo:'aprovado' };
 }
 
-// Rodape usado na copia enviada ao grupo so-cupons: em vez de convidar para o
-// proprio grupo, faz o convite cruzado para o grupo de ofertas.
-// Troca o rodape padrao do TSP pelo convite cruzado (ambos configuraveis na
-// aba Configuracoes). Tenta primeiro o rodape de cupom exato da config — cobre
-// textos customizados que o regex generico nao reconhece — e mantem o regex
-// historico como rede para mensagens antigas na fila. Se o operador tiver
-// editado/removido o rodape, apenas anexa o novo ao final.
-function mensagemParaGrupoCupons(msg) {
-  const cruzado = rodapeGrupoCupons();
-  if (!cruzado) return msg;
-  const atual = rodapeCupom();
-  if (atual && msg.includes(atual)) return msg.replace(atual, cruzado);
-  const rodapeTsp = /`Convide seus amigos para entrar aqui no grupo:[^`]*`/;
-  if (rodapeTsp.test(msg)) return msg.replace(rodapeTsp, cruzado);
-  return msg + '\n\n' + cruzado;
-}
-
-// Envia um cupom para TODOS os grupos de destino configurados (radarDestinos).
-// O grupo so-cupons recebe a versao com o rodape de convite cruzado; os demais
-// recebem a mensagem original. Falha isolada em um grupo NAO derruba os outros:
-// loga, segue para o proximo e avisa o operador ao final.
+// Envia um cupom para TODOS os grupos de destino configurados (radarDestinos)
+// mais os grupos so-cupons. Todos recebem exatamente a mesma mensagem — a
+// regra do rodape de convite cruzado foi removida. Falha isolada em um grupo
+// NAO derruba os outros: loga, segue para o proximo e avisa o operador ao final.
 async function enviarCupomParaGrupos(mensagem, imagem) {
   // Mesma conta em todos os grupos: o cupom e as copias dele saem juntos, e
   // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
@@ -1753,8 +1756,7 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
   const enviados = [], falhas = [];
 
   for (const jid of alvos) {
-    // Rodape cruzado so no grupo exclusivo de cupons.
-    const texto = soCupons.includes(jid) ? mensagemParaGrupoCupons(mensagem) : mensagem;
+    const texto = mensagem;
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -5916,13 +5918,25 @@ app.delete('/vitrine/:asin', (req, res) => {
 
 // ── TEMPLATES DE MENSAGEM POR LOJA ───────────────────────────────────────────
 app.get('/templates', (req, res) => {
-  res.json({ ok:true, templates: listarTemplates(), variaveis: VARIAVEIS_TEMPLATE });
+  res.json({ ok:true, templates: listarTemplates(),
+             variaveis: VARIAVEIS_TEMPLATE, variaveisCupom: VARIAVEIS_CUPOM });
 });
 
 // Renderiza um corpo de template com dados de exemplo. Serve ao preview ao vivo
 // do editor: o operador ve o resultado sem precisar esperar uma oferta real.
 app.post('/templates/preview', (req, res) => {
   try {
+    // Template de cupom tem outro conjunto de variaveis — previa propria, com
+    // um cupom de exemplo que exercita minimo, teto de desconto e codigo.
+    if (req.body.tipo === 'cupom') {
+      const corpoCup = req.body.corpo !== undefined
+        ? req.body.corpo
+        : (templateCupom()?.corpo || '');
+      return res.json({ ok:true, mensagem: renderTemplate(corpoCup, varsDoCupomTSP({
+        loja:'Amazon', tipo:'pct', valor:15, minimo:150, limite:60,
+        codigo: req.body.comCupom === false ? '' : 'CURTEAPROMO',
+      })) });
+    }
     const exemplo = {
       asin:'B0H6N6K239', loja: req.body.loja || 'Amazon', marca:'Samsung',
       titulo:'Samsung Smart TV 58" Crystal UHD 4K U8000H 2026, Vision AI Companion, Modo Jogo',
@@ -5944,6 +5958,28 @@ app.post('/templates/:loja', (req, res) => {
     const tpl = salvarTemplate(req.params.loja, req.body || {});
     console.log('[TPL] Template salvo — ' + req.params.loja);
     res.json({ ok:true, template: tpl });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Monta a mensagem de um cupom a partir do template '_cupom'. Existe para a
+// aba Cupom do painel parar de ter a sua propria copia do formato: o que o
+// operador gera na mao e o que o auto-envio dispara saem do MESMO corpo.
+app.post('/cupons/montar', (req, res) => {
+  try {
+    const b = req.body || {};
+    const num = v => (v === '' || v === null || v === undefined) ? null : Number(v);
+    res.json({ ok:true, mensagem: formatarCupomTSP({
+      loja:    b.loja,
+      tipo:    b.tipo === 'pct' ? 'pct' : 'reais',
+      valor:   num(b.valor) || 0,
+      minimo:  num(b.minimo),
+      maximo:  num(b.maximo),
+      limite:  num(b.limite),
+      codigo:  String(b.codigo || '').trim(),
+      gatilho: b.gatilho,
+      aviso:   b.aviso,
+      minimoDesconhecido: !!b.minimoDesconhecido,
+    }) });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
