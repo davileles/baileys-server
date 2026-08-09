@@ -4378,7 +4378,11 @@ app.get('/painel-json', (req, res) => {
   try {
     limparFila(); // garante que cupons com +12h nunca apareçam no painel
     const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-    const ofertas = filaPendentes.slice(0,50).map(o => ({ ...o, conteudoOriginal: typeof o.conteudoOriginal==='string'?o.conteudoOriginal:(Array.isArray(o.conteudoOriginal)?o.conteudoOriginal.join('\n'):''), imagens:Array.isArray(o.imagens)?o.imagens:[] }));
+    // Fila por OPERADOR: cada um so ve o que e dele. Item antigo sem etiqueta
+    // pertence a operacao padrao (todo o historico e dela).
+    const ofertas = filaPendentes
+      .filter(o => (o.tenant || TENANT_PADRAO) === req.tenantId)
+      .slice(0,50).map(o => ({ ...o, conteudoOriginal: typeof o.conteudoOriginal==='string'?o.conteudoOriginal:(Array.isArray(o.conteudoOriginal)?o.conteudoOriginal.join('\n'):''), imagens:Array.isArray(o.imagens)?o.imagens:[] }));
     res.json({ ok:true, bufferAtivo:emBuffer, ofertas });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
@@ -4387,6 +4391,8 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  // Dono: agir em item de outro operador e proibido (defesa alem do filtro de listagem).
+  if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   if (!conectado || !sock) {
     const ok = await aguardarSock();
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
@@ -4495,6 +4501,8 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  // Dono: agir em item de outro operador e proibido (defesa alem do filtro de listagem).
+  if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   oferta.status = 'rejeitado';
   salvarFila();
   res.json({ ok:true });
@@ -4504,6 +4512,8 @@ app.post('/painel/remover-imagem/:id', (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  // Dono: agir em item de outro operador e proibido (defesa alem do filtro de listagem).
+  if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   oferta.imagens = [];
   salvarFila();
   res.json({ ok:true });
@@ -4539,6 +4549,8 @@ app.post('/painel/reformatar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  // Dono: agir em item de outro operador e proibido (defesa alem do filtro de listagem).
+  if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   if (oferta.tipoConteudo === 'cupom_tsp') return res.status(400).json({ ok:false, erro:'Cupom TSP nao usa formatacao de emissao.' });
   try {
     const de = aplicarDadosEditados(oferta, req.body && req.body.dados);
@@ -4577,6 +4589,9 @@ app.post('/painel/mesclar', (req, res) => {
   const o1 = filaPendentes.find(o => String(o.id)===String(id1)&&o.status==='pendente');
   const o2 = filaPendentes.find(o => String(o.id)===String(id2)&&o.status==='pendente');
   if (!o1||!o2) return res.status(404).json({ ok:false, erro:'Uma ou ambas não encontradas.' });
+  if ((o1.tenant || TENANT_PADRAO) !== req.tenantId || (o2.tenant || TENANT_PADRAO) !== req.tenantId) {
+    return res.status(404).json({ ok:false, erro:'Uma ou ambas não encontradas.' });
+  }
   const toArray = v => Array.isArray(v)?v:(v?[v]:[]);
   o1.conteudoOriginal  = [...toArray(o1.conteudoOriginal),...toArray(o2.conteudoOriginal)];
   o1.imagens           = [...(o1.imagens||[]),...(o2.imagens||[])];
@@ -4611,6 +4626,7 @@ app.post('/painel/limpar', (req, res) => {
     : (tipoConteudo ? [tipoConteudo] : null);
   let removidos = 0;
   filaPendentes.forEach(o => {
+    if ((o.tenant || TENANT_PADRAO) !== req.tenantId) return;  // so a fila do proprio operador
     if (o.status !== 'pendente') return;
     if (tipos && !tipos.includes(o.tipoConteudo)) return;
     o.status = 'rejeitado';
@@ -6366,6 +6382,22 @@ app.get('/shopee/status', async (req, res) => {
 });
 
 app.get('/grupos', async (req, res) => {
+  // ── Operador nao-padrao: lista os grupos da CONTA DELE, nunca os do socket
+  // principal (que sao os grupos do telefone da operacao padrao).
+  if (req.tenantId !== TENANT_PADRAO) {
+    const idConta = contaConectadaDoTenant(req.tenantId);
+    if (!idConta) return res.json({ ok:true, total:0, grupos:[], aviso:'Conecte um WhatsApp na aba Conexao para listar os seus grupos.' });
+    try {
+      const chats = await contasExtras.get(idConta).sock.groupFetchAllParticipating();
+      const grupos = Object.values(chats)
+        .map(g => ({ id: g.id, nome: g.subject || '(sem nome)' }))
+        .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+      // Nomes tambem no cache global: paineis resolvem jid->nome por ele.
+      for (const g of grupos) if (!NOMES_GRUPOS.has(g.id)) NOMES_GRUPOS.set(g.id, g.nome);
+      return res.json({ ok:true, total:grupos.length, grupos });
+    } catch (e) { return res.status(500).json({ ok:false, erro:e.message }); }
+  }
+
   // groupFetchAllParticipating leva ~6s com 400 grupos e trava a aba a cada
   // abertura. O cache e preenchido na conexao e a lista muda raramente, entao
   // responde na hora e so busca de verdade com ?refresh=1 ou cache vazio.
