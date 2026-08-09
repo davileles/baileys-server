@@ -23,6 +23,7 @@ import {
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
+  cupomCitadoDesconhecido,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
@@ -33,7 +34,6 @@ import {
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
-  recarregarRadarTenants,
 } from './radar-amazon.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -48,11 +48,6 @@ import {
   gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
   estadoCredenciais, aplicarCredenciais,
 } from './config-tsp.js';
-
-// ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
-import {
-  carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant,
-} from './tenants.js';
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
 import {
@@ -196,9 +191,8 @@ const baileysLogger = pino({ level: 'silent' });
   try {
     const r = await baixarDoGitHub();
     if (r.baixados) {
-      carregarTenants(); carregarConfigTsp();
+      carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-      recarregarRadarTenants();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
     }
@@ -361,19 +355,6 @@ const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
-// Resolucao de operador por requisicao (fase 2.1). Hoje tudo resolve para o
-// tenant padrao — comportamento identico ao anterior. Nas proximas fases a
-// origem passa a ser o token de sessao do login, e os modulos de dados leem
-// req.tenantId em vez de estado global.
-app.use((req, _res, next) => {
-  const t = resolverTenant(req);
-  req.tenantId = t ? t.id : TENANT_PADRAO;
-  // Contexto assincrono: tudo que a requisicao tocar (mesmo apos awaits)
-  // enxerga o estado DESTE operador nos modulos de dados. Pipelines e workers
-  // fora de requisicao seguem no tenant padrao ate as fases 2.3/2.4.
-  comContextoTenant(req.tenantId, next);
-});
 
 let sock         = null;
 let conectado    = false;
@@ -3027,7 +3008,6 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
-  'tenants.json',           // registro dos operadores do modelo hospedado
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
@@ -3072,6 +3052,43 @@ const _TIPOS_IGNORADOS = new Set(['protocolMessage','reactionMessage','pollUpdat
 // ── RADAR DE MARKETPLACE ─────────────────────────────────────────────────────
 // Extrai o link do produto da mensagem do grupo-fonte, consulta a Creators API
 // (que e a fonte da verdade de preco e estoque — nunca o texto do grupo) e
+// ── AVISO: CUPOM CITADO QUE NAO ESTA NA BASE ─────────────────────────────────
+// Dedup por (loja, codigo) com janela de 6h: um cupom novo do ML aparece em
+// dezenas de posts no mesmo dia e o operador so precisa ser avisado uma vez.
+// Em memoria de proposito — perder o registro num redeploy so custa um aviso
+// repetido, e persistir isso no GitHub nao vale a escrita.
+const AVISOS_CUPOM_SEM_BASE = new Map();
+const AVISO_CUPOM_SEM_BASE_TTL_MS = 6 * 60 * 60 * 1000;
+
+async function avisarCupomDesconhecido(loja, codigos, p, jid) {
+  const agora = Date.now();
+  const novos = codigos.filter(cod => {
+    const k = loja + ':' + cod;
+    const visto = AVISOS_CUPOM_SEM_BASE.get(k);
+    if (visto && agora - visto < AVISO_CUPOM_SEM_BASE_TTL_MS) return false;
+    AVISOS_CUPOM_SEM_BASE.set(k, agora);
+    return true;
+  });
+  if (!novos.length) return;
+
+  const grupo = NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+  const preco = Number(p.preco);
+  const texto = '🏷️ *Cupom citado não está na base*\n\n'
+    + '*Cupom* ' + novos.join(', ') + '\n'
+    + '*Loja* ' + (loja || '—') + '\n'
+    + '*Oferta* ' + (p.titulo || p.asin || '—') + '\n'
+    + (preco ? '*Preço sem cupom* R$ ' + preco.toFixed(2).replace('.', ',') + '\n' : '')
+    + (p.link ? '*Link* ' + p.link + '\n' : '')
+    + '*Grupo de origem* ' + grupo + '\n\n'
+    + 'A oferta saiu pelo preço cheio. Cadastre o cupom na base para o radar '
+    + 'aplicar o desconto nas próximas.';
+
+  try {
+    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    console.log('[CUPOM-SEM-BASE] ' + loja + ' — ' + novos.join(', ') + ' (grupo ' + grupo + ')');
+  } catch (e) { console.error('[CUPOM-SEM-BASE] Falha ao avisar operador:', e.message); }
+}
+
 // enfileira em filaPendentes com tipoConteudo 'oferta_amazon'. A partir dai
 // segue exatamente o mesmo caminho de aprovacao dos cupons TSP.
 // O Mercado Livre publica as imagens de produto em WebP, e o WhatsApp so
@@ -3176,6 +3193,13 @@ async function processarRadarMarketplace(jid, texto) {
       continue;
     }
     const p = r.produto;
+
+    // Cupom citado no post original que nao existe na base: sem a regra
+    // (percentual, minimo, teto) o radar nao calcula o desconto e a oferta sai
+    // pelo preco cheio. Aviso ao operador, sem travar o envio.
+    const _cupSemBase = cupomCitadoDesconhecido(p.loja, texto);
+    if (_cupSemBase.length) avisarCupomDesconhecido(p.loja, _cupSemBase, p, jid).catch(() => {});
+
     const imagem = await baixarImagemProduto(p.imagemUrl);
 
     const oferta = {
@@ -4570,17 +4594,6 @@ app.post('/config-tsp', (req, res) => {
   }
 });
 
-// ── REGISTRO DE OPERADORES ───────────────────────────────────────────────────
-// Leitura publica MASCARADA: sem e-mails (endpoints do painel sao abertos; a
-// gestao completa do registro entra junto do login por operador, na fase 2.5).
-app.get('/tenants', (req, res) => {
-  res.json({
-    ok: true,
-    atual: req.tenantId,
-    tenants: listarTenants().map(t => ({ id: t.id, nome: t.nome, ativo: t.ativo, criadoEm: t.criadoEm })),
-  });
-});
-
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
 app.get('/sync', async (req, res) => {
   const base = estadoSync();
@@ -4597,9 +4610,8 @@ app.post('/sync/pull', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
   try {
     const r = await baixarDoGitHub();
-    carregarTenants(); carregarConfigTsp();
+    carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-    recarregarRadarTenants();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
