@@ -17,6 +17,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createHash } from 'crypto';
+import { credencialTsp } from './config-tsp.js';
 import { resolverPrecoDe, FONTE_API } from './preco-de.js';
 import {
   melhorCupom, cupomPorCodigo, cupomVigente, calcularDesconto,
@@ -26,7 +27,7 @@ import {
 const API_URL = 'https://open-api.affiliate.shopee.com.br/graphql';
 
 export function credenciaisShopeeOk() {
-  return !!(process.env.SHOPEE_APP_ID && process.env.SHOPEE_SECRET);
+  return !!(credencialTsp('SHOPEE_APP_ID') && credencialTsp('SHOPEE_SECRET'));
 }
 
 /**
@@ -34,8 +35,8 @@ export function credenciaisShopeeOk() {
  * O corpo e montado UMA vez e reusado na assinatura e no envio.
  */
 async function chamarShopee(query, variables = null) {
-  const appId  = process.env.SHOPEE_APP_ID;
-  const secret = process.env.SHOPEE_SECRET;
+  const appId  = credencialTsp('SHOPEE_APP_ID');
+  const secret = credencialTsp('SHOPEE_SECRET');
   if (!appId || !secret) throw new Error('SHOPEE_APP_ID / SHOPEE_SECRET nao configurados.');
 
   // A Shopee rejeita Int64 passado por variavel ("wrong type"); os exemplos
