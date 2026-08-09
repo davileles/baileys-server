@@ -42,23 +42,17 @@ import {
 
 // ── CONFIG DA OPERACAO TSP (editavel pelo painel) ─────────────────────────────
 import {
-  carregarConfigTsp, configTsp, salvarConfigTsp, configTspPublico, credenciaisEstado,
+  carregarConfigTsp, configTsp, salvarConfigTsp,
   linksTsp, rodapeCupom, rodapeGrupoCupons,
   grupoTspPadrao, grupoTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
 } from './config-tsp.js';
-
-// ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
-import {
-  carregarTenants, listarTenants, tenantPorId, tenantPorEmail,
-  criarTenant, atualizarTenant, resolverTenant, TENANT_PADRAO,
-} from './tenants.js';
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
 import {
   credenciaisAwinOk, carregarProgramasAwin, atualizarProgramasAwin,
   listarProgramasAwin, programaAwinPorLoja, programaAwinPorUrl, linkAwinDaLoja,
   gerarLinkAwin, quotaLinkAwin, buscarOfertasAwin, normalizarOfertaAwin,
-  estadoAwin,
+  estadoAwin, ehLinkAwin, processarTextoAwin, limparUrlAwin, extrairProdutoAwin,
 } from './radar-awin.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
@@ -74,6 +68,7 @@ import {
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
+  resolverLinhaVitrineMl, montarOfertasMlVitrine,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -151,6 +146,7 @@ setTimeout(() => {
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
   processarTextoMagalu, ehLinkMagalu, converterLinkMagalu, lojaMagalu,
+  resolverLinhaVitrineMagalu, montarOfertasMagaluVitrine, ttlPrecoMagalu,
 } from './radar-magalu.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -172,34 +168,22 @@ const baileysLogger = pino({ level: 'silent' });
   try {
     const r = await baixarDoGitHub();
     if (r.baixados) {
-      carregarTenants(); carregarConfigTsp();
+      carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
       semearMonitorDasFontes();
-      bootAwin();   // credenciais do painel so existem a partir daqui
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
     }
   } catch (e) { console.error('[SYNC] Falha no boot:', e.message); }
 })();
 
+// ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
 // Boot da Awin: catalogo do disco (instantaneo) e refresh diario em segundo
 // plano. Sem credenciais o modulo fica inerte — nada mais no server muda.
-//
-// Idempotente de proposito: as credenciais podem chegar por duas vias — env do
-// Railway (disponivel ja no import) ou config do painel, que so entra em
-// process.env quando carregarConfigTsp() roda, depois do download do GitHub.
-// Chamar duas vezes cobre as duas, e o guard abaixo impede agendar dois timers.
-let _awinAgendado = false;
-function bootAwin() {
-  carregarProgramasAwin();
-  if (!credenciaisAwinOk() || _awinAgendado) return;
-  _awinAgendado = true;
+carregarProgramasAwin();
+if (credenciaisAwinOk()) {
   atualizarProgramasAwin().catch(e => console.log('[AWIN] Falha ao atualizar catalogo:', e.message));
   setInterval(() => atualizarProgramasAwin().catch(() => {}), 24 * 60 * 60 * 1000).unref?.();
-  console.log('[AWIN] Catalogo de programas ativo.');
 }
-bootAwin();
-
-// ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
 
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
@@ -340,16 +324,6 @@ const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
-// Resolucao de operador por requisicao (fase 2.1). Hoje tudo resolve para o
-// tenant padrao — comportamento identico ao anterior. Nas proximas fases a
-// origem passa a ser o token de sessao do login, e os modulos de dados leem
-// req.tenantId em vez de estado global.
-app.use((req, _res, next) => {
-  const t = resolverTenant(req);
-  req.tenantId = t ? t.id : TENANT_PADRAO;
-  next();
-});
 
 let sock         = null;
 let conectado    = false;
@@ -2994,7 +2968,6 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
-  'tenants.json',           // registro dos operadores do modelo hospedado
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
@@ -3123,6 +3096,18 @@ async function processarRadarMarketplace(jid, texto) {
       catch (e) { console.error('[SHOPEE] Falha no pipeline:', e.message); }
     }
   }
+  if (ehLinkAwin(texto)) {
+    const prog = programaAwinPorUrl((texto.match(/https?:\/\/[^\s]+/) || [''])[0]);
+    const lojaAwin = String(prog?.name || 'Awin').replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const podeAwin = podeCapturar(jid, lojaAwin);
+    if (!podeAwin.ok) {
+      console.log('[MONITOR] ' + lojaAwin + ' ignorada em ' + jid.split('@')[0] + ' — ' + podeAwin.motivo);
+    } else {
+      try { resultados.push(...await processarTextoAwin(texto, { clickref: 'grupo' })); }
+      catch (e) { console.error('[AWIN] Falha no pipeline:', e.message); }
+    }
+  }
+
   if (!resultados.length) return;
 
   for (const r of resultados) {
@@ -4487,37 +4472,18 @@ app.post('/mkt/config', (req, res) => {
 });
 
 // ── CONFIG DA OPERACAO (aba Configuracoes do painel Gestao TSP) ──────────────
-// As credenciais NUNCA saem em claro por aqui: os endpoints do painel sao
-// publicos, entao o GET devolve apenas o estado mascarado de cada uma.
 app.get('/config-tsp', (req, res) => {
-  const t = tenantPorId(req.tenantId);
-  res.json({
-    ok: true,
-    tenant: t ? { id: t.id, nome: t.nome } : null,
-    config: configTspPublico(req.tenantId),
-    credenciais: credenciaisEstado(req.tenantId),
-  });
+  res.json({ ok: true, config: configTsp() });
 });
 
 app.post('/config-tsp', (req, res) => {
   try {
-    salvarConfigTsp(req.body || {}, req.tenantId);
-    console.log('[CFG-TSP] Configuracao atualizada pelo painel (' + req.tenantId + ').');
-    res.json({ ok: true, config: configTspPublico(req.tenantId), credenciais: credenciaisEstado(req.tenantId) });
+    const cfg = salvarConfigTsp(req.body || {});
+    console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
+    res.json({ ok: true, config: cfg });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
-});
-
-// ── REGISTRO DE OPERADORES ───────────────────────────────────────────────────
-// Leitura publica MASCARADA: sem e-mails (endpoints do painel sao abertos; a
-// gestao completa do registro entra junto do login por operador, na fase 2.5).
-app.get('/tenants', (req, res) => {
-  res.json({
-    ok: true,
-    atual: req.tenantId,
-    tenants: listarTenants().map(t => ({ id: t.id, nome: t.nome, ativo: t.ativo, criadoEm: t.criadoEm })),
-  });
 });
 
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
@@ -4536,7 +4502,7 @@ app.post('/sync/pull', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
   try {
     const r = await baixarDoGitHub();
-    carregarTenants(); carregarConfigTsp();
+    carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
@@ -4829,6 +4795,11 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) return { ok:false, motivo:'Shopee nao configurada' };
     montado = await montarOfertasShopeeVitrine([item], codigoCupom);
+  } else if (item.loja === 'Mercado Livre') {
+    if (!tokenAffOk()) return { ok:false, motivo:'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
+    montado = await montarOfertasMlVitrine([item], codigoCupom);
+  } else if (item.loja === 'Magazine Luiza') {
+    montado = await montarOfertasMagaluVitrine([item], codigoCupom);
   } else {
     montado = await montarOfertasVitrine([asin], codigoCupom);
   }
@@ -4838,12 +4809,15 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
 
   const oferta = {
     id: gerarId(), origem:'lista',
-    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
     mensagemFormatada: o.mensagem,
     dadosExtraidos: {
       loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
       precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
       cupom:o.cupom, precoFinal:o.precoFinal,
+      precoDeReferencia: !!o.precoDeReferencia,
     },
     imagens: [],
   };
@@ -5052,7 +5026,9 @@ app.post('/listas/:id/cancelar', (req, res) => {
 // ── VITRINE ──────────────────────────────────────────────────────────────────
 app.get('/vitrine', (req, res) => {
   const itens = listarVitrine();
-  res.json({ ok:true, total: itens.length, itens });
+  // O painel precisa do TTL para avisar quando o preco da Magalu venceu — a
+  // unica loja em que o preco nao e reconsultado no disparo.
+  res.json({ ok:true, total: itens.length, itens, ttlPrecoMagalu: ttlPrecoMagalu() });
 });
 
 // Recebe o texto colado (um link por linha) e cadastra o que conseguir resolver.
@@ -5098,13 +5074,32 @@ app.post('/vitrine', async (req, res) => {
           nome: (nomeManual || '').trim() || node?.productName || ('Produto ' + ids[0].itemId),
           url: node?.offerLink || node?.productLink || linha.trim(),
           cupom,
-        }), jaExistia: jaTinha, linha });
+        }), jaExistia: jaTinha });
+        continue;
+      }
+      // Magazine Luiza: link vira link de afiliado por transformacao de URL, sem
+      // rede. Preco vem da propria linha porque nao ha fonte para consultar.
+      if (ehLinkMagalu(linha)) {
+        const rmg = await resolverLinhaVitrineMagalu(linha);
+        if (!rmg || rmg.erro) { erros.push({ linha, erro: rmg?.erro || 'falhou' }); continue; }
+        const jaTinhaMg = !!itemVitrine(rmg.asin);
+        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom }), jaExistia: jaTinhaMg });
+        continue;
+      }
+      // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
+      // e gerado no disparo — por isso nao passa pelo resolvedor da Amazon.
+      if (ehLinkMl(linha)) {
+        if (!tokenAffOk()) { erros.push({ linha, erro: 'Mercado Livre nao configurado (ML_AFF_TOKEN)' }); continue; }
+        const rml = await resolverLinhaVitrineMl(linha);
+        if (!rml || rml.erro) { erros.push({ linha, erro: rml?.erro || 'falhou' }); continue; }
+        const jaTinhaMl = !!itemVitrine(rml.asin);
+        salvos.push({ ...salvarItemVitrine({ ...rml, cupom }), jaExistia: jaTinhaMl });
         continue;
       }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
-      salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha, linha });
+      salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha });
     } catch (e) { erros.push({ linha, erro: e.message }); }
   }
   console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s).');
@@ -5128,7 +5123,11 @@ app.post('/vitrine/disparar', async (req, res) => {
   // Cada loja tem sua API: separa antes de consultar e junta os resultados.
   const itens = asins.map(a => itemVitrine(a)).filter(Boolean);
   const daShopee = itens.filter(i => i.loja === 'Shopee');
-  const daAmazon = asins.filter(a => !daShopee.some(s => s.asin === a));
+  const daMl     = itens.filter(i => i.loja === 'Mercado Livre');
+  const daMagalu = itens.filter(i => i.loja === 'Magazine Luiza');
+  const daAmazon = asins.filter(a =>
+    !daShopee.some(s => s.asin === a) && !daMl.some(m => m.asin === a)
+    && !daMagalu.some(g => g.asin === a));
 
   let montado = { prontos: [], descartados: [] };
   if (daAmazon.length) {
@@ -5136,6 +5135,26 @@ app.post('/vitrine/disparar', async (req, res) => {
       const m = await montarOfertasVitrine(daAmazon, req.body?.cupom || null);
       montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
     } catch (e) { return res.status(500).json({ ok:false, erro:'falha na API da Amazon: ' + e.message }); }
+  }
+  if (daMagalu.length) {
+    try {
+      const m = await montarOfertasMagaluVitrine(daMagalu, req.body?.cupom || null);
+      montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+    } catch (e) {
+      daMagalu.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Magazine Luiza: ' + e.message }));
+    }
+  }
+  if (daMl.length) {
+    if (!tokenAffOk()) {
+      daMl.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Mercado Livre nao configurado' }));
+    } else {
+      try {
+        const m = await montarOfertasMlVitrine(daMl, req.body?.cupom || null);
+        montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+      } catch (e) {
+        daMl.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Mercado Livre: ' + e.message }));
+      }
+    }
   }
   if (daShopee.length) {
     if (!credenciaisShopeeOk()) {
@@ -5154,12 +5173,15 @@ app.post('/vitrine/disparar', async (req, res) => {
   for (const o of montado.prontos) {
     const oferta = {
       id: gerarId(), origem:'vitrine',
-      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu' : 'oferta_amazon',
       mensagemFormatada: o.mensagem,
       dadosExtraidos: {
         loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
         precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
         cupom:o.cupom, precoFinal:o.precoFinal,
+        precoDeReferencia: !!o.precoDeReferencia,
       },
       imagens: [],
     };
@@ -5541,6 +5563,14 @@ function pipelineDoLink(texto) {
   if (ehLinkMl(texto))     return { loja: 'Mercado Livre',  run: t => processarTextoMl(t) };
   if (ehLinkShopee(texto)) return { loja: 'Shopee',         run: t => processarTextoShopee(t) };
   if (ehLinkMagalu(texto)) return { loja: 'Magazine Luiza', run: t => processarTextoMagalu(t) };
+  // Rede Awin: cobre os 80+ anunciantes afiliados, cada um com sua propria
+  // pagina de produto. Fica depois das lojas com API propria e antes do
+  // fallback da Amazon, que so deve pegar o que ninguem reconheceu.
+  const progAwin = programaAwinPorUrl((String(texto).match(/https?:\/\/[^\s]+/) || [''])[0]);
+  if (progAwin) return {
+    loja: String(progAwin.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+    run: t => processarTextoAwin(t),
+  };
   return { loja: 'Amazon', run: t => processarTextoAmazon(t, { ignorarDedup: true, ignorarMinimo: true }) };
 }
 
