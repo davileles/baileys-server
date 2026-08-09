@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
-import { rodapeOferta } from './config-tsp.js';
+import { rodapeOferta, credencialTsp } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -98,7 +98,9 @@ const CFG_PADRAO = {
   ativo: true,
   descontoMinimo: 5,      // % — abaixo disso descarta, salvo se for deal relampago
   dedupHoras: 24,
-  partnerTag: process.env.AMZ_PARTNER_TAG || '',
+  // Vazio de proposito: resolvido no uso via credencialTsp — um tenant novo
+  // NAO pode nascer com a partner tag da operacao original.
+  partnerTag: '',
   gatilhoPadrao: '',      // texto opcional no topo da mensagem
   // Janela de publicacao dos cupons no auto-envio. Antes era o horario fixo da
   // fila CDV (8h-21h) no codigo; virou config porque cupom e oferta tem ritmos
@@ -819,7 +821,8 @@ const MARKETPLACE    = 'www.amazon.com.br';
 
 async function getToken() {
   if (E().token.valor && Date.now() < E().token.expiraEm) return E().token.valor;
-  if (!process.env.AMZ_CLIENT_ID || !process.env.AMZ_CLIENT_SECRET) {
+  const amzId = credencialTsp('AMZ_CLIENT_ID'), amzSecret = credencialTsp('AMZ_CLIENT_SECRET');
+  if (!amzId || !amzSecret) {
     throw new Error('AMZ_CLIENT_ID / AMZ_CLIENT_SECRET nao configurados.');
   }
   const res = await fetch(TOKEN_ENDPOINT, {
@@ -827,8 +830,8 @@ async function getToken() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       grant_type: 'client_credentials',
-      client_id: process.env.AMZ_CLIENT_ID,
-      client_secret: process.env.AMZ_CLIENT_SECRET,
+      client_id: amzId,
+      client_secret: amzSecret,
       scope: 'creatorsapi::default',
     }),
     signal: AbortSignal.timeout(15000),
@@ -861,7 +864,7 @@ const RECURSOS = [
  */
 export async function sondarRecursos(asin, recursos) {
   const token = await getToken();
-  const partnerTag = E().cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
+  const partnerTag = E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
   const res = await fetch(API_BASE + '/catalog/v1/getItems', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'x-marketplace': MARKETPLACE },
@@ -880,7 +883,7 @@ export async function sondarRecursos(asin, recursos) {
 export async function buscarProdutos(asins) {
   if (!asins.length) return [];
   const token = await getToken();
-  const partnerTag = E().cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
+  const partnerTag = E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
   if (!partnerTag) throw new Error('partnerTag nao configurado.');
 
   const lotes = [];
