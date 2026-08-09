@@ -612,6 +612,16 @@ function precosDaLinha(texto) {
  * nome e preco escritos a mao servem de rede de seguranca para as lojas que
  * respondem 403 a leitura automatica.
  */
+/**
+ * Identificador do produto na vitrine. Precisa ser deterministico e vir de um
+ * lugar so: o cadastro por link colado e o cadastro vindo do catalogo tem de
+ * gerar a MESMA chave, senao o mesmo produto entra duas vezes na base.
+ */
+export function chaveVitrineAwin(advertiserId, urlProduto) {
+  return 'AWIN-' + advertiserId + '-'
+    + createHash('sha1').update(limparUrlAwin(String(urlProduto || ''))).digest('hex').slice(0, 10);
+}
+
 export async function resolverLinhaVitrineAwin(linha) {
   const bruto = String(linha || '').trim();
   if (!bruto) return null;
@@ -648,7 +658,7 @@ export async function resolverLinhaVitrineAwin(linha) {
   const preco = lido.preco ?? manual.preco ?? null;
 
   return {
-    asin: 'AWIN-' + prog.id + '-' + createHash('sha1').update(urlProduto).digest('hex').slice(0, 10),
+    asin: chaveVitrineAwin(prog.id, urlProduto),
     nome,
     url: link,
     urlProduto,
