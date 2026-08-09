@@ -22,7 +22,7 @@ import {
   radarFontes, radarDestinos, ehFonteRadar,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
-  cupomPorCodigo, cupomVigente, calcularDesconto,
+  cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
@@ -59,6 +59,11 @@ import {
   credenciaisFeedOk, carregarFeedListDoDisco, atualizarFeedList,
   feedsDoAnunciante, estadoFeed, amostraFeed,
 } from './awin-feed.js';
+import {
+  configOfertasAwin, carregarOfertadosAwin, marcarOfertado,
+  usoDeHoje, buscarOfertasDosFeeds,
+} from './awin-ofertas.js';
+import { formatarOfertaAwin } from './radar-awin.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
@@ -4600,6 +4605,130 @@ app.post('/awin/cupons/importar', async (req, res) => {
     console.log('[AWIN] Importacao de cupons — ' + importados.length + ' ok, ' + ignorados.length + ' ignorado(s).');
     res.json({ ok:true, total: brutas.length, importados, ignorados });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── OFERTAS AUTOMATICAS A PARTIR DOS FEEDS ───────────────────────────────────
+// Uma varredura acha centenas de produtos com desconto. O que impede isso de
+// virar spam nao e o filtro de percentual — e a cota: teto por dia, teto por
+// loja e bloqueio de repeticao, tudo aplicado em awin-ofertas.js. Aqui entram
+// as duas ultimas travas: janela de horario e espacamento entre envios.
+const AWIN_VARREDURA_MS = Math.max(1, Number(process.env.AWIN_VARREDURA_H) || 12) * 3600 * 1000;
+let _varrendoAwin = false;
+
+async function processarOfertasAwin({ simular = false } = {}) {
+  const cfg = configOfertasAwin();
+  if (cfg.modo === 'off' && !simular) return { ok:false, erro:'AWIN_OFERTAS=off' };
+  if (_varrendoAwin) return { ok:false, erro:'ja ha uma varredura em andamento' };
+  _varrendoAwin = true;
+
+  try {
+    const r = await buscarOfertasDosFeeds({ simular });
+    if (!r.ok) return r;
+
+    const saida = { ok:true, simulacao: simular, modo: cfg.modo, usoHoje: r.usoHoje,
+      lojasExaminadas: r.lojasExaminadas, descartadosPorCota: r.descartadosPorCota,
+      enviadas: [], naFila: [], previa: [] };
+
+    for (const c of r.candidatos) {
+      const p = {
+        asin: 'AWIN-' + c.advertiserId + '-feed',
+        codigo: c.urlLoja || '',
+        titulo: c.titulo || '',
+        preco: c.preco,
+        precoDe: c.precoDe,
+        precoTexto: 'R$ ' + c.preco.toFixed(2).replace('.', ','),
+        precoDeTexto: c.precoDe ? 'R$ ' + c.precoDe.toFixed(2).replace('.', ',') : null,
+        desconto: c.desconto,
+        disponivel: true,
+        link: c.linkAfiliado,
+        imagemUrl: c.imagem || null,
+        vendedor: null, marca: c.marca || '', nota: null, avaliacoes: null,
+        dealTermina: null, ehDeal: false,
+        loja: c.loja.replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+        precoDeReferencia: true,   // preco de feed, nao lido do site agora
+      };
+
+      // Cupom vigente da propria loja, se algum se aplicar a este preco. E o
+      // ganho de juntar as duas pontas: os cupons da Awin ja estao na base.
+      const mc = melhorCupomAplicavel(p.loja, p.preco);
+      const cupom = mc ? { reg: mc.reg, desconto: mc.desconto, citado: true } : null;
+      const mensagem = formatarOfertaAwin(p, { cupom });
+
+      if (simular) {
+        saida.previa.push({ loja: p.loja, titulo: p.titulo, preco: p.preco, precoDe: p.precoDe,
+          desconto: p.desconto, cupom: cupom?.reg?.codigo || null, mensagem });
+        continue;
+      }
+
+      const oferta = {
+        id: gerarId(), origem: 'awin-feed', tipoConteudo: 'oferta_awin',
+        mensagemFormatada: mensagem,
+        dadosExtraidos: {
+          loja: p.loja, asin: p.asin, titulo: p.titulo, preco: p.preco, precoDe: p.precoDe,
+          desconto: p.desconto, link: p.link,
+          cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+          precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+          precoDeReferencia: true,
+        },
+        imagens: [], status: 'pendente', timestamp: new Date().toISOString(),
+      };
+      try {
+        const img = await baixarImagemProduto(p.imagemUrl);
+        if (img) oferta.imagens = [img];
+      } catch {}
+
+      // Consome a vaga assim que a oferta e aceita, mesmo indo para a fila: o
+      // proposito do historico e nao repetir o produto, nao contar envios.
+      marcarOfertado(c.chaveHistorico);
+
+      const janela = dentroDaJanelaCupom();
+      if (cfg.modo === 'on' && janela.ok) {
+        try {
+          const env = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
+          oferta.status = 'enviado';
+          oferta.enviadoEm = new Date().toISOString();
+          oferta.gruposEnviados = env.enviados;
+          filaPendentes.unshift(oferta); salvarFila();
+          saida.enviadas.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
+          console.log('[AWIN-OFERTAS] Enviada — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
+          // Espacamento: rajada de ofertas seguidas e o jeito mais rapido de
+          // fazer o grupo silenciar as notificacoes.
+          await new Promise(r2 => setTimeout(r2, intervaloAutoEnvioMs()));
+          continue;
+        } catch (e) {
+          console.error('[AWIN-OFERTAS] Falha no envio, indo para a fila:', e.message);
+        }
+      }
+
+      if (cfg.modo === 'on' && !janela.ok) oferta.motivoFila = janela.motivo;
+      filaPendentes.unshift(oferta); salvarFila();
+      saida.naFila.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
+      console.log('[AWIN-OFERTAS] Na fila — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
+    }
+    return saida;
+  } catch (e) {
+    console.log('[AWIN-OFERTAS] Erro na varredura:', e.message);
+    return { ok:false, erro:e.message };
+  } finally { _varrendoAwin = false; }
+}
+
+carregarOfertadosAwin();
+if (credenciaisFeedOk() && configOfertasAwin().modo !== 'off') {
+  setInterval(() => { processarOfertasAwin().catch(() => {}); }, AWIN_VARREDURA_MS).unref?.();
+  console.log('[AWIN-OFERTAS] Varredura ligada (modo ' + configOfertasAwin().modo
+    + ') — a cada ' + (AWIN_VARREDURA_MS / 3600000) + 'h, ate '
+    + configOfertasAwin().maxDia + ' oferta(s)/dia.');
+}
+
+// Simulacao: mostra exatamente o que sairia, sem enviar e sem gastar cota.
+app.post('/awin/ofertas/varrer', async (req, res) => {
+  const r = await processarOfertasAwin({ simular: !!req.body?.simular });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+app.get('/awin/ofertas/estado', (req, res) => {
+  res.json({ ok:true, config: configOfertasAwin(), usoHoje: usoDeHoje(),
+    intervaloHoras: AWIN_VARREDURA_MS / 3600000, varrendo: _varrendoAwin });
 });
 
 // ── PRODUCT FEEDS DA AWIN ────────────────────────────────────────────────────
