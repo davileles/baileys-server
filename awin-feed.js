@@ -15,6 +15,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createGunzip } from 'zlib';
+import { resolverPrecoDe, FONTE_FEED } from './preco-de.js';
 import { Readable } from 'stream';
 import { createInterface } from 'readline';
 import { createReadStream, createWriteStream, existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'fs';
@@ -264,28 +265,39 @@ export function normalizarLinhaFeed(l, feed) {
   const atual  = paraNumero(l.search_price);
   const antigo = paraNumero(l.product_price_old);
 
-  let preco = null, precoDe = null;
+  let preco = null, bruto = null, fatorMax = 5;
   if (atual && antigo) {
-    preco   = Math.min(atual, antigo);
-    precoDe = Math.max(atual, antigo) > preco ? Math.max(atual, antigo) : null;
+    preco = Math.min(atual, antigo);
+    bruto = Math.max(atual, antigo);
   } else {
     const candidatos = [
       atual, paraNumero(l.store_price), paraNumero(l.rrp_price), paraNumero(l.base_price),
     ].filter(Boolean);
     if (!candidatos.length) return null;
-    const menor = Math.min(...candidatos);
-    const maior = Math.max(...candidatos);
-    preco   = menor;
-    precoDe = (maior > menor && menor / maior >= 0.3) ? maior : null;
+    preco = Math.min(...candidatos);
+    bruto = Math.max(...candidatos);
+    // Sem campo explicito de preco antigo, o teto e mais apertado (3,33x, a
+    // antiga razao minima de 0,3): protege contra preco unitario (R$/kg) virar
+    // uma oferta boa demais para ser verdade.
+    fatorMax = 3.33;
   }
   if (!preco) return null;
+
+  const resolvido = resolverPrecoDe({
+    preco,
+    limites: { fatorMax },
+    rotulo: 'feed ' + (l.merchant_product_id || ''),
+    candidatos: [{ fonte: FONTE_FEED, valor: bruto }],
+  });
+  const precoDe = resolvido.precoDe;
 
   return {
     titulo: l.product_name || null,
     imagem: l.aw_image_url || null,
     preco,
     precoDe,
-    desconto: precoDe ? Math.round((1 - preco / precoDe) * 100) : 0,
+    precoDeFonte: resolvido.fonte,
+    desconto: resolvido.desconto,
     marca: l.brand_name || '',
     // in_stock vazio nao e o mesmo que zero: so o "0" explicito significa fora
     // de estoque, senao produto de feed sem a coluna seria sempre descartado.
