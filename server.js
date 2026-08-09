@@ -22,7 +22,7 @@ import {
   radarFontes, radarDestinos, ehFonteRadar,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
-  cupomPorCodigo, cupomVigente, calcularDesconto,
+  cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
@@ -33,7 +33,6 @@ import {
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
-  recarregarRadarTenants,
 } from './radar-amazon.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -43,17 +42,40 @@ import {
 
 // ── CONFIG DA OPERACAO TSP (editavel pelo painel) ─────────────────────────────
 import {
-  carregarConfigTsp, configTsp, salvarConfigTsp, configTspPublico, credenciaisEstado,
+  carregarConfigTsp, configTsp, salvarConfigTsp,
   linksTsp, rodapeCupom, rodapeGrupoCupons,
-  grupoTspPadrao, grupoTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
+  gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
+  estadoCredenciais, aplicarCredenciais,
 } from './config-tsp.js';
 
-// ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
+// ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
 import {
-  carregarTenants, listarTenants, tenantPorId, tenantPorEmail,
-  criarTenant, atualizarTenant, resolverTenant, TENANT_PADRAO,
-  comContextoTenant, tenantContexto,
-} from './tenants.js';
+  credenciaisAwinOk, carregarProgramasAwin, atualizarProgramasAwin,
+  listarProgramasAwin, programaAwinPorLoja, programaAwinPorUrl, linkAwinDaLoja,
+  gerarLinkAwin, quotaLinkAwin, buscarOfertasAwin, normalizarOfertaAwin,
+  estadoAwin, ehLinkAwin, processarTextoAwin, limparUrlAwin, extrairProdutoAwin,
+  resolverLinhaVitrineAwin, montarOfertasAwinVitrine, ttlPrecoAwin,
+} from './radar-awin.js';
+import {
+  credenciaisFeedOk, carregarFeedListDoDisco, atualizarFeedList,
+  feedsDoAnunciante, estadoFeed, amostraFeed,
+} from './awin-feed.js';
+import {
+  configOfertasAwin, carregarConfigOfertasAwin, salvarConfigOfertasAwin,
+  carregarOfertadosAwin, marcarOfertado, usoDeHoje,
+  carregarCandidatosAwin, reabastecerCandidatosAwin, estadoCandidatos,
+  proximosCandidatos, dentroDaJanelaAwin, vagasAgora,
+} from './awin-ofertas.js';
+import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
+import { definirTtlFeedHoras } from './awin-feed.js';
+
+// Espalha os prazos da config para os modulos que os usam. Chamado no boot e
+// depois de cada gravacao, para valer sem redeploy.
+function aplicarTtlsAwin() {
+  const c = configOfertasAwin();
+  definirTtlPrecoAwin(c.precoTtlHoras);
+  definirTtlFeedHoras(c.feedTtlHoras);
+}
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
@@ -68,6 +90,7 @@ import {
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
+  resolverLinhaVitrineMl, montarOfertasMlVitrine,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -145,6 +168,7 @@ setTimeout(() => {
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
   processarTextoMagalu, ehLinkMagalu, converterLinkMagalu, lojaMagalu,
+  resolverLinhaVitrineMagalu, montarOfertasMagaluVitrine, ttlPrecoMagalu,
 } from './radar-magalu.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -166,9 +190,8 @@ const baileysLogger = pino({ level: 'silent' });
   try {
     const r = await baixarDoGitHub();
     if (r.baixados) {
-      carregarTenants(); carregarConfigTsp();
+      carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-      recarregarRadarTenants();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
     }
@@ -176,6 +199,20 @@ const baileysLogger = pino({ level: 'silent' });
 })();
 
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
+// Boot da Awin: catalogo do disco (instantaneo) e refresh diario em segundo
+// plano. Sem credenciais o modulo fica inerte — nada mais no server muda.
+carregarProgramasAwin();
+// Lista de feeds: cache em disco no boot, atualizacao diaria em segundo plano.
+carregarFeedListDoDisco();
+if (credenciaisFeedOk()) {
+  atualizarFeedList().catch(e => console.log('[AWIN-FEED] Falha ao atualizar lista:', e.message));
+  setInterval(() => atualizarFeedList().catch(() => {}), 24 * 60 * 60 * 1000).unref?.();
+}
+if (credenciaisAwinOk()) {
+  atualizarProgramasAwin().catch(e => console.log('[AWIN] Falha ao atualizar catalogo:', e.message));
+  setInterval(() => atualizarProgramasAwin().catch(() => {}), 24 * 60 * 60 * 1000).unref?.();
+}
+
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
 
@@ -184,10 +221,10 @@ process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledReject
 // painel (aba Configuracoes) — getters para toda leitura ver o valor atual.
 // Os grupos do CDV seguem fixos: pertencem a outra operacao, fora deste painel.
 const GRUPOS = {
-  get tsp()        { return grupoTspPadrao(); },
-  // Grupo exclusivo de cupons — recebe copia de todo cupom_tsp com rodape
-  // convidando para o grupo de ofertas (convite cruzado).
-  get tsp_cupons() { return grupoTspCupons(); },
+  // Grupos exclusivos de cupons — recebem copia de todo cupom_tsp com rodape
+  // convidando para o grupo de ofertas (convite cruzado). Nunca recebem oferta
+  // de produto. Podem ser varios.
+  get tsp_cupons() { return gruposTspCupons(); },
   cdv_ofertas: '120363170138704529@g.us',
   cdv_emissao: '120363172490263905@g.us',
   // Grupo interno do operador — avisos operacionais que NAO vao para clientes
@@ -234,7 +271,9 @@ const GRUPOS_FILTRO_DATAS_MIN = {
 };
 
 const PORT          = process.env.PORT || 3001;
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+// Funcao, nao const: a chave pode ser gravada pelo painel depois do boot e
+// precisa valer na proxima chamada, sem restart.
+function anthropicKey() { return process.env.ANTHROPIC_API_KEY; }
 const SESSAO_DIR    = './sessao';
 const UPLOAD_DIR    = './tmp-uploads';
 
@@ -315,19 +354,6 @@ const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-
-// Resolucao de operador por requisicao (fase 2.1). Hoje tudo resolve para o
-// tenant padrao — comportamento identico ao anterior. Nas proximas fases a
-// origem passa a ser o token de sessao do login, e os modulos de dados leem
-// req.tenantId em vez de estado global.
-app.use((req, _res, next) => {
-  const t = resolverTenant(req);
-  req.tenantId = t ? t.id : TENANT_PADRAO;
-  // Contexto assincrono: tudo que a requisicao tocar (mesmo apos awaits)
-  // enxerga o estado DESTE operador nos modulos de dados. Pipelines e workers
-  // fora de requisicao seguem no tenant padrao ate as fases 2.3/2.4.
-  comContextoTenant(req.tenantId, next);
-});
 
 let sock         = null;
 let conectado    = false;
@@ -1314,8 +1340,15 @@ function ehZeDelivery(loja) {
   return n.includes('zedelivery') || n === 'ze';
 }
 
+// A IA devolve lojas fora das quatro principais como "Outro: Casas Bahia".
+// O prefixo e um rotulo interno de classificacao — nunca deve vazar para a
+// mensagem enviada ao grupo, onde so o nome da loja faz sentido.
+function nomeLojaExibicao(loja) {
+  return String(loja || '').replace(/^outr[oa]s?\s*:\s*/i, '').trim();
+}
+
 function formatarCupomTSP(dados) {
-  const loja   = dados.loja   || '';
+  const loja   = nomeLojaExibicao(dados.loja);
   const tipo   = dados.tipo   || 'reais';
   const valor  = dados.valor  || 0;
   // minimo null/0 = sem valor minimo. Antes caia em `|| 0` e a mensagem saia
@@ -1336,9 +1369,14 @@ function formatarCupomTSP(dados) {
   if (maximo) partes.push(`em produtos de até R$ ${maximo}`);
   if (isPct && limite) partes.push(`com limite de R$ ${limite} de desconto`);
 
+  // "Sem valor minimo" e uma AFIRMACAO. So pode ser feita quando a fonte disse
+  // que nao ha minimo. Quando ela apenas nao informou (caso comum nas ofertas
+  // da rede), a mensagem manda conferir as condicoes em vez de prometer algo.
   const validade = partes.length
     ? 'Válido ' + partes.join(', ') + '.'
-    : 'Válido sem valor mínimo de compra.';
+    : (dados.minimoDesconhecido
+        ? 'Confira as condições de uso na página da loja.'
+        : 'Válido sem valor mínimo de compra.');
 
   let msg = `*🚨 Cupom de ${valor}${tipoStr} - ${loja}*\n\n`;
   msg += validade + '\n\n';
@@ -1370,6 +1408,11 @@ function formatarCupomTSP(dados) {
   else if (loja === 'Shopee')   url = codigo ? LINKS_TSP['Shopee_com'] : LINKS_TSP['Shopee_sem'];
   else if (isMagalu)            url = LINKS_TSP['Magazine Luiza'];
   else if (ehZeDelivery(loja))  url = LINKS_TSP['Zé Delivery'];
+  // Fora das lojas com link fixo, a Awin cobre qualquer anunciante afiliado.
+  // Usa o clickThroughUrl do programa: e sincrono, nao faz rede e nao consome
+  // a quota diaria de shortlinks. Um link ja resolvido em dados.urlAfiliado
+  // (caso da propria Offers API) tem prioridade sobre tudo.
+  if (!url) url = dados.urlAfiliado || linkAwinDaLoja(loja) || '';
 
   if (url) msg += `🔗 *RESGATE O CUPOM AQUI* ${url}`;
 
@@ -1394,7 +1437,7 @@ async function chamarClaude(system, userContent, maxTokens) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': ANTHROPIC_KEY,
+          'x-api-key': anthropicKey(),
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
@@ -1483,7 +1526,8 @@ function lojaComLink(loja, codigo) {
   if (loja === 'Shopee')        return !!codigo && !!LINKS_TSP['Shopee_com'];
   if (/magazine\s*luiza|magalu/.test(norm)) return !!LINKS_TSP['Magazine Luiza'];
   if (ehZeDelivery(loja))       return !!LINKS_TSP['Zé Delivery'];
-  return false;
+  // Loja da rede Awin: o link sai do proprio catalogo de programas afiliados.
+  return !!linkAwinDaLoja(loja);
 }
 
 // Confere se um numero extraido pela IA aparece de fato no texto original.
@@ -1541,14 +1585,19 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   if (cupom.tipo !== 'pct' && cupom.tipo !== 'reais') return { auto:false, motivo:'tipo invalido' };
   if (!(Number(cupom.valor) > 0))         return { auto:false, motivo:'valor ausente ou zero' };
 
-  if (cupom.minimo === null || cupom.minimo === undefined)
+  // Cupom lido de texto solto pode ter minimo omitido por falha de extracao —
+  // dai a exigencia. Vindo da API do proprio anunciante (Awin), a ausencia e um
+  // fato da oferta, nao um erro de leitura, e a mensagem ja avisa para conferir
+  // as condicoes em vez de prometer "sem minimo".
+  if (!cupom.fonteOficial && (cupom.minimo === null || cupom.minimo === undefined))
     return { auto:false, motivo:'minimo nao informado (regra de aplicacao incompleta)' };
   if (Number(cupom.minimo) < 0)           return { auto:false, motivo:'minimo invalido' };
 
   // Percentual precisa de ALGUM teto declarado: ou o do desconto ('limite') ou o
   // do produto elegivel ('maximo'). Sem nenhum dos dois a regra de aplicacao
   // esta incompleta e o cupom nao pode sair sozinho.
-  if (cupom.tipo === 'pct' && !(Number(cupom.limite) > 0) && !(Number(cupom.maximo) > 0))
+  if (!cupom.fonteOficial && cupom.tipo === 'pct'
+      && !(Number(cupom.limite) > 0) && !(Number(cupom.maximo) > 0))
     return { auto:false, motivo:'cupom percentual sem teto de desconto nem de produto' };
   if (cupom.maximo != null && cupom.minimo != null && Number(cupom.maximo) > 0
       && Number(cupom.maximo) < Number(cupom.minimo))
@@ -1605,12 +1654,13 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
   // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
   const op = { conta: contaDoTurno() };
   const destinos = radarDestinos();
-  const alvos = [...new Set([...(destinos.length ? destinos : []), GRUPOS['tsp_cupons']])];
+  const soCupons = GRUPOS['tsp_cupons'];
+  const alvos = [...new Set([...destinos, ...soCupons])];
   const enviados = [], falhas = [];
 
   for (const jid of alvos) {
     // Rodape cruzado so no grupo exclusivo de cupons.
-    const texto = jid === GRUPOS['tsp_cupons'] ? mensagemParaGrupoCupons(mensagem) : mensagem;
+    const texto = soCupons.includes(jid) ? mensagemParaGrupoCupons(mensagem) : mensagem;
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -1705,13 +1755,21 @@ async function montarLinkPreviewManual(dados) {
 }
 
 async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
-  const destinos = radarDestinos();
-  const alvos = destinos.length ? destinos : [GRUPOS['tsp']];
+  // Sem fallback: oferta vai para os grupos marcados como DESTINO na aba
+  // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
+  // uma mensagem que diz o que fazer — antes isso caia num grupo fixo que o
+  // operador nao tinha escolhido.
+  const alvos = radarDestinos();
+  if (!alvos.length) throw new Error('Nenhum grupo marcado como destino na aba Grupos.');
+  // Grupo so-cupons nao recebe oferta de produto, mesmo que esteja marcado
+  // como destino por engano.
+  const soCupons = new Set(GRUPOS['tsp_cupons']);
   const enviados = [], falhas = [];
   const preview = oferta ? montarLinkPreview(oferta, mensagem) : null;
   const op = { conta: contaDoTurno() };
 
   for (const jid of alvos) {
+    if (soCupons.has(jid)) continue;
     try {
       await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem }, 0, op);
       enviados.push(jid);
@@ -1780,7 +1838,7 @@ setInterval(async () => {
     if (!oferta) return;
 
     const d = oferta.dadosExtraidos || {};
-    const rotulo = `${d.loja} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
+    const rotulo = `${nomeLojaExibicao(d.loja)} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
 
     // Marca como 'enviando' antes do await para o card sumir do painel e
     // reduzir a janela de corrida com uma aprovacao manual simultanea.
@@ -1808,6 +1866,111 @@ setInterval(async () => {
     }
   } finally { _workerAutoRodando = false; }
 }, 15 * 1000);
+
+// ── ENFILEIRAR / DESPACHAR UM CUPOM ──────────────────────────────────────────
+// Caminho unico para todo cupom, venha do Telegram ou da Awin: dedup, gravacao
+// na base, gate de auto-envio e envio (ou fila). Antes isso vivia dentro do
+// processador do Telegram; extrair evita que uma segunda fonte reimplemente as
+// mesmas regras de seguranca com sutis diferencas.
+async function enfileirarCupomTSP(c, ctx = {}) {
+  const {
+    origem = 'desconhecida',
+    textoOriginal = '',
+    imagens = [],
+    tinhaMultiplos = false,
+    codigosLista = [],
+    somenteFila = false,
+  } = ctx;
+
+  const mensagemFormatada = formatarCupomTSP(c);
+  const oferta = {
+    id: gerarId(),
+    timestamp: new Date().toISOString(),
+    grupoOrigem: origem,
+    tipoConteudo: 'cupom_tsp',
+    conteudoOriginal: textoOriginal,
+    imagens,
+    mensagemFormatada,
+    dadosExtraidos: c,
+    status: 'pendente',
+  };
+
+  // Verificar deduplicação: ignorar se o mesmo cupom já foi visto recentemente
+  if (cupomJaVisto(c)) {
+    console.log(`[DEDUP] Cupom ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
+    return { ignorado: true, motivo: 'duplicata' };
+  }
+
+  // Registra ANTES de qualquer envio: se o envio falhar preferimos perder um
+  // cupom a arriscar mandar duplicado quando o outro canal repostar.
+  registrarCupomVisto(c);
+  // Mesmo ponto, mesma garantia: o cupom entra na base antes de qualquer
+  // envio, para ja estar disponivel quando uma oferta do radar chegar.
+  try { registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
+
+  const veredito = avaliarAutoEnvio(c, textoOriginal, tinhaMultiplos, codigosLista);
+  const rotulo   = `${nomeLojaExibicao(c.loja)} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
+
+  // Veredito fica gravado na oferta para aparecer no card da fila (o log do
+  // Railway sozinho nao serve: em modo sombra o operador precisa comparar a
+  // decisao do gate com a propria aprovacao manual, cupom a cupom.
+  oferta.autoAvaliacao = {
+    auto: veredito.auto,
+    motivo: veredito.motivo,
+    modo: AUTO_ENVIO_MODO,
+    avaliadoEm: new Date().toISOString(),
+  };
+
+  // Bloqueio APENAS temporal (janela/intervalo): todas as regras de conteudo
+  // passaram. Em modo 'on', em vez de exigir aprovacao manual, o cupom entra
+  // agendado e o worker de espacamento envia quando a condicao liberar.
+  const bloqueioTemporal = !veredito.auto && /^(fora da janela|intervalo minimo)/.test(veredito.motivo);
+  if (AUTO_ENVIO_MODO === 'on' && bloqueioTemporal && !somenteFila) oferta.autoAgendado = true;
+
+  // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
+  // acerto do gate contra a aprovacao manual antes de ligar 'on'.
+  if (AUTO_ENVIO_MODO === 'sombra') {
+    console.log(`[AUTO-SOMBRA] ${veredito.auto ? 'ENVIARIA' : 'BLOQUEADO'} — ${rotulo} — ${veredito.motivo}`);
+  }
+
+  if (AUTO_ENVIO_MODO === 'on' && veredito.auto && !somenteFila) {
+    try {
+      await despacharCupomAuto(oferta);
+      filaPendentes.unshift(oferta);
+      salvarFila();
+      console.log(`[AUTO] Cupom #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
+      try {
+        await enviarMensagem(GRUPOS.operador, {
+          text: `*Cupom enviado automaticamente* 🤖\n\n${rotulo}\n\nOrigem: ${origem}`
+        });
+      } catch(e) { console.warn('[AUTO] Falha ao avisar operador:', e.message); }
+      return { oferta, veredito, enviado: true };
+    } catch(err) {
+      // Falha no envio: cai para a fila manual em vez de perder o cupom.
+      console.error(`[AUTO] Falha no envio automatico, caindo para fila: ${err.message}`);
+    }
+  }
+
+  filaPendentes.unshift(oferta);
+  salvarFila();
+  console.log(`[FILA] Cupom #${oferta.id} adicionado à fila — ${rotulo} (${veredito.motivo}) — origem ${origem}`);
+
+  // Cupom agendado para auto-envio: sem alerta de aprovacao — o worker de
+  // espacamento avisa o operador quando de fato enviar (ou se expirar).
+  if (oferta.autoAgendado) {
+    console.log(`[AUTO-FILA] Cupom #${oferta.id} agendado para auto-envio com espacamento.`);
+    return { oferta, veredito, agendado: true };
+  }
+
+  // Alerta de novo cupom no grupo do operador
+  try {
+    await enviarMensagem(GRUPOS.operador, {
+      text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+    });
+  } catch(e) { console.warn('[FILA] Falha ao enviar alerta de cupom:', e.message); }
+
+  return { oferta, veredito, enviado: false };
+}
 
 // ── PROCESSAR MENSAGEM DO TELEGRAM ────────────────────────────────────────────
 // Serializacao: o gate de dedup so roda DEPOIS da chamada a Anthropic (1-3s).
@@ -1843,92 +2006,14 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
     const codigosLista = lista.map(x => x.codigo).filter(Boolean);
 
     for (const c of lista) {
-      const mensagemFormatada = formatarCupomTSP(c);
-      const oferta = {
-        id: gerarId(),
-        timestamp: new Date().toISOString(),
-        grupoOrigem: `telegram:@${canalUsername}`,
-        tipoConteudo: 'cupom_tsp',
-        conteudoOriginal: texto,
+      await enfileirarCupomTSP(c, {
+        origem: `telegram:@${canalUsername}`,
+        textoOriginal: texto,
         imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
-        mensagemFormatada,
-        dadosExtraidos: c,
-        status: 'pendente',
-      };
-      // Verificar deduplicação: ignorar se o mesmo cupom já foi visto recentemente
-      if (cupomJaVisto(c)) {
-        console.log(`[DEDUP] Cupom ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
-        continue;
-      }
-
-      // Registra ANTES de qualquer envio: se o envio falhar preferimos perder um
-      // cupom a arriscar mandar duplicado quando o outro canal repostar.
-      registrarCupomVisto(c);
-      // Mesmo ponto, mesma garantia: o cupom entra na base antes de qualquer
-      // envio, para ja estar disponivel quando uma oferta do radar chegar.
-      try { registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
-
-      const veredito = avaliarAutoEnvio(c, texto, tinhaMultiplos, codigosLista);
-      const rotulo   = `${c.loja} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
-
-      // Veredito fica gravado na oferta para aparecer no card da fila (o log do
-      // Railway sozinho nao serve: em modo sombra o operador precisa comparar a
-      // decisao do gate com a propria aprovacao manual, cupom a cupom.
-      oferta.autoAvaliacao = {
-        auto: veredito.auto,
-        motivo: veredito.motivo,
-        modo: AUTO_ENVIO_MODO,
-        avaliadoEm: new Date().toISOString(),
-      };
-
-      // Bloqueio APENAS temporal (janela/intervalo): todas as regras de conteudo
-      // passaram. Em modo 'on', em vez de exigir aprovacao manual, o cupom entra
-      // agendado e o worker de espacamento envia quando a condicao liberar.
-      const bloqueioTemporal = !veredito.auto && /^(fora da janela|intervalo minimo)/.test(veredito.motivo);
-      if (AUTO_ENVIO_MODO === 'on' && bloqueioTemporal) oferta.autoAgendado = true;
-
-      // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
-      // acerto do gate contra a aprovacao manual antes de ligar 'on'.
-      if (AUTO_ENVIO_MODO === 'sombra') {
-        console.log(`[AUTO-SOMBRA] ${veredito.auto ? 'ENVIARIA' : 'BLOQUEADO'} — ${rotulo} — ${veredito.motivo}`);
-      }
-
-      if (AUTO_ENVIO_MODO === 'on' && veredito.auto) {
-        try {
-          await despacharCupomAuto(oferta);
-          filaPendentes.unshift(oferta);
-          salvarFila();
-          console.log(`[AUTO] Cupom #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
-          try {
-            await enviarMensagem(GRUPOS.operador, {
-              text: `*Cupom enviado automaticamente* 🤖\n\n${rotulo}\n\nOrigem: @${canalUsername}`
-            });
-          } catch(e) { console.warn('[AUTO] Falha ao avisar operador:', e.message); }
-          continue;
-        } catch(err) {
-          // Falha no envio: cai para a fila manual em vez de perder o cupom.
-          console.error(`[AUTO] Falha no envio automatico, caindo para fila: ${err.message}`);
-        }
-      }
-
-      filaPendentes.unshift(oferta);
-      salvarFila();
-      console.log(`[TG] Cupom #${oferta.id} adicionado à fila — ${rotulo} (${veredito.motivo})`);
-
-      // Cupom agendado para auto-envio: sem alerta de aprovacao — o worker de
-      // espacamento avisa o operador quando de fato enviar (ou se expirar).
-      if (oferta.autoAgendado) {
-        console.log(`[AUTO-FILA] Cupom #${oferta.id} agendado para auto-envio com espacamento.`);
-        continue;
-      }
-
-      // Alerta de novo cupom no grupo do operador
-      try {
-        await enviarMensagem(GRUPOS.operador, {
-          text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
-        });
-      } catch(e) { console.warn('[TG] Falha ao enviar alerta de cupom:', e.message); }
+        tinhaMultiplos, codigosLista,
+      });
     }
+
   } catch(err) {
     console.error('[TG] Erro ao processar cupom:', err.message);
   }
@@ -2922,7 +3007,6 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
-  'tenants.json',           // registro dos operadores do modelo hospedado
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
@@ -3051,6 +3135,18 @@ async function processarRadarMarketplace(jid, texto) {
       catch (e) { console.error('[SHOPEE] Falha no pipeline:', e.message); }
     }
   }
+  if (ehLinkAwin(texto)) {
+    const prog = programaAwinPorUrl((texto.match(/https?:\/\/[^\s]+/) || [''])[0]);
+    const lojaAwin = String(prog?.name || 'Awin').replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const podeAwin = podeCapturar(jid, lojaAwin);
+    if (!podeAwin.ok) {
+      console.log('[MONITOR] ' + lojaAwin + ' ignorada em ' + jid.split('@')[0] + ' — ' + podeAwin.motivo);
+    } else {
+      try { resultados.push(...await processarTextoAwin(texto, { clickref: 'grupo' })); }
+      catch (e) { console.error('[AWIN] Falha no pipeline:', e.message); }
+    }
+  }
+
   if (!resultados.length) return;
 
   for (const r of resultados) {
@@ -3650,8 +3746,7 @@ app.get('/contas/:id/grupos', async (req, res) => {
   if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
   try {
     const daConta = Object.keys(await c.sock.groupFetchAllParticipating());
-    const destinos = radarDestinos().length ? radarDestinos() : [GRUPOS['tsp']];
-    const alvos = [...new Set([...destinos, GRUPOS['tsp'], GRUPOS['tsp_cupons']])];
+    const alvos = [...new Set([...radarDestinos(), ...GRUPOS['tsp_cupons']])];
     const ausentes = (lista) => [...new Set(lista)]
       .filter(j => !daConta.includes(j))
       .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
@@ -3881,7 +3976,7 @@ app.get('/painel', (req, res) => {
     const isTSP = o.tipoConteudo === 'cupom_tsp';
 
     if (isTSP) {
-      const loja  = d.loja || '';
+      const loja  = nomeLojaExibicao(d.loja);
       const valor = d.valor || '';
       const tipo  = d.tipo === 'pct' ? '%' : ' R$';
       const cod   = d.codigo ? `<span class="tag">${d.codigo}</span>` : '';
@@ -4415,37 +4510,43 @@ app.post('/mkt/config', (req, res) => {
 });
 
 // ── CONFIG DA OPERACAO (aba Configuracoes do painel Gestao TSP) ──────────────
-// As credenciais NUNCA saem em claro por aqui: os endpoints do painel sao
-// publicos, entao o GET devolve apenas o estado mascarado de cada uma.
 app.get('/config-tsp', (req, res) => {
-  const t = tenantPorId(req.tenantId);
-  res.json({
-    ok: true,
-    tenant: t ? { id: t.id, nome: t.nome } : null,
-    config: configTspPublico(req.tenantId),
-    credenciais: credenciaisEstado(req.tenantId),
-  });
+  // A config sai SEM os valores das credenciais: quem abre o painel ve o que
+  // esta configurado, nao o segredo em si. O painel recebe so o estado
+  // (preenchida, origem, ultimos 4 caracteres).
+  const cfg = { ...configTsp() };
+  delete cfg.credenciais;
+  res.json({ ok: true, config: cfg, credenciais: estadoCredenciais() });
 });
 
 app.post('/config-tsp', (req, res) => {
   try {
-    salvarConfigTsp(req.body || {}, req.tenantId);
-    console.log('[CFG-TSP] Configuracao atualizada pelo painel (' + req.tenantId + ').');
-    res.json({ ok: true, config: configTspPublico(req.tenantId), credenciais: credenciaisEstado(req.tenantId) });
+    const corpo = { ...(req.body || {}) };
+    // Campo em branco no formulario significa "nao mexi nisso", nunca "apague a
+    // credencial". Para limpar de proposito existe o valor especial '--'.
+    if (corpo.credenciais && typeof corpo.credenciais === 'object') {
+      const limpas = {};
+      for (const [k, v] of Object.entries(corpo.credenciais)) {
+        const s2 = String(v ?? '').trim();
+        if (!s2) continue;
+        limpas[k] = s2 === '--' ? '' : s2;
+      }
+      corpo.credenciais = limpas;
+    }
+    const cfg = salvarConfigTsp(corpo);
+    console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
+    // Credencial nova so vale se os modulos rebuscarem o que depende dela: sem
+    // isso, colar a chave da Awin no painel nao carregava catalogo nenhum ate o
+    // proximo restart.
+    if (credenciaisAwinOk()) atualizarProgramasAwin(true).catch(() => {});
+    if (credenciaisFeedOk()) atualizarFeedList(true).catch(() => {});
+    agendarAwin();
+    const saida = { ...cfg };
+    delete saida.credenciais;
+    res.json({ ok: true, config: saida, credenciais: estadoCredenciais() });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
-});
-
-// ── REGISTRO DE OPERADORES ───────────────────────────────────────────────────
-// Leitura publica MASCARADA: sem e-mails (endpoints do painel sao abertos; a
-// gestao completa do registro entra junto do login por operador, na fase 2.5).
-app.get('/tenants', (req, res) => {
-  res.json({
-    ok: true,
-    atual: req.tenantId,
-    tenants: listarTenants().map(t => ({ id: t.id, nome: t.nome, ativo: t.ativo, criadoEm: t.criadoEm })),
-  });
 });
 
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
@@ -4464,11 +4565,472 @@ app.post('/sync/pull', async (req, res) => {
   if (!sincronizacaoAtiva()) return res.status(400).json({ ok:false, erro:'GITHUB_TOKEN nao configurado.' });
   try {
     const r = await baixarDoGitHub();
-    carregarTenants(); carregarConfigTsp();
+    carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-    recarregarRadarTenants();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
+// A Awin nao e uma loja: e uma rede com dezenas de anunciantes sob o mesmo
+// token. E o que permite publicar cupom de loja que nao seja uma das quatro
+// grandes sem perder a comissao.
+app.get('/awin/estado', async (req, res) => {
+  const base = estadoAwin();
+  if (!base.configurado) return res.json({ ok:true, ...base });
+  let quota = null;
+  try { quota = await quotaLinkAwin(); } catch (e) { quota = { erro: e.message }; }
+  res.json({ ok:true, ...base, quota });
+});
+
+app.get('/awin/programas', (req, res) => {
+  const busca = String(req.query.q || '').trim().toLowerCase();
+  let lista = listarProgramasAwin();
+  if (busca) lista = lista.filter(p => (p.name || '').toLowerCase().includes(busca));
+  lista.sort((a, b) => (a.name || '').localeCompare(b.name || '', 'pt-BR'));
+  res.json({ ok:true, total: lista.length, programas: lista });
+});
+
+app.post('/awin/programas/atualizar', async (req, res) => {
+  try { res.json({ ok:true, total: (await atualizarProgramasAwin(true)).length }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Diagnostico: dado um nome de loja ou um link, mostra que programa responde.
+app.get('/awin/resolver', (req, res) => {
+  const loja = String(req.query.loja || '').trim();
+  const url  = String(req.query.url || '').trim();
+  const p = url ? programaAwinPorUrl(url) : (loja ? programaAwinPorLoja(loja) : null);
+  if (!p) return res.json({ ok:false, erro:'nenhum programa afiliado para essa loja/link.' });
+  res.json({ ok:true, advertiserId:p.id, nome:p.name, link:p.clickThroughUrl });
+});
+
+// Deeplink para uma URL especifica. O clickref viaja ate o relatorio de
+// transacoes — e por ele que se descobre depois qual disparo gerou a venda.
+app.post('/awin/link', async (req, res) => {
+  try {
+    const r = await gerarLinkAwin({
+      url: req.body?.url,
+      advertiserId: req.body?.advertiserId || null,
+      clickref: req.body?.clickref || '',
+      encurtar: req.body?.encurtar !== false,
+    });
+    res.json({ ok:true, ...r });
+  } catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+
+app.get('/awin/ofertas', async (req, res) => {
+  try {
+    const brutas = await buscarOfertasAwin({
+      tipo:   req.query.tipo   || 'voucher',
+      status: req.query.status || 'active',
+      atualizadoDesde: req.query.desde || null,
+    });
+    res.json({ ok:true, total: brutas.length, ofertas: brutas.map(normalizarOfertaAwin) });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Importa os vouchers ativos para a base de cupons. NAO dispara nada: so
+// popula a base que a vitrine e o gerador ja consomem. Diferente da captura do
+// Telegram, aqui a validade e a real do anunciante (endDate), nao um TTL fixo.
+app.post('/awin/cupons/importar', async (req, res) => {
+  try {
+    const brutas = await buscarOfertasAwin({ tipo:'voucher', status: req.body?.status || 'active' });
+    const importados = [], ignorados = [];
+    for (const bruta of brutas) {
+      const c = normalizarOfertaAwin(bruta);
+      if (!c.codigo)            { ignorados.push({ loja:c.loja, motivo:'sem codigo' }); continue; }
+      if (!c.tipo || !c.valor)  { ignorados.push({ loja:c.loja, codigo:c.codigo, motivo:'valor/tipo nao identificado no titulo' }); continue; }
+      const reg = registrarCupomBase({
+        loja: c.loja, codigo: c.codigo, tipo: c.tipo, valor: c.valor,
+        minimo: c.minimo, limite: c.limite, maximo: c.maximo,
+        validadeAte: c.validadeAte,
+        observacao: 'Awin' + (c.atribuivel ? ' (atribuivel)' : '') + (c.exclusivo ? ' (exclusivo)' : ''),
+      });
+      if (reg) importados.push({ loja:reg.loja, codigo:reg.codigo, valor:reg.valor, tipo:reg.tipo, validadeAte:reg.validadeAte });
+    }
+    console.log('[AWIN] Importacao de cupons — ' + importados.length + ' ok, ' + ignorados.length + ' ignorado(s).');
+    res.json({ ok:true, total: brutas.length, importados, ignorados });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── OFERTAS AUTOMATICAS A PARTIR DOS FEEDS ───────────────────────────────────
+// Uma varredura acha centenas de produtos com desconto. O que impede isso de
+// virar spam nao e o filtro de percentual — e a cota: teto por dia, teto por
+// loja e bloqueio de repeticao, tudo aplicado em awin-ofertas.js. Aqui entram
+// as duas ultimas travas: janela de horario e espacamento entre envios.
+// Dois ritmos distintos: varrer os feeds e caro e roda de poucas em poucas
+// horas; publicar e barato e roda de meia em meia hora. Ambos em funcao (nao
+// const) para o painel mudar o ritmo sem redeploy.
+function awinVarreduraMs()  { return Math.max(5, configOfertasAwin().varreduraMin) * 60 * 1000; }
+function awinPublicacaoMs() { return Math.max(5, configOfertasAwin().intervaloMin) * 60 * 1000; }
+let _varrendoAwin = false;
+
+async function processarOfertasAwin({ simular = false } = {}) {
+  const cfg = configOfertasAwin();
+  if (cfg.modo === 'off' && !simular) return { ok:false, erro:'AWIN_OFERTAS=off' };
+  if (_varrendoAwin) return { ok:false, erro:'ja ha uma varredura em andamento' };
+  _varrendoAwin = true;
+
+  try {
+    // Fora da janela nao ha o que fazer: a proxima rodada tenta de novo.
+    const janela = dentroDaJanelaAwin();
+    if (!simular && !janela.ok) return { ok:true, pulada: janela.motivo, fila: estadoCandidatos() };
+
+    const r = proximosCandidatos({ simular });
+    const saida = { ok:true, simulacao: simular, modo: cfg.modo, usoHoje: usoDeHoje(),
+      vagas: r.vagas, motivo: r.motivo, fila: estadoCandidatos(),
+      enviadas: [], naFila: [], previa: [] };
+
+    for (const c of r.escolhidos) {
+      const p = {
+        asin: 'AWIN-' + c.advertiserId + '-feed',
+        codigo: c.urlLoja || '',
+        titulo: c.titulo || '',
+        preco: c.preco,
+        precoDe: c.precoDe,
+        precoTexto: 'R$ ' + c.preco.toFixed(2).replace('.', ','),
+        precoDeTexto: c.precoDe ? 'R$ ' + c.precoDe.toFixed(2).replace('.', ',') : null,
+        desconto: c.desconto,
+        disponivel: true,
+        link: c.linkAfiliado,
+        imagemUrl: c.imagem || null,
+        vendedor: null, marca: c.marca || '', nota: null, avaliacoes: null,
+        dealTermina: null, ehDeal: false,
+        loja: c.loja.replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+        precoDeReferencia: true,   // preco de feed, nao lido do site agora
+      };
+
+      // Cupom vigente da propria loja, se algum se aplicar a este preco. E o
+      // ganho de juntar as duas pontas: os cupons da Awin ja estao na base.
+      const mc = melhorCupomAplicavel(p.loja, p.preco);
+      const cupom = mc ? { reg: mc.reg, desconto: mc.desconto, citado: true } : null;
+      const mensagem = formatarOfertaAwin(p, { cupom });
+
+      if (simular) {
+        saida.previa.push({ loja: p.loja, titulo: p.titulo, preco: p.preco, precoDe: p.precoDe,
+          desconto: p.desconto, cupom: cupom?.reg?.codigo || null, mensagem });
+        continue;
+      }
+
+      const oferta = {
+        id: gerarId(), origem: 'awin-feed', tipoConteudo: 'oferta_awin',
+        mensagemFormatada: mensagem,
+        dadosExtraidos: {
+          loja: p.loja, asin: p.asin, titulo: p.titulo, preco: p.preco, precoDe: p.precoDe,
+          desconto: p.desconto, link: p.link,
+          cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+          precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+          precoDeReferencia: true,
+        },
+        imagens: [], status: 'pendente', timestamp: new Date().toISOString(),
+      };
+      try {
+        const img = await baixarImagemProduto(p.imagemUrl);
+        if (img) oferta.imagens = [img];
+      } catch {}
+
+      // Consome a vaga assim que a oferta e aceita, mesmo indo para a fila: o
+      // proposito do historico e nao repetir o produto, nao contar envios.
+      marcarOfertado(c.chaveHistorico);
+
+      if (cfg.modo === 'on') {
+        try {
+          const env = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
+          oferta.status = 'enviado';
+          oferta.enviadoEm = new Date().toISOString();
+          oferta.gruposEnviados = env.enviados;
+          filaPendentes.unshift(oferta); salvarFila();
+          saida.enviadas.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
+          console.log('[AWIN-OFERTAS] Enviada — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
+          // Espacamento so quando a rodada leva mais de uma: com maxRodada=1 o
+          // proprio intervalo entre rodadas ja e o espacamento.
+          if (r.escolhidos.length > 1) await new Promise(r2 => setTimeout(r2, intervaloAutoEnvioMs()));
+          continue;
+        } catch (e) {
+          console.error('[AWIN-OFERTAS] Falha no envio, indo para a fila:', e.message);
+        }
+      }
+
+      filaPendentes.unshift(oferta); salvarFila();
+      saida.naFila.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
+      console.log('[AWIN-OFERTAS] Na fila — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
+    }
+    return saida;
+  } catch (e) {
+    console.log('[AWIN-OFERTAS] Erro na varredura:', e.message);
+    return { ok:false, erro:e.message };
+  } finally { _varrendoAwin = false; }
+}
+
+carregarConfigOfertasAwin();
+aplicarTtlsAwin();
+carregarOfertadosAwin();
+// Agendamento reprogramavel: cada rodada marca a proxima com o intervalo atual
+// da config, entao alterar no painel muda o ritmo sem reiniciar o container.
+let _timerVarredura = null, _timerPublicacao = null;
+function agendarAwin() {
+  if (_timerVarredura)  clearTimeout(_timerVarredura);
+  if (_timerPublicacao) clearTimeout(_timerPublicacao);
+  if (!credenciaisFeedOk() || configOfertasAwin().modo === 'off') return;
+
+  _timerVarredura = setTimeout(async () => {
+    try { await reabastecerCandidatosAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    agendarAwin();
+  }, awinVarreduraMs());
+  _timerVarredura.unref?.();
+
+  _timerPublicacao = setTimeout(async () => {
+    try { await processarOfertasAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    // Reagenda so a publicacao: a varredura tem ritmo proprio.
+    _timerPublicacao = null;
+    agendarPublicacaoAwin();
+  }, awinPublicacaoMs());
+  _timerPublicacao.unref?.();
+}
+function agendarPublicacaoAwin() {
+  if (_timerPublicacao) clearTimeout(_timerPublicacao);
+  if (!credenciaisFeedOk() || configOfertasAwin().modo === 'off') return;
+  _timerPublicacao = setTimeout(async () => {
+    try { await processarOfertasAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    agendarPublicacaoAwin();
+  }, awinPublicacaoMs());
+  _timerPublicacao.unref?.();
+}
+carregarCandidatosAwin();
+if (credenciaisFeedOk() && configOfertasAwin().modo !== 'off') {
+  const c = configOfertasAwin();
+  // Primeira varredura logo apos o boot: sem fila, nao ha o que publicar.
+  setTimeout(() => reabastecerCandidatosAwin().catch(() => {}), 90 * 1000);
+  agendarAwin();
+  console.log('[AWIN-OFERTAS] Ligada (modo ' + c.modo + ') — publica a cada '
+    + c.intervaloMin + 'min entre ' + c.horaInicio + ' e ' + c.horaFim
+    + ', ate ' + c.maxDia + '/dia; varredura a cada ' + (c.varreduraMin / 60) + 'h.');
+}
+
+// Varredura sob demanda: reabastece a fila sem publicar nada.
+app.post('/awin/ofertas/varredura', async (req, res) => {
+  const r = await reabastecerCandidatosAwin({ forcar: !!req.body?.forcar });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+app.get('/awin/ofertas/fila', (req, res) => {
+  res.json({ ok:true, ...estadoCandidatos(), ...vagasAgora(), janela: dentroDaJanelaAwin() });
+});
+
+// Simulacao: mostra exatamente o que sairia, sem enviar e sem gastar cota.
+app.post('/awin/ofertas/varrer', async (req, res) => {
+  const r = await processarOfertasAwin({ simular: !!req.body?.simular });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+app.get('/awin/ofertas/estado', (req, res) => {
+  const c = configOfertasAwin();
+  // Teto real do dia: a publicacao so acontece dentro da janela e entrega no
+  // maximo maxRodada por vez, entao o limite efetivo costuma ser menor que
+  // maxDia — e melhor mostrar a conta pronta do que deixar o operador supor.
+  const paraMin = h => { const m = String(h).match(/^(\d{1,2}):(\d{2})$/); return m ? +m[1]*60 + +m[2] : 0; };
+  const minutosJanela = Math.max(0, paraMin(c.horaFim) - paraMin(c.horaInicio));
+  const rodadasNaJanela = Math.floor(minutosJanela / Math.max(1, c.intervaloMin));
+  res.json({ ok:true, config: c, usoHoje: usoDeHoje(), varrendo: _varrendoAwin,
+    fila: estadoCandidatos(), janela: dentroDaJanelaAwin(),
+    // As duas credenciais da Awin sao independentes e vem de lugares
+    // diferentes na interface deles. Sem dizer qual falta, o operador so
+    // descobre ao clicar em varrer e receber um erro seco.
+    credenciais: {
+      api:  credenciaisAwinOk(),   // AWIN_TOKEN + AWIN_PUBLISHER_ID
+      feed: credenciaisFeedOk(),   // AWIN_FEED_APIKEY (Toolbox > Create-a-Feed)
+    },
+    rodadasNaJanela,
+    tetoEfetivoDia: Math.min(c.maxDia, rodadasNaJanela * Math.max(1, c.maxRodada)) });
+});
+
+app.get('/awin/ofertas/config', (req, res) => res.json({ ok:true, config: configOfertasAwin() }));
+
+app.post('/awin/ofertas/config', (req, res) => {
+  try {
+    const nova = salvarConfigOfertasAwin(req.body || {});
+    aplicarTtlsAwin();
+    agendarPush('awin_config.json');
+    agendarAwin();   // ritmo novo passa a valer agora
+    res.json({ ok:true, config: nova });
+  } catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+
+// ── PRODUCT FEEDS DA AWIN ────────────────────────────────────────────────────
+app.get('/awin/feeds', (req, res) => {
+  const anunciante = req.query.advertiserId;
+  res.json({ ok:true, ...estadoFeed(),
+    feeds: anunciante ? feedsDoAnunciante(anunciante) : undefined });
+});
+
+app.post('/awin/feeds/atualizar', async (req, res) => {
+  try { res.json({ ok:true, total: (await atualizarFeedList(true)).length }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Amostra crua do feed. Serve para conferir a olho qual coluna de preco a loja
+// usa: a Awin nao impoe a mesma semantica para todos os anunciantes.
+app.get('/awin/feeds/amostra', async (req, res) => {
+  try { res.json({ ok:true, ...await amostraFeed(req.query.advertiserId, Number(req.query.n) || 5) }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── POLLER DE CUPONS DA AWIN ─────────────────────────────────────────────────
+// Roda de tempos em tempos, pega o que apareceu de novo na Offers API e joga no
+// MESMO caminho dos cupons do Telegram (enfileirarCupomTSP): dedup, base, gate
+// de auto-envio e envio ou fila. Nada aqui contorna as regras de seguranca.
+//
+// AWIN_CUPONS:
+//   'off'  (padrao) — poller desligado
+//   'fila'          — coleta e manda para aprovacao manual, nunca auto-envia
+//   'on'            — coleta e passa pelo gate; auto-envia se AUTO_ENVIO_CUPOM=on
+// AWIN_POLL_MIN: intervalo em minutos (minimo 5, padrao 20).
+function awinCuponsModo()  { return configOfertasAwin().cupons; }
+function awinCuponsAtivo() { return ['on', 'fila'].includes(awinCuponsModo()); }
+function awinPollMs() { return Math.max(5, configOfertasAwin().cupomPollMin) * 60 * 1000; }
+const AWIN_VISTOS_PATH = SESSAO_DIR + '/awin_vistos.json';
+
+let _awinVistos = {};       // promotionId -> ISO da 1a vez que foi visto
+let _awinRodando = false;
+
+function carregarAwinVistos() {
+  try {
+    if (existsSync(AWIN_VISTOS_PATH)) _awinVistos = JSON.parse(readFileSync(AWIN_VISTOS_PATH, 'utf-8')) || {};
+  } catch (e) { console.log('[AWIN] Erro ao ler vistos:', e.message); _awinVistos = {}; }
+  return _awinVistos;
+}
+
+function salvarAwinVistos() {
+  // Poda o que ja passou de 90 dias: promocao antiga nao volta a ser "nova".
+  const limite = Date.now() - 90 * 24 * 60 * 60 * 1000;
+  for (const [k, v] of Object.entries(_awinVistos)) {
+    const t = new Date(v).getTime();
+    if (isFinite(t) && t < limite) delete _awinVistos[k];
+  }
+  try { writeFileSync(AWIN_VISTOS_PATH, JSON.stringify(_awinVistos)); }
+  catch (e) { console.log('[AWIN] Falha ao gravar vistos:', e.message); }
+}
+
+/**
+ * Uma passada no catalogo de ofertas.
+ * `semear`: marca tudo como visto e grava na base SEM enviar nada. E o que
+ * impede que a primeira execucao despeje as dezenas de cupons ja existentes
+ * nos grupos de uma vez so. Roda sozinho quando ainda nao ha arquivo de vistos.
+ */
+async function processarCuponsAwin({ semear = false, forcarEnvio = false } = {}) {
+  if (!credenciaisAwinOk()) return { ok:false, erro:'Awin nao configurada' };
+  if (_awinRodando) return { ok:false, erro:'ja ha uma coleta em andamento' };
+  _awinRodando = true;
+  const resumo = { novos: 0, enviados: 0, naFila: 0, ignorados: 0, semeados: 0, erros: [] };
+
+  try {
+    const brutas = await buscarOfertasAwin({ tipo:'voucher', status:'active' });
+    for (const bruta of brutas) {
+      const id = String(bruta?.promotionId || '');
+      if (!id || _awinVistos[id]) continue;
+
+      const base = normalizarOfertaAwin(bruta);
+      _awinVistos[id] = new Date().toISOString();
+      if (!base.codigo) { resumo.ignorados++; continue; }
+
+      // Semeadura: entra na base de cupons (para a vitrine e o gerador ja
+      // poderem vincular) mas nao vai para grupo nenhum.
+      if (semear) {
+        if (base.tipo && base.valor) {
+          try {
+            registrarCupomBase({ loja:base.loja, codigo:base.codigo, tipo:base.tipo, valor:base.valor,
+              minimo:base.minimo, limite:base.limite, maximo:base.maximo, validadeAte:base.validadeAte,
+              observacao:'Awin' });
+            resumo.semeados++;
+          } catch (e) { resumo.erros.push({ loja:base.loja, erro:e.message }); }
+        }
+        continue;
+      }
+
+      // Texto de referencia da validacao cruzada. Loja, codigo e validade vem
+      // da propria rede (nao da IA), entao entram no texto de proposito: o que
+      // precisa ser conferido contra alucinacao sao os NUMEROS extraidos.
+      const texto = [bruta.title, bruta.description, bruta.terms !== '..' ? bruta.terms : '',
+                     'Cupom: ' + base.codigo, 'Loja: ' + base.loja].filter(Boolean).join('\n');
+
+      // A IA le so os numeros (valor, minimo, limite, maximo). Se falhar, cai
+      // no que o regex do normalizador conseguiu tirar do titulo.
+      let campos = null;
+      try { campos = await extrairCupomTelegram(texto); } catch (e) { resumo.erros.push({ loja:base.loja, erro:e.message }); }
+
+      const c = {
+        loja: base.loja,
+        codigo: base.codigo,
+        tipo:   campos?.tipo   ?? base.tipo,
+        valor:  campos?.valor  ?? base.valor,
+        minimo: campos?.minimo ?? base.minimo,
+        limite: campos?.limite ?? base.limite,
+        maximo: campos?.maximo ?? base.maximo,
+        validadeAte: base.validadeAte,
+        urlAfiliado: base.urlAfiliado,
+        // Loja, codigo e validade vieram da API do anunciante, nao de leitura de
+        // texto: e o que autoriza o gate a dispensar minimo e teto obrigatorios.
+        fonteOficial: awinCuponsModo() === 'on',
+        minimoDesconhecido: (campos?.minimo ?? base.minimo) === null
+                         || (campos?.minimo ?? base.minimo) === undefined,
+        observacao: 'Awin' + (base.atribuivel ? ' (atribuivel)' : '') + (base.exclusivo ? ' (exclusivo)' : ''),
+      };
+      if (!c.tipo || !(Number(c.valor) > 0)) { resumo.ignorados++; continue; }
+
+      resumo.novos++;
+      const r = await enfileirarCupomTSP(c, {
+        origem: 'awin:' + base.loja,
+        textoOriginal: texto,
+        somenteFila: awinCuponsModo() === 'fila',
+      });
+      if (r?.enviado) resumo.enviados++;
+      else if (r?.ignorado) resumo.ignorados++;
+      else resumo.naFila++;
+    }
+    salvarAwinVistos();
+    console.log('[AWIN] Coleta de cupons — ' + (semear
+      ? resumo.semeados + ' semeado(s) sem envio.'
+      : resumo.novos + ' novo(s), ' + resumo.enviados + ' enviado(s), ' + resumo.naFila + ' na fila.'));
+    return { ok:true, total: brutas.length, ...resumo };
+  } catch (e) {
+    console.log('[AWIN] Falha na coleta:', e.message);
+    return { ok:false, erro:e.message };
+  } finally { _awinRodando = false; }
+}
+
+// Boot: sem arquivo de vistos, a primeira passada e sempre semeadura. So a
+// partir da segunda e que cupom novo vira mensagem.
+if (credenciaisAwinOk() && awinCuponsAtivo()) {
+  const primeiraVez = !existsSync(AWIN_VISTOS_PATH);
+  carregarAwinVistos();
+  setTimeout(() => {
+    processarCuponsAwin({ semear: primeiraVez })
+      .then(() => { if (primeiraVez) console.log('[AWIN] Semeadura concluida — a partir de agora so cupom novo e publicado.'); })
+      .catch(e => console.log('[AWIN] Erro no boot da coleta:', e.message));
+  }, 60 * 1000);
+  setInterval(() => { processarCuponsAwin().catch(() => {}); }, awinPollMs()).unref?.();
+  console.log('[AWIN] Coleta automatica de cupons ligada (modo ' + awinCuponsModo()
+    + ') — a cada ' + (awinPollMs() / 60000) + ' min.');
+} else {
+  carregarAwinVistos();
+}
+
+// Coleta sob demanda. { semear: true } refaz a marcacao sem enviar nada.
+app.post('/awin/cupons/poll', async (req, res) => {
+  const r = await processarCuponsAwin({ semear: !!req.body?.semear });
+  res.status(r.ok ? 200 : 400).json(r);
+});
+
+app.get('/awin/cupons/estado', (req, res) => {
+  res.json({
+    ok: true,
+    modo: awinCuponsModo(),
+    intervaloMin: awinPollMs() / 60000,
+    autoEnvio: AUTO_ENVIO_MODO,
+    promocoesConhecidas: Object.keys(_awinVistos).length,
+    coletando: _awinRodando,
+  });
 });
 
 // ── MONITORAMENTO POR GRUPO ──────────────────────────────────────────────────
@@ -4518,6 +5080,13 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) return { ok:false, motivo:'Shopee nao configurada' };
     montado = await montarOfertasShopeeVitrine([item], codigoCupom);
+  } else if (item.loja === 'Mercado Livre') {
+    if (!tokenAffOk()) return { ok:false, motivo:'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
+    montado = await montarOfertasMlVitrine([item], codigoCupom);
+  } else if (item.loja === 'Magazine Luiza') {
+    montado = await montarOfertasMagaluVitrine([item], codigoCupom);
+  } else if (String(item.asin).startsWith('AWIN-')) {
+    montado = await montarOfertasAwinVitrine([item], codigoCupom);
   } else {
     montado = await montarOfertasVitrine([asin], codigoCupom);
   }
@@ -4527,12 +5096,16 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
 
   const oferta = {
     id: gerarId(), origem:'lista',
-    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+    tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu'
+                : String(o.asin || '').startsWith('AWIN-') ? 'oferta_awin' : 'oferta_amazon',
     mensagemFormatada: o.mensagem,
     dadosExtraidos: {
       loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
       precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
       cupom:o.cupom, precoFinal:o.precoFinal,
+      precoDeReferencia: !!o.precoDeReferencia,
     },
     imagens: [],
   };
@@ -4741,7 +5314,9 @@ app.post('/listas/:id/cancelar', (req, res) => {
 // ── VITRINE ──────────────────────────────────────────────────────────────────
 app.get('/vitrine', (req, res) => {
   const itens = listarVitrine();
-  res.json({ ok:true, total: itens.length, itens });
+  // O painel precisa do TTL para avisar quando o preco da Magalu venceu — a
+  // unica loja em que o preco nao e reconsultado no disparo.
+  res.json({ ok:true, total: itens.length, itens, ttlPrecoMagalu: ttlPrecoMagalu() });
 });
 
 // Recebe o texto colado (um link por linha) e cadastra o que conseguir resolver.
@@ -4790,6 +5365,35 @@ app.post('/vitrine', async (req, res) => {
         }), jaExistia: jaTinha });
         continue;
       }
+      // Magazine Luiza: link vira link de afiliado por transformacao de URL, sem
+      // rede. Preco vem da propria linha porque nao ha fonte para consultar.
+      if (ehLinkMagalu(linha)) {
+        const rmg = await resolverLinhaVitrineMagalu(linha);
+        if (!rmg || rmg.erro) { erros.push({ linha, erro: rmg?.erro || 'falhou' }); continue; }
+        const jaTinhaMg = !!itemVitrine(rmg.asin);
+        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom }), jaExistia: jaTinhaMg });
+        continue;
+      }
+      // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
+      // e gerado no disparo — por isso nao passa pelo resolvedor da Amazon.
+      if (ehLinkMl(linha)) {
+        if (!tokenAffOk()) { erros.push({ linha, erro: 'Mercado Livre nao configurado (ML_AFF_TOKEN)' }); continue; }
+        const rml = await resolverLinhaVitrineMl(linha);
+        if (!rml || rml.erro) { erros.push({ linha, erro: rml?.erro || 'falhou' }); continue; }
+        const jaTinhaMl = !!itemVitrine(rml.asin);
+        salvos.push({ ...salvarItemVitrine({ ...rml, cupom }), jaExistia: jaTinhaMl });
+        continue;
+      }
+      // Rede Awin: qualquer anunciante afiliado. Vem antes do fallback da
+      // Amazon, que so deve receber o que nenhuma outra loja reconheceu.
+      if (ehLinkAwin(linha)) {
+        const raw = await resolverLinhaVitrineAwin(linha);
+        if (!raw || raw.erro) { erros.push({ linha, erro: raw?.erro || 'falhou' }); continue; }
+        const jaTinhaAw = !!itemVitrine(raw.asin);
+        salvos.push({ ...salvarItemVitrine({ ...raw, cupom }), jaExistia: jaTinhaAw,
+          aviso: raw.precoManual ? 'preco informado a mao — a loja bloqueou a leitura automatica' : null });
+        continue;
+      }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
@@ -4817,7 +5421,11 @@ app.post('/vitrine/disparar', async (req, res) => {
   // Cada loja tem sua API: separa antes de consultar e junta os resultados.
   const itens = asins.map(a => itemVitrine(a)).filter(Boolean);
   const daShopee = itens.filter(i => i.loja === 'Shopee');
-  const daAmazon = asins.filter(a => !daShopee.some(s => s.asin === a));
+  const daMl     = itens.filter(i => i.loja === 'Mercado Livre');
+  const daMagalu = itens.filter(i => i.loja === 'Magazine Luiza');
+  const daAmazon = asins.filter(a =>
+    !daShopee.some(s => s.asin === a) && !daMl.some(m => m.asin === a)
+    && !daMagalu.some(g => g.asin === a));
 
   let montado = { prontos: [], descartados: [] };
   if (daAmazon.length) {
@@ -4825,6 +5433,26 @@ app.post('/vitrine/disparar', async (req, res) => {
       const m = await montarOfertasVitrine(daAmazon, req.body?.cupom || null);
       montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
     } catch (e) { return res.status(500).json({ ok:false, erro:'falha na API da Amazon: ' + e.message }); }
+  }
+  if (daMagalu.length) {
+    try {
+      const m = await montarOfertasMagaluVitrine(daMagalu, req.body?.cupom || null);
+      montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+    } catch (e) {
+      daMagalu.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Magazine Luiza: ' + e.message }));
+    }
+  }
+  if (daMl.length) {
+    if (!tokenAffOk()) {
+      daMl.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Mercado Livre nao configurado' }));
+    } else {
+      try {
+        const m = await montarOfertasMlVitrine(daMl, req.body?.cupom || null);
+        montado.prontos.push(...m.prontos); montado.descartados.push(...m.descartados);
+      } catch (e) {
+        daMl.forEach(i => montado.descartados.push({ asin:i.asin, nome:i.nome, motivo:'Mercado Livre: ' + e.message }));
+      }
+    }
   }
   if (daShopee.length) {
     if (!credenciaisShopeeOk()) {
@@ -4843,12 +5471,16 @@ app.post('/vitrine/disparar', async (req, res) => {
   for (const o of montado.prontos) {
     const oferta = {
       id: gerarId(), origem:'vitrine',
-      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_amazon',
+      tipoConteudo: o.produto.loja === 'Shopee' ? 'oferta_shopee'
+                : o.produto.loja === 'Mercado Livre' ? 'oferta_ml'
+                : o.produto.loja === 'Magazine Luiza' ? 'oferta_magalu'
+                : String(o.asin || '').startsWith('AWIN-') ? 'oferta_awin' : 'oferta_amazon',
       mensagemFormatada: o.mensagem,
       dadosExtraidos: {
         loja:o.produto.loja || 'Amazon', asin:o.asin, titulo:o.produto.titulo, preco:o.produto.preco,
         precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
         cupom:o.cupom, precoFinal:o.precoFinal,
+        precoDeReferencia: !!o.precoDeReferencia,
       },
       imagens: [],
     };
@@ -5230,6 +5862,14 @@ function pipelineDoLink(texto) {
   if (ehLinkMl(texto))     return { loja: 'Mercado Livre',  run: t => processarTextoMl(t) };
   if (ehLinkShopee(texto)) return { loja: 'Shopee',         run: t => processarTextoShopee(t) };
   if (ehLinkMagalu(texto)) return { loja: 'Magazine Luiza', run: t => processarTextoMagalu(t) };
+  // Rede Awin: cobre os 80+ anunciantes afiliados, cada um com sua propria
+  // pagina de produto. Fica depois das lojas com API propria e antes do
+  // fallback da Amazon, que so deve pegar o que ninguem reconheceu.
+  const progAwin = programaAwinPorUrl((String(texto).match(/https?:\/\/[^\s]+/) || [''])[0]);
+  if (progAwin) return {
+    loja: String(progAwin.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+    run: t => processarTextoAwin(t),
+  };
   return { loja: 'Amazon', run: t => processarTextoAmazon(t, { ignorarDedup: true, ignorarMinimo: true }) };
 }
 
