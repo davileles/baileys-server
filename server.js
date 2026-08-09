@@ -44,7 +44,8 @@ import {
 import {
   carregarConfigTsp, configTsp, salvarConfigTsp,
   linksTsp, rodapeCupom, rodapeGrupoCupons,
-  grupoTspPadrao, grupoTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
+  gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
+  estadoCredenciais, aplicarCredenciais,
 } from './config-tsp.js';
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
@@ -220,10 +221,10 @@ process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledReject
 // painel (aba Configuracoes) — getters para toda leitura ver o valor atual.
 // Os grupos do CDV seguem fixos: pertencem a outra operacao, fora deste painel.
 const GRUPOS = {
-  get tsp()        { return grupoTspPadrao(); },
-  // Grupo exclusivo de cupons — recebe copia de todo cupom_tsp com rodape
-  // convidando para o grupo de ofertas (convite cruzado).
-  get tsp_cupons() { return grupoTspCupons(); },
+  // Grupos exclusivos de cupons — recebem copia de todo cupom_tsp com rodape
+  // convidando para o grupo de ofertas (convite cruzado). Nunca recebem oferta
+  // de produto. Podem ser varios.
+  get tsp_cupons() { return gruposTspCupons(); },
   cdv_ofertas: '120363170138704529@g.us',
   cdv_emissao: '120363172490263905@g.us',
   // Grupo interno do operador — avisos operacionais que NAO vao para clientes
@@ -1651,12 +1652,13 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
   // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
   const op = { conta: contaDoTurno() };
   const destinos = radarDestinos();
-  const alvos = [...new Set([...(destinos.length ? destinos : []), GRUPOS['tsp_cupons']])];
+  const soCupons = GRUPOS['tsp_cupons'];
+  const alvos = [...new Set([...destinos, ...soCupons])];
   const enviados = [], falhas = [];
 
   for (const jid of alvos) {
     // Rodape cruzado so no grupo exclusivo de cupons.
-    const texto = jid === GRUPOS['tsp_cupons'] ? mensagemParaGrupoCupons(mensagem) : mensagem;
+    const texto = soCupons.includes(jid) ? mensagemParaGrupoCupons(mensagem) : mensagem;
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -1751,13 +1753,21 @@ async function montarLinkPreviewManual(dados) {
 }
 
 async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
-  const destinos = radarDestinos();
-  const alvos = destinos.length ? destinos : [GRUPOS['tsp']];
+  // Sem fallback: oferta vai para os grupos marcados como DESTINO na aba
+  // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
+  // uma mensagem que diz o que fazer — antes isso caia num grupo fixo que o
+  // operador nao tinha escolhido.
+  const alvos = radarDestinos();
+  if (!alvos.length) throw new Error('Nenhum grupo marcado como destino na aba Grupos.');
+  // Grupo so-cupons nao recebe oferta de produto, mesmo que esteja marcado
+  // como destino por engano.
+  const soCupons = new Set(GRUPOS['tsp_cupons']);
   const enviados = [], falhas = [];
   const preview = oferta ? montarLinkPreview(oferta, mensagem) : null;
   const op = { conta: contaDoTurno() };
 
   for (const jid of alvos) {
+    if (soCupons.has(jid)) continue;
     try {
       await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem }, 0, op);
       enviados.push(jid);
@@ -3734,8 +3744,7 @@ app.get('/contas/:id/grupos', async (req, res) => {
   if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
   try {
     const daConta = Object.keys(await c.sock.groupFetchAllParticipating());
-    const destinos = radarDestinos().length ? radarDestinos() : [GRUPOS['tsp']];
-    const alvos = [...new Set([...destinos, GRUPOS['tsp'], GRUPOS['tsp_cupons']])];
+    const alvos = [...new Set([...radarDestinos(), ...GRUPOS['tsp_cupons']])];
     const ausentes = (lista) => [...new Set(lista)]
       .filter(j => !daConta.includes(j))
       .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
@@ -4500,14 +4509,33 @@ app.post('/mkt/config', (req, res) => {
 
 // ── CONFIG DA OPERACAO (aba Configuracoes do painel Gestao TSP) ──────────────
 app.get('/config-tsp', (req, res) => {
-  res.json({ ok: true, config: configTsp() });
+  // A config sai SEM os valores das credenciais: quem abre o painel ve o que
+  // esta configurado, nao o segredo em si. O painel recebe so o estado
+  // (preenchida, origem, ultimos 4 caracteres).
+  const cfg = { ...configTsp() };
+  delete cfg.credenciais;
+  res.json({ ok: true, config: cfg, credenciais: estadoCredenciais() });
 });
 
 app.post('/config-tsp', (req, res) => {
   try {
-    const cfg = salvarConfigTsp(req.body || {});
+    const corpo = { ...(req.body || {}) };
+    // Campo em branco no formulario significa "nao mexi nisso", nunca "apague a
+    // credencial". Para limpar de proposito existe o valor especial '--'.
+    if (corpo.credenciais && typeof corpo.credenciais === 'object') {
+      const limpas = {};
+      for (const [k, v] of Object.entries(corpo.credenciais)) {
+        const s2 = String(v ?? '').trim();
+        if (!s2) continue;
+        limpas[k] = s2 === '--' ? '' : s2;
+      }
+      corpo.credenciais = limpas;
+    }
+    const cfg = salvarConfigTsp(corpo);
     console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
-    res.json({ ok: true, config: cfg });
+    const saida = { ...cfg };
+    delete saida.credenciais;
+    res.json({ ok: true, config: saida, credenciais: estadoCredenciais() });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
