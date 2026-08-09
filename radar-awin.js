@@ -569,7 +569,13 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
 // o preco informado no cadastro vale por um prazo, como na Magalu.
 
 /** Horas que um preco informado a mao continua valendo. */
+let _ttlPrecoHoras = null;
+export function definirTtlPrecoAwin(h) {
+  const v = Number(h);
+  if (isFinite(v) && v > 0) _ttlPrecoHoras = v;
+}
 export function ttlPrecoAwin() {
+  if (_ttlPrecoHoras) return _ttlPrecoHoras;
   const h = Number(process.env.AWIN_PRECO_TTL_H);
   return isFinite(h) && h > 0 ? h : 24;
 }
