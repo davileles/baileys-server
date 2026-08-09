@@ -60,10 +60,19 @@ import {
   feedsDoAnunciante, estadoFeed, amostraFeed,
 } from './awin-feed.js';
 import {
-  configOfertasAwin, carregarOfertadosAwin, marcarOfertado,
-  usoDeHoje, buscarOfertasDosFeeds,
+  configOfertasAwin, carregarConfigOfertasAwin, salvarConfigOfertasAwin,
+  carregarOfertadosAwin, marcarOfertado, usoDeHoje, buscarOfertasDosFeeds,
 } from './awin-ofertas.js';
-import { formatarOfertaAwin } from './radar-awin.js';
+import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
+import { definirTtlFeedHoras } from './awin-feed.js';
+
+// Espalha os prazos da config para os modulos que os usam. Chamado no boot e
+// depois de cada gravacao, para valer sem redeploy.
+function aplicarTtlsAwin() {
+  const c = configOfertasAwin();
+  definirTtlPrecoAwin(c.precoTtlHoras);
+  definirTtlFeedHoras(c.feedTtlHoras);
+}
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
@@ -4612,7 +4621,9 @@ app.post('/awin/cupons/importar', async (req, res) => {
 // virar spam nao e o filtro de percentual — e a cota: teto por dia, teto por
 // loja e bloqueio de repeticao, tudo aplicado em awin-ofertas.js. Aqui entram
 // as duas ultimas travas: janela de horario e espacamento entre envios.
-const AWIN_VARREDURA_MS = Math.max(1, Number(process.env.AWIN_VARREDURA_H) || 12) * 3600 * 1000;
+// Intervalo em funcao (nao const): mudar no painel passa a valer na proxima
+// rodada, sem redeploy.
+function awinVarreduraMs() { return Math.max(1, configOfertasAwin().intervaloHoras) * 3600 * 1000; }
 let _varrendoAwin = false;
 
 async function processarOfertasAwin({ simular = false } = {}) {
@@ -4712,12 +4723,26 @@ async function processarOfertasAwin({ simular = false } = {}) {
   } finally { _varrendoAwin = false; }
 }
 
+carregarConfigOfertasAwin();
+aplicarTtlsAwin();
 carregarOfertadosAwin();
+// Agendamento reprogramavel: cada rodada marca a proxima com o intervalo atual
+// da config, entao alterar no painel muda o ritmo sem reiniciar o container.
+let _timerVarredura = null;
+function agendarVarreduraAwin() {
+  if (_timerVarredura) clearTimeout(_timerVarredura);
+  if (!credenciaisFeedOk() || configOfertasAwin().modo === 'off') return;
+  _timerVarredura = setTimeout(async () => {
+    try { await processarOfertasAwin(); } catch (e) { console.log('[AWIN-OFERTAS] ' + e.message); }
+    agendarVarreduraAwin();
+  }, awinVarreduraMs());
+  _timerVarredura.unref?.();
+}
 if (credenciaisFeedOk() && configOfertasAwin().modo !== 'off') {
-  setInterval(() => { processarOfertasAwin().catch(() => {}); }, AWIN_VARREDURA_MS).unref?.();
-  console.log('[AWIN-OFERTAS] Varredura ligada (modo ' + configOfertasAwin().modo
-    + ') — a cada ' + (AWIN_VARREDURA_MS / 3600000) + 'h, ate '
-    + configOfertasAwin().maxDia + ' oferta(s)/dia.');
+  const c = configOfertasAwin();
+  agendarVarreduraAwin();
+  console.log('[AWIN-OFERTAS] Varredura ligada (modo ' + c.modo + ') — a cada '
+    + c.intervaloHoras + 'h, ate ' + c.maxRodada + ' por rodada e ' + c.maxDia + ' por dia.');
 }
 
 // Simulacao: mostra exatamente o que sairia, sem enviar e sem gastar cota.
@@ -4727,8 +4752,23 @@ app.post('/awin/ofertas/varrer', async (req, res) => {
 });
 
 app.get('/awin/ofertas/estado', (req, res) => {
-  res.json({ ok:true, config: configOfertasAwin(), usoHoje: usoDeHoje(),
-    intervaloHoras: AWIN_VARREDURA_MS / 3600000, varrendo: _varrendoAwin });
+  const c = configOfertasAwin();
+  res.json({ ok:true, config: c, usoHoje: usoDeHoje(), varrendo: _varrendoAwin,
+    // Teto real do dia: a rodada nunca entrega mais que maxRodada, entao o
+    // maximo efetivo e o menor entre a cota diaria e o que cabe nas rodadas.
+    tetoEfetivoDia: Math.min(c.maxDia, c.maxRodada * Math.floor(24 / Math.max(1, c.intervaloHoras))) });
+});
+
+app.get('/awin/ofertas/config', (req, res) => res.json({ ok:true, config: configOfertasAwin() }));
+
+app.post('/awin/ofertas/config', (req, res) => {
+  try {
+    const nova = salvarConfigOfertasAwin(req.body || {});
+    aplicarTtlsAwin();
+    agendarPush('awin_config.json');
+    agendarVarreduraAwin();   // ritmo novo passa a valer agora
+    res.json({ ok:true, config: nova });
+  } catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
 });
 
 // ── PRODUCT FEEDS DA AWIN ────────────────────────────────────────────────────
@@ -4760,9 +4800,9 @@ app.get('/awin/feeds/amostra', async (req, res) => {
 //   'fila'          — coleta e manda para aprovacao manual, nunca auto-envia
 //   'on'            — coleta e passa pelo gate; auto-envia se AUTO_ENVIO_CUPOM=on
 // AWIN_POLL_MIN: intervalo em minutos (minimo 5, padrao 20).
-const AWIN_CUPONS_MODO = (process.env.AWIN_CUPONS || 'off').toLowerCase();
-const AWIN_CUPONS_ATIVO = AWIN_CUPONS_MODO === 'on' || AWIN_CUPONS_MODO === 'fila';
-const AWIN_POLL_MS     = Math.max(5, Number(process.env.AWIN_POLL_MIN) || 20) * 60 * 1000;
+function awinCuponsModo()  { return configOfertasAwin().cupons; }
+function awinCuponsAtivo() { return ['on', 'fila'].includes(awinCuponsModo()); }
+function awinPollMs() { return Math.max(5, configOfertasAwin().cupomPollMin) * 60 * 1000; }
 const AWIN_VISTOS_PATH = SESSAO_DIR + '/awin_vistos.json';
 
 let _awinVistos = {};       // promotionId -> ISO da 1a vez que foi visto
@@ -4845,7 +4885,7 @@ async function processarCuponsAwin({ semear = false, forcarEnvio = false } = {})
         urlAfiliado: base.urlAfiliado,
         // Loja, codigo e validade vieram da API do anunciante, nao de leitura de
         // texto: e o que autoriza o gate a dispensar minimo e teto obrigatorios.
-        fonteOficial: AWIN_CUPONS_MODO === 'on',
+        fonteOficial: awinCuponsModo() === 'on',
         minimoDesconhecido: (campos?.minimo ?? base.minimo) === null
                          || (campos?.minimo ?? base.minimo) === undefined,
         observacao: 'Awin' + (base.atribuivel ? ' (atribuivel)' : '') + (base.exclusivo ? ' (exclusivo)' : ''),
@@ -4856,7 +4896,7 @@ async function processarCuponsAwin({ semear = false, forcarEnvio = false } = {})
       const r = await enfileirarCupomTSP(c, {
         origem: 'awin:' + base.loja,
         textoOriginal: texto,
-        somenteFila: AWIN_CUPONS_MODO === 'fila',
+        somenteFila: awinCuponsModo() === 'fila',
       });
       if (r?.enviado) resumo.enviados++;
       else if (r?.ignorado) resumo.ignorados++;
@@ -4875,7 +4915,7 @@ async function processarCuponsAwin({ semear = false, forcarEnvio = false } = {})
 
 // Boot: sem arquivo de vistos, a primeira passada e sempre semeadura. So a
 // partir da segunda e que cupom novo vira mensagem.
-if (credenciaisAwinOk() && AWIN_CUPONS_ATIVO) {
+if (credenciaisAwinOk() && awinCuponsAtivo()) {
   const primeiraVez = !existsSync(AWIN_VISTOS_PATH);
   carregarAwinVistos();
   setTimeout(() => {
@@ -4883,9 +4923,9 @@ if (credenciaisAwinOk() && AWIN_CUPONS_ATIVO) {
       .then(() => { if (primeiraVez) console.log('[AWIN] Semeadura concluida — a partir de agora so cupom novo e publicado.'); })
       .catch(e => console.log('[AWIN] Erro no boot da coleta:', e.message));
   }, 60 * 1000);
-  setInterval(() => { processarCuponsAwin().catch(() => {}); }, AWIN_POLL_MS).unref?.();
-  console.log('[AWIN] Coleta automatica de cupons ligada (modo ' + AWIN_CUPONS_MODO
-    + ') — a cada ' + (AWIN_POLL_MS / 60000) + ' min.');
+  setInterval(() => { processarCuponsAwin().catch(() => {}); }, awinPollMs()).unref?.();
+  console.log('[AWIN] Coleta automatica de cupons ligada (modo ' + awinCuponsModo()
+    + ') — a cada ' + (awinPollMs() / 60000) + ' min.');
 } else {
   carregarAwinVistos();
 }
@@ -4899,8 +4939,8 @@ app.post('/awin/cupons/poll', async (req, res) => {
 app.get('/awin/cupons/estado', (req, res) => {
   res.json({
     ok: true,
-    modo: AWIN_CUPONS_MODO,
-    intervaloMin: AWIN_POLL_MS / 60000,
+    modo: awinCuponsModo(),
+    intervaloMin: awinPollMs() / 60000,
     autoEnvio: AUTO_ENVIO_MODO,
     promocoesConhecidas: Object.keys(_awinVistos).length,
     coletando: _awinRodando,
