@@ -16,7 +16,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { resolverPrecoDe, FONTE_API } from './preco-de.js';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
 import { rodapeOferta } from './config-tsp.js';
@@ -662,12 +661,53 @@ export function melhorCupom(loja, preco, textoOriginal = '') {
   if (melhor) return melhor;
 
   // Etapa 2: mencao generica ao cupom, sem codigo.
+  // Usa o MELHOR cupom aplicavel a este preco, nao o mais recente capturado. O
+  // ML publica varios cupons por dia com minimo alto (R$ 299, R$ 399, R$ 899):
+  // o mais novo quase nunca vale para produto de ticket baixo, e a etapa antes
+  // desistia ali mesmo, deixando a oferta sair sem cupom nenhum apesar de haver
+  // outro vigente que servia.
   if (!REGEX_CUPOM_GENERICO.test(String(textoOriginal))) return null;
-  const reg = ultimoCupomDaLoja(loja);
-  if (!reg) return null;
-  const desconto = calcularDesconto(reg, preco);
-  if (desconto <= 0) return null;
-  return { reg, desconto, citado: false, generico: true };
+  const m = melhorCupomAplicavel(loja, preco);
+  if (!m) return null;
+  return { reg: m.reg, desconto: m.desconto, citado: false, generico: true };
+}
+
+// Codigos que aparecem depois da palavra "cupom" no texto do grupo-fonte.
+// Aceita "cupom XYZ", "cupom: XYZ", "cupom de desconto XYZ".
+const REGEX_CODIGO_CITADO = /\bcupo(?:m|ns)\s*(?:de\s+desconto\s*)?:?\s*(?:e|eh|de|do|da)?\s*([A-Z0-9][A-Z0-9._-]{3,29})\b/gi;
+
+// Palavras que seguem "cupom" sem serem codigo. Sem esta lista, texto escrito
+// todo em caixa alta geraria aviso a cada mensagem.
+const PALAVRAS_NAO_CODIGO = new Set([
+  'DESCONTO','DESCONTOS','EXCLUSIVO','EXCLUSIVA','PROMO','PROMOCAO','ANUNCIO',
+  'LOJA','LOJAS','LINK','AQUI','ABAIXO','ACIMA','GRATIS','FRETE','APLIQUE',
+  'RESGATE','SOMENTE','PRIMEIRA','COMPRA','COMPRAS','APENAS','VALIDO','CLIQUE',
+  'NOVOS','USUARIOS','PONTOS','REAIS','MERCADO','LIVRE','SHOPEE','AMAZON',
+  'MAGALU','MAGAZINE','LUIZA','PARA','PELO','PELA','COM','SEM','MAIS',
+]);
+
+/**
+ * Codigos de cupom citados na postagem original que NAO estao na base.
+ *
+ * Sem o registro nao ha regra (percentual, minimo, teto) para calcular o
+ * desconto, entao a oferta sai pelo preco cheio mesmo o post prometendo outro
+ * valor. Serve para o operador cadastrar e nao perder as proximas.
+ *
+ * Conservador de proposito: so aceita token em CAIXA ALTA ou com digito, para
+ * nao confundir "cupom do anuncio" com codigo.
+ */
+export function cupomCitadoDesconhecido(loja, textoOriginal) {
+  const texto = String(textoOriginal || '');
+  const achados = new Set();
+  for (const m of texto.matchAll(REGEX_CODIGO_CITADO)) {
+    const bruto = m[1];
+    const codigo = bruto.toUpperCase();
+    if (PALAVRAS_NAO_CODIGO.has(codigo)) continue;
+    if (bruto !== codigo && !/\d/.test(codigo)) continue;   // nao parece codigo
+    if (cupomPorCodigo(loja, codigo)) continue;              // ja esta na base
+    achados.add(codigo);
+  }
+  return [...achados];
 }
 
 carregarCuponsBase();
@@ -891,15 +931,9 @@ export function normalizar(item) {
   const l = escolherListing(item);
   const preco = l?.price?.money;
   const de    = l?.price?.savingBasis?.money;
-  // O savingBasis e fonte oficial, mas passa pelas mesmas travas das outras
-  // lojas (maior que o preco, no maximo 5x, desconto ate 90%): listing com
-  // preco de tabela antigo ou errado nao vira "90% OFF" na mensagem.
-  const resolvido = resolverPrecoDe({
-    preco: preco?.amount ?? null,
-    rotulo: 'Amazon ' + (item.asin || ''),
-    candidatos: [{ fonte: FONTE_API, valor: de?.amount ?? null }],
-  });
-  const desconto = resolvido.desconto;
+  const desconto = (de?.amount && preco?.amount)
+    ? Math.round((1 - preco.amount / de.amount) * 100)
+    : 0;
 
   return {
     asin: item.asin,
@@ -909,9 +943,8 @@ export function normalizar(item) {
     link: item.detailPageURL,          // ja vem com o partnerTag aplicado
     preco: preco?.amount ?? null,
     precoTexto: preco?.displayAmount || null,
-    precoDe: resolvido.precoDe,
-    precoDeFonte: resolvido.fonte,
-    precoDeTexto: resolvido.precoDe ? (de?.displayAmount || 'R$ ' + resolvido.precoDe.toFixed(2).replace('.', ',')) : null,
+    precoDe: de?.amount ?? null,
+    precoDeTexto: de?.displayAmount || null,
     desconto,
     disponivel: l?.availability?.type === 'IN_STOCK',
     vendedor: l?.merchantInfo?.name || null,
