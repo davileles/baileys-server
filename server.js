@@ -55,6 +55,10 @@ import {
   estadoAwin, ehLinkAwin, processarTextoAwin, limparUrlAwin, extrairProdutoAwin,
   resolverLinhaVitrineAwin, montarOfertasAwinVitrine, ttlPrecoAwin,
 } from './radar-awin.js';
+import {
+  credenciaisFeedOk, carregarFeedListDoDisco, atualizarFeedList,
+  feedsDoAnunciante, estadoFeed, amostraFeed,
+} from './awin-feed.js';
 
 // ── RADAR SHOPEE ──────────────────────────────────────────────────────────────
 import {
@@ -181,6 +185,12 @@ const baileysLogger = pino({ level: 'silent' });
 // Boot da Awin: catalogo do disco (instantaneo) e refresh diario em segundo
 // plano. Sem credenciais o modulo fica inerte — nada mais no server muda.
 carregarProgramasAwin();
+// Lista de feeds: cache em disco no boot, atualizacao diaria em segundo plano.
+carregarFeedListDoDisco();
+if (credenciaisFeedOk()) {
+  atualizarFeedList().catch(e => console.log('[AWIN-FEED] Falha ao atualizar lista:', e.message));
+  setInterval(() => atualizarFeedList().catch(() => {}), 24 * 60 * 60 * 1000).unref?.();
+}
 if (credenciaisAwinOk()) {
   atualizarProgramasAwin().catch(e => console.log('[AWIN] Falha ao atualizar catalogo:', e.message));
   setInterval(() => atualizarProgramasAwin().catch(() => {}), 24 * 60 * 60 * 1000).unref?.();
@@ -4590,6 +4600,25 @@ app.post('/awin/cupons/importar', async (req, res) => {
     console.log('[AWIN] Importacao de cupons — ' + importados.length + ' ok, ' + ignorados.length + ' ignorado(s).');
     res.json({ ok:true, total: brutas.length, importados, ignorados });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── PRODUCT FEEDS DA AWIN ────────────────────────────────────────────────────
+app.get('/awin/feeds', (req, res) => {
+  const anunciante = req.query.advertiserId;
+  res.json({ ok:true, ...estadoFeed(),
+    feeds: anunciante ? feedsDoAnunciante(anunciante) : undefined });
+});
+
+app.post('/awin/feeds/atualizar', async (req, res) => {
+  try { res.json({ ok:true, total: (await atualizarFeedList(true)).length }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Amostra crua do feed. Serve para conferir a olho qual coluna de preco a loja
+// usa: a Awin nao impoe a mesma semantica para todos os anunciantes.
+app.get('/awin/feeds/amostra', async (req, res) => {
+  try { res.json({ ok:true, ...await amostraFeed(req.query.advertiserId, Number(req.query.n) || 5) }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // ── POLLER DE CUPONS DA AWIN ─────────────────────────────────────────────────
