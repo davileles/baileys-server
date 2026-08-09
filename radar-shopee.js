@@ -17,6 +17,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { createHash } from 'crypto';
+import { resolverPrecoDe, FONTE_API } from './preco-de.js';
 import {
   melhorCupom, cupomPorCodigo, cupomVigente, calcularDesconto,
   templateDaLoja, renderTemplate, varsDoProduto, melhorCupomAplicavel,
@@ -188,9 +189,18 @@ export async function buscarProdutoShopee({ shopId, itemId }) {
 export function normalizarShopee(n) {
   const preco = Number(n.priceMin);
   const taxa  = Number(n.priceDiscountRate) || 0;
-  const precoDe = (taxa > 0 && taxa < 100 && isFinite(preco))
+  const derivado = (taxa > 0 && taxa < 100 && isFinite(preco))
     ? Math.round((preco / (1 - taxa / 100)) * 100) / 100
     : null;
+  // O valor e derivado da taxa, entao a conferencia cruzada sempre bate — o que
+  // as travas pegam aqui e taxa absurda (95% vira um "de" de 20x o preco).
+  const resolvido = resolverPrecoDe({
+    preco,
+    descontoDeclarado: taxa || null,
+    rotulo: 'Shopee ' + (n.itemId || ''),
+    candidatos: [{ fonte: FONTE_API, valor: derivado }],
+  });
+  const precoDe = resolvido.precoDe;
 
   return {
     asin: String(n.itemId),          // o template usa 'asin' como id generico
@@ -207,8 +217,9 @@ export function normalizarShopee(n) {
     preco: isFinite(preco) ? preco : null,
     precoTexto: isFinite(preco) ? 'R$ ' + preco.toFixed(2).replace('.', ',') : null,
     precoDe,
+    precoDeFonte: resolvido.fonte,
     precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
-    desconto: taxa,
+    desconto: precoDe ? resolvido.desconto : 0,
     // A Shopee nao expoe estoque nesta query; uma oferta listada e considerada
     // ativa. Preco ausente continua barrando o envio.
     disponivel: isFinite(preco) && preco > 0,
