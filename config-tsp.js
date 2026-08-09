@@ -306,6 +306,18 @@ export function estadoCredenciais(tenantId) {
 
 export function tgIgnoradosConfig(tenantId) { return obter(tenantId).telegram.canaisIgnorados.slice(); }
 
+// ── Credencial por contexto (fase 2.3) ───────────────────────────────────────
+// Resolucao para os radares: o que o operador do contexto salvou no painel; na
+// operacao padrao a env do Railway continua valendo como fallback. Operador
+// novo NUNCA herda credencial da plataforma — sem a chave dele, a integracao
+// simplesmente fica indisponivel para ele.
+export function credencialTsp(nome, tenantId) {
+  const id = resolver(tenantId);
+  const daConfig = String(((obter(id).credenciais || {})[nome]) || '').trim();
+  if (daConfig) return daConfig;
+  return id === TENANT_RAIZ ? String(process.env[nome] || '').trim() : '';
+}
+
 // Auto-carrega no import: os modulos que consomem (server.js, radar-amazon.js)
 // podem ler a config imediatamente, sem depender da ordem do boot.
 carregarConfigTsp();
