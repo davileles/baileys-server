@@ -16,6 +16,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { agendarPush } from './sync-github.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 const SESSAO_DIR   = './sessao';
 const TENANTS_PATH = SESSAO_DIR + '/tenants.json';
@@ -125,11 +126,45 @@ export function atualizarTenant(id, patch = {}) {
   return { ...t };
 }
 
-// Resolucao por requisicao. Fase 2.1: sempre o tenant padrao — o parametro
-// existe para as fases seguintes trocarem a origem (token de sessao do login)
-// sem mexer nos pontos de uso.
-export function resolverTenant(_req) {
-  return tenantPorId(TENANT_PADRAO);
+// ── Token de sessao por operador (fase 2.5) ─────────────────────────────────
+// Cunhado pelo proxy apos o OTP por e-mail, verificado aqui por HMAC com o
+// segredo compartilhado TSP_TENANT_SECRET (mesma env nos dois servicos).
+// Formato: base64url(JSON{email,exp}) + '.' + hmacSHA256hex.
+export function verificarTokenTenant(bruto) {
+  const secret = process.env.TSP_TENANT_SECRET || '';
+  const tk = String(bruto || '').trim();
+  if (!secret || !tk) return null;
+  const ponto = tk.lastIndexOf('.');
+  if (ponto < 1) return null;
+  const payload = tk.slice(0, ponto), assinatura = tk.slice(ponto + 1);
+  const esperada = createHmac('sha256', secret).update(payload).digest('hex');
+  try {
+    if (!timingSafeEqual(Buffer.from(assinatura, 'hex'), Buffer.from(esperada, 'hex'))) return null;
+  } catch { return null; }
+  try {
+    const d = JSON.parse(Buffer.from(payload, 'base64url').toString('utf-8'));
+    if (!d.email || !d.exp || Date.now() > d.exp) return null;
+    return { email: String(d.email).toLowerCase(), exp: d.exp };
+  } catch { return null; }
+}
+
+// Extrai e valida o token da requisicao. Query string existe para paginas
+// abertas em aba propria (QR, /tg-auth), que nao mandam header.
+// Retorno: payload | null (sem token — superficie publica legada, cai na raiz)
+// | false (token presente mas invalido/expirado — 401, NUNCA cair na raiz:
+// sessao vencida de um operador operando os dados de outro seria gravissimo).
+export function tokenDaReq(req) {
+  const bruto = req?.headers?.['x-tsp-token'] || req?.query?.tsp_token || '';
+  if (!bruto) return null;
+  return verificarTokenTenant(bruto) || false;
+}
+
+// Resolucao por requisicao: token valido manda; sem token, operacao padrao
+// (compatibilidade com toda a superficie publica existente).
+export function resolverTenant(req) {
+  const tk = tokenDaReq(req);
+  if (tk === false || tk === null) return tk === false ? null : tenantPorId(TENANT_PADRAO);
+  return tenantPorEmail(tk.email) || null;
 }
 
 // ── Contexto de tenant por cadeia de execucao ────────────────────────────────
