@@ -4416,16 +4416,16 @@ app.get('/config-tsp', (req, res) => {
   res.json({
     ok: true,
     tenant: t ? { id: t.id, nome: t.nome } : null,
-    config: configTspPublico(),
-    credenciais: credenciaisEstado(),
+    config: configTspPublico(req.tenantId),
+    credenciais: credenciaisEstado(req.tenantId),
   });
 });
 
 app.post('/config-tsp', (req, res) => {
   try {
-    salvarConfigTsp(req.body || {});
-    console.log('[CFG-TSP] Configuracao atualizada pelo painel.');
-    res.json({ ok: true, config: configTspPublico(), credenciais: credenciaisEstado() });
+    salvarConfigTsp(req.body || {}, req.tenantId);
+    console.log('[CFG-TSP] Configuracao atualizada pelo painel (' + req.tenantId + ').');
+    res.json({ ok: true, config: configTspPublico(req.tenantId), credenciais: credenciaisEstado(req.tenantId) });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
