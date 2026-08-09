@@ -14,7 +14,9 @@
 //   ML_TAG                            etiqueta de afiliado (opcional para consulta)
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { credencialTsp } from './config-tsp.js';
+import { tenantContexto } from './tenants.js';
 import {
   resolverPrecoDe, precoDeDoLd, precoDeDoEstado, precoDeDoDom,
   descontoDeclaradoNoHtml, numeroJson,
@@ -22,7 +24,16 @@ import {
 } from './preco-de.js';
 
 const SESSAO_DIR = './sessao';
-const TOKEN_PATH = SESSAO_DIR + '/ml_token.json';
+// Token OAuth por OPERADOR (fase 2.3): cada um autoriza a propria conta do
+// Mercado Livre. Raiz mantem o caminho historico; demais em tenants/<id>/.
+function tenantMl() { return tenantContexto() || 'tsp'; }
+function tokenPath() {
+  const id = tenantMl();
+  if (id === 'tsp') return SESSAO_DIR + '/ml_token.json';
+  const dir = SESSAO_DIR + '/tenants/' + id;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return dir + '/ml_token.json';
+}
 const API = 'https://api.mercadolibre.com';
 const AUTH = 'https://auth.mercadolivre.com.br';
 
@@ -30,26 +41,29 @@ export const ML_REDIRECT_URI =
   process.env.ML_REDIRECT_URI ||
   'https://baileys-server-production-ebfe.up.railway.app/ml/callback';
 
-let _tok = null;   // { access_token, refresh_token, expira_em }
+const _toks = new Map();   // tenantId -> { access_token, refresh_token, expira_em } | null
+function tokAtual()  { return _toks.get(tenantMl()) || null; }
+function tokDef(t)   { _toks.set(tenantMl(), t); return t; }
 
 export function credenciaisMlOk() {
-  return !!(process.env.ML_CLIENT_ID && process.env.ML_CLIENT_SECRET);
+  return !!(credencialTsp('ML_CLIENT_ID') && credencialTsp('ML_CLIENT_SECRET'));
 }
-export function tagMl() { return process.env.ML_TAG || null; }
+export function tagMl() { return credencialTsp('ML_TAG') || null; }
 
 function carregarToken() {
-  try { if (existsSync(TOKEN_PATH)) _tok = JSON.parse(readFileSync(TOKEN_PATH, 'utf-8')); }
-  catch (e) { _tok = null; }
-  return _tok;
+  try { if (existsSync(tokenPath())) tokDef(JSON.parse(readFileSync(tokenPath(), 'utf-8'))); }
+  catch (e) { tokDef(null); }
+  return tokAtual();
 }
 function salvarToken(t) {
-  _tok = t;
-  try { writeFileSync(TOKEN_PATH, JSON.stringify(t, null, 2), 'utf-8'); }
+  tokDef(t);
+  try { writeFileSync(tokenPath(), JSON.stringify(t, null, 2), 'utf-8'); }
   catch (e) { console.log('[ML] Erro ao salvar token:', e.message); }
 }
 
 export function estadoMl() {
-  if (!_tok) carregarToken();
+  if (!tokAtual()) carregarToken();
+  const _tok = tokAtual();   // leitura local do operador do contexto
   return {
     credenciais: credenciaisMlOk(),
     tag: tagMl(),
@@ -58,9 +72,9 @@ export function estadoMl() {
     tokenValido: !!(_tok?.access_token && Date.now() < (_tok.expira_em || 0)),
     redirectUri: ML_REDIRECT_URI,
     diagnostico: {
-      ML_CLIENT_ID_presente: !!process.env.ML_CLIENT_ID,
-      ML_CLIENT_SECRET_presente: !!process.env.ML_CLIENT_SECRET,
-      ML_TAG_presente: !!process.env.ML_TAG,
+      ML_CLIENT_ID_presente: !!credencialTsp('ML_CLIENT_ID'),
+      ML_CLIENT_SECRET_presente: !!credencialTsp('ML_CLIENT_SECRET'),
+      ML_TAG_presente: !!credencialTsp('ML_TAG'),
       variaveis_ml_vistas: Object.keys(process.env).filter(k => /^ML_/.test(k)).sort(),
     },
   };
@@ -70,7 +84,7 @@ export function estadoMl() {
 export function urlAutorizacao(estado = 'cdv') {
   const p = new URLSearchParams({
     response_type: 'code',
-    client_id: process.env.ML_CLIENT_ID,
+    client_id: credencialTsp('ML_CLIENT_ID'),
     redirect_uri: ML_REDIRECT_URI,
     state: estado,
   });
@@ -90,40 +104,40 @@ async function pedirToken(corpo) {
   // token que expira no meio da chamada.
   salvarToken({
     access_token: d.access_token,
-    refresh_token: d.refresh_token || _tok?.refresh_token || null,
+    refresh_token: d.refresh_token || tokAtual()?.refresh_token || null,
     expira_em: Date.now() + ((d.expires_in || 21600) - 300) * 1000,
-    user_id: d.user_id ?? _tok?.user_id ?? null,
+    user_id: d.user_id ?? tokAtual()?.user_id ?? null,
   });
-  return _tok;
+  return tokAtual();
 }
 
 /** Troca o 'code' do callback pelo par de tokens. */
 export async function trocarCodePorToken(code) {
   return pedirToken({
     grant_type: 'authorization_code',
-    client_id: process.env.ML_CLIENT_ID,
-    client_secret: process.env.ML_CLIENT_SECRET,
+    client_id: credencialTsp('ML_CLIENT_ID'),
+    client_secret: credencialTsp('ML_CLIENT_SECRET'),
     code,
     redirect_uri: ML_REDIRECT_URI,
   });
 }
 
 async function renovar() {
-  if (!_tok?.refresh_token) throw new Error('sem refresh_token — autorize em /ml/conectar');
+  if (!tokAtual()?.refresh_token) throw new Error('sem refresh_token — autorize em /ml/conectar');
   console.log('[ML] Renovando access_token…');
   return pedirToken({
     grant_type: 'refresh_token',
-    client_id: process.env.ML_CLIENT_ID,
-    client_secret: process.env.ML_CLIENT_SECRET,
-    refresh_token: _tok.refresh_token,
+    client_id: credencialTsp('ML_CLIENT_ID'),
+    client_secret: credencialTsp('ML_CLIENT_SECRET'),
+    refresh_token: tokAtual().refresh_token,
   });
 }
 
 async function tokenValido() {
-  if (!_tok) carregarToken();
-  if (!_tok) throw new Error('não autorizado — acesse /ml/conectar');
-  if (Date.now() >= (_tok.expira_em || 0)) await renovar();
-  return _tok.access_token;
+  if (!tokAtual()) carregarToken();
+  if (!tokAtual()) throw new Error('não autorizado — acesse /ml/conectar');
+  if (Date.now() >= (tokAtual().expira_em || 0)) await renovar();
+  return tokAtual().access_token;
 }
 
 async function apiMl(caminho) {
@@ -135,7 +149,7 @@ async function apiMl(caminho) {
   // 401 fora da janela prevista: renova e tenta uma vez.
   if (res.status === 401) {
     await renovar();
-    token = _tok.access_token;
+    token = tokAtual().access_token;
     res = await fetch(API + caminho, {
       headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
       signal: AbortSignal.timeout(20000),
@@ -376,7 +390,7 @@ export async function gerarLinksAfiliadoMl(urls) {
 
 let _saudeAff = { ok: null, verificadoEm: null, erro: null, avisado: false };
 
-export function tokenAffOk() { return !!process.env.ML_AFF_TOKEN; }
+export function tokenAffOk() { return !!credencialTsp('ML_AFF_TOKEN'); }
 export function saudeAff() { return { ..._saudeAff, configurado: tokenAffOk() }; }
 
 /**
@@ -385,7 +399,7 @@ export function saudeAff() { return { ..._saudeAff, configurado: tokenAffOk() };
  * primeira tentativa deu 404/403.
  */
 export function cookieAff() {
-  const bruto = (process.env.ML_AFF_TOKEN || '').trim();
+  const bruto = (credencialTsp('ML_AFF_TOKEN') || '').trim();
   if (!bruto) return null;
   try {
     const decodificado = Buffer.from(bruto, 'base64').toString('utf-8');
@@ -466,7 +480,7 @@ export async function verificarTokenAff(urlTeste, aoFalhar) {
  * prazo de validade (exp).
  */
 export function inspecionarTokenAff() {
-  const tk = (process.env.ML_AFF_TOKEN || '').replace(/^Bearer\s+/i, '').trim();
+  const tk = (credencialTsp('ML_AFF_TOKEN') || '').replace(/^Bearer\s+/i, '').trim();
   if (!tk) return { configurado: false };
   const base = { configurado: true, tamanho: tk.length, prefixo: tk.slice(0, 6) + '…', formatoJwt: false };
   const partes = tk.split('.');
