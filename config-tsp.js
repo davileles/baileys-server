@@ -12,11 +12,25 @@
 // volume do Railway.
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { agendarPush } from './sync-github.js';
+import { tenantContexto } from './tenants.js';
 
-const SESSAO_DIR   = './sessao';
-const CFG_TSP_PATH = SESSAO_DIR + '/config_tsp.json';
+const SESSAO_DIR = './sessao';
+// Mesmo valor de TENANT_PADRAO em tenants.js (nao importado para este modulo
+// nao depender do registro). Raiz de ./sessao = operacao original, layout
+// historico; demais operadores em ./sessao/tenants/<id>/.
+const TENANT_RAIZ = 'tsp';
+const RE_TENANT = /^[a-z0-9][a-z0-9-]{1,30}$/;
+
+function caminhoLocalDe(tenantId) {
+  return tenantId === TENANT_RAIZ
+    ? SESSAO_DIR + '/config_tsp.json'
+    : SESSAO_DIR + '/tenants/' + tenantId + '/config_tsp.json';
+}
+function caminhoPushDe(tenantId) {
+  return tenantId === TENANT_RAIZ ? 'config_tsp.json' : 'tenants/' + tenantId + '/config_tsp.json';
+}
 
 // Valores padrao = operacao original (Tudo Sobre Promos / Davi), que e o
 // "primeiro usuario" do modelo hospedado. Um deploy novo sem config gravada se
@@ -81,14 +95,31 @@ const CFG_TSP_PADRAO = {
   },
 };
 
+// Config de partida por operador: a raiz herda os valores historicos da
+// operacao original; um tenant novo nasce com tudo VAZIO — links, rodapes,
+// grupos, credenciais. Evita o pior bug do modelo hospedado: comissao ou envio
+// caindo na operacao errada por um campo esquecido.
+function padraoDe(tenantId) {
+  if (tenantId === TENANT_RAIZ) return CFG_TSP_PADRAO;
+  const vazio = JSON.parse(JSON.stringify(CFG_TSP_PADRAO));
+  for (const k of Object.keys(vazio.afiliados))   vazio.afiliados[k] = '';
+  for (const k of Object.keys(vazio.rodapes))     vazio.rodapes[k] = '';
+  for (const k of Object.keys(vazio.credenciais)) vazio.credenciais[k] = '';
+  vazio.grupos = { cupons: [], operador: '' };
+  vazio.telegram.canaisIgnorados = [];
+  vazio.branding.nome = '';
+  return vazio;
+}
+
 // Merge raso por secao: cada bloco do padrao e preenchido com o que veio do
 // disco. Suficiente para a estrutura de 2 niveis deste arquivo e evita que uma
 // config antiga (sem um campo novo) derrube o padrao do campo.
-function estruturar(bruto) {
+function estruturar(bruto, tenantId = TENANT_RAIZ) {
+  const PADRAO = padraoDe(tenantId);
   const b = (bruto && typeof bruto === 'object') ? bruto : {};
   const out = {};
-  for (const secao of Object.keys(CFG_TSP_PADRAO)) {
-    out[secao] = { ...CFG_TSP_PADRAO[secao], ...(b[secao] && typeof b[secao] === 'object' ? b[secao] : {}) };
+  for (const secao of Object.keys(PADRAO)) {
+    out[secao] = { ...PADRAO[secao], ...(b[secao] && typeof b[secao] === 'object' ? b[secao] : {}) };
   }
   // Config gravada antes desta versao tem grupos.cupons como string e um
   // grupos.padrao que nao existe mais — normaliza sem perder o que estava la.
@@ -104,43 +135,82 @@ function estruturar(bruto) {
   // canaisIgnorados precisa ser array de strings limpas.
   out.telegram.canaisIgnorados = Array.isArray(out.telegram.canaisIgnorados)
     ? out.telegram.canaisIgnorados.map(s => String(s).trim().toLowerCase()).filter(Boolean)
-    : CFG_TSP_PADRAO.telegram.canaisIgnorados.slice();
+    : padraoDe(tenantId).telegram.canaisIgnorados.slice();
   return out;
 }
 
-let _cfg = estruturar({});
+const _cfgs = new Map();   // tenantId -> config estruturada
 
-export function carregarConfigTsp() {
-  try {
-    if (existsSync(CFG_TSP_PATH)) {
-      _cfg = estruturar(JSON.parse(readFileSync(CFG_TSP_PATH, 'utf-8')));
-      console.log('[CFG-TSP] Configuracao da operacao carregada.');
-    } else {
-      _cfg = estruturar({});
-      console.log('[CFG-TSP] Sem config em disco — usando padrao da operacao original.');
-    }
-  } catch (e) {
-    console.log('[CFG-TSP] Erro ao carregar config:', e.message);
-  }
-  return _cfg;
+// Resolucao do operador: parametro explicito > contexto da requisicao
+// (AsyncLocalStorage, aberto pelo middleware) > operacao padrao. Assim os
+// acessores chamados sem parametro dentro de uma requisicao ja enxergam o
+// tenant certo, e pipelines/workers sem contexto caem na raiz.
+function resolver(tenantId) {
+  const id = tenantId || tenantContexto() || TENANT_RAIZ;
+  return RE_TENANT.test(String(id || '')) ? id : TENANT_RAIZ;
 }
 
-export function configTsp() { return _cfg; }
+function obter(tenantId) {
+  const id = resolver(tenantId);
+  if (!_cfgs.has(id)) carregarUm(id);
+  return _cfgs.get(id);
+}
+
+function carregarUm(tenantId) {
+  const caminho = caminhoLocalDe(tenantId);
+  try {
+    if (existsSync(caminho)) {
+      _cfgs.set(tenantId, estruturar(JSON.parse(readFileSync(caminho, 'utf-8')), tenantId));
+    } else {
+      _cfgs.set(tenantId, estruturar({}, tenantId));
+    }
+  } catch (e) {
+    console.log('[CFG-TSP] Erro ao carregar config de "' + tenantId + '":', e.message);
+    if (!_cfgs.has(tenantId)) _cfgs.set(tenantId, estruturar({}, tenantId));
+  }
+  if (tenantId === TENANT_RAIZ) aplicarCredenciais();
+}
+
+// Recarrega do disco: o padrao sempre, e todo tenant com pasta em ./sessao/tenants.
+export function carregarConfigTsp() {
+  _cfgs.clear();
+  carregarUm(TENANT_RAIZ);
+  try {
+    const dir = SESSAO_DIR + '/tenants';
+    if (existsSync(dir)) {
+      for (const id of readdirSync(dir)) {
+        if (RE_TENANT.test(id) && id !== TENANT_RAIZ) carregarUm(id);
+      }
+    }
+  } catch (e) { console.log('[CFG-TSP] Erro ao enumerar tenants:', e.message); }
+  console.log('[CFG-TSP] Config carregada para ' + _cfgs.size + ' operador(es).');
+  return obter();
+}
+
+export function configTsp(tenantId) { return obter(tenantId); }
 
 const RE_JID_GRUPO = /^\d{5,}@g\.us$/;
 
-export function salvarConfigTsp(parcial = {}) {
+export function salvarConfigTsp(parcial = {}, tenantId) {
+  tenantId = resolver(tenantId);
+  const atual = obter(tenantId);
   const novo = estruturar({
-    branding: { ..._cfg.branding, ...(parcial.branding || {}) },
-    afiliados:{ ..._cfg.afiliados, ...(parcial.afiliados || {}) },
-    rodapes:  { ..._cfg.rodapes,   ...(parcial.rodapes   || {}) },
-    grupos:   { ..._cfg.grupos,    ...(parcial.grupos    || {}) },
-    telegram: { ..._cfg.telegram,  ...(parcial.telegram  || {}) },
-    credenciais: { ..._cfg.credenciais, ...(parcial.credenciais || {}) },
-  });
+    branding: { ...atual.branding, ...(parcial.branding || {}) },
+    afiliados:{ ...atual.afiliados, ...(parcial.afiliados || {}) },
+    rodapes:  { ...atual.rodapes,   ...(parcial.rodapes   || {}) },
+    grupos:   { ...atual.grupos,    ...(parcial.grupos    || {}) },
+    telegram: { ...atual.telegram,  ...(parcial.telegram  || {}) },
+    credenciais: { ...atual.credenciais, ...(parcial.credenciais || {}) },
+  }, tenantId);
   // Um JID invalido quebra avisos do operador em silencio — melhor recusar.
-  if (!RE_JID_GRUPO.test(String(novo.grupos.operador || ''))) {
+  // Tenant novo pode ficar sem grupo do operador ate conectar o WhatsApp.
+  const opd = String(novo.grupos.operador || '').trim();
+  novo.grupos.operador = opd;
+  if (opd && !RE_JID_GRUPO.test(opd)) {
     throw new Error('Grupo do operador invalido: informe um JID de grupo (…@g.us).');
+  }
+  if (!opd && tenantId === TENANT_RAIZ) {
+    throw new Error('Grupo do operador e obrigatorio na operacao padrao.');
   }
   for (const jid of novo.grupos.cupons) {
     if (!RE_JID_GRUPO.test(jid)) {
@@ -155,20 +225,26 @@ export function salvarConfigTsp(parcial = {}) {
       throw new Error('Link de afiliado "' + k + '" invalido: use uma URL http(s) ou deixe vazio.');
     }
   }
-  _cfg = novo;
-  aplicarCredenciais();
+  _cfgs.set(tenantId, novo);
+  // Injecao em process.env e inerentemente global: so a operacao padrao usa
+  // esse caminho. Credenciais dos demais operadores ficam armazenadas e passam
+  // a ser consumidas por contexto na fase 2.3.
+  if (tenantId === TENANT_RAIZ) aplicarCredenciais();
   try {
-    writeFileSync(CFG_TSP_PATH, JSON.stringify(_cfg, null, 2), 'utf-8');
-    agendarPush('config_tsp.json');
-  } catch (e) { console.log('[CFG-TSP] Erro ao salvar config:', e.message); }
-  return _cfg;
+    const caminho = caminhoLocalDe(tenantId);
+    const dir = caminho.slice(0, caminho.lastIndexOf('/'));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(caminho, JSON.stringify(novo, null, 2), 'utf-8');
+    agendarPush(caminhoPushDe(tenantId));
+  } catch (e) { console.log('[CFG-TSP] Erro ao salvar config de "' + tenantId + '":', e.message); }
+  return novo;
 }
 
 // ── Acessores usados pelo restante do servidor ───────────────────────────────
 
 // Mapa no formato historico do LINKS_TSP, para o formatador nao mudar de shape.
-export function linksTsp() {
-  const a = _cfg.afiliados || {};
+export function linksTsp(tenantId) {
+  const a = obter(tenantId).afiliados || {};
   return {
     'Amazon':         a.amazon || '',
     'Mercado Livre':  a.mercadolivre || '',
@@ -179,12 +255,12 @@ export function linksTsp() {
   };
 }
 
-export function rodapeCupom()       { return (_cfg.rodapes.cupom || '').trim(); }
-export function rodapeOferta()      { return (_cfg.rodapes.oferta || '').trim(); }
-export function rodapeGrupoCupons() { return (_cfg.rodapes.grupoCupons || '').trim(); }
+export function rodapeCupom(tenantId)       { return (obter(tenantId).rodapes.cupom || '').trim(); }
+export function rodapeOferta(tenantId)      { return (obter(tenantId).rodapes.oferta || '').trim(); }
+export function rodapeGrupoCupons(tenantId) { return (obter(tenantId).rodapes.grupoCupons || '').trim(); }
 
-export function gruposTspCupons()   { return (_cfg.grupos.cupons || []).slice(); }
-export function grupoOperadorTsp()  { return _cfg.grupos.operador; }
+export function gruposTspCupons(tenantId)   { return (obter(tenantId).grupos.cupons || []).slice(); }
+export function grupoOperadorTsp(tenantId)  { return obter(tenantId).grupos.operador; }
 
 // ── CREDENCIAIS ──────────────────────────────────────────────────────────────
 // Em vez de trocar cada leitura de process.env espalhada pelos modulos, o que
@@ -192,7 +268,7 @@ export function grupoOperadorTsp()  { return _cfg.grupos.operador; }
 // o codigo existente continua lendo do mesmo lugar e o painel passa a mandar,
 // com a env do Railway sobrando como fallback de quem nao preencheu nada.
 export function aplicarCredenciais() {
-  const c = _cfg.credenciais || {};
+  const c = (_cfgs.get(TENANT_RAIZ) || {}).credenciais || {};
   const aplicadas = [];
   for (const [chave, valor] of Object.entries(c)) {
     const v = String(valor || '').trim();
@@ -209,12 +285,15 @@ export function aplicarCredenciais() {
  * preenchida, de onde veio e um sufixo para o operador reconhecer qual chave
  * esta la sem poder copia-la de volta.
  */
-export function estadoCredenciais() {
-  const c = _cfg.credenciais || {};
+export function estadoCredenciais(tenantId) {
+  tenantId = resolver(tenantId);
+  const c = obter(tenantId).credenciais || {};
   const out = {};
   for (const chave of Object.keys(CFG_TSP_PADRAO.credenciais)) {
     const daConfig = String(c[chave] || '').trim();
-    const daEnv    = String(process.env[chave] || '').trim();
+    // A env do Railway e infraestrutura da OPERACAO PADRAO — operador novo nao
+    // enxerga (nem herda) as chaves da plataforma.
+    const daEnv    = tenantId === TENANT_RAIZ ? String(process.env[chave] || '').trim() : '';
     const valor    = daConfig || daEnv;
     out[chave] = {
       preenchida: !!valor,
@@ -225,7 +304,7 @@ export function estadoCredenciais() {
   return out;
 }
 
-export function tgIgnoradosConfig() { return _cfg.telegram.canaisIgnorados.slice(); }
+export function tgIgnoradosConfig(tenantId) { return obter(tenantId).telegram.canaisIgnorados.slice(); }
 
 // Auto-carrega no import: os modulos que consomem (server.js, radar-amazon.js)
 // podem ler a config imediatamente, sem depender da ordem do boot.
