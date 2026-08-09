@@ -6490,19 +6490,31 @@ app.get('/grupos/info', async (req, res) => {
 app.get('/grupos/convite', async (req, res) => {
   const jid = String(req.query.jid || '').trim();
   if (!jid.endsWith('@g.us')) return res.status(400).json({ ok:false, erro:'informe ?jid=<id>@g.us' });
-  if (!sock || !conectado) {
-    const ok = await aguardarSock(15000);
-    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+  // Operador nao-padrao: o convite sai da CONTA DELE — o socket principal nem
+  // esta nos grupos dele, e um convite gerado pelo numero errado seria de outro
+  // grupo homonimo ou simplesmente falharia.
+  let sockConvite = null;
+  if (req.tenantId !== TENANT_PADRAO) {
+    const idConta = contaConectadaDoTenant(req.tenantId);
+    if (!idConta) return res.status(503).json({ ok:false, erro:'WhatsApp do operador nao conectado.' });
+    sockConvite = contasExtras.get(idConta).sock;
+  } else {
+    if (!sock || !conectado) {
+      const ok = await aguardarSock(15000);
+      if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+    }
+    sockConvite = sock;
   }
   const forcar = req.query.refresh === '1';
-  const c = _ggConviteCache.get(jid);
+  const chaveCache = req.tenantId + '|' + jid;   // cache por operador: mesmo jid, contas diferentes
+  const c = _ggConviteCache.get(chaveCache);
   if (!forcar && c && (Date.now() - c.ts) < GG_CONVITE_TTL_MS) {
     return res.json({ ok:true, jid, url:c.url, doCache:true });
   }
   try {
-    const code = await sock.groupInviteCode(jid);
+    const code = await sockConvite.groupInviteCode(jid);
     const url  = 'https://chat.whatsapp.com/' + code;
-    _ggConviteCache.set(jid, { ts: Date.now(), url });
+    _ggConviteCache.set(chaveCache, { ts: Date.now(), url });
     res.json({ ok:true, jid, url });
   } catch (e) {
     const bruto = e?.message || String(e);
