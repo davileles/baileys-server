@@ -1447,7 +1447,12 @@ function formatarCupomTSP(dados) {
 reformatarCupomsTSPPendentes();
 
 // ── CHAMADA ANTHROPIC ─────────────────────────────────────────────────────────
+// Motivo da ultima falha do chamarClaude. Serve para o aviso ao operador dizer
+// POR QUE a mensagem foi descartada, em vez de um generico "falhou".
+let _ultimoMotivoClaude = null;
+
 async function chamarClaude(system, userContent, maxTokens) {
+  _ultimoMotivoClaude = null;
   // 3 tentativas com backoff — antes uma falha momentânea da API/parse fazia
   // a classificação retornar null e o item sumia silenciosamente do buffer.
   const ESPERAS = [0, 2000, 5000];
@@ -1470,9 +1475,23 @@ async function chamarClaude(system, userContent, maxTokens) {
       });
       const data = await response.json();
       if (data.error) { console.log('API erro (tentativa '+(tentativa+1)+'/3):', JSON.stringify(data.error)); continue; }
+      // stop_reason 'max_tokens' = resposta cortada no meio. O JSON.parse vai
+      // falhar nas 3 tentativas sempre igual (o corte e deterministico), entao
+      // repetir e desperdicio: o log precisa dizer que o teto e que e curto,
+      // senao isso aparece como "parse falhou" e manda investigar o lugar errado.
+      if (data.stop_reason === 'max_tokens') {
+        console.error('[CLAUDE] Resposta truncada em max_tokens=' + (maxTokens || 1024)
+          + ' — aumente o teto desta chamada. Nao adianta repetir.');
+        _ultimoMotivoClaude = 'resposta truncada (max_tokens=' + (maxTokens || 1024) + ')';
+        return null;
+      }
       const raw = data.content?.[0]?.text || '{}';
       try { return JSON.parse(raw.replace(/```json|```/g,'').trim()); }
-      catch(e) { console.log('JSON parse falhou (tentativa '+(tentativa+1)+'/3):', e.message); continue; }
+      catch(e) {
+        console.log('JSON parse falhou (tentativa '+(tentativa+1)+'/3):', e.message);
+        _ultimoMotivoClaude = 'JSON invalido: ' + e.message;
+        continue;
+      }
     } catch(e) {
       console.log('Fetch API falhou (tentativa '+(tentativa+1)+'/3):', e.message);
     }
@@ -1519,7 +1538,10 @@ Regras:
   • Na dúvida entre os dois, olhe se o valor se refere ao que o cliente ECONOMIZA (limite) ou ao que ele COMPRA (maximo).
 - Em "multiplos", cada item pode ter seu próprio "minimo", "maximo" e "limite".`;
 
-  return await chamarClaude(system, [{ type:'text', text: texto }], 500);
+  // 2000 e nao 500: uma mensagem com 8 cupons ja estoura 500 tokens de saida,
+  // o JSON volta cortado e a mensagem INTEIRA era descartada em silencio. As
+  // listas diarias do Juao passam de 8 cupons com frequencia.
+  return await chamarClaude(system, [{ type:'text', text: texto }], 2000);
 }
 
 // ── AUTO-ENVIO DE CUPOM TSP ──────────────────────────────────────────────────
@@ -1888,6 +1910,29 @@ setInterval(async () => {
   } finally { _workerAutoRodando = false; }
 }, 15 * 1000);
 
+// ── AVISO: FALHA NA EXTRACAO DE CUPOM ────────────────────────────────────────
+// Throttle de 10 min: se a API da Anthropic cair, cada mensagem do canal viraria
+// um aviso e o grupo do operador ficaria inutilizavel justo na hora do problema.
+let _ultimoAvisoExtracao = 0;
+const AVISO_EXTRACAO_INTERVALO_MS = 10 * 60 * 1000;
+
+async function avisarExtracaoFalhou(texto, canal) {
+  const agora = Date.now();
+  if (agora - _ultimoAvisoExtracao < AVISO_EXTRACAO_INTERVALO_MS) return;
+  _ultimoAvisoExtracao = agora;
+
+  const trecho = String(texto || '').trim().slice(0, 300);
+  const msg = '⚠️ *Mensagem descartada — extração falhou*\n\n'
+    + '*Canal* @' + canal + '\n'
+    + '*Motivo* ' + (_ultimoMotivoClaude || 'API não respondeu após 3 tentativas') + '\n\n'
+    + '*Trecho*\n' + trecho + (String(texto || '').length > 300 ? '…' : '') + '\n\n'
+    + 'Nenhum cupom desta mensagem entrou na base. Cadastre à mão se ainda valer. '
+    + '(Avisos deste tipo são agrupados a cada 10 min.)';
+
+  try { await enviarMensagem(GRUPOS.operador, { text: msg }); }
+  catch (e) { console.error('[TG] Falha ao avisar operador sobre extração:', e.message); }
+}
+
 // ── ENFILEIRAR / DESPACHAR UM CUPOM ──────────────────────────────────────────
 // Caminho unico para todo cupom, venha do Telegram ou da Awin: dedup, gravacao
 // na base, gate de auto-envio e envio (ou fila). Antes isso vivia dentro do
@@ -2013,7 +2058,17 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
 
   try {
     const campos = await extrairCupomTelegram(texto);
-    if (!campos || !campos.eh_cupom) {
+
+    // Distinguir os dois casos e o ponto todo: 'eh_cupom: false' e uma decisao
+    // (a mensagem nao era cupom); null e uma FALHA (API fora, JSON invalido,
+    // resposta truncada). O segundo caso jogava a mensagem fora em silencio,
+    // e uma lista com 8 cupons sumia sem deixar rastro nenhum.
+    if (!campos) {
+      console.error('[TG] Extração falhou — mensagem descartada:', texto.slice(0, 120));
+      avisarExtracaoFalhou(texto, canalUsername).catch(() => {});
+      return;
+    }
+    if (!campos.eh_cupom) {
       console.log('[TG] Não é cupom, ignorado.');
       return;
     }
@@ -2026,13 +2081,20 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       : [campos];
     const codigosLista = lista.map(x => x.codigo).filter(Boolean);
 
+    // try/catch POR ITEM: antes um cupom que estourasse derrubava o catch geral
+    // e os seguintes da mesma mensagem nunca eram processados — perda silenciosa
+    // proporcional ao tamanho da lista.
     for (const c of lista) {
-      await enfileirarCupomTSP(c, {
-        origem: `telegram:@${canalUsername}`,
-        textoOriginal: texto,
-        imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
-        tinhaMultiplos, codigosLista,
-      });
+      try {
+        await enfileirarCupomTSP(c, {
+          origem: `telegram:@${canalUsername}`,
+          textoOriginal: texto,
+          imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
+          tinhaMultiplos, codigosLista,
+        });
+      } catch (e) {
+        console.error(`[TG] Falha no cupom ${c.codigo || 'sem código'} (${c.loja}): ${e.message} — seguindo para o próximo.`);
+      }
     }
 
   } catch(err) {
@@ -2168,7 +2230,10 @@ async function iniciarTelegram() {
     for (const canal of TG_CANAIS_MONITORADOS) {
       try {
         const ent = await tgClient.getInputEntity(canal);
-        const msgs = await tgClient.getMessages(ent, { limit: 5 });
+        // 20 e nao 5: o canal posta em rajada e, com update MTProto perdido, o
+        // que passar de 5 numa janela de 60s sumia sem rastro. O corte real e
+        // o _ultimosMsgIds abaixo, entao ler mais so custa uma chamada maior.
+        const msgs = await tgClient.getMessages(ent, { limit: 20 });
         const cid = (ent?.channelId ?? ent?.chatId ?? ent?.userId)?.toString();
         for (const msg of msgs.reverse()) { // do mais antigo ao mais novo
           if (!msg.message?.trim()) continue;
