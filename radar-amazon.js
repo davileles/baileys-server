@@ -15,13 +15,78 @@
 //   AMZ_PARTNER_TAG    ex: tudosobrepromos-20
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
 import { rodapeOferta } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
-const RADAR_CFG_PATH  = SESSAO_DIR + '/radar_config.json';
-const RADAR_DEDUP_PATH = SESSAO_DIR + '/radar_vistos.json';
+
+// ═══════════ ESTADO POR OPERADOR (fase 2.2b) ═══════════
+// Todo o estado deste modulo (radar_config, dedup, base de cupons, templates,
+// vitrine, listas, token Amazon) vive num mapa por tenant. E() resolve o
+// operador do contexto da requisicao (AsyncLocalStorage); fora de requisicao
+// — pipelines, workers, boot — cai no tenant padrao, a operacao original.
+// O padrao mantem o layout historico na raiz de ./sessao; os demais em
+// ./sessao/tenants/<id>/, espelhado em tenants/<id>/ no repo de dados.
+const TENANT_RAIZ = 'tsp';
+const _estados = new Map();          // tenantId -> estado do modulo
+let _moduloPronto = false;           // vira true na ultima linha do modulo
+
+function novoEstado() {
+  return {
+    cfg: { ...CFG_PADRAO },
+    vistos: {},            // asin -> { preco, ts }
+    cupons: {},            // chave -> registro
+    templates: {},
+    vitrine: {},
+    listas: {},
+    token: { valor: null, expiraEm: 0 },
+  };
+}
+
+function tenantAtual() { return tenantContexto() || TENANT_RAIZ; }
+function E() { return estadoDe(tenantAtual()); }
+
+function estadoDe(id) {
+  if (!_estados.has(id)) {
+    _estados.set(id, novoEstado());  // antes de hidratar: corta recursao
+    // O tenant raiz e hidratado pelas chamadas top-level historicas deste
+    // modulo (ordem preservada — evita TDZ das consts declaradas adiante).
+    // Os demais so aparecem via requisicao, com o modulo ja pronto.
+    if (id !== TENANT_RAIZ && _moduloPronto) hidratarTenant(id);
+  }
+  return _estados.get(id);
+}
+
+function hidratarTenant(id) {
+  comContextoTenant(id, () => {
+    carregarRadarConfig(); carregarVistos(); carregarCuponsBase();
+    carregarTemplates(); carregarVitrine(); carregarListas();
+  });
+  console.log('[RADAR] Estado do operador "' + id + '" hidratado do disco.');
+}
+
+// Recarrega do disco os operadores ja em memoria (usado apos /sync/pull).
+export function recarregarRadarTenants() {
+  for (const id of _estados.keys()) {
+    if (id !== TENANT_RAIZ) hidratarTenant(id);
+  }
+}
+
+// Caminho local do arquivo do tenant atual (cria a pasta de tenants novos).
+function cT(nome) {
+  const t = tenantAtual();
+  if (t === TENANT_RAIZ) return SESSAO_DIR + '/' + nome;
+  const dir = SESSAO_DIR + '/tenants/' + t;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return dir + '/' + nome;
+}
+// Caminho relativo para o push (raiz ou tenants/<id>/).
+function pT(nome) {
+  const t = tenantAtual();
+  return t === TENANT_RAIZ ? nome : 'tenants/' + t + '/' + nome;
+}
 
 const LINK_CONVITE_OFERTAS = 'https://chat.whatsapp.com/Ia5ZTqeTJdXHG5OT9LUwz8';
 
@@ -45,12 +110,11 @@ const CFG_PADRAO = {
   turnosTsp: { ativo: false, turnos: [] },
 };
 
-let _cfg = { ...CFG_PADRAO };
 
 export function carregarRadarConfig() {
   try {
-    if (existsSync(RADAR_CFG_PATH)) {
-      _cfg = { ...CFG_PADRAO, ...JSON.parse(readFileSync(RADAR_CFG_PATH, 'utf-8')) };
+    if (existsSync(cT('radar_config.json'))) {
+      E().cfg = { ...CFG_PADRAO, ...JSON.parse(readFileSync(cT('radar_config.json'), 'utf-8')) };
       const f = radarFontes().length, d = radarDestinos().length;
       console.log(`[MKT] Config carregada — ${f} grupo(s) fonte, ${d} destino.`);
     } else {
@@ -59,31 +123,31 @@ export function carregarRadarConfig() {
   } catch (e) {
     console.log('[MKT] Erro ao carregar config:', e.message);
   }
-  return _cfg;
+  return E().cfg;
 }
 
-export function radarConfig() { return _cfg; }
+export function radarConfig() { return E().cfg; }
 
 export function salvarRadarConfig(novo = {}) {
-  _cfg = { ..._cfg, ...novo };
-  if (novo.papeis) _cfg.papeis = novo.papeis;
+  E().cfg = { ...E().cfg, ...novo };
+  if (novo.papeis) E().cfg.papeis = novo.papeis;
   try {
-    writeFileSync(RADAR_CFG_PATH, JSON.stringify(_cfg, null, 2), 'utf-8');
-    agendarPush('radar_config.json');
+    writeFileSync(cT('radar_config.json'), JSON.stringify(E().cfg, null, 2), 'utf-8');
+    agendarPush(pT('radar_config.json'));
   } catch (e) {
     console.log('[MKT] Erro ao salvar config:', e.message);
   }
-  return _cfg;
+  return E().cfg;
 }
 
 export function radarFontes() {
-  return Object.keys(_cfg.papeis || {}).filter(j => _cfg.papeis[j] === 'fonte');
+  return Object.keys(E().cfg.papeis || {}).filter(j => E().cfg.papeis[j] === 'fonte');
 }
 export function radarDestinos() {
-  return Object.keys(_cfg.papeis || {}).filter(j => _cfg.papeis[j] === 'destino');
+  return Object.keys(E().cfg.papeis || {}).filter(j => E().cfg.papeis[j] === 'destino');
 }
 export function ehFonteRadar(jid) {
-  return _cfg.ativo !== false && _cfg.papeis?.[jid] === 'fonte';
+  return E().cfg.ativo !== false && E().cfg.papeis?.[jid] === 'fonte';
 }
 
 // ── MONITORAMENTO POR GRUPO ───────────────────────────────────────────────
@@ -121,7 +185,7 @@ function paraMinutos(hhmm, padrao) {
 // cupom que o gate de auto-envio liberar.
 
 export function janelaCupom() {
-  return { ...CFG_PADRAO.janelaCupom, ...(_cfg.janelaCupom || {}) };
+  return { ...CFG_PADRAO.janelaCupom, ...(E().cfg.janelaCupom || {}) };
 }
 
 export function salvarJanelaCupom(dados = {}) {
@@ -168,7 +232,7 @@ export function dentroDaJanelaCupom(quando = new Date()) {
 // diferentes chama mais atencao do que uma sequencia coerente.
 
 export function turnosTsp() {
-  const t = _cfg.turnosTsp || {};
+  const t = E().cfg.turnosTsp || {};
   return { ativo: !!t.ativo, turnos: Array.isArray(t.turnos) ? t.turnos : [] };
 }
 
@@ -200,9 +264,9 @@ export function contaDoTurno(quando = new Date()) {
   return 'principal';
 }
 
-export function listarMonitor() { return _cfg.monitor || {}; }
+export function listarMonitor() { return E().cfg.monitor || {}; }
 
-export function monitorDoGrupo(jid) { return (_cfg.monitor || {})[jid] || null; }
+export function monitorDoGrupo(jid) { return (E().cfg.monitor || {})[jid] || null; }
 
 // Um grupo pode ter VARIAS janelas de captura no mesmo dia (ex: 08:00-08:30,
 // 11:00-11:30, 12:30-14:00). Serve para espalhar o volume de mensagens em vez
@@ -248,8 +312,8 @@ function normalizarJanelas(dados, anterior) {
 
 export function salvarMonitor(jid, dados = {}) {
   if (!jid) return null;
-  if (!_cfg.monitor) _cfg.monitor = {};
-  const anterior = _cfg.monitor[jid] || {};
+  if (!E().cfg.monitor) E().cfg.monitor = {};
+  const anterior = E().cfg.monitor[jid] || {};
 
   const lojas = Array.isArray(dados.lojas)
     ? dados.lojas.filter(l => LOJAS_MONITORAVEIS.includes(l))
@@ -257,7 +321,7 @@ export function salvarMonitor(jid, dados = {}) {
 
   const janelas = normalizarJanelas(dados, anterior);
 
-  _cfg.monitor[jid] = {
+  E().cfg.monitor[jid] = {
     jid,
     lojas,
     janelas,
@@ -268,8 +332,8 @@ export function salvarMonitor(jid, dados = {}) {
     ativo:  dados.ativo !== undefined ? !!dados.ativo : (anterior.ativo !== false),
     atualizadoEm: new Date().toISOString(),
   };
-  salvarRadarConfig({ monitor: _cfg.monitor });
-  return _cfg.monitor[jid];
+  salvarRadarConfig({ monitor: E().cfg.monitor });
+  return E().cfg.monitor[jid];
 }
 
 // Cadastro salvo antes das multiplas janelas so tem inicio/fim: le como uma
@@ -280,9 +344,9 @@ export function janelasDoMonitor(cfg) {
 }
 
 export function removerMonitor(jid) {
-  if (!_cfg.monitor?.[jid]) return false;
-  delete _cfg.monitor[jid];
-  salvarRadarConfig({ monitor: _cfg.monitor });
+  if (!E().cfg.monitor?.[jid]) return false;
+  delete E().cfg.monitor[jid];
+  salvarRadarConfig({ monitor: E().cfg.monitor });
   return true;
 }
 
@@ -337,32 +401,30 @@ export function semearMonitorDasFontes() {
 // ── DEDUPLICACAO ──────────────────────────────────────────────────────────
 // Persiste em disco para nao repostar o mesmo ASIN depois de um restart.
 
-let _vistos = {};   // asin -> { preco, ts }
-
 function carregarVistos() {
   try {
-    if (existsSync(RADAR_DEDUP_PATH)) _vistos = JSON.parse(readFileSync(RADAR_DEDUP_PATH, 'utf-8'));
-  } catch (e) { _vistos = {}; }
+    if (existsSync(cT('radar_vistos.json'))) E().vistos = JSON.parse(readFileSync(cT('radar_vistos.json'), 'utf-8'));
+  } catch (e) { E().vistos = {}; }
 }
 function salvarVistos() {
   try {
-    const limite = Date.now() - (_cfg.dedupHoras || 24) * 3600e3;
-    for (const k of Object.keys(_vistos)) if (_vistos[k].ts < limite) delete _vistos[k];
-    writeFileSync(RADAR_DEDUP_PATH, JSON.stringify(_vistos), 'utf-8');
+    const limite = Date.now() - (E().cfg.dedupHoras || 24) * 3600e3;
+    for (const k of Object.keys(E().vistos)) if (E().vistos[k].ts < limite) delete E().vistos[k];
+    writeFileSync(cT('radar_vistos.json'), JSON.stringify(E().vistos), 'utf-8');
   } catch (e) {}
 }
 carregarVistos();
 
 function jaDivulgado(p) {
-  const ant = _vistos[p.asin];
+  const ant = E().vistos[p.asin];
   if (!ant) return false;
-  if (Date.now() - ant.ts > (_cfg.dedupHoras || 24) * 3600e3) return false;
+  if (Date.now() - ant.ts > (E().cfg.dedupHoras || 24) * 3600e3) return false;
   // Se caiu mais de 5% desde a ultima vez, vale repostar
   if (ant.preco && p.preco && p.preco < ant.preco * 0.95) return false;
   return true;
 }
 function registrarVisto(p) {
-  _vistos[p.asin] = { preco: p.preco, ts: Date.now() };
+  E().vistos[p.asin] = { preco: p.preco, ts: Date.now() };
   salvarVistos();
 }
 
@@ -375,10 +437,8 @@ function registrarVisto(p) {
 // Validade: 2 dias a partir da captura, salvo se o registro for editado a mao
 // via endpoint. Flag 'ativo' permite desligar um cupom sem apagar o historico.
 
-const CUPONS_BASE_PATH = SESSAO_DIR + '/cupons_base.json';
 const CUPOM_VALIDADE_PADRAO_MS = 24 * 3600e3;
 
-let _cupons = {};   // chave -> registro
 
 function normalizarTexto(s) {
   return (s || '')
@@ -397,12 +457,12 @@ export function chaveCupom(loja, codigo) {
 
 export function carregarCuponsBase() {
   try {
-    if (existsSync(CUPONS_BASE_PATH)) {
-      _cupons = JSON.parse(readFileSync(CUPONS_BASE_PATH, 'utf-8'));
+    if (existsSync(cT('cupons_base.json'))) {
+      E().cupons = JSON.parse(readFileSync(cT('cupons_base.json'), 'utf-8'));
       // A validade padrao caiu de 48h para 24h: recalcula quem foi gravado com a
       // janela antiga, para a base nao ficar com dois criterios convivendo.
       let migrados = 0;
-      for (const reg of Object.values(_cupons)) {
+      for (const reg of Object.values(E().cupons)) {
         const base = new Date(reg.capturadoEm).getTime();
         if (!isFinite(base)) continue;
         const alvo = base + CUPOM_VALIDADE_PADRAO_MS;
@@ -412,21 +472,21 @@ export function carregarCuponsBase() {
         }
       }
       if (migrados) { salvarCuponsBase(); console.log('[CUPONS] ' + migrados + ' cupom(ns) migrado(s) para validade de 24h.'); }
-      console.log('[CUPONS] Base carregada — ' + Object.keys(_cupons).length + ' cupom(ns).');
+      console.log('[CUPONS] Base carregada — ' + Object.keys(E().cupons).length + ' cupom(ns).');
     }
-  } catch (e) { console.log('[CUPONS] Erro ao carregar base:', e.message); _cupons = {}; }
-  return _cupons;
+  } catch (e) { console.log('[CUPONS] Erro ao carregar base:', e.message); E().cupons = {}; }
+  return E().cupons;
 }
 
 function salvarCuponsBase() {
   try {
     // Purga o que venceu ha mais de 7 dias para o arquivo nao crescer sem fim.
     const corte = Date.now() - 7 * 24 * 3600e3;
-    for (const k of Object.keys(_cupons)) {
-      if (new Date(_cupons[k].validadeAte).getTime() < corte) delete _cupons[k];
+    for (const k of Object.keys(E().cupons)) {
+      if (new Date(E().cupons[k].validadeAte).getTime() < corte) delete E().cupons[k];
     }
-    writeFileSync(CUPONS_BASE_PATH, JSON.stringify(_cupons, null, 2), 'utf-8');
-    agendarPush('cupons_base.json');
+    writeFileSync(cT('cupons_base.json'), JSON.stringify(E().cupons, null, 2), 'utf-8');
+    agendarPush(pT('cupons_base.json'));
   } catch (e) { console.log('[CUPONS] Erro ao salvar base:', e.message); }
 }
 
@@ -434,19 +494,11 @@ function salvarCuponsBase() {
  * Grava (ou atualiza) um cupom na base a partir do objeto que a IA extraiu.
  * Cupom sem codigo nao entra: sem codigo nao ha o que aplicar no checkout.
  */
-// Aceita ISO ou Date; devolve null para lixo, para nunca gravar 'Invalid Date'
-// como validade e derrubar o cupomVigente() de todos os cupons da loja.
-function validadeInformada(v) {
-  if (!v) return null;
-  const d = new Date(v);
-  return isFinite(d.getTime()) ? d.toISOString() : null;
-}
-
 export function registrarCupomBase(c) {
   const chave = chaveCupom(c?.loja, c?.codigo);
   if (!chave) return null;
   const agora = Date.now();
-  const anterior = _cupons[chave];
+  const anterior = E().cupons[chave];
 
   const reg = {
     chave,
@@ -464,13 +516,11 @@ export function registrarCupomBase(c) {
     observacao: c.observacao || null,
     capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
     atualizadoEm: new Date(agora).toISOString(),
-    // Validade informada pela fonte (ex.: endDate da Awin) vale mais que o
-    // prazo padrao chutado — so cai no padrao quando a fonte nao diz nada.
-    validadeAte: validadeInformada(c?.validadeAte) || new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
+    validadeAte: new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
     // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
     ativo: anterior ? anterior.ativo !== false : true,
   };
-  _cupons[chave] = reg;
+  E().cupons[chave] = reg;
   salvarCuponsBase();
   console.log('[CUPONS] ' + (anterior ? 'Atualizado' : 'Novo') + ' — ' + reg.loja + ' ' + reg.codigo +
     ' ' + reg.valor + (reg.tipo === 'pct' ? '%' : ' R$'));
@@ -478,11 +528,11 @@ export function registrarCupomBase(c) {
 }
 
 export function listarCuponsBase() {
-  return Object.values(_cupons).sort((a, b) => (a.loja || '').localeCompare(b.loja || '', 'pt-BR'));
+  return Object.values(E().cupons).sort((a, b) => (a.loja || '').localeCompare(b.loja || '', 'pt-BR'));
 }
 
 export function atualizarCupomBase(chave, campos = {}) {
-  const reg = _cupons[chave];
+  const reg = E().cupons[chave];
   if (!reg) return null;
   for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
@@ -493,8 +543,8 @@ export function atualizarCupomBase(chave, campos = {}) {
 }
 
 export function removerCupomBase(chave) {
-  if (!_cupons[chave]) return false;
-  delete _cupons[chave];
+  if (!E().cupons[chave]) return false;
+  delete E().cupons[chave];
   salvarCuponsBase();
   return true;
 }
@@ -503,7 +553,7 @@ export function removerCupomBase(chave) {
 export function definirAtivoPorLoja(loja, ativo) {
   const alvo = normalizarTexto(loja);
   let n = 0;
-  for (const reg of Object.values(_cupons)) {
+  for (const reg of Object.values(E().cupons)) {
     if (normalizarTexto(reg.loja) !== alvo) continue;
     if (reg.ativo === ativo) continue;
     reg.ativo = ativo;
@@ -549,7 +599,7 @@ export function calcularDesconto(reg, preco) {
 export function melhorCupomAplicavel(loja, preco) {
   const alvo = normalizarTexto(loja);
   let melhor = null, melhorDesc = 0;
-  for (const reg of Object.values(_cupons)) {
+  for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
     const d = calcularDesconto(reg, preco);
@@ -561,7 +611,7 @@ export function melhorCupomAplicavel(loja, preco) {
 /** Busca um cupom da base pelo par (loja, codigo). Usado pela vitrine. */
 export function cupomPorCodigo(loja, codigo) {
   const k = chaveCupom(loja, codigo);
-  return k ? (_cupons[k] || null) : null;
+  return k ? (E().cupons[k] || null) : null;
 }
 
 // Mensagens que falam de cupom sem dar o codigo: "resgate cupom do anuncio",
@@ -573,7 +623,7 @@ const REGEX_CUPOM_GENERICO = /\bcupom\b|\bcupons\b|\bcoupon\b/i;
 export function ultimoCupomDaLoja(loja) {
   const alvo = normalizarTexto(loja);
   let recente = null;
-  for (const reg of Object.values(_cupons)) {
+  for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
     if (!recente || new Date(reg.capturadoEm) > new Date(recente.capturadoEm)) recente = reg;
@@ -598,7 +648,7 @@ export function melhorCupom(loja, preco, textoOriginal = '') {
   if (!texto) return null;
   let melhor = null;
 
-  for (const reg of Object.values(_cupons)) {
+  for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== lojaKey) continue;
     if (!reg.codigo || !texto.includes(normalizarTexto(reg.codigo))) continue;
@@ -725,10 +775,9 @@ const TOKEN_ENDPOINT = 'https://api.amazon.com/auth/o2/token';  // regiao NA (BR
 const API_BASE       = 'https://creatorsapi.amazon';
 const MARKETPLACE    = 'www.amazon.com.br';
 
-let _token = { valor: null, expiraEm: 0 };
 
 async function getToken() {
-  if (_token.valor && Date.now() < _token.expiraEm) return _token.valor;
+  if (E().token.valor && Date.now() < E().token.expiraEm) return E().token.valor;
   if (!process.env.AMZ_CLIENT_ID || !process.env.AMZ_CLIENT_SECRET) {
     throw new Error('AMZ_CLIENT_ID / AMZ_CLIENT_SECRET nao configurados.');
   }
@@ -745,8 +794,8 @@ async function getToken() {
   });
   if (!res.ok) throw new Error('Token Creators API falhou: ' + res.status + ' ' + (await res.text()).slice(0, 200));
   const data = await res.json();
-  _token = { valor: data.access_token, expiraEm: Date.now() + (data.expires_in - 300) * 1000 };
-  return _token.valor;
+  E().token = { valor: data.access_token, expiraEm: Date.now() + (data.expires_in - 300) * 1000 };
+  return E().token.valor;
 }
 
 const RECURSOS = [
@@ -771,7 +820,7 @@ const RECURSOS = [
  */
 export async function sondarRecursos(asin, recursos) {
   const token = await getToken();
-  const partnerTag = _cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
+  const partnerTag = E().cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
   const res = await fetch(API_BASE + '/catalog/v1/getItems', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'x-marketplace': MARKETPLACE },
@@ -790,7 +839,7 @@ export async function sondarRecursos(asin, recursos) {
 export async function buscarProdutos(asins) {
   if (!asins.length) return [];
   const token = await getToken();
-  const partnerTag = _cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
+  const partnerTag = E().cfg.partnerTag || process.env.AMZ_PARTNER_TAG;
   if (!partnerTag) throw new Error('partnerTag nao configurado.');
 
   const lotes = [];
@@ -884,7 +933,7 @@ export function formatarOfertaAmazon(p, opcoes = {}) {
   const cupom = opcoes.cupom || null;
   const tpl   = opcoes.template || templateDaLoja(p.loja);
   const vars  = varsDoProduto(p, cupom);
-  if (opcoes.gatilho ?? _cfg.gatilhoPadrao) vars.gatilho = opcoes.gatilho ?? _cfg.gatilhoPadrao;
+  if (opcoes.gatilho ?? E().cfg.gatilhoPadrao) vars.gatilho = opcoes.gatilho ?? E().cfg.gatilhoPadrao;
   return renderTemplate(tpl?.corpo || TEMPLATE_PADRAO, vars);
 }
 
@@ -897,7 +946,6 @@ export function formatarOfertaAmazon(p, opcoes = {}) {
 // As condicionais existem porque sem elas a mensagem sai com "De: ~R$ ~" ou um
 // selo de cupom orfao quando o campo nao veio da API.
 
-const TEMPLATES_PATH = SESSAO_DIR + '/templates.json';
 
 // Funcao (nao const): o rodape vem da config editavel pelo painel, entao a
 // semente do template padrao de um operador novo ja nasce com o convite DELE.
@@ -915,7 +963,7 @@ function templatePadrao() {
     '',
     '\uD83D\uDD17 *LINK* {{link}}',
   ];
-  const r = rodapeOferta();
+  const r = rodapeOferta(tenantAtual());
   if (r) linhas.push('', r);
   return linhas.join('\n');
 }
@@ -931,7 +979,6 @@ const TEMPLATE_PADRAO_LEGADO = [
   '`Convide seus amigos para entrar aqui no grupo:  ' + LINK_CONVITE_OFERTAS + '`',
 ].join('\n');
 
-let _templates = {};
 
 function chaveLoja(loja) {
   return (loja || '')
@@ -941,39 +988,39 @@ function chaveLoja(loja) {
 
 export function carregarTemplates() {
   try {
-    if (existsSync(TEMPLATES_PATH)) _templates = JSON.parse(readFileSync(TEMPLATES_PATH, 'utf-8'));
-  } catch (e) { console.log('[TPL] Erro ao carregar templates:', e.message); _templates = {}; }
+    if (existsSync(cT('templates.json'))) E().templates = JSON.parse(readFileSync(cT('templates.json'), 'utf-8'));
+  } catch (e) { console.log('[TPL] Erro ao carregar templates:', e.message); E().templates = {}; }
   // Semeia o padrao na primeira execucao para o operador ter de onde partir.
-  if (!_templates._padrao) {
-    _templates._padrao = { nome: 'Padrão', corpo: templatePadrao(), usarLinkPreview: true,
+  if (!E().templates._padrao) {
+    E().templates._padrao = { nome: 'Padrão', corpo: templatePadrao(), usarLinkPreview: true,
                            atualizadoEm: new Date().toISOString() };
     salvarTemplates();
-  } else if ((_templates._padrao.corpo || '').trim() === TEMPLATE_PADRAO_LEGADO.trim()) {
-    _templates._padrao.corpo = templatePadrao();
-    _templates._padrao.atualizadoEm = new Date().toISOString();
+  } else if ((E().templates._padrao.corpo || '').trim() === TEMPLATE_PADRAO_LEGADO.trim()) {
+    E().templates._padrao.corpo = templatePadrao();
+    E().templates._padrao.atualizadoEm = new Date().toISOString();
     salvarTemplates();
     console.log('[TPL] Padrao migrado para a sintaxe sem condicionais.');
   }
-  console.log('[TPL] ' + Object.keys(_templates).length + ' template(s) carregado(s).');
-  return _templates;
+  console.log('[TPL] ' + Object.keys(E().templates).length + ' template(s) carregado(s).');
+  return E().templates;
 }
 
 function salvarTemplates() {
-  try { writeFileSync(TEMPLATES_PATH, JSON.stringify(_templates, null, 2), 'utf-8');
-    agendarPush('templates.json'); }
+  try { writeFileSync(cT('templates.json'), JSON.stringify(E().templates, null, 2), 'utf-8');
+    agendarPush(pT('templates.json')); }
   catch (e) { console.log('[TPL] Erro ao salvar templates:', e.message); }
 }
 
-export function listarTemplates() { return _templates; }
+export function listarTemplates() { return E().templates; }
 
 export function templateDaLoja(loja) {
-  return _templates[chaveLoja(loja)] || _templates._padrao;
+  return E().templates[chaveLoja(loja)] || E().templates._padrao;
 }
 
 export function salvarTemplate(loja, dados = {}) {
   const k = chaveLoja(loja);
-  const anterior = _templates[k] || {};
-  _templates[k] = {
+  const anterior = E().templates[k] || {};
+  E().templates[k] = {
     nome: dados.nome || anterior.nome || loja || 'Padrão',
     corpo: dados.corpo !== undefined ? dados.corpo : (anterior.corpo || TEMPLATE_PADRAO),
     usarLinkPreview: dados.usarLinkPreview !== undefined
@@ -982,13 +1029,13 @@ export function salvarTemplate(loja, dados = {}) {
     atualizadoEm: new Date().toISOString(),
   };
   salvarTemplates();
-  return _templates[k];
+  return E().templates[k];
 }
 
 export function removerTemplate(loja) {
   const k = chaveLoja(loja);
-  if (k === '_padrao' || !_templates[k]) return false;   // o padrao nunca some
-  delete _templates[k];
+  if (k === '_padrao' || !E().templates[k]) return false;   // o padrao nunca some
+  delete E().templates[k];
   salvarTemplates();
   return true;
 }
@@ -1108,12 +1155,12 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
     // ignorarMinimo: montagem manual pelo gerador. Quando o operador cola o
     // link ele ja decidiu que quer aquele produto — o piso de desconto existe
     // para o radar automatico, que escolhe sozinho o que divulgar.
-    if (p.desconto < (_cfg.descontoMinimo ?? 5) && !p.ehDeal && !opcoes.ignorarMinimo) {
+    if (p.desconto < (E().cfg.descontoMinimo ?? 5) && !p.ehDeal && !opcoes.ignorarMinimo) {
       saida.push({ produto: p, descartadoPor: 'desconto de ' + p.desconto + '% abaixo do mínimo' });
       continue;
     }
     if (!opcoes.ignorarDedup && jaDivulgado(p)) {
-      saida.push({ produto: p, descartadoPor: 'já divulgado nas últimas ' + (_cfg.dedupHoras || 24) + 'h' });
+      saida.push({ produto: p, descartadoPor: 'já divulgado nas últimas ' + (E().cfg.dedupHoras || 24) + 'h' });
       continue;
     }
 
@@ -1147,17 +1194,15 @@ carregarTemplates();
 // no disparo, porque preco salvo envelhece e anunciar preco velho e o erro que
 // esse pipeline inteiro existe para evitar.
 
-const VITRINE_PATH = SESSAO_DIR + '/vitrine.json';
-let _vitrine = {};
 
 export function carregarVitrine() {
-  try { if (existsSync(VITRINE_PATH)) _vitrine = JSON.parse(readFileSync(VITRINE_PATH, 'utf-8')); }
-  catch (e) { console.log('[VITRINE] Erro ao carregar:', e.message); _vitrine = {}; }
-  return _vitrine;
+  try { if (existsSync(cT('vitrine.json'))) E().vitrine = JSON.parse(readFileSync(cT('vitrine.json'), 'utf-8')); }
+  catch (e) { console.log('[VITRINE] Erro ao carregar:', e.message); E().vitrine = {}; }
+  return E().vitrine;
 }
 function salvarVitrine() {
-  try { writeFileSync(VITRINE_PATH, JSON.stringify(_vitrine, null, 2), 'utf-8');
-    agendarPush('vitrine.json'); }
+  try { writeFileSync(cT('vitrine.json'), JSON.stringify(E().vitrine, null, 2), 'utf-8');
+    agendarPush(pT('vitrine.json')); }
   catch (e) { console.log('[VITRINE] Erro ao salvar:', e.message); }
 }
 
@@ -1188,8 +1233,7 @@ export async function resolverLinhaVitrine(linha) {
   if (sep) { nomeManual = sep[1].trim(); url = sep[2].trim(); }
   else {
     const m = bruto.match(REGEX_URL_AMAZON);
-    if (!m) return { erro: 'link nao reconhecido — a vitrine aceita Amazon, '
-                          + 'Mercado Livre, Shopee e Magazine Luiza', linha: bruto };
+    if (!m) return { erro: 'sem link da Amazon', linha: bruto };
     url = m[0].replace(/[)\]}.,;!]+$/, '');
     REGEX_URL_AMAZON.lastIndex = 0;
   }
@@ -1210,14 +1254,14 @@ export async function resolverLinhaVitrine(linha) {
 }
 
 export function listarVitrine() {
-  return Object.values(_vitrine).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
+  return Object.values(E().vitrine).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
 }
 
 const NOME_PROVISORIO = /^Produto [A-Z0-9]{10}$/;
 
 export function salvarItemVitrine(item) {
   if (!item?.asin) return null;
-  const anterior = _vitrine[item.asin];
+  const anterior = E().vitrine[item.asin];
 
   // Um nome provisorio nunca sobrescreve um nome bom: o mesmo produto colado por
   // dois formatos de link (um com slug, outro encurtado) perderia o nome legivel.
@@ -1226,7 +1270,7 @@ export function salvarItemVitrine(item) {
     nome = anterior.nome;
   }
 
-  _vitrine[item.asin] = {
+  E().vitrine[item.asin] = {
     asin: item.asin,
     nome,
     url: item.url || anterior?.url || '',
@@ -1235,40 +1279,27 @@ export function salvarItemVitrine(item) {
     // como o ASIN — os dois precisam sobreviver no cadastro.
     shopId: item.shopId || anterior?.shopId || null,
     itemId: item.itemId || anterior?.itemId || null,
-    // Awin: o item guarda DOIS enderecos — 'url' e o link de afiliado que vai na
-    // mensagem e 'urlProduto' e a pagina original da loja, que e o que permite
-    // reconsultar o preco no instante do disparo.
-    urlProduto: item.urlProduto || anterior?.urlProduto || null,
-    advertiserId: item.advertiserId || anterior?.advertiserId || null,
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
-    // Magazine Luiza nao tem API de afiliado nem leitura de pagina a partir do
-    // Railway (403 em IP de datacenter), entao e a unica loja em que o preco nao
-    // pode ser consultado no disparo — ele e informado pelo operador. Guardar o
-    // instante permite recusar um preco velho em vez de anunciar valor que sumiu.
-    preco: item.preco !== undefined ? (item.preco ?? null) : (anterior?.preco ?? null),
-    precoDe: item.precoDe !== undefined ? (item.precoDe ?? null) : (anterior?.precoDe ?? null),
-    precoEm: (item.preco !== undefined && item.preco != null)
-      ? new Date().toISOString() : (anterior?.precoEm || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
     ultimoDisparo: anterior?.ultimoDisparo || null,
   };
   salvarVitrine();
-  return _vitrine[item.asin];
+  return E().vitrine[item.asin];
 }
 
 export function removerItemVitrine(asin) {
-  if (!_vitrine[asin]) return false;
-  delete _vitrine[asin];
+  if (!E().vitrine[asin]) return false;
+  delete E().vitrine[asin];
   salvarVitrine();
   return true;
 }
 
 export function marcarDisparo(asin) {
-  if (_vitrine[asin]) { _vitrine[asin].ultimoDisparo = new Date().toISOString(); salvarVitrine(); }
+  if (E().vitrine[asin]) { E().vitrine[asin].ultimoDisparo = new Date().toISOString(); salvarVitrine(); }
 }
 
-export function itemVitrine(asin) { return _vitrine[asin] || null; }
+export function itemVitrine(asin) { return E().vitrine[asin] || null; }
 
 /**
  * Monta as mensagens de uma lista de ASINs no momento do disparo: consulta a
@@ -1284,7 +1315,7 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
   for (const item of itens) {
     const p = normalizar(item);
     achados.add(p.asin);
-    const salvo = _vitrine[p.asin];
+    const salvo = E().vitrine[p.asin];
     // Link sem slug entra como "Produto ASIN"; o disparo e a primeira vez que
     // temos o titulo real, entao aproveita para gravar.
     let nome = salvo?.nome || p.titulo;
@@ -1332,7 +1363,7 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
 
   for (const a of asins) {
     if (!achados.has(a)) {
-      descartados.push({ asin:a, nome:_vitrine[a]?.nome || a, motivo:'produto não retornado pela API' });
+      descartados.push({ asin:a, nome:E().vitrine[a]?.nome || a, motivo:'produto não retornado pela API' });
     }
   }
   return { prontos, descartados };
@@ -1344,28 +1375,26 @@ carregarVitrine();
 // Conjunto nomeado de produtos da vitrine que o operador dispara de tempos em
 // tempos (produtos que ele sabe que vendem). O disparo NAO e uma rajada: sai um
 // produto por vez, com o intervalo que a lista define, para nao inundar o grupo.
-const LISTAS_PATH = SESSAO_DIR + '/listas.json';
-let _listas = {};
 
 export function carregarListas() {
-  try { if (existsSync(LISTAS_PATH)) _listas = JSON.parse(readFileSync(LISTAS_PATH, 'utf-8')); }
-  catch (e) { console.log('[LISTAS] Erro ao carregar:', e.message); _listas = {}; }
-  return _listas;
+  try { if (existsSync(cT('listas.json'))) E().listas = JSON.parse(readFileSync(cT('listas.json'), 'utf-8')); }
+  catch (e) { console.log('[LISTAS] Erro ao carregar:', e.message); E().listas = {}; }
+  return E().listas;
 }
 function salvarListas() {
-  try { writeFileSync(LISTAS_PATH, JSON.stringify(_listas, null, 2), 'utf-8');
-    agendarPush('listas.json'); }
+  try { writeFileSync(cT('listas.json'), JSON.stringify(E().listas, null, 2), 'utf-8');
+    agendarPush(pT('listas.json')); }
   catch (e) { console.log('[LISTAS] Erro ao salvar:', e.message); }
 }
 
 export function listarListas() {
-  return Object.values(_listas).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
+  return Object.values(E().listas).sort((a, b) => (a.nome || '').localeCompare(b.nome || '', 'pt-BR'));
 }
-export function listaPorId(id) { return _listas[id] || null; }
+export function listaPorId(id) { return E().listas[id] || null; }
 
 export function salvarLista(dados = {}) {
   const id = dados.id || ('L' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
-  const ant = _listas[id] || {};
+  const ant = E().listas[id] || {};
 
   const produtos = Array.isArray(dados.produtos)
     ? [...new Set(dados.produtos.filter(Boolean))]
@@ -1393,7 +1422,7 @@ export function salvarLista(dados = {}) {
     hora: /^([01]\d|2[0-3]):([0-5]\d)$/.test(String(ag.hora || '')) ? ag.hora : '09:00',
   };
 
-  _listas[id] = {
+  E().listas[id] = {
     id,
     nome: dados.nome !== undefined ? String(dados.nome).trim() : (ant.nome || 'Lista sem nome'),
     produtos,
@@ -1410,23 +1439,23 @@ export function salvarLista(dados = {}) {
     atualizadoEm: new Date().toISOString(),
   };
   salvarListas();
-  return _listas[id];
+  return E().listas[id];
 }
 
 export function removerLista(id) {
-  if (!_listas[id]) return false;
-  delete _listas[id];
+  if (!E().listas[id]) return false;
+  delete E().listas[id];
   salvarListas();
   return true;
 }
 
 /** Grava o andamento do disparo. Persistido para sobreviver a restart do container. */
 export function atualizarExecucaoLista(id, execucao) {
-  if (!_listas[id]) return null;
-  _listas[id].execucao = execucao;
-  if (execucao === null) _listas[id].ultimoDisparo = new Date().toISOString();
+  if (!E().listas[id]) return null;
+  E().listas[id].execucao = execucao;
+  if (execucao === null) E().listas[id].ultimoDisparo = new Date().toISOString();
   salvarListas();
-  return _listas[id];
+  return E().listas[id];
 }
 
 /** Codigo de cupom a passar para o montador, conforme o modo da lista. */
@@ -1437,3 +1466,5 @@ export function cupomDaLista(lista) {
 }
 
 carregarListas();
+
+_moduloPronto = true;
