@@ -79,6 +79,7 @@ import {
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
+import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH } from './bot-tsp.js';
 
 // Espalha os prazos da config para os modulos que os usam. Chamado no boot e
 // depois de cada gravacao, para valer sem redeploy.
@@ -3882,6 +3883,14 @@ const PAINEL_CSS = `*{box-sizing:border-box;margin:0;padding:0}body{font-family:
 // ── ROTAS ─────────────────────────────────────────────────────────────────────
 
 // ── TELEGRAM DO OPERADOR (fase 2.4b) — API JSON para o painel ────────────────
+// ── BOT DO TELEGRAM (criacao manual de cupom / oferta / mensagem) ────────────
+// Responde 200 na hora e processa depois: a Bot API reenvia o update se a
+// resposta demorar, e um reenvio no meio do wizard duplicaria o passo.
+app.post(BOT_TSP_PATH, (req, res) => {
+  res.sendStatus(200);
+  tratarUpdateBotTsp(req.body).catch(e => console.error('[BOT-TSP] Erro:', e.message));
+});
+
 app.get('/tg/estado', (req, res) => {
   if (req.tenantId === TENANT_PADRAO) {
     return res.json({ ok:true, tenant:'tsp', conectado: tgConectado, authState: tgAuthState, conta: tgConta });
@@ -7373,6 +7382,19 @@ app.get('/historico-seats/rotas', (req, res) => {
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
+
+// Bot de criacao manual no Telegram. As funcoes reais do servidor sao injetadas
+// para o bot nao guardar copia de nenhuma regra: o cupom criado no celular sai
+// pelo MESMO caminho do capturado no monitoramento (template, dedup, base).
+bootBotTsp({
+  PORT,
+  formatarCupomTSP,
+  enfileirarCupomTSP,
+  enviarCupomParaGrupos,
+  enviarMensagem,
+  radarDestinos,
+  salvarFila,
+}).catch(e => console.warn('[BOT-TSP] Falha no boot:', e.message));
 
 // Conecta ao WhatsApp imediatamente no startup.
 // Garante que mensagens dos grupos monitorados não sejam perdidas após deploy.
