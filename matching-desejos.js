@@ -12,8 +12,6 @@
 //  Nada neste modulo envia mensagem para o cliente final. O envio direto so
 //  entra depois que o numero dedicado existir e o opt-in estiver registrado.
 // ══════════════════════════════════════════════════════════════════════════════
-const fetch = require('node-fetch');
-
 const CDV_PROXY = 'https://cdv-proxy-production.up.railway.app';
 const MODO = String(process.env.MATCH_DESEJOS || 'off').toLowerCase();
 const CACHE_TTL_MS = 10 * 60 * 1000;   // desejos mudam devagar; 10 min basta
@@ -190,4 +188,4 @@ async function casarDesejosComOferta(oferta, { enviarAviso } = {}) {
   }
 }
 
-module.exports = { casarDesejosComOferta, carregarDesejos, MODO_DESEJOS: MODO };
+export { casarDesejosComOferta, carregarDesejos, MODO as MODO_DESEJOS };
