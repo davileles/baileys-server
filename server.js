@@ -1005,12 +1005,42 @@ async function despacharAgendamento(ag, grupoId) {
   return enviarMensagem(grupoId, lp ? { text: ag.mensagem, linkPreview: lp } : { text: ag.mensagem });
 }
 
+// Versao multi-grupo do despacho agendado. Anexo so vale se for imagem: enviar
+// um PDF de 3 MB em doze grupos nao e caso de uso do painel, entao um anexo
+// nao-imagem e ignorado e a mensagem sai como texto.
+async function despacharAgendamentoMulti(ag) {
+  let imagem = null;
+  const mt = String(ag.anexo?.mimetype || '');
+  if (ag.anexo?.base64 && (!mt || mt.indexOf('image/') === 0)) {
+    imagem = {
+      imagemBase64: String(ag.anexo.base64).replace(/^data:[^;]+;base64,/, ''),
+      mime: mt || 'image/jpeg',
+    };
+  }
+  return enviarManualParaGrupos({
+    mensagem: ag.mensagem,
+    tipo:     ag.tipo || null,
+    imagem,
+    preview:  ag.preview || null,
+  });
+}
+
 setInterval(() => {
   const agora = Date.now();
   const prontos = agendamentos.filter(a => a.status === 'aguardando' && a.dispararEm <= agora);
   for (const ag of prontos) {
     ag.status = 'despachado';
     salvarAgendamentos();
+    // Agendamento multi-grupo: a lista de destinos e lida AGORA, na hora do
+    // disparo, e nao na hora do agendamento — se o operador mexeu na aba Grupos
+    // no meio do caminho, vale a configuracao atual.
+    if (ehGrupoMulti(ag.grupo)) {
+      despacharAgendamentoMulti(ag)
+        .then(() => { ag.status = 'enviado'; delete ag.anexo; salvarAgendamentos(); })
+        .catch(e  => { ag.status = 'erro';   delete ag.anexo; salvarAgendamentos(); console.error('[AGEND] Erro envio multi:', e.message); });
+      console.log('[AGEND] Disparando agendamento #' + ag.id + ' para todos os grupos (' + ag.grupo + ')');
+      continue;
+    }
     const grupoId = resolverGrupo(ag.grupo);
     if (!grupoId) { ag.status = 'erro'; delete ag.anexo; salvarAgendamentos(); continue; }
     const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
@@ -1051,6 +1081,13 @@ setInterval(() => {
 function resolverGrupo(chave) {
   return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
 }
+
+// Apelidos que NAO sao um JID: significam "todos os grupos configurados na aba
+// Grupos". 'tsp' e o apelido historico do gerador manual — antes apontava para
+// um unico grupo padrao, que deixou de existir quando os destinos passaram a
+// ser configuraveis. Quem resolve a lista e o envio, na hora do disparo.
+const ALIAS_MULTI = new Set(['tsp', 'tsp_destinos', 'todos']);
+function ehGrupoMulti(chave) { return ALIAS_MULTI.has(String(chave || '').toLowerCase()); }
 function gerarId() { return contadorId++; }
 
 // ── TABELA IATA → CIDADE ──────────────────────────────────────────────────────
@@ -1913,6 +1950,70 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
     }
   }
   if (!enviados.length) throw new Error('Nenhum grupo recebeu a oferta.');
+  return { enviados, falhas };
+}
+
+// ── ENVIO MANUAL PARA VARIOS GRUPOS ──────────────────────────────────────────
+// Usado pelo gerador manual do painel (abas Cupom, Oferta e Livre), que manda o
+// apelido 'tsp'. Cupom sai nos grupos de destino MAIS os grupos so-cupons;
+// qualquer outro tipo sai so nos destinos, porque grupo so-cupons nunca recebe
+// oferta de produto. Falha isolada num grupo nao derruba os outros: loga, segue
+// para o proximo e avisa o operador no fim.
+//
+// Existe separado de enviarCupomParaGrupos/enviarOfertaParaDestinos porque a
+// mensagem manual pode trazer imagem E card de link, combinacao que nao aparece
+// no fluxo da fila.
+async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
+  const ehCupom  = String(tipo || '').toLowerCase() === 'cupom';
+  const destinos = radarDestinos();
+  const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
+  const alvos = ehCupom
+    ? [...new Set([...destinos, ...soCupons])]
+    : destinos.filter(j => !soCupons.has(j));
+  if (!alvos.length) throw new Error('Nenhum grupo marcado como destino na aba Grupos.');
+
+  // Mesma conta em todos os grupos: alternar no meio deixaria a mesma mensagem
+  // com dois remetentes no mesmo minuto.
+  const op = { conta: contaDoTurno() };
+
+  // Card de link so vale quando nao ha imagem — o WhatsApp mostra um ou outro.
+  let lp = null;
+  if (!imagem?.imagemBase64 && preview?.link) {
+    try { lp = await montarLinkPreviewManual(preview); }
+    catch (e) { console.warn('[MANUAL] Nao montou o preview:', e.message); }
+  }
+
+  const enviados = [], falhas = [];
+  for (const jid of alvos) {
+    try {
+      if (imagem?.imagemBase64) {
+        await enviarMensagem(jid, {
+          image:    Buffer.from(imagem.imagemBase64, 'base64'),
+          caption:  mensagem || '',
+          mimetype: imagem.mime || 'image/jpeg',
+        }, 0, op);
+      } else {
+        await enviarMensagem(jid, lp ? { text: mensagem, linkPreview: lp } : { text: mensagem }, 0, op);
+      }
+      enviados.push(jid);
+      // Espacamento entre grupos: mesmo padrao do radar. Disparo simultaneo em
+      // varios grupos e justamente o que o WhatsApp usa para achar automacao.
+      if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+    } catch (e) {
+      console.error('[MANUAL] Falha ao enviar em ' + jid + ':', e.message);
+      falhas.push({ jid, erro: e.message });
+    }
+  }
+
+  if (!enviados.length) throw new Error('Nenhum grupo recebeu a mensagem.');
+  if (falhas.length) {
+    try {
+      await enviarMensagem(GRUPOS.operador, { text: '*Envio manual nao entregue em ' + falhas.length + ' grupo(s)* \u26a0\ufe0f\n\n'
+        + falhas.map(f => (NOMES_GRUPOS.get(f.jid) || f.jid) + ': ' + f.erro).join('\n') });
+    } catch(_) {}
+  }
+  console.log('[MANUAL] ' + (ehCupom ? 'Cupom' : 'Oferta') + ' manual enviado em '
+    + enviados.length + '/' + alvos.length + ' grupo(s).');
   return { enviados, falhas };
 }
 
@@ -4722,15 +4823,21 @@ app.post('/enviar', async (req, res) => {
   // preview: { link, titulo, descricao, imagemUrl } — opcional. Existe para a
   // mensagem montada a mao no gerador sair com o mesmo card de link das ofertas
   // do radar. So vale no envio imediato: agendamento guarda apenas o texto.
-  const { grupo, mensagem, agendarEm, direto, preview, anexo } = req.body;
+  // tipo: 'cupom' | 'oferta' — so importa quando o grupo e um apelido multi.
+  // Decide se os grupos so-cupons entram na lista de alvos.
+  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo } = req.body;
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
     const ok = await aguardarSock(15000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado. Acesse /qr para reconectar.' });
   }
-  const grupoId = resolverGrupo(grupo);
-  if (!grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
+  // Apelido multi ('tsp') nao resolve para um JID: a mensagem sai em todos os
+  // grupos da aba Grupos. Agendado, o apelido e guardado como veio e a lista so
+  // e resolvida no disparo.
+  const multi   = ehGrupoMulti(grupo);
+  const grupoId = multi ? null : resolverGrupo(grupo);
+  if (!multi && !grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
 
   if (agendarEm) {
@@ -4752,12 +4859,20 @@ app.post('/enviar', async (req, res) => {
     }
     const id = gerarId();
     agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto,
+                        tipo: tipo || null,
                         preview: preview?.link ? preview : null,
                         anexo: anexoGuardado,
                         criadoEm: new Date().toISOString() });
     salvarAgendamentos();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
     return res.json({ ok:true, agendado:true, id, horario });
+  }
+
+  if (multi) {
+    try {
+      const r = await enviarManualParaGrupos({ mensagem, tipo, preview });
+      return res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
+    } catch(err) { return res.status(500).json({ ok:false, erro:err.message }); }
   }
 
   const isEmissao = grupo==='cdv_emissao'||grupoId===GRUPOS['cdv_emissao'];
@@ -4809,7 +4924,8 @@ const EXT_POR_MIME = {
 };
 
 async function enviarAnexoHandler(req, res, padraoImagem) {
-  const { grupo, legenda, base64, mimetype, nomeArquivo } = req.body;
+  // tipoEnvio (nao 'tipo': o nome ja e usado mais abaixo para imagem/documento)
+  const { grupo, legenda, base64, mimetype, nomeArquivo, tipo: tipoEnvio } = req.body;
   const file = req.file;
   const limpar = () => { try { if (file && existsSync(file.path)) unlinkSync(file.path); } catch(e) {} };
 
@@ -4819,6 +4935,30 @@ async function enviarAnexoHandler(req, res, padraoImagem) {
     const ok = await aguardarSock(15000);
     if (!ok) { limpar(); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
   }
+  // Apelido multi ('tsp'): a mesma imagem sai em todos os grupos da aba Grupos.
+  // Documento nao entra aqui de proposito — ver despacharAgendamentoMulti.
+  if (ehGrupoMulti(grupo)) {
+    try {
+      const buf = file
+        ? readFileSync(file.path)
+        : Buffer.from(String(base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
+      if (!buf || !buf.length) throw new Error('Arquivo vazio ou base64 invalido.');
+      const mtMulti = String(mimetype || (file && file.mimetype) || '');
+      if (mtMulti && mtMulti.indexOf('image/') !== 0) {
+        throw new Error('Envio para varios grupos aceita apenas imagem.');
+      }
+      const r = await enviarManualParaGrupos({
+        mensagem: legenda || '',
+        tipo:     tipoEnvio,
+        imagem:   { imagemBase64: buf.toString('base64'), mime: mtMulti || 'image/jpeg' },
+      });
+      return res.json({ ok:true, tipo:'imagem', enviados:r.enviados.length, falhas:r.falhas });
+    } catch(err) {
+      console.error('[ANEXO] Erro no envio multi-grupo:', err.message);
+      return res.status(500).json({ ok:false, erro:err.message });
+    } finally { limpar(); }
+  }
+
   const grupoId = resolverGrupo(grupo);
   if (!grupoId) { limpar(); return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo }); }
 
