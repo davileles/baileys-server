@@ -1339,6 +1339,10 @@ function formatarMensagemCDV(d) {
 // ── REGISTRO DE PASSAGEM NO PROXY + HISTÓRICO 180 DIAS ───────────────────────
 const CDV_PROXY_URL = 'https://cdv-proxy-production.up.railway.app';
 
+// Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
+// (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
+const { casarDesejosComOferta, MODO_DESEJOS } = require('./matching-desejos');
+
 async function registrarPassagemProxy(dados) {
   // Chama /passagens/registrar e retorna hist180 stats ({ minPts, mediaPts, count, isMin })
   // ou null em caso de falha (fire-and-register, não bloqueia o fluxo).
@@ -3471,6 +3475,12 @@ async function processarRadarMarketplace(jid, texto) {
       timestamp: new Date().toISOString(),
     };
 
+    // Cruzamento com os desejos de compra registrados. Fire-and-forget: roda em
+    // paralelo e nunca lanca, para nao interferir no pipeline de ofertas.
+    casarDesejosComOferta(oferta, {
+      enviarAviso: (texto) => enviarMensagem(GRUPOS['operador'], { text: texto })
+    }).catch(() => {});
+
     // AUTO_ENVIO_OFERTA: 'off' (tudo para a fila, padrao) | 'on' (dispara direto
     // nos destinos). Existe para validar o fluxo completo com grupo de teste;
     // apontar para grupo de cliente exige voltar para 'off' no Railway.
@@ -4856,6 +4866,7 @@ app.get('/mkt/config', (req, res) => {
     credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
     credenciaisShopeeOk: credenciaisShopeeOk(),
     autoEnvioOferta: AUTO_ENVIO_OFERTA,
+    matchDesejos: MODO_DESEJOS,
     autoEnvioCupom: AUTO_ENVIO_MODO,
     janelaCupom: janelaCupom(),
     turnosTsp: turnosTsp(),
