@@ -80,6 +80,9 @@ import {
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
 import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH } from './bot-tsp.js';
+// Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
+// (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
+import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 
 // Espalha os prazos da config para os modulos que os usam. Chamado no boot e
 // depois de cada gravacao, para valer sem redeploy.
@@ -1339,10 +1342,6 @@ function formatarMensagemCDV(d) {
 
 // ── REGISTRO DE PASSAGEM NO PROXY + HISTÓRICO 180 DIAS ───────────────────────
 const CDV_PROXY_URL = 'https://cdv-proxy-production.up.railway.app';
-
-// Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
-// (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
-const { casarDesejosComOferta, MODO_DESEJOS } = require('./matching-desejos');
 
 async function registrarPassagemProxy(dados) {
   // Chama /passagens/registrar e retorna hist180 stats ({ minPts, mediaPts, count, isMin })
