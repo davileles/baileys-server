@@ -956,6 +956,8 @@ requeueAprovadas();
 
 // ── AGENDAMENTOS ──────────────────────────────────────────────────────────────
 const AGEND_PATH = SESSAO_DIR + '/agendamentos.json';
+// Teto do anexo agendado (bytes do arquivo, nao da string base64).
+const AGEND_ANEXO_MAX_BYTES = 3 * 1024 * 1024;
 let agendamentos = [];
 
 function carregarAgendamentos() {
@@ -977,6 +979,24 @@ carregarAgendamentos();
 // o link preview e assincrono (baixa a thumbnail) e o loop nao pode esperar.
 // Falha ao montar o card nao cancela o envio: a mensagem sai sem preview.
 async function despacharAgendamento(ag, grupoId) {
+  // Anexo agendado: os bytes viajam dentro do proprio agendamento (o painel
+  // manda em base64), entao o disparo nao depende de nenhum arquivo em disco
+  // nem de baixar nada na hora. Imagem vai com legenda; qualquer outro mime
+  // vai como documento, mesma regra do envio imediato.
+  if (ag.anexo && ag.anexo.base64) {
+    const buffer = Buffer.from(String(ag.anexo.base64).replace(/^data:[^;]+;base64,/, ''), 'base64');
+    if (!buffer.length) throw new Error('Anexo do agendamento vazio ou base64 invalido.');
+    const mt = String(ag.anexo.mimetype || '');
+    if (!mt || mt.indexOf('image/') === 0) {
+      const conteudo = { image: buffer, caption: ag.mensagem || '' };
+      if (mt) conteudo.mimetype = mt;
+      return enviarMensagem(grupoId, conteudo);
+    }
+    const conteudo = { document: buffer, mimetype: mt, fileName: ag.anexo.nomeArquivo || 'arquivo' };
+    if (ag.mensagem && ag.mensagem.trim()) conteudo.caption = ag.mensagem;
+    return enviarMensagem(grupoId, conteudo);
+  }
+
   let lp = null;
   if (ag.preview?.link) {
     try { lp = await montarLinkPreviewManual(ag.preview); }
@@ -992,7 +1012,7 @@ setInterval(() => {
     ag.status = 'despachado';
     salvarAgendamentos();
     const grupoId = resolverGrupo(ag.grupo);
-    if (!grupoId) { ag.status = 'erro'; salvarAgendamentos(); continue; }
+    if (!grupoId) { ag.status = 'erro'; delete ag.anexo; salvarAgendamentos(); continue; }
     const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
     if (isEmissao && !ag.direto) {
       enfileirarEnvio(ag.ofertaId ?? ('ag-'+ag.id), ag.mensagem, grupoId, ag.dados || null);
@@ -1001,8 +1021,8 @@ setInterval(() => {
       // guardar bytes no agendamentos.json inflaria o arquivo e ainda entregaria
       // uma foto velha se a loja trocasse a imagem do anuncio no meio do caminho.
       despacharAgendamento(ag, grupoId)
-        .then(() => { ag.status = 'enviado'; salvarAgendamentos(); })
-        .catch(e  => { ag.status = 'erro';   salvarAgendamentos(); console.error('[AGEND] Erro envio:', e.message); });
+        .then(() => { ag.status = 'enviado'; delete ag.anexo; salvarAgendamentos(); })
+        .catch(e  => { ag.status = 'erro';   delete ag.anexo; salvarAgendamentos(); console.error('[AGEND] Erro envio:', e.message); });
     }
     console.log('[AGEND] Disparando agendamento #'+ag.id+' para grupo '+ag.grupo);
   }
@@ -1015,6 +1035,17 @@ setInterval(() => {
   salvarFila();
   const depois = filaPendentes.length;
   if (antes !== depois) console.log('[FILA] Limpeza automática: ' + (antes - depois) + ' oferta(s) removida(s).');
+
+  // Agendamentos ja resolvidos so interessam por alguns dias: sem poda o
+  // arquivo cresce para sempre e o boot fica mais lento a cada semana.
+  const corte = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const antesAg = agendamentos.length;
+  agendamentos = agendamentos.filter(a =>
+    a.status === 'aguardando' || new Date(a.criadoEm || 0).getTime() > corte);
+  if (agendamentos.length !== antesAg) {
+    salvarAgendamentos();
+    console.log('[AGEND] Poda: ' + (antesAg - agendamentos.length) + ' agendamento(s) antigo(s) removido(s).');
+  }
 }, 15 * 60 * 1000);
 
 function resolverGrupo(chave) {
@@ -4507,7 +4538,15 @@ app.post('/backfill-passagens', async (req, res) => {
 });
 
 app.get('/agendamentos', (req, res) => {
-  res.json({ ok:true, agendamentos: agendamentos.filter(a => a.status === 'aguardando') });
+  // Os bytes do anexo ficam de fora: o painel so precisa saber que existe um,
+  // e devolver base64 aqui deixaria a listagem pesada sem nenhum ganho.
+  const lista = agendamentos.filter(a => a.status === 'aguardando').map(a => {
+    const { anexo, ...resto } = a;
+    return anexo
+      ? { ...resto, anexo: { nomeArquivo: anexo.nomeArquivo || '', mimetype: anexo.mimetype || '', bytes: anexo.bytes || 0 } }
+      : { ...resto, anexo: null };
+  });
+  res.json({ ok:true, agendamentos: lista });
 });
 
 app.delete('/agendamentos/:id', (req, res) => {
@@ -4515,6 +4554,7 @@ app.delete('/agendamentos/:id', (req, res) => {
   const idx = agendamentos.findIndex(a => a.id === id);
   if (idx === -1) return res.status(404).json({ ok:false, erro:'Agendamento não encontrado.' });
   agendamentos[idx].status = 'cancelado';
+  delete agendamentos[idx].anexo;
   salvarAgendamentos();
   res.json({ ok:true });
 });
@@ -4682,7 +4722,7 @@ app.post('/enviar', async (req, res) => {
   // preview: { link, titulo, descricao, imagemUrl } — opcional. Existe para a
   // mensagem montada a mao no gerador sair com o mesmo card de link das ofertas
   // do radar. So vale no envio imediato: agendamento guarda apenas o texto.
-  const { grupo, mensagem, agendarEm, direto, preview } = req.body;
+  const { grupo, mensagem, agendarEm, direto, preview, anexo } = req.body;
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
@@ -4696,9 +4736,24 @@ app.post('/enviar', async (req, res) => {
   if (agendarEm) {
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
+    // Anexo agendado fica guardado em base64 no proprio agendamento. Tem teto:
+    // agendamentos.json e lido inteiro a cada boot, entao um arquivo grande
+    // demais penaliza todos os outros agendamentos, nao so o dele.
+    let anexoGuardado = null;
+    if (anexo?.base64) {
+      const bruto = String(anexo.base64).replace(/^data:[^;]+;base64,/, '');
+      const bytes = Math.floor(bruto.length * 3 / 4);
+      if (bytes > AGEND_ANEXO_MAX_BYTES) {
+        return res.status(413).json({ ok:false, erro:'Anexo de ' + Math.round(bytes/1024) +
+          ' KB acima do limite de ' + Math.round(AGEND_ANEXO_MAX_BYTES/1024) + ' KB para envio agendado.' });
+      }
+      anexoGuardado = { base64: bruto, mimetype: String(anexo.mimetype || ''),
+                        nomeArquivo: String(anexo.nomeArquivo || ''), bytes };
+    }
     const id = gerarId();
     agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto,
                         preview: preview?.link ? preview : null,
+                        anexo: anexoGuardado,
                         criadoEm: new Date().toISOString() });
     salvarAgendamentos();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
