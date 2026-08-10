@@ -30,6 +30,7 @@ import {
   templateCupom, templateAwin, templateProprioDaLoja,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE, VARIAVEIS_CUPOM,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
+  buscarProdutos, normalizar,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
@@ -5986,6 +5987,44 @@ app.post('/listas/:id/cancelar', (req, res) => {
 });
 
 // ── VITRINE ──────────────────────────────────────────────────────────────────
+// Link encurtado (amzn.to) e link /dp/ASIN puro nao trazem o slug com o nome do
+// produto, entao o item entrava na base como "Produto B0XXXXXXXX". O disparo ja
+// corrigia isso ao ler o titulo na Creators API, mas so DEPOIS de a mensagem
+// existir — o operador montava a lista sem saber o que estava mandando.
+// Aqui o titulo e resolvido no cadastro, em lote (a propria buscarProdutos
+// quebra em grupos de 10). Falha de rede nao derruba o cadastro: o nome
+// provisorio continua valendo e o disparo ainda o corrige.
+const NOME_PROVISORIO_VIT = /^Produto [A-Z0-9]{10}$/;
+
+async function resolverNomesProvisorios(asins) {
+  const alvo = [...new Set(asins)].filter(a => {
+    const i = itemVitrine(a);
+    return i && (i.loja || '') === 'Amazon' && NOME_PROVISORIO_VIT.test(i.nome || '');
+  });
+  if (!alvo.length) return { resolvidos: 0, restantes: 0 };
+  let resolvidos = 0;
+  try {
+    const itens = await buscarProdutos(alvo);
+    for (const it of itens) {
+      const titulo = normalizar(it).titulo;
+      if (!titulo) continue;
+      salvarItemVitrine({ asin: it.asin, nome: titulo });
+      resolvidos++;
+    }
+  } catch (e) {
+    console.warn('[VITRINE] Nao resolveu titulos:', e.message);
+  }
+  return { resolvidos, restantes: alvo.length - resolvidos };
+}
+
+// Repara a base inteira de uma vez. Existe porque os itens cadastrados antes
+// desta correcao continuam com o nome provisorio gravado.
+app.post('/vitrine/nomes', async (req, res) => {
+  const todos = listarVitrine().map(i => i.asin);
+  const r = await resolverNomesProvisorios(todos);
+  res.json({ ok:true, ...r });
+});
+
 app.get('/vitrine', (req, res) => {
   const itens = listarVitrine();
   // O painel precisa do TTL para avisar quando o preco da Magalu venceu — a
@@ -6074,6 +6113,15 @@ app.post('/vitrine', async (req, res) => {
       salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha });
     } catch (e) { erros.push({ linha, erro: e.message }); }
   }
+  // Titulo real antes de o produto aparecer na base — ver resolverNomesProvisorios.
+  if (salvos.length) {
+    await resolverNomesProvisorios(salvos.map(s => s.asin));
+    for (const s of salvos) {
+      const atual = itemVitrine(s.asin);
+      if (atual?.nome) s.nome = atual.nome;
+    }
+  }
+
   console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s).');
   res.json({ ok: salvos.length > 0, salvos, erros });
 });
