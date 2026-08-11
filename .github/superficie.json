@@ -2,7 +2,7 @@
   "limiarRemocao": 150,
   "arquivos": {
     "server.js": {
-      "minLinhas": 6010,
+      "minLinhas": 7880,
       "obrigatorio": [
         "app.delete('/agendamentos/:id'",
         "app.delete('/contas/:id'",
@@ -21,6 +21,7 @@
         "app.get('/awin/ofertas/candidatos'",
         "app.get('/awin/programas'",
         "app.get('/awin/resolver'",
+        "app.get('/campanha/status'",
         "app.get('/config-tsp'",
         "app.get('/contas'",
         "app.get('/contas/:id/grupos'",
@@ -73,6 +74,8 @@
         "app.post('/awin/ofertas/cadastrar'",
         "app.post('/awin/programas/atualizar'",
         "app.post('/backfill-passagens'",
+        "app.post('/campanha/iniciar'",
+        "app.post('/campanha/pausar'",
         "app.post('/config-tsp'",
         "app.post('/contas/:id/conectar'",
         "app.post('/cupons/base'",
@@ -127,7 +130,13 @@
         "app.post('/vitrine'",
         "app.post('/vitrine/:asin'",
         "app.post('/vitrine/disparar'",
-        "app.post('/webhook/hubla'"
+        "app.post('/webhook/hubla'",
+        "async function campanhaCiclo",
+        "async function campanhaMarcarResposta",
+        "campanhaMarcarResposta(msg)",
+        "const CAMPANHAS_KEY",
+        "function saidaSerializada",
+        "saidaSerializada(() => enviarMensagem(item.destino"
       ]
     },
     "radar-awin.js": {
