@@ -107,6 +107,7 @@ import {
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
+  sincronizarCuponsContaMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -6595,6 +6596,14 @@ app.get('/ml/diagnostico-cupom', async (req, res) => {
 // mesmo percentual deixa de existir.
 app.get('/ml/diagnostico-campanhas', async (req, res) => {
   try { res.json({ ok:true, ...await dumpCampanhasCupomMl() }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Le os cupons da conta do ML e grava na base com codigo, campanhaId, minimo,
+// teto e expiracao reais. O campanhaId e o que permite casar, sem ambiguidade,
+// o cupom que a pagina do produto anuncia com o codigo que o membro digita.
+app.get('/ml/sync-cupons-conta', async (req, res) => {
+  try { res.json({ ok:true, ...await sincronizarCuponsContaMl() }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
