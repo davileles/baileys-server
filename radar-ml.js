@@ -553,7 +553,7 @@ export function normalizarMl(it) {
 
 import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
          calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto,
-         casarCupomDaPagina } from './radar-amazon.js';
+         casarCupomDaPagina, registrarCupomBase } from './radar-amazon.js';
 
 export function formatarOfertaMl(p, opcoes = {}) {
   const tpl = opcoes.template || templateDaLoja('Mercado Livre');
@@ -1361,4 +1361,102 @@ export async function dumpCampanhasCupomMl() {
     chavesComCampanha: chaves,
     ocorrencias: janelasDeTexto(html, /"[A-Za-z0-9_]*campaign[A-Za-z0-9_]*"\s*:/i, 300, 25),
   };
+}
+
+// ── CUPONS DA CONTA PELO BLOCO DE TRACKING ────────────────────────────────
+// A pagina /cupons/active monta os cards para exibicao, mas tambem embute um
+// payload de analytics em tracking.view.eventData.coupons_list — e esse payload
+// e um contrato bem melhor do que os cards: traz o codigo, o campaign_id, o
+// minimo, o teto do desconto, o tipo e a expiracao real, tudo tipado.
+//
+// O campaign_id e a peca que faltava: e a MESMA chave que a pagina do produto
+// publica. Com ela, casar o cupom do anuncio com a base deixa de ser inferencia
+// por percentual — o que importa porque hoje ha tres cupons de 25% ativos
+// (COMPRINHASPRACASA, OFFMELI e MAISCUPONS) e o casamento por valor empataria
+// entre os tres.
+
+const MARCA_TRACKING_CUPONS = '"coupons_list":[';
+
+/** Cupons da conta, a partir do payload de tracking da pagina de cupons. */
+export function extrairCuponsTrackingMl(html) {
+  const porCampanha = new Map();
+  let i = 0;
+  while ((i = html.indexOf(MARCA_TRACKING_CUPONS, i)) !== -1) {
+    const bruto = fatiarJsonBalanceado(html, i + MARCA_TRACKING_CUPONS.length - 1);
+    i += MARCA_TRACKING_CUPONS.length;
+    if (!bruto) continue;
+    let lista;
+    try { lista = JSON.parse(bruto); } catch (e) { continue; }
+    if (!Array.isArray(lista)) continue;
+    for (const c of lista) {
+      if (!c?.campaign_id) continue;
+      const pct = String(c.discount_type || '').toUpperCase() === 'PERCENT';
+      const valor = Number(c.discount_value) || 0;
+      if (!valor) continue;
+      porCampanha.set(String(c.campaign_id), {
+        campanhaId: String(c.campaign_id),
+        codigo: String(c.code || '').trim() || null,
+        titulo: c.title || null,
+        tipo: pct ? 'pct' : 'reais',
+        valor,
+        minimo: Number(c.min_amount) || null,
+        // cap_amount e teto do DESCONTO, nao do produto — vai para 'limite'.
+        // Em cupom de valor fixo o teto e o proprio valor, entao nao se aplica.
+        limite: pct ? (Number(c.cap_amount) || null) : null,
+        validadeAte: c.expiration_date || null,
+        ativoNoMl: String(c.status_id || '').toUpperCase() === 'ACTIVE',
+      });
+    }
+  }
+  return [...porCampanha.values()];
+}
+
+/**
+ * Le os cupons da conta e grava na base com codigo, campanhaId e regras reais.
+ * Cupom sem codigo digitavel (o ML tem campanhas que aplicam sozinhas) nao entra
+ * na base: sem codigo nao ha o que passar ao membro. Ele volta em 'semCodigo'
+ * para o operador decidir o que fazer.
+ */
+export async function sincronizarCuponsContaMl() {
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+  const res = await fetch(URL_CUPONS_ML, {
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+  const html = await res.text();
+  if (/suspicious-traffic|captcha/i.test(html)) throw new Error('pagina de cupons bloqueada (antibot)');
+
+  const lidos = extrairCuponsTrackingMl(html);
+  const gravados = [], semCodigo = [], inativos = [];
+
+  for (const c of lidos) {
+    if (!c.ativoNoMl) { inativos.push(c.campanhaId); continue; }
+    if (!c.codigo)    { semCodigo.push({ campanhaId: c.campanhaId, titulo: c.titulo,
+                                         tipo: c.tipo, valor: c.valor }); continue; }
+    const reg = registrarCupomBase({
+      loja: 'Mercado Livre',
+      codigo: c.codigo,
+      tipo: c.tipo,
+      valor: c.valor,
+      minimo: c.minimo,
+      limite: c.limite,
+      maximo: null,
+      validadeAte: c.validadeAte,
+      campanhaId: c.campanhaId,
+    });
+    if (reg) gravados.push({ codigo: reg.codigo, campanhaId: reg.campanhaId,
+                             tipo: reg.tipo, valor: reg.valor,
+                             minimo: reg.minimo, limite: reg.limite,
+                             validadeAte: reg.validadeAte });
+  }
+  console.log('[CUPONS-ML] ' + gravados.length + ' gravados, ' + semCodigo.length +
+              ' sem codigo, ' + inativos.length + ' inativos');
+  return { lidos: lidos.length, gravados, semCodigo, inativos };
 }
