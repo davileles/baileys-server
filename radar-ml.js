@@ -343,6 +343,9 @@ export async function buscarDadosProdutoMl(url) {
     avaliacoes: Number(ld?.aggregateRating?.reviewCount) || null,
     vendedor: oferta?.seller?.name || null,
     achouLd: !!ld,
+    // Cupons que o proprio anuncio declara. O ML ja resolveu categoria,
+    // vendedor, minimo e teto para ESTE item — coisa que a base nao modela.
+    cuponsPagina: extrairCupomMl(html),
   };
 }
 
@@ -708,13 +711,40 @@ export async function processarTextoMl(texto) {
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço na página' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto pausado ou sem estoque' }); continue; }
 
-    const cupom = melhorCupom('Mercado Livre', p.preco, texto);
-    if (cupom) console.log('[ML] ' + p.id + ' + cupom ' + cupom.reg.codigo);
+    // Duas fontes de cupom, nesta ordem:
+    //   1. o proprio anuncio — o ML confirmou que o cupom se aplica a ESTE item
+    //      e ja declarou quanto economiza. E a unica fonte que enxerga restricao
+    //      de categoria e de vendedor.
+    //   2. o texto do post — inferencia: o cupom foi citado, mas nada garante
+    //      que o item e elegivel.
+    // A pagina vence quando casa com a base, porque promete um desconto que o
+    // checkout realmente entrega.
+    const daPagina = resolverCupomPaginaMl(dados.cuponsPagina, p.preco);
+    let cupom = daPagina.cupom;
+    if (!cupom) cupom = melhorCupom('Mercado Livre', p.preco, texto);
+
+    if (cupom?.daPagina) {
+      console.log('[ML] ' + p.id + ' + cupom do anúncio ' + cupom.codigo +
+                  (cupom.ambiguo ? ' (ambíguo)' : '') + ' — R$ ' + cupom.desconto);
+    } else if (cupom) {
+      console.log('[ML] ' + p.id + ' + cupom ' + cupom.reg.codigo);
+    }
+    if (daPagina.aviso) {
+      console.log('[ML] ' + p.id + ' — ' + daPagina.aviso.motivo + ' (' + daPagina.aviso.percentual + ')');
+    }
 
     saida.push({
       produto: p,
-      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto,
-                       citado: cupom.citado, generico: !!cupom.generico } : null,
+      cupom: cupom
+        ? (cupom.daPagina
+            ? { codigo: cupom.codigo, desconto: cupom.desconto, citado: true,
+                generico: false, daPagina: true, ambiguo: !!cupom.ambiguo,
+                idCampanhaLoja: cupom.idCampanhaLoja, reg: cupom.reg }
+            : { codigo: cupom.reg.codigo, desconto: cupom.desconto,
+                citado: cupom.citado, generico: !!cupom.generico, daPagina: false })
+        : null,
+      // Cupom no anuncio sem correspondente na base: o server avisa o operador.
+      avisoCupomPagina: daPagina.aviso,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaMl(p, { cupom }),
     });
@@ -1288,6 +1318,21 @@ export function extrairCupomMl(html) {
 }
 
 /**
+ * Desconto do cupom da pagina, com trava de coerencia.
+ *
+ * O valor em R$ vem do label ("Você economiza R$ 16,5") e o percentual vem de
+ * um campo separado. Quando os dois discordam, o percentual manda: economizar
+ * MAIS do que o percentual sobre o preco e impossivel, e publicar isso seria
+ * anunciar um preco que o checkout nao entrega. Economizar MENOS e legitimo —
+ * e o teto do cupom agindo (cap_amount), entao esse caso passa intacto.
+ */
+function descontoSeguroMl(c, preco) {
+  const tetoPercentual = c.tipo === 'pct' ? (preco * c.valor / 100) : c.valor;
+  const bruto = c.descontoMl != null ? Math.min(c.descontoMl, tetoPercentual) : tetoPercentual;
+  return Math.min(Math.round(bruto * 100) / 100, preco || 0);
+}
+
+/**
  * Resolve o cupom da pagina contra a base e devolve o que a mensagem precisa.
  * Nunca inventa desconto: quando o ML nao declara o valor em R$, cai para o
  * calculo pelo percentual sobre o preco lido.
@@ -1296,10 +1341,10 @@ export function resolverCupomPaginaMl(cupons, preco) {
   if (!cupons?.length) return { cupom: null, aviso: null };
   // Entre varios, o de maior beneficio em reais.
   const melhorPagina = cupons
-    .map(c => ({ c, r: c.descontoMl ?? (c.tipo === 'pct' ? preco * c.valor / 100 : c.valor) }))
+    .map(c => ({ c, r: descontoSeguroMl(c, preco) }))
     .sort((a, b) => b.r - a.r)[0];
   const p = melhorPagina.c;
-  const desconto = Math.min(Math.round((melhorPagina.r || 0) * 100) / 100, preco || 0);
+  const desconto = melhorPagina.r;
   if (!(desconto > 0)) return { cupom: null, aviso: null };
 
   const casado = casarCupomDaPagina('Mercado Livre', p);
