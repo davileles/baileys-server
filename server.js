@@ -2800,6 +2800,48 @@ function corrigirCia(cia, programa, origemCodigo, destinoCodigo, tipoVoo, destin
   // opera amplamente voos internacionais — mantém o comportamento anterior.
   return normalizarCia(CIA_POR_PROGRAMA[programa] || cia || 'Desconhecida');
 }
+
+// ── FALLBACK: cia nao consta no texto → le APENAS a companhia na imagem ───────
+// Grupos de texto estruturado ignoram a imagem por design (o texto e a fonte
+// canonica de rota/programa/milhas), mas a cia OPERADORA quase nunca esta no
+// texto e costuma estar impressa no screenshot ("GOL LINHAS AEREAS").
+// Nesses casos corrigirCia() devolve 'Desconhecida' e a oferta sai sem cia.
+// Nao da para deduzir pelo destino: a Smiles emite em varias parceiras que
+// servem a mesma rota (EZE = GOL, Aerolineas, Emirates, Turkish; MIA = GOL e
+// American). So a leitura da imagem resolve — chamada curta, disparada apenas
+// quando a cia ficou desconhecida E existe imagem.
+async function ciaPelaImagem(imagemBase64, rotaDesc) {
+  if (!imagemBase64) return null;
+  const content = [
+    { type:'image', source:{ type:'base64', media_type:'image/jpeg', data:imagemBase64 } },
+    { type:'text', text:
+      'Este screenshot e de uma busca de passagem aerea com milhas'+(rotaDesc ? ' ('+rotaDesc+')' : '')+'.\n'
+      +'Responda APENAS qual e a COMPANHIA AEREA OPERADORA do voo, lida literalmente da imagem.\n'
+      +'REGRAS:\n'
+      +'- Nao deduza a cia a partir do programa de fidelidade nem do destino. Vale somente o que estiver escrito ou no logo visivel.\n'
+      +'- Se houver conexao com companhias diferentes, devolva a do primeiro trecho.\n'
+      +'- Se nao houver nome nem logo de companhia legivel, devolva cia vazia.\n'
+      +'Responda somente este JSON: {"cia":"GOL"} ou {"cia":""}'
+    }
+  ];
+  const r = await chamarClaude('Voce le screenshots de busca de passagens aereas. Responda APENAS JSON sem markdown.', content, 200);
+  const cia = String(r?.cia || '').trim();
+  return cia || null;
+}
+
+// Wrapper usado por todos os ramos de classificarItens(): aplica corrigirCia()
+// e, so quando o resultado for 'Desconhecida', tenta recuperar da imagem.
+async function resolverCiaComImagem(r, item) {
+  const cia = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
+  if (cia !== 'Desconhecida' || !item || !item.imagemBase64) return cia;
+  const rota = (r.origemCodigo || r.origem || '?')+'->'+(r.destinoCodigo || r.destino || '?')
+             + ', programa '+(r.programa || '?');
+  const lida = await ciaPelaImagem(item.imagemBase64, rota);
+  if (!lida) { console.log('   [CIA-IMG] Cia nao legivel na imagem ('+rota+').'); return cia; }
+  const norm = normalizarCia(lida);
+  console.log('   [CIA-IMG] Cia recuperada da imagem: '+norm+' ('+rota+')');
+  return norm;
+}
 const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
 
@@ -2893,7 +2935,7 @@ async function classificarItens(itens, grupoId) {
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
+          r.cia     = await resolverCiaComImagem(r, item);
         } else {
           // Diagnóstico: item do grupo-imagem descartado como inválido
           console.log('[GRUPO-IMG] Item '+indiceOriginal+' classificado como INVÁLIDO ('+(temImagem?'com imagem':'sem imagem')+'). Legenda: '+(item.texto||'').slice(0,80).replace(/\n/g,' | '));
@@ -2936,7 +2978,7 @@ async function classificarItens(itens, grupoId) {
           r.cabine  = 'Executiva';
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
+          r.cia     = await resolverCiaComImagem(r, item);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -2974,7 +3016,7 @@ async function classificarItens(itens, grupoId) {
         if (r?.valido) {
           r.origem  = resolverCidade(r.origemCodigo, r.origem);
           r.destino = resolverCidade(r.destinoCodigo, r.destino);
-          r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
+          r.cia     = await resolverCiaComImagem(r, item);
         }
         resultados.push(r || { valido:false, indice:indiceOriginal });
       }
@@ -3011,7 +3053,7 @@ async function classificarItens(itens, grupoId) {
       if (r?.valido) {
         r.origem  = resolverCidade(r.origemCodigo, r.origem);
         r.destino = resolverCidade(r.destinoCodigo, r.destino);
-        r.cia     = corrigirCia(r.cia, r.programa, r.origemCodigo, r.destinoCodigo, r.tipoVoo, r.destino);
+        r.cia     = await resolverCiaComImagem(r, item);
       }
       resultados.push(r || { valido:false, indice:i });
     }
