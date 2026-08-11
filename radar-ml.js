@@ -175,6 +175,76 @@ export function idDeUrl(url) {
   return m ? 'MLB' + m[1] : null;
 }
 
+// ── RESOLUCAO DE LINK ─────────────────────────────────────────────────────
+// Tres formatos chegam pelos grupos e pelo painel:
+//   1. pagina de produto — /p/MLB123 ou /up/MLBU123 (catalogo unificado)
+//   2. encurtador        — meli.la/xxxx e /sec/xxxx
+//   3. perfil de afiliado — /social/<usuario>?ref=<token>
+// O (3) e o formato que os SEUS links de afiliado assumem: meli.la redireciona
+// para ele, e a pagina embute o produto destacado num bloco 'show_product'.
+
+const RE_ENCURTADOR_ML = /^https?:\/\/(www\.)?meli\.la\/|\/sec\//i;
+const RE_SOCIAL_ML = /mercadolivre\.com(\.br)?\/social\//i;
+
+/** Qualquer id de produto do ML, incluindo o do catalogo unificado (MLBU). */
+export function idProdutoMl(url) {
+  const s = String(url || '');
+  const m = s.match(/\/(?:p|up)\/(MLBU?\d{6,})/i) || s.match(/(?:^|[^A-Za-z0-9])(MLBU\d{6,})/i);
+  return m ? m[1].toUpperCase() : idDeUrl(s);
+}
+
+/** Extrai a URL do produto destacado numa pagina de perfil de afiliado. */
+export function produtoDeLinkSocialMl(html) {
+  // Ancora estavel: o CTA "Ir para produto" do card em destaque. Contar
+  // ocorrencias de MLB no HTML nao serve — a pagina lista recomendacoes.
+  const bloco = html.match(/"id"\s*:\s*"show_product"[\s\S]{0,400}?"url"\s*:\s*"([^"]+)"/i);
+  if (bloco) {
+    const u = bloco[1].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+    return /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
+  }
+  // Reserva: o primeiro polycard traz product_id e a url canonica.
+  const meta = html.match(/"product_id"\s*:\s*"(MLB\d{6,})"[\s\S]{0,200}?"url"\s*:\s*"([^"]+)"/i);
+  if (meta) {
+    const u = meta[2].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+    return /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
+  }
+  return null;
+}
+
+/**
+ * Converte qualquer um dos tres formatos na URL da pagina do produto.
+ *
+ * Importante: URL que ja e do dominio principal NAO passa pelo resolvedor de
+ * encurtador. Ele faz ate 6 requisicoes ANONIMAS (sem o cookie de sessao), e
+ * era isso que derrubava /up/MLBU na tela antibot — o id nao era reconhecido,
+ * o codigo achava que era link curto e disparava a cascata.
+ */
+export async function resolverLinkMl(url) {
+  let alvo = String(url || '').trim();
+  if (!alvo) return alvo;
+
+  if (RE_ENCURTADOR_ML.test(alvo)) alvo = await resolverEncurtadorMl(alvo);
+
+  if (RE_SOCIAL_ML.test(alvo)) {
+    const cookie = cookieAff();
+    const res = await fetch(alvo, {
+      headers: {
+        ...(cookie ? { 'Cookie': cookie } : {}),
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(25000),
+    });
+    const html = await res.text();
+    const doProduto = produtoDeLinkSocialMl(html);
+    if (doProduto) return doProduto;
+    throw new Error('link de perfil de afiliado sem produto identificavel');
+  }
+  return alvo;
+}
+
 async function resolverEncurtadorMl(url, tentativas = 6) {
   let atual = url;
   for (let i = 0; i < tentativas; i++) {
@@ -285,7 +355,10 @@ async function precoDeApiMl(id) {
 export async function buscarDadosProdutoMl(url) {
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
-  const res = await fetch(url, {
+  // Aceita pagina de produto, encurtador e perfil de afiliado.
+  let alvoUrl = url;
+  try { alvoUrl = await resolverLinkMl(url); } catch (e) { /* segue com a original */ }
+  const res = await fetch(alvoUrl, {
     headers: {
       'Cookie': cookie,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
@@ -315,7 +388,7 @@ export async function buscarDadosProdutoMl(url) {
   // O regex anterior lia "original_price": 33.61 e removia o ponto achando que
   // era separador de milhar — virava 3361, a trava de 5x descartava e a oferta
   // saia sem "De:" com o valor cheio a vista na pagina.
-  const idProduto = idDeUrl(url);
+  const idProduto = idDeUrl(alvoUrl);
   const descontoDeclarado = descontoDeclaradoNoHtml(html);
   const resolvido = resolverPrecoDe({
     preco,
@@ -1192,9 +1265,7 @@ export async function dumpCupomMl(url) {
 
   let alvo = String(url || '').trim();
   if (!alvo) throw new Error('passe a url do produto');
-  if (!idDeUrl(alvo)) {
-    try { alvo = await resolverEncurtadorMl(alvo); } catch (e) { /* segue com a original */ }
-  }
+  try { alvo = await resolverLinkMl(alvo); } catch (e) { /* segue com a original */ }
 
   const res = await fetch(alvo, {
     headers: {
