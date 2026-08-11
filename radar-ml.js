@@ -1463,6 +1463,11 @@ const _campanhasMl = new Map();
 export function campanhaMlConhecida(id) {
   return id ? (_campanhasMl.get(String(id)) || null) : null;
 }
+/** Lista o mapa de campanhas, para conferir de fora o que o sync aprendeu. */
+export function listarCampanhasMl() {
+  return [..._campanhasMl.values()].sort((a, b) =>
+    (a.codigo || 'zzz').localeCompare(b.codigo || 'zzz', 'pt-BR'));
+}
 export function estadoCampanhasMl() {
   return { total: _campanhasMl.size,
            semCodigo: [..._campanhasMl.values()].filter(c => !c.codigo).length,
