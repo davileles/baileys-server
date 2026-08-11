@@ -1450,6 +1450,16 @@ export function extrairCuponsTrackingMl(html) {
         limite: pct ? (Number(c.cap_amount) || null) : null,
         validadeAte: c.expiration_date || null,
         ativoNoMl: String(c.status_id || '').toUpperCase() === 'ACTIVE',
+        // Cupom sem codigo so pode ser anunciado se for campanha ABERTA. Se o
+        // ML segmentou por comprador, o membro nao vai ver o mesmo desconto e a
+        // oferta viraria reclamacao. 'collectors' e a pista de segmentacao.
+        segmentacao: {
+          collectors: c.segmentations?.collectors?.length || 0,
+          categorias: c.segmentations?.categories?.length || 0,
+          containers: c.segmentations?.containers?.length || 0,
+          itens: c.item_ids?.length || 0,
+        },
+        criadoPor: c.created_by || null,
       });
     }
   }
@@ -1484,7 +1494,9 @@ export async function sincronizarCuponsContaMl() {
   for (const c of lidos) {
     if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
     if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
-                                         tipo: c.tipo, valor: c.valor }); continue; }
+                                         tipo: c.tipo, valor: c.valor, minimo: c.minimo,
+                                         limite: c.limite, validadeAte: c.validadeAte,
+                                         segmentacao: c.segmentacao, criadoPor: c.criadoPor }); continue; }
     const reg = registrarCupomBase({
       loja: 'Mercado Livre',
       codigo: c.codigo,
