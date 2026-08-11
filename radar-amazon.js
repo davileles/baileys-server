@@ -521,6 +521,11 @@ export function registrarCupomBase(c) {
     validadeAte: new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
     // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
     ativo: anterior ? anterior.ativo !== false : true,
+    // Id da campanha do ML, aprendido ao casar com o cupom que a pagina do
+    // produto anuncia. Precisa sobreviver a recaptura: sem isso, o cupom
+    // reaparecer num grupo apagaria o vinculo e o casamento voltaria a ser
+    // por (tipo, valor), que e ambiguo quando ha dois cupons do mesmo valor.
+    campanhaId: c.campanhaId || anterior?.campanhaId || null,
   };
   E().cupons[chave] = reg;
   salvarCuponsBase();
@@ -536,7 +541,7 @@ export function listarCuponsBase() {
 export function atualizarCupomBase(chave, campos = {}) {
   const reg = E().cupons[chave];
   if (!reg) return null;
-  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao']) {
+  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'campanhaId']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
   }
   reg.atualizadoEm = new Date().toISOString();
@@ -1624,3 +1629,54 @@ export function cupomDaLista(lista) {
 carregarListas();
 
 _moduloPronto = true;
+
+/**
+ * Casa o cupom que a PAGINA DO PRODUTO anuncia com um registro da base.
+ *
+ * A pagina do ML entrega o beneficio (25%, R$ 16,50 de economia) e um
+ * campaign_id, mas nunca o codigo digitavel — e o codigo e justamente a unica
+ * coisa que o membro precisa. Dai a inversao de papeis: quanto vale vem do ML,
+ * qual e o codigo vem daqui.
+ *
+ * Duas vias, nesta ordem:
+ *   1. campanhaId — exato, sem ambiguidade possivel
+ *   2. (tipo, valor) — funciona sempre, mas empata quando ha dois cupons de
+ *      mesmo percentual. No empate NAO escolhe: devolve os candidatos para a
+ *      mensagem citar "CUPOM1 ou CUPOM2" e o membro testar.
+ *
+ * Quando a via 2 acerta em cheio (candidato unico), grava o campanhaId no
+ * registro. Da proxima vez o casamento ja sai pela via 1. Em caso de empate
+ * nao aprende nada — gravar o id no cupom errado envenenaria a base.
+ */
+export function casarCupomDaPagina(loja, cupomPagina) {
+  const vazio = { reg: null, candidatos: [], via: null, ambiguo: false };
+  if (!cupomPagina || !cupomPagina.valor) return vazio;
+  const alvo = normalizarTexto(loja);
+
+  const porCampanha = [], porValor = [];
+  for (const reg of Object.values(E().cupons)) {
+    if (!cupomVigente(reg)) continue;
+    if (normalizarTexto(reg.loja) !== alvo) continue;
+    if (cupomPagina.campanhaId && reg.campanhaId &&
+        String(reg.campanhaId) === String(cupomPagina.campanhaId)) porCampanha.push(reg);
+    if (reg.tipo === cupomPagina.tipo && Number(reg.valor) === Number(cupomPagina.valor)) porValor.push(reg);
+  }
+
+  if (porCampanha.length === 1) {
+    return { reg: porCampanha[0], candidatos: porCampanha, via: 'campanha', ambiguo: false };
+  }
+  if (porValor.length === 1) {
+    const reg = porValor[0];
+    if (cupomPagina.campanhaId && !reg.campanhaId) {
+      reg.campanhaId = String(cupomPagina.campanhaId);
+      reg.atualizadoEm = new Date().toISOString();
+      salvarCuponsBase();
+      console.log('[CUPONS] campanhaId ' + reg.campanhaId + ' aprendido para ' + reg.loja + ' ' + reg.codigo);
+    }
+    return { reg, candidatos: porValor, via: 'valor', ambiguo: false };
+  }
+  if (porValor.length > 1) {
+    return { reg: null, candidatos: porValor, via: 'valor', ambiguo: true };
+  }
+  return vazio;
+}
