@@ -1253,7 +1253,7 @@ function normalizarCupomPagina(c) {
   const m = String(c.label || '').match(/economiza\s*R\$\s*([\d.]*\d(?:,\d+)?)/i);
   const descontoMl = m ? Number(m[1].replace(/\./g, '').replace(',', '.')) : null;
   return {
-    campanhaId: c.campaign_id ? String(c.campaign_id) : null,
+    idCampanhaLoja: c.campaign_id ? String(c.campaign_id) : null,
     tipo, valor,
     descontoMl: Number.isFinite(descontoMl) && descontoMl > 0 ? descontoMl : null,
     status: c.status || null,      // 'redeemed' = ja resgatado nesta conta
@@ -1280,7 +1280,7 @@ export function extrairCupomMl(html) {
     for (const c of lista) {
       const n = normalizarCupomPagina(c);
       if (!n) continue;
-      const k = (n.campanhaId || '') + '|' + n.tipo + '|' + n.valor;
+      const k = (n.idCampanhaLoja || '') + '|' + n.tipo + '|' + n.valor;
       if (!achados.has(k)) achados.set(k, n);
     }
   }
@@ -1307,14 +1307,14 @@ export function resolverCupomPaginaMl(cupons, preco) {
   if (casado.ambiguo) {
     return {
       cupom: { codigo: casado.candidatos.map(r => r.codigo).join(' ou '), desconto,
-               campanhaId: p.campanhaId, daPagina: true, ambiguo: true,
+               idCampanhaLoja: p.idCampanhaLoja, daPagina: true, ambiguo: true,
                reg: casado.candidatos[0] },
       aviso: null,
     };
   }
   if (casado.reg) {
     return {
-      cupom: { codigo: casado.reg.codigo, desconto, campanhaId: p.campanhaId,
+      cupom: { codigo: casado.reg.codigo, desconto, idCampanhaLoja: p.idCampanhaLoja,
                daPagina: true, ambiguo: false, reg: casado.reg },
       aviso: null,
     };
@@ -1327,7 +1327,7 @@ export function resolverCupomPaginaMl(cupons, preco) {
     aviso: {
       motivo: 'cupom no anúncio sem correspondente na base',
       percentual: p.tipo === 'pct' ? p.valor + '%' : 'R$ ' + p.valor,
-      desconto, campanhaId: p.campanhaId, status: p.status, label: p.label,
+      desconto, idCampanhaLoja: p.idCampanhaLoja, status: p.status, label: p.label,
     },
   };
 }
@@ -1394,7 +1394,7 @@ export function extrairCuponsTrackingMl(html) {
       const valor = Number(c.discount_value) || 0;
       if (!valor) continue;
       porCampanha.set(String(c.campaign_id), {
-        campanhaId: String(c.campaign_id),
+        idCampanhaLoja: String(c.campaign_id),
         codigo: String(c.code || '').trim() || null,
         titulo: c.title || null,
         tipo: pct ? 'pct' : 'reais',
@@ -1412,7 +1412,7 @@ export function extrairCuponsTrackingMl(html) {
 }
 
 /**
- * Le os cupons da conta e grava na base com codigo, campanhaId e regras reais.
+ * Le os cupons da conta e grava na base com codigo, idCampanhaLoja e regras reais.
  * Cupom sem codigo digitavel (o ML tem campanhas que aplicam sozinhas) nao entra
  * na base: sem codigo nao ha o que passar ao membro. Ele volta em 'semCodigo'
  * para o operador decidir o que fazer.
@@ -1437,8 +1437,8 @@ export async function sincronizarCuponsContaMl() {
   const gravados = [], semCodigo = [], inativos = [];
 
   for (const c of lidos) {
-    if (!c.ativoNoMl) { inativos.push(c.campanhaId); continue; }
-    if (!c.codigo)    { semCodigo.push({ campanhaId: c.campanhaId, titulo: c.titulo,
+    if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
+    if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
                                          tipo: c.tipo, valor: c.valor }); continue; }
     const reg = registrarCupomBase({
       loja: 'Mercado Livre',
@@ -1449,9 +1449,9 @@ export async function sincronizarCuponsContaMl() {
       limite: c.limite,
       maximo: null,
       validadeAte: c.validadeAte,
-      campanhaId: c.campanhaId,
+      idCampanhaLoja: c.idCampanhaLoja,
     });
-    if (reg) gravados.push({ codigo: reg.codigo, campanhaId: reg.campanhaId,
+    if (reg) gravados.push({ codigo: reg.codigo, idCampanhaLoja: reg.idCampanhaLoja,
                              tipo: reg.tipo, valor: reg.valor,
                              minimo: reg.minimo, limite: reg.limite,
                              validadeAte: reg.validadeAte });
