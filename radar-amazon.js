@@ -1228,7 +1228,10 @@ export function varsDoProduto(p, cupom) {
     preco_de: (riscado && riscado > precoFinal) ? brl(riscado) : '',
     desconto: descTotal > 0 ? descTotal : '',
     economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
-    cupom: cupom ? cupom.reg.codigo : '',
+    // 'codigo' direto vence 'reg.codigo': o cupom lido do anuncio pode nao ter
+    // um registro unico (dois cupons de mesmo percentual viram "A ou B") e
+    // precisa mandar o rotulo pronto para a mensagem.
+    cupom: cupom ? (cupom.codigo || cupom.reg?.codigo || '') : '',
     cupom_desconto: cupom ? brl(cupom.desconto) : '',
     alerta: alertas.join('. '),
     link: p.link || '',
