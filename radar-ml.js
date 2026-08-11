@@ -1443,6 +1443,19 @@ export function resolverCupomPaginaMl(cupons, preco) {
   // oferta sairia com um codigo que nao e o do anuncio.
   const conhecida = campanhaMlConhecida(p.idCampanhaLoja);
 
+  // O estado lido no PROPRIO anuncio vence o que o mapa infere. Um cupom com
+  // botao "Aplicar" na pagina esta disponivel para quem abriu o anuncio, mesmo
+  // que a varredura de cupons tenha marcado a campanha como segmentada — o
+  // anuncio e evidencia direta, o mapa e inferencia.
+  if (naoResgatado && !conhecida?.codigo) {
+    return {
+      cupom: { codigo: null, semCodigo: true, segmentado: false, naoResgatado: true,
+               desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
+               ambiguo: false, reg: null },
+      aviso: null,
+    };
+  }
+
   if (conhecida && !conhecida.codigo) {
     // Campanha sem codigo digitavel: o desconto aparece sozinho na pagina para
     // quem for elegivel. Segmentada ou nao, a oferta e divulgada — suprimir o
@@ -1451,15 +1464,6 @@ export function resolverCupomPaginaMl(cupons, preco) {
     // para todos, para o membro conferir no anuncio antes de contar com o preco.
     return {
       cupom: { codigo: null, semCodigo: true, segmentado: !!conhecida.segmentado,
-               desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
-               ambiguo: false, reg: null },
-      aviso: null,
-    };
-  }
-
-  if (naoResgatado && !conhecida?.codigo) {
-    return {
-      cupom: { codigo: null, semCodigo: true, segmentado: false, naoResgatado: true,
                desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
                ambiguo: false, reg: null },
       aviso: null,
@@ -1674,14 +1678,22 @@ export async function sincronizarCuponsContaMl() {
   _campanhasMl.clear();
   const gravados = [], semCodigo = [], inativos = [], fontes = [];
 
-  const registrarNoMapa = (c) => {
+  const registrarNoMapa = (c, ehAtivos) => {
     const anterior = _campanhasMl.get(c.idCampanhaLoja);
     // Um mesmo cupom pode aparecer em varios filtros; fica a versao com codigo.
     if (anterior && anterior.codigo && !c.codigo) return;
+    // 'collectors' so significa segmentacao por comprador em /cupons/active, que
+    // lista OS SEUS cupons. Nas paginas de filtro o mesmo campo vem preenchido
+    // para quase tudo (48 de 70 campanhas) e marcava como segmentada campanha
+    // aberta — verificado num cupom que o modal do anuncio oferece a qualquer um.
+    // Fora de /active a segmentacao fica indefinida, e indefinido nao e "sim".
+    const segmentado = ehAtivos ? (c.segmentacao?.collectors || 0) > 0
+                                : (anterior?.segmentado || false);
     _campanhasMl.set(c.idCampanhaLoja, {
       idCampanhaLoja: c.idCampanhaLoja, codigo: c.codigo, titulo: c.titulo,
       tipo: c.tipo, valor: c.valor, minimo: c.minimo, limite: c.limite,
-      segmentado: (c.segmentacao?.collectors || 0) > 0, ativoNoMl: c.ativoNoMl,
+      segmentado, segmentacaoConfirmada: !!ehAtivos || !!anterior?.segmentacaoConfirmada,
+      ativoNoMl: c.ativoNoMl,
     });
   };
 
@@ -1690,7 +1702,7 @@ export async function sincronizarCuponsContaMl() {
     try {
       const lidos = extrairCuponsTrackingMl(await buscar(url));
       for (const c of lidos) {
-        registrarNoMapa(c);
+        registrarNoMapa(c, ehAtivos);
         if (!ehAtivos) continue;            // filtros so alimentam o mapa
         if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
         if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
