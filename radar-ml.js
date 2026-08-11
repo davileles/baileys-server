@@ -740,6 +740,7 @@ export async function processarTextoMl(texto) {
             ? { codigo: cupom.codigo, desconto: cupom.desconto, citado: true,
                 generico: false, daPagina: true, ambiguo: !!cupom.ambiguo,
                 semCodigo: !!cupom.semCodigo, segmentado: !!cupom.segmentado,
+                naoResgatado: !!cupom.naoResgatado,
                 idCampanhaLoja: cupom.idCampanhaLoja, reg: cupom.reg }
             : { codigo: cupom.reg.codigo, desconto: cupom.desconto,
                 citado: cupom.citado, generico: !!cupom.generico, daPagina: false })
@@ -1356,6 +1357,14 @@ export function resolverCupomPaginaMl(cupons, preco) {
   const desconto = melhorPagina.r;
   if (!(desconto > 0)) return { cupom: null, aviso: null };
 
+  // O proprio PDP diz em que estado o cupom esta:
+  //   redeemed   / APPLIED_COUPON            -> ja esta na conta, aplica no checkout
+  //   unredeemed / INACTIVE_COUPON_NOT_APPLIED -> disponivel, falta clicar em aplicar
+  // 'unredeemed' e resposta direta, nao inferencia: o cupom esta ali para
+  // qualquer um que abrir o anuncio resgatar com um clique, sem digitar codigo.
+  const naoResgatado = String(p.status || '').toLowerCase() === 'unredeemed'
+    || /NOT_APPLIED|INACTIVE_COUPON/i.test(String(p.tipoMl || ''));
+
   // A campanha lida do sync manda sobre o casamento por valor. Sem essa ordem,
   // um cupom segmentado de 25% casaria com QUALQUER cupom de 25% da base e a
   // oferta sairia com um codigo que nao e o do anuncio.
@@ -1369,6 +1378,15 @@ export function resolverCupomPaginaMl(cupons, preco) {
     // para todos, para o membro conferir no anuncio antes de contar com o preco.
     return {
       cupom: { codigo: null, semCodigo: true, segmentado: !!conhecida.segmentado,
+               desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
+               ambiguo: false, reg: null },
+      aviso: null,
+    };
+  }
+
+  if (naoResgatado && !conhecida?.codigo) {
+    return {
+      cupom: { codigo: null, semCodigo: true, segmentado: false, naoResgatado: true,
                desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
                ambiguo: false, reg: null },
       aviso: null,
