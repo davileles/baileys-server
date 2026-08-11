@@ -552,7 +552,8 @@ export function normalizarMl(it) {
 // ── PIPELINE ──────────────────────────────────────────────────────────────
 
 import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
-         calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
+         calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto,
+         casarCupomDaPagina } from './radar-amazon.js';
 
 export function formatarOfertaMl(p, opcoes = {}) {
   const tpl = opcoes.template || templateDaLoja('Mercado Livre');
@@ -1211,5 +1212,153 @@ export async function dumpCupomMl(url) {
     jsonLdComCupom: ldBrutos,
     ocorrenciasJson,
     ocorrenciasTexto,
+  };
+}
+
+// ── CUPOM ANUNCIADO NA PAGINA DO PRODUTO ──────────────────────────────────
+// Diagnostico confirmou o formato: o estado embutido traz
+//   "coupons":{"coupons":[{ "label":"25% OFF ao comprar. Você economiza R$ 16,5.",
+//                           "status":"redeemed", "amount_type":"percentage",
+//                           "amount":25, "campaign_id":"14022492",
+//                           "type":"APPLIED_COUPON" }]}
+// Sem codigo digitavel — so o beneficio e o id da campanha. O JSON-LD nao fala
+// de cupom, entao esta e a fonte unica.
+//
+// Confirmado tambem que o preco do JSON-LD e ANTES do cupom (66 x 25% = 16,50,
+// o mesmo valor que o proprio ML declara economizar), logo pode subtrair.
+
+/** Recorta um {...} ou [...] equilibrado a partir de uma posicao, respeitando strings. */
+function fatiarJsonBalanceado(texto, inicio) {
+  const abre = texto[inicio];
+  const fecha = abre === '[' ? ']' : '}';
+  let nivel = 0, emString = false, escape = false;
+  for (let i = inicio; i < texto.length; i++) {
+    const c = texto[i];
+    if (escape) { escape = false; continue; }
+    if (c === '\\') { escape = true; continue; }
+    if (c === '"') { emString = !emString; continue; }
+    if (emString) continue;
+    if (c === abre) nivel++;
+    else if (c === fecha && --nivel === 0) return texto.slice(inicio, i + 1);
+  }
+  return null;
+}
+
+function normalizarCupomPagina(c) {
+  const valor = Number(c?.amount) || 0;
+  if (!valor) return null;
+  const tipo = String(c.amount_type || '').toLowerCase() === 'percentage' ? 'pct' : 'reais';
+  // O ML ja calculou quanto o cupom vale em R$ neste item, aplicando minimo,
+  // teto, categoria e vendedor — regras que a base nao consegue modelar.
+  const m = String(c.label || '').match(/economiza\s*R\$\s*([\d.]*\d(?:,\d+)?)/i);
+  const descontoMl = m ? Number(m[1].replace(/\./g, '').replace(',', '.')) : null;
+  return {
+    campanhaId: c.campaign_id ? String(c.campaign_id) : null,
+    tipo, valor,
+    descontoMl: Number.isFinite(descontoMl) && descontoMl > 0 ? descontoMl : null,
+    status: c.status || null,      // 'redeemed' = ja resgatado nesta conta
+    tipoMl: c.type || null,
+    label: c.label || null,
+  };
+}
+
+const MARCA_CUPONS_ML = '"coupons":{"coupons":[';
+
+/** Cupons que a pagina do produto anuncia. Lista vazia quando nao ha nenhum. */
+export function extrairCupomMl(html) {
+  const achados = new Map();
+  let i = 0;
+  // O estado aparece duas vezes no HTML (SSR + hidratacao); a dedup por
+  // campanha+valor resolve sem depender de qual bloco veio primeiro.
+  while ((i = html.indexOf(MARCA_CUPONS_ML, i)) !== -1) {
+    const bruto = fatiarJsonBalanceado(html, i + MARCA_CUPONS_ML.length - 1);
+    i += MARCA_CUPONS_ML.length;
+    if (!bruto) continue;
+    let lista;
+    try { lista = JSON.parse(bruto); } catch (e) { continue; }
+    if (!Array.isArray(lista)) continue;
+    for (const c of lista) {
+      const n = normalizarCupomPagina(c);
+      if (!n) continue;
+      const k = (n.campanhaId || '') + '|' + n.tipo + '|' + n.valor;
+      if (!achados.has(k)) achados.set(k, n);
+    }
+  }
+  return [...achados.values()];
+}
+
+/**
+ * Resolve o cupom da pagina contra a base e devolve o que a mensagem precisa.
+ * Nunca inventa desconto: quando o ML nao declara o valor em R$, cai para o
+ * calculo pelo percentual sobre o preco lido.
+ */
+export function resolverCupomPaginaMl(cupons, preco) {
+  if (!cupons?.length) return { cupom: null, aviso: null };
+  // Entre varios, o de maior beneficio em reais.
+  const melhorPagina = cupons
+    .map(c => ({ c, r: c.descontoMl ?? (c.tipo === 'pct' ? preco * c.valor / 100 : c.valor) }))
+    .sort((a, b) => b.r - a.r)[0];
+  const p = melhorPagina.c;
+  const desconto = Math.min(Math.round((melhorPagina.r || 0) * 100) / 100, preco || 0);
+  if (!(desconto > 0)) return { cupom: null, aviso: null };
+
+  const casado = casarCupomDaPagina('Mercado Livre', p);
+
+  if (casado.ambiguo) {
+    return {
+      cupom: { codigo: casado.candidatos.map(r => r.codigo).join(' ou '), desconto,
+               campanhaId: p.campanhaId, daPagina: true, ambiguo: true,
+               reg: casado.candidatos[0] },
+      aviso: null,
+    };
+  }
+  if (casado.reg) {
+    return {
+      cupom: { codigo: casado.reg.codigo, desconto, campanhaId: p.campanhaId,
+               daPagina: true, ambiguo: false, reg: casado.reg },
+      aviso: null,
+    };
+  }
+  // Cupom no anuncio sem correspondente na base: nao ha codigo para passar ao
+  // membro, e 'redeemed' indica cupom desta conta — anunciar o preco com
+  // desconto seria prometer algo que o membro nao consegue reproduzir.
+  return {
+    cupom: null,
+    aviso: {
+      motivo: 'cupom no anúncio sem correspondente na base',
+      percentual: p.tipo === 'pct' ? p.valor + '%' : 'R$ ' + p.valor,
+      desconto, campanhaId: p.campanhaId, status: p.status, label: p.label,
+    },
+  };
+}
+
+// ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────
+// Se a pagina /cupons/active publicar o campaign_id ao lado do codigo, o
+// vinculo campanha -> codigo deixa de ser aprendido por (tipo, valor) e passa a
+// ser exato desde o cadastro, matando a ambiguidade de dois cupons de mesmo
+// percentual. Vale checar antes de aceitar o casamento por valor como teto.
+export async function dumpCampanhasCupomMl() {
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+  const res = await fetch(URL_CUPONS_ML, {
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+  const html = await res.text();
+  const chaves = [...new Set(
+    [...html.matchAll(/"([A-Za-z0-9_]*(?:campaign|campanha)[A-Za-z0-9_]*)"\s*:/gi)].map(m => m[1])
+  )].slice(0, 60);
+  return {
+    httpStatus: res.status,
+    bloqueado: /suspicious-traffic|captcha/i.test(html),
+    tamanhoHtml: html.length,
+    chavesComCampanha: chaves,
+    ocorrencias: janelasDeTexto(html, /"[A-Za-z0-9_]*campaign[A-Za-z0-9_]*"\s*:/i, 300, 25),
   };
 }
