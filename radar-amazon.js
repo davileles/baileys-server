@@ -1236,9 +1236,11 @@ export function varsDoProduto(p, cupom) {
     // e some da mensagem se a linha for suprimida.
     cupom: cupom
       ? (cupom.semCodigo
-          ? (cupom.segmentado
-              ? 'Desconto de cupom disponível no anúncio para contas selecionadas — confira na página do produto se aparece para você'
-              : 'Desconto de cupom já disponível no anúncio — resgate na página do produto')
+          ? (cupom.naoResgatado
+              ? 'Cupom disponível no anúncio — clique em aplicar na página do produto antes de finalizar'
+              : cupom.segmentado
+                ? 'Desconto de cupom disponível no anúncio para contas selecionadas — confira na página do produto se aparece para você'
+                : 'Desconto de cupom já disponível no anúncio — resgate na página do produto')
           : (cupom.codigo || cupom.reg?.codigo || ''))
       : '',
     cupom_desconto: cupom ? brl(cupom.desconto) : '',
