@@ -530,7 +530,7 @@ export function registrarCupomBase(c) {
     // produto anuncia. Precisa sobreviver a recaptura: sem isso, o cupom
     // reaparecer num grupo apagaria o vinculo e o casamento voltaria a ser
     // por (tipo, valor), que e ambiguo quando ha dois cupons do mesmo valor.
-    campanhaId: c.campanhaId || anterior?.campanhaId || null,
+    idCampanhaLoja: c.idCampanhaLoja || anterior?.idCampanhaLoja || null,
   };
   E().cupons[chave] = reg;
   salvarCuponsBase();
@@ -546,7 +546,7 @@ export function listarCuponsBase() {
 export function atualizarCupomBase(chave, campos = {}) {
   const reg = E().cupons[chave];
   if (!reg) return null;
-  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'campanhaId']) {
+  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
   }
   reg.atualizadoEm = new Date().toISOString();
@@ -1644,12 +1644,12 @@ _moduloPronto = true;
  * qual e o codigo vem daqui.
  *
  * Duas vias, nesta ordem:
- *   1. campanhaId — exato, sem ambiguidade possivel
+ *   1. idCampanhaLoja — exato, sem ambiguidade possivel
  *   2. (tipo, valor) — funciona sempre, mas empata quando ha dois cupons de
  *      mesmo percentual. No empate NAO escolhe: devolve os candidatos para a
  *      mensagem citar "CUPOM1 ou CUPOM2" e o membro testar.
  *
- * Quando a via 2 acerta em cheio (candidato unico), grava o campanhaId no
+ * Quando a via 2 acerta em cheio (candidato unico), grava o idCampanhaLoja no
  * registro. Da proxima vez o casamento ja sai pela via 1. Em caso de empate
  * nao aprende nada — gravar o id no cupom errado envenenaria a base.
  */
@@ -1662,8 +1662,8 @@ export function casarCupomDaPagina(loja, cupomPagina) {
   for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
-    if (cupomPagina.campanhaId && reg.campanhaId &&
-        String(reg.campanhaId) === String(cupomPagina.campanhaId)) porCampanha.push(reg);
+    if (cupomPagina.idCampanhaLoja && reg.idCampanhaLoja &&
+        String(reg.idCampanhaLoja) === String(cupomPagina.idCampanhaLoja)) porCampanha.push(reg);
     if (reg.tipo === cupomPagina.tipo && Number(reg.valor) === Number(cupomPagina.valor)) porValor.push(reg);
   }
 
@@ -1672,11 +1672,11 @@ export function casarCupomDaPagina(loja, cupomPagina) {
   }
   if (porValor.length === 1) {
     const reg = porValor[0];
-    if (cupomPagina.campanhaId && !reg.campanhaId) {
-      reg.campanhaId = String(cupomPagina.campanhaId);
+    if (cupomPagina.idCampanhaLoja && !reg.idCampanhaLoja) {
+      reg.idCampanhaLoja = String(cupomPagina.idCampanhaLoja);
       reg.atualizadoEm = new Date().toISOString();
       salvarCuponsBase();
-      console.log('[CUPONS] campanhaId ' + reg.campanhaId + ' aprendido para ' + reg.loja + ' ' + reg.codigo);
+      console.log('[CUPONS] idCampanhaLoja ' + reg.idCampanhaLoja + ' aprendido para ' + reg.loja + ' ' + reg.codigo);
     }
     return { reg, candidatos: porValor, via: 'valor', ambiguo: false };
   }
