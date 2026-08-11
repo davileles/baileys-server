@@ -739,7 +739,7 @@ export async function processarTextoMl(texto) {
         ? (cupom.daPagina
             ? { codigo: cupom.codigo, desconto: cupom.desconto, citado: true,
                 generico: false, daPagina: true, ambiguo: !!cupom.ambiguo,
-                semCodigo: !!cupom.semCodigo,
+                semCodigo: !!cupom.semCodigo, segmentado: !!cupom.segmentado,
                 idCampanhaLoja: cupom.idCampanhaLoja, reg: cupom.reg }
             : { codigo: cupom.reg.codigo, desconto: cupom.desconto,
                 citado: cupom.citado, generico: !!cupom.generico, daPagina: false })
@@ -1362,16 +1362,15 @@ export function resolverCupomPaginaMl(cupons, preco) {
   const conhecida = campanhaMlConhecida(p.idCampanhaLoja);
 
   if (conhecida && !conhecida.codigo) {
-    // Campanha sem codigo digitavel. Se for aberta, o desconto aparece sozinho
-    // para quem abrir o anuncio (verificado em janela anonima) e a oferta sai
-    // com o preco ja com desconto. Se for segmentada, so quem o ML escolheu ve.
-    if (conhecida.segmentado) {
-      return { cupom: null, aviso: avisoDeCupomMl(p, desconto,
-        'cupom do anúncio é segmentado por comprador', true) };
-    }
+    // Campanha sem codigo digitavel: o desconto aparece sozinho na pagina para
+    // quem for elegivel. Segmentada ou nao, a oferta e divulgada — suprimir o
+    // cupom faria quem TEM acesso perder a oferta por causa de quem nao tem.
+    // A diferenca fica no texto: campanha segmentada avisa que pode nao valer
+    // para todos, para o membro conferir no anuncio antes de contar com o preco.
     return {
-      cupom: { codigo: null, semCodigo: true, desconto,
-               idCampanhaLoja: p.idCampanhaLoja, daPagina: true, ambiguo: false, reg: null },
+      cupom: { codigo: null, semCodigo: true, segmentado: !!conhecida.segmentado,
+               desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
+               ambiguo: false, reg: null },
       aviso: null,
     };
   }
