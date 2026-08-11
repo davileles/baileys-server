@@ -739,6 +739,7 @@ export async function processarTextoMl(texto) {
         ? (cupom.daPagina
             ? { codigo: cupom.codigo, desconto: cupom.desconto, citado: true,
                 generico: false, daPagina: true, ambiguo: !!cupom.ambiguo,
+                semCodigo: !!cupom.semCodigo,
                 idCampanhaLoja: cupom.idCampanhaLoja, reg: cupom.reg }
             : { codigo: cupom.reg.codigo, desconto: cupom.desconto,
                 citado: cupom.citado, generico: !!cupom.generico, daPagina: false })
@@ -1332,6 +1333,14 @@ function descontoSeguroMl(c, preco) {
   return Math.min(Math.round(bruto * 100) / 100, preco || 0);
 }
 
+function avisoDeCupomMl(p, desconto, motivo, segmentado) {
+  return {
+    motivo, segmentado,
+    percentual: p.tipo === 'pct' ? p.valor + '%' : 'R$ ' + p.valor,
+    desconto, idCampanhaLoja: p.idCampanhaLoja, status: p.status, label: p.label,
+  };
+}
+
 /**
  * Resolve o cupom da pagina contra a base e devolve o que a mensagem precisa.
  * Nunca inventa desconto: quando o ML nao declara o valor em R$, cai para o
@@ -1347,34 +1356,57 @@ export function resolverCupomPaginaMl(cupons, preco) {
   const desconto = melhorPagina.r;
   if (!(desconto > 0)) return { cupom: null, aviso: null };
 
-  const casado = casarCupomDaPagina('Mercado Livre', p);
+  // A campanha lida do sync manda sobre o casamento por valor. Sem essa ordem,
+  // um cupom segmentado de 25% casaria com QUALQUER cupom de 25% da base e a
+  // oferta sairia com um codigo que nao e o do anuncio.
+  const conhecida = campanhaMlConhecida(p.idCampanhaLoja);
 
+  if (conhecida && !conhecida.codigo) {
+    // Campanha sem codigo digitavel. Se for aberta, o desconto aparece sozinho
+    // para quem abrir o anuncio (verificado em janela anonima) e a oferta sai
+    // com o preco ja com desconto. Se for segmentada, so quem o ML escolheu ve.
+    if (conhecida.segmentado) {
+      return { cupom: null, aviso: avisoDeCupomMl(p, desconto,
+        'cupom do anúncio é segmentado por comprador', true) };
+    }
+    return {
+      cupom: { codigo: null, semCodigo: true, desconto,
+               idCampanhaLoja: p.idCampanhaLoja, daPagina: true, ambiguo: false, reg: null },
+      aviso: null,
+    };
+  }
+
+  if (conhecida?.codigo) {
+    // Campanha conhecida e com codigo: e ESTE codigo, sem inferencia.
+    const reg = cupomPorCodigo('Mercado Livre', conhecida.codigo);
+    return {
+      cupom: { codigo: conhecida.codigo, desconto, idCampanhaLoja: p.idCampanhaLoja,
+               daPagina: true, ambiguo: false, semCodigo: false, reg },
+      aviso: null,
+    };
+  }
+
+  // Campanha desconhecida (o sync ainda nao rodou nesta instancia): cai para o
+  // casamento por (tipo, valor) contra a base.
+  const casado = casarCupomDaPagina('Mercado Livre', p);
   if (casado.ambiguo) {
     return {
       cupom: { codigo: casado.candidatos.map(r => r.codigo).join(' ou '), desconto,
                idCampanhaLoja: p.idCampanhaLoja, daPagina: true, ambiguo: true,
-               reg: casado.candidatos[0] },
+               semCodigo: false, reg: casado.candidatos[0] },
       aviso: null,
     };
   }
   if (casado.reg) {
     return {
       cupom: { codigo: casado.reg.codigo, desconto, idCampanhaLoja: p.idCampanhaLoja,
-               daPagina: true, ambiguo: false, reg: casado.reg },
+               daPagina: true, ambiguo: false, semCodigo: false, reg: casado.reg },
       aviso: null,
     };
   }
-  // Cupom no anuncio sem correspondente na base: nao ha codigo para passar ao
-  // membro, e 'redeemed' indica cupom desta conta — anunciar o preco com
-  // desconto seria prometer algo que o membro nao consegue reproduzir.
-  return {
-    cupom: null,
-    aviso: {
-      motivo: 'cupom no anúncio sem correspondente na base',
-      percentual: p.tipo === 'pct' ? p.valor + '%' : 'R$ ' + p.valor,
-      desconto, idCampanhaLoja: p.idCampanhaLoja, status: p.status, label: p.label,
-    },
-  };
+  return { cupom: null, aviso: avisoDeCupomMl(p, desconto,
+    'cupom no anúncio sem correspondente na base', false) };
+
 }
 
 // ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────
@@ -1421,6 +1453,22 @@ export async function dumpCampanhasCupomMl() {
 // entre os tres.
 
 const MARCA_TRACKING_CUPONS = '"coupons_list":[';
+
+// Campanhas do ML conhecidas, indexadas pelo id que a pagina do produto publica.
+// Alimentado pelo sync (que ja roda de hora em hora). A pagina do produto diz
+// QUE ha cupom; so a pagina de cupons diz se ele tem codigo e se e segmentado.
+// Enquanto o primeiro sync nao roda, o mapa fica vazio e o comportamento e o
+// conservador: nao aplica cupom sem codigo, avisa o operador.
+const _campanhasMl = new Map();
+
+export function campanhaMlConhecida(id) {
+  return id ? (_campanhasMl.get(String(id)) || null) : null;
+}
+export function estadoCampanhasMl() {
+  return { total: _campanhasMl.size,
+           semCodigo: [..._campanhasMl.values()].filter(c => !c.codigo).length,
+           segmentadas: [..._campanhasMl.values()].filter(c => c.segmentado).length };
+}
 
 /** Cupons da conta, a partir do payload de tracking da pagina de cupons. */
 export function extrairCuponsTrackingMl(html) {
@@ -1490,8 +1538,18 @@ export async function sincronizarCuponsContaMl() {
 
   const lidos = extrairCuponsTrackingMl(html);
   const gravados = [], semCodigo = [], inativos = [];
+  _campanhasMl.clear();
 
   for (const c of lidos) {
+    // 'collectors' preenchido = o ML escolheu a dedo quem recebe. Cupom assim
+    // nao pode ser anunciado sem codigo: o membro abre o link e nao ve o
+    // desconto. Sem collectors, a campanha vale para quem abrir o anuncio.
+    const segmentado = (c.segmentacao?.collectors || 0) > 0;
+    _campanhasMl.set(c.idCampanhaLoja, {
+      idCampanhaLoja: c.idCampanhaLoja, codigo: c.codigo, titulo: c.titulo,
+      tipo: c.tipo, valor: c.valor, minimo: c.minimo, limite: c.limite,
+      segmentado, ativoNoMl: c.ativoNoMl,
+    });
     if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
     if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
                                          tipo: c.tipo, valor: c.valor, minimo: c.minimo,
