@@ -1213,6 +1213,11 @@ export function varsDoProduto(p, cupom) {
     : p.desconto;
 
   const alertas = [];
+  // Cupom sem codigo digitavel: a linha "CUPOM" nao faz sentido (nao ha o que
+  // copiar), mas o desconto e real e aparece sozinho na pagina. Vira aviso.
+  if (cupom?.semCodigo) {
+    alertas.push('Desconto de cupom já disponível no anúncio — resgate na própria página do produto');
+  }
   if (descTotal >= 40) alertas.push(descTotal + '% de desconto');
   if (p.dealTermina) {
     alertas.push('Oferta relâmpago, termina em ' + new Date(p.dealTermina).toLocaleString('pt-BR', {
@@ -1231,7 +1236,7 @@ export function varsDoProduto(p, cupom) {
     // 'codigo' direto vence 'reg.codigo': o cupom lido do anuncio pode nao ter
     // um registro unico (dois cupons de mesmo percentual viram "A ou B") e
     // precisa mandar o rotulo pronto para a mensagem.
-    cupom: cupom ? (cupom.codigo || cupom.reg?.codigo || '') : '',
+    cupom: (cupom && !cupom.semCodigo) ? (cupom.codigo || cupom.reg?.codigo || '') : '',
     cupom_desconto: cupom ? brl(cupom.desconto) : '',
     alerta: alertas.join('. '),
     link: p.link || '',
