@@ -135,8 +135,24 @@ async function avisarTokenMlCaiu(motivo) {
 
 // Sincroniza os cupons do ML de hora em hora. Cupom esgotado que continua ativo
 // na base faz o radar anunciar preco que nao se aplica no checkout.
+// Alimenta o mapa de campanhas do ML (radar-ml.js), que vive em memoria e por
+// isso zera a cada redeploy. Sem esta passada o mapa fica vazio em producao e
+// todo cupom sem codigo digitavel cai no caminho conservador: a oferta sai pelo
+// preco cheio. Roda junto do sync de cupons — mesmo gatilho, fonte diferente.
+async function sincronizarCampanhasMlAgendado() {
+  if (!tokenAffOk()) return;
+  try {
+    const r = await sincronizarCuponsContaMl();
+    console.log('[CAMPANHAS-ML] Sync agendado — ' + (r.campanhas?.total || 0) +
+      ' campanha(s) no mapa, ' + (r.gravados || []).length + ' cupom(ns) na base.');
+  } catch (e) { console.warn('[CAMPANHAS-ML] Sync agendado — erro:', e.message); }
+}
+
 async function sincronizarCuponsMlAgendado() {
   if (!tokenAffOk()) return;
+  // O mapa de campanhas nao depende do resultado abaixo: roda antes e em
+  // separado para que uma falha do sync antigo nao deixe o mapa vazio.
+  sincronizarCampanhasMlAgendado().catch(() => {});
   try {
     const r = await fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/cupons/sync-ml', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
@@ -172,6 +188,9 @@ async function sincronizarCuponsMlAgendado() {
 }
 setInterval(sincronizarCuponsMlAgendado, 60 * 60 * 1000);
 setTimeout(sincronizarCuponsMlAgendado, 120000);   // primeira passada apos o boot
+// O mapa de campanhas e pre-requisito para aplicar cupom sem codigo, entao nao
+// espera os 2 minutos do sync de cupons: sobe assim que o socket estabiliza.
+setTimeout(() => sincronizarCampanhasMlAgendado().catch(() => {}), 20000);
 
 // Verifica no boot e a cada 30 min. Frequencia alta de proposito: o custo de
 // uma chamada e irrelevante perto de descobrir tarde que o radar parou.
