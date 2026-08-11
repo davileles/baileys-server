@@ -122,6 +122,26 @@ export function validarPrecoDe(candidato, preco, opcoes = {}) {
  * @param {{preco:number, candidatos:Array<{fonte:string, valor:*}>, descontoDeclarado?:number, rotulo?:string}} ctx
  * @returns {{precoDe:number|null, fonte:string|null, desconto:number, verificado:boolean, descartes:Array}}
  */
+// ── LOG AGREGADO DE DESCARTE ────────────────────────────────────────────────
+// Um passe de feed avalia milhares de produtos e a maioria cai aqui: preco de
+// menor ou igual ao atual e o resultado NORMAL, nao um erro. Uma linha por
+// produto estourava o teto de 500 logs/s do Railway e derrubava o log do
+// processo INTEIRO — inclusive o de qualquer worker rodando junto. Emite no
+// maximo uma linha a cada 30s, com a contagem do que foi suprimido.
+const DESCARTE_INTERVALO_MS = 30000;
+let _descarteSuprimidos = 0;
+let _descarteUltimoLog  = 0;
+
+function logDescarte(msg) {
+  const agora = Date.now();
+  if (agora - _descarteUltimoLog < DESCARTE_INTERVALO_MS) { _descarteSuprimidos++; return; }
+  _descarteUltimoLog = agora;
+  const extra = _descarteSuprimidos
+    ? ' (+' + _descarteSuprimidos + ' descarte(s) suprimido(s) nos ultimos 30s)' : '';
+  _descarteSuprimidos = 0;
+  console.warn(msg + extra);
+}
+
 export function resolverPrecoDe(ctx = {}) {
   const preco = Number(ctx.preco);
   const lista = (ctx.candidatos || []).filter(c => c && c.valor !== null && c.valor !== undefined && c.valor !== '');
@@ -142,8 +162,8 @@ export function resolverPrecoDe(ctx = {}) {
   }
 
   if (descartes.length) {
-    console.warn('[PRECO-DE] ' + rotulo + 'nenhuma fonte aprovada: ' +
-                 descartes.map(d => d.fonte + '=' + d.valor + ' (' + d.motivo + ')').join('; '));
+    logDescarte('[PRECO-DE] ' + rotulo + 'nenhuma fonte aprovada: ' +
+                descartes.map(d => d.fonte + '=' + d.valor + ' (' + d.motivo + ')').join('; '));
   }
   return { precoDe: null, fonte: null, desconto: 0, verificado: false, descartes };
 }
