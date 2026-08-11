@@ -865,6 +865,19 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
 // Timestamp do último envio — persiste entre execuções do worker
 let ultimoEnvioMs = 0;
 
+// ── PONTO UNICO DE SAIDA ─────────────────────────────────────────────────────
+// A fila de ofertas e o worker de campanha disputam o mesmo socket. Sem isto,
+// uma oferta aprovada no meio de um disparo de campanha sai colada na mensagem
+// anterior — duas mensagens no mesmo segundo pelo mesmo numero. Toda saida passa
+// por esta cadeia de promessas: nunca ha dois sendMessage simultaneos.
+let _cadeiaSaida = Promise.resolve();
+function saidaSerializada(fn) {
+  const proxima = _cadeiaSaida.then(fn, fn);
+  // O catch mantem a cadeia viva depois de um erro; quem chamou recebe a rejeicao.
+  _cadeiaSaida = proxima.catch(() => {});
+  return proxima;
+}
+
 async function workerFila() {
   if (workerRodando) return;
   workerRodando = true;
@@ -898,7 +911,7 @@ async function workerFila() {
     if (!item) break;
     try {
       console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
-      await enviarMensagem(item.destino, { text: item.mensagem });
+      await saidaSerializada(() => enviarMensagem(item.destino, { text: item.mensagem }));
       filaEnvio.shift();
       ultimoEnvioMs = Date.now(); // registra timestamp do envio
 
@@ -3990,6 +4003,10 @@ async function conectar() {
           continue;
         }
         if (msg.message) errosDescripto = 0; // decifrou com sucesso → sessão saudável
+        // Campanha: resposta de um contato cancela o follow-up dele na hora.
+        // Sem isto o sistema cobra quem ja respondeu — o pior erro possivel
+        // numa campanha de recuperacao.
+        campanhaMarcarResposta(msg).catch(() => {});
         // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos = paralelo
         const jid = msg.key?.remoteJid;
         if (jid) {
@@ -4008,6 +4025,334 @@ async function conectar() {
     if (delay >= 0) _agendarReconexao(delay);
   }
 }
+
+// ── WORKER DE CAMPANHAS DE WHATSAPP ──────────────────────────────────────────
+// Disparo individual para lista propria (nao e grupo). Le a campanha 'ativa' do
+// proxy CDV, respeita janela/teto/intervalo e grava o status de volta a cada
+// envio. So liga se CAMPANHAS_KEY existir no ambiente — a variavel e o
+// kill switch: sem ela o modulo inteiro fica inerte.
+const CAMPANHAS_KEY = process.env.CAMPANHAS_KEY || '';
+const CAMP_LOG = (...a) => console.log('[CAMPANHA]', ...a);
+
+let _campCicloRodando  = false;
+let _campErrosSeguidos = 0;
+let _campDesdeAPausa   = 0;
+let _campPausaAte      = 0;
+let _campUltimoEnvioMs = 0;
+let _campIntervaloAlvo = 0;
+const _campMidiaCache  = new Map();   // arquivo -> Buffer (carregado uma vez)
+let _campJids          = new Map();   // jid -> { campanhaId, contatoId }
+
+function campHeaders() {
+  return { 'Content-Type': 'application/json', 'X-CDV-Op': CAMPANHAS_KEY };
+}
+async function campApi(rota, metodo, corpo) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 20000);
+  try {
+    const r = await fetch(CDV_PROXY_URL + rota, {
+      method: metodo || 'GET',
+      headers: campHeaders(),
+      body: corpo ? JSON.stringify(corpo) : undefined,
+      signal: ctrl.signal
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.erro || ('status ' + r.status));
+    return d;
+  } finally { clearTimeout(t); }
+}
+
+// ── Tempo ────────────────────────────────────────────────────────────────────
+function campPartesSP(ts) {
+  const p = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: TZ_SP, weekday: 'short', year: 'numeric', month: '2-digit',
+    day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false
+  }).formatToParts(new Date(ts || Date.now()));
+  const g = t => (p.find(x => x.type === t) || {}).value;
+  return {
+    dia: `${g('year')}-${g('month')}-${g('day')}`,
+    minutos: parseInt(g('hour'), 10) * 60 + parseInt(g('minute'), 10),
+    semana: String(g('weekday') || '').toLowerCase()
+  };
+}
+function campHhmmParaMin(hhmm) {
+  const [h, m] = String(hhmm || '').split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+function campDentroDaJanela(cfg) {
+  const { minutos, semana } = campPartesSP();
+  if (cfg.diasUteisApenas && /^(s[áa]b|dom)/.test(semana)) return false;
+  const janelas = Array.isArray(cfg.janelas) ? cfg.janelas : [];
+  if (!janelas.length) return false;
+  return janelas.some(j => minutos >= campHhmmParaMin(j[0]) && minutos < campHhmmParaMin(j[1]));
+}
+// Conta pelos carimbos gravados nos contatos, nao por contador em memoria: o
+// Railway reinicia o processo e o teto do dia nao pode zerar junto.
+function campEnviosHoje(camp) {
+  const hoje = campPartesSP().dia;
+  return (camp.contatos || []).filter(c => {
+    const ts = c.followupEm || c.enviadoEm;
+    return ts && campPartesSP(Date.parse(ts)).dia === hoje;
+  }).length;
+}
+function campAleatorio(min, max) {
+  return Math.floor(min + Math.random() * Math.max(0, max - min));
+}
+
+// ── Variaveis e spintax (mesma regra da previa no gerador) ───────────────────
+function campResolver(txt, ct) {
+  let t = String(txt || '');
+  t = t.replace(/\{([^{}]*\|[^{}]*)\}/g, (_, g) => {
+    let partes = g.split('|');
+    // {rotulo|opcao A|opcao B} — o primeiro pedaco e so rotulo, sai do sorteio
+    if (partes.length > 2 && /^[a-zA-Z0-9_]+$/.test(partes[0].trim())) partes = partes.slice(1);
+    return partes[Math.floor(Math.random() * partes.length)];
+  });
+  t = t.replace(/\{([a-zA-Z0-9_]+)\}/g, (m, k) =>
+    (ct && ct[k] !== undefined && ct[k] !== null && ct[k] !== '') ? String(ct[k]) : m);
+  return t;
+}
+
+async function campMidia(arquivo) {
+  if (_campMidiaCache.has(arquivo)) return _campMidiaCache.get(arquivo);
+  const d = await campApi('/campanhas/midia/' + encodeURIComponent(arquivo));
+  const buf = Buffer.from(d.base64, 'base64');
+  _campMidiaCache.set(arquivo, { buffer: buf, mime: d.mime || 'image/png' });
+  return _campMidiaCache.get(arquivo);
+}
+
+async function campPatchContato(campanhaId, contatoId, patch) {
+  try {
+    await campApi('/campanhas/contato', 'POST', { campanhaId, contatoId, patch });
+  } catch (e) {
+    CAMP_LOG('Falha ao gravar status de ' + contatoId + ':', e.message);
+  }
+}
+
+// ── Envio de um contato ──────────────────────────────────────────────────────
+async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
+  const cfg = camp.config || {};
+
+  // Numero invalido nao consome tentativa: vira erro e sai da fila.
+  if (cfg.verificarNumeroAntes !== false) {
+    let existe = false;
+    try {
+      const r = await sock.onWhatsApp(ct.telefone);
+      existe = Array.isArray(r) && r.length > 0 && r[0].exists;
+    } catch (e) {
+      throw new Error('onWhatsApp falhou: ' + e.message);
+    }
+    if (!existe) {
+      await campPatchContato(camp.id, ct.id, { status: 'erro', erro: 'numero sem WhatsApp' });
+      CAMP_LOG('✗ ' + ct.nome + ' — numero sem WhatsApp.');
+      return { enviado: false, contabiliza: false };
+    }
+  }
+
+  const [dMin, dMax] = cfg.delayEntreMensagensSegundos || [20, 40];
+  const blocos = mensagem.blocos || [];
+  for (let i = 0; i < blocos.length; i++) {
+    const b = blocos[i];
+    let conteudo;
+    if (b.tipo === 'imagem') {
+      if (!b.arquivo) continue;
+      const m = await campMidia(b.arquivo);
+      conteudo = { image: m.buffer, mimetype: m.mime };
+      if (b.legenda) conteudo.caption = campResolver(b.legenda, ct);
+    } else {
+      const txt = campResolver(b.conteudo, ct).trim();
+      if (!txt) continue;
+      conteudo = { text: txt };
+    }
+    // Passa pela mesma cadeia da fila de ofertas: nunca dois envios ao mesmo tempo
+    await saidaSerializada(() => enviarMensagem(ct.jid, conteudo));
+    if (i < blocos.length - 1) {
+      await new Promise(r => setTimeout(r, campAleatorio(dMin * 1000, dMax * 1000)));
+    }
+  }
+
+  const agora = new Date().toISOString();
+  await campPatchContato(camp.id, ct.id, ehFollowup
+    ? { followupEm: agora }
+    : { status: 'enviado', enviadoEm: agora, erro: null, tentativasEnvio: (ct.tentativasEnvio || 0) + 1 });
+
+  ultimoEnvioMs = Date.now();       // a fila de ofertas respeita o mesmo espacamento
+  _campUltimoEnvioMs = Date.now();
+  CAMP_LOG((ehFollowup ? '↻ follow-up' : '✓ enviado') + ' — ' + ct.nome);
+  return { enviado: true, contabiliza: true };
+}
+
+// ── Escolha do proximo alvo ──────────────────────────────────────────────────
+function campProximoAlvo(camp) {
+  const fila = (camp.contatos || []).find(c => c.status === 'fila');
+  if (fila) {
+    const msg = (camp.mensagens || []).find(m => m.id === fila.mensagemId)
+             || (camp.mensagens || []).find(m => m.segmento === fila.segmento)
+             || (camp.mensagens || []).find(m => m.segmento === '*');
+    return msg ? { ct: fila, mensagem: msg, followup: false } : null;
+  }
+  const f = camp.config && camp.config.followup;
+  if (!f || !f.ativo || !f.variante) return null;
+  const limite = Date.now() - (f.aposDias || 3) * 86400000;
+  const alvo = (camp.contatos || []).find(c =>
+    c.status === 'enviado' && !c.respondidoEm && !c.followupEm &&
+    c.enviadoEm && Date.parse(c.enviadoEm) < limite);
+  if (!alvo) return null;
+  const msg = (camp.mensagens || []).find(m => m.id === f.variante);
+  return msg ? { ct: alvo, mensagem: msg, followup: true } : null;
+}
+
+// ── Ciclo de 1 minuto ────────────────────────────────────────────────────────
+async function campanhaCiclo() {
+  if (_campCicloRodando) return;
+  _campCicloRodando = true;
+  try {
+    const { campanha: camp } = await campApi('/campanhas/ativa');
+    if (!camp) { _campJids = new Map(); return; }
+
+    // Mapa de JIDs para o hook de resposta, refeito a cada ciclo
+    const mapa = new Map();
+    (camp.contatos || []).forEach(c => {
+      if (c.jid && c.status !== 'respondido' && c.status !== 'optout') {
+        mapa.set(c.jid, { campanhaId: camp.id, contatoId: c.id });
+      }
+    });
+    _campJids = mapa;
+
+    const cfg = camp.config || {};
+    if (Date.now() < _campPausaAte) return;
+    if (!campDentroDaJanela(cfg)) return;
+
+    const hoje = campEnviosHoje(camp);
+    if (hoje >= (cfg.limiteDiario || 15)) return;
+
+    // Intervalo aleatorio, sorteado uma vez por envio — cadencia regular e padrao detectavel
+    if (!_campIntervaloAlvo) {
+      _campIntervaloAlvo = campAleatorio(
+        (cfg.intervaloMinSegundos || 180) * 1000,
+        (cfg.intervaloMaxSegundos || 480) * 1000);
+    }
+    if (_campUltimoEnvioMs && Date.now() - _campUltimoEnvioMs < _campIntervaloAlvo) return;
+    // A fila de ofertas tambem conta: se uma oferta acabou de sair, espera
+    if (ultimoEnvioMs && Date.now() - ultimoEnvioMs < _campIntervaloAlvo) return;
+
+    const alvo = campProximoAlvo(camp);
+    if (!alvo) {
+      if (!(camp.contatos || []).some(c => c.status === 'fila')) {
+        CAMP_LOG('Fila vazia — concluindo "' + camp.nome + '".');
+        await campApi('/campanhas/status', 'POST', { campanhaId: camp.id, status: 'concluida' });
+      }
+      return;
+    }
+
+    try { await aguardarConectado(120000); }
+    catch (e) { CAMP_LOG('Sem conexao:', e.message); return; }
+
+    try {
+      const r = await campEnviarContato(camp, alvo.ct, alvo.mensagem, alvo.followup);
+      _campErrosSeguidos = 0;
+      _campIntervaloAlvo = 0;
+      if (r.contabiliza) {
+        _campDesdeAPausa++;
+        const cada = cfg.pausaLongaACada || 0;
+        if (cada && _campDesdeAPausa >= cada) {
+          const [pMin, pMax] = cfg.pausaLongaMinutos || [20, 30];
+          const ms = campAleatorio(pMin * 60000, pMax * 60000);
+          _campPausaAte = Date.now() + ms;
+          _campDesdeAPausa = 0;
+          CAMP_LOG('Pausa longa de ' + Math.round(ms / 60000) + ' min apos ' + cada + ' envios.');
+        }
+      }
+    } catch (e) {
+      _campErrosSeguidos++;
+      _campIntervaloAlvo = 0;
+      CAMP_LOG('✗ Erro em ' + alvo.ct.nome + ': ' + e.message + ' (' + _campErrosSeguidos + ' seguido(s))');
+      await campPatchContato(camp.id, alvo.ct.id, {
+        status: 'erro', erro: e.message, tentativasEnvio: (alvo.ct.tentativasEnvio || 0) + 1 });
+      // Erros em sequencia = sessao quebrada ou bloqueio. Para tudo e avisa.
+      if (_campErrosSeguidos >= (cfg.pararSeErrosSeguidos || 3)) {
+        CAMP_LOG('PARANDO: ' + _campErrosSeguidos + ' erros seguidos.');
+        await campApi('/campanhas/status', 'POST', { campanhaId: camp.id, status: 'pausada' }).catch(() => {});
+        _campErrosSeguidos = 0;
+      }
+    }
+  } catch (e) {
+    CAMP_LOG('Ciclo falhou:', e.message);
+  } finally {
+    _campCicloRodando = false;
+  }
+}
+
+// ── Hook de resposta (chamado do messages.upsert) ────────────────────────────
+async function campanhaMarcarResposta(msg) {
+  if (!CAMPANHAS_KEY) return;
+  const jid = msg?.key?.remoteJid;
+  if (!jid || msg.key.fromMe || jid.endsWith('@g.us')) return;
+  const ref = _campJids.get(jid);
+  if (!ref) return;
+  _campJids.delete(jid);   // uma vez so: as proximas mensagens dele nao reescrevem
+  CAMP_LOG('↩ resposta de ' + jid.split('@')[0] + ' — follow-up cancelado.');
+  await campPatchContato(ref.campanhaId, ref.contatoId, {
+    status: 'respondido', respondidoEm: new Date().toISOString() });
+}
+
+if (CAMPANHAS_KEY) {
+  setInterval(() => { campanhaCiclo().catch(() => {}); }, 60000);
+  CAMP_LOG('Worker ligado (ciclo de 1 min).');
+} else {
+  CAMP_LOG('Worker desligado — CAMPANHAS_KEY nao definida.');
+}
+
+// ── Rotas de campanha ────────────────────────────────────────────────────────
+function campRotaAutorizada(req, res) {
+  if (!CAMPANHAS_KEY) { res.status(503).json({ ok: false, erro: 'CAMPANHAS_KEY nao definida' }); return false; }
+  if ((req.headers['x-cdv-op'] || '') !== CAMPANHAS_KEY) { res.status(401).json({ ok: false, erro: 'nao autorizado' }); return false; }
+  return true;
+}
+
+app.post('/campanha/iniciar', async (req, res) => {
+  if (!campRotaAutorizada(req, res)) return;
+  const { campanhaId } = req.body || {};
+  if (!campanhaId) return res.status(400).json({ ok: false, erro: 'campanhaId obrigatorio' });
+  try {
+    await campApi('/campanhas/status', 'POST', { campanhaId, status: 'ativa' });
+    _campErrosSeguidos = 0; _campPausaAte = 0; _campIntervaloAlvo = 0;
+    campanhaCiclo().catch(() => {});
+    res.json({ ok: true, status: 'ativa' });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+app.post('/campanha/pausar', async (req, res) => {
+  if (!campRotaAutorizada(req, res)) return;
+  const { campanhaId } = req.body || {};
+  if (!campanhaId) return res.status(400).json({ ok: false, erro: 'campanhaId obrigatorio' });
+  try {
+    await campApi('/campanhas/status', 'POST', { campanhaId, status: 'pausada' });
+    res.json({ ok: true, status: 'pausada' });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+app.get('/campanha/status', async (req, res) => {
+  if (!campRotaAutorizada(req, res)) return;
+  try {
+    const { campanha } = await campApi('/campanhas/ativa');
+    if (!campanha) return res.json({ ok: true, ativa: null });
+    const por = { fila: 0, enviado: 0, respondido: 0, erro: 0, optout: 0 };
+    (campanha.contatos || []).forEach(c => { if (por[c.status] !== undefined) por[c.status]++; });
+    res.json({
+      ok: true,
+      ativa: { id: campanha.id, nome: campanha.nome },
+      contadores: por,
+      enviosHoje: campEnviosHoje(campanha),
+      limiteDiario: (campanha.config || {}).limiteDiario || null,
+      dentroDaJanela: campDentroDaJanela(campanha.config || {}),
+      pausaLongaAte: _campPausaAte > Date.now() ? new Date(_campPausaAte).toISOString() : null,
+      errosSeguidos: _campErrosSeguidos,
+      whatsappConectado: !!conectado
+    });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
 
 // ── CSS DO PAINEL ─────────────────────────────────────────────────────────────
 const PAINEL_CSS = `*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#0d0d0d;color:#f0f0f0;min-height:100vh}header{background:#111;border-bottom:1px solid #222;padding:16px 24px;display:flex;align-items:center;justify-content:space-between}header h1{font-size:18px;color:#ffa500}header .nav a{color:#aaa;text-decoration:none;margin-left:16px;font-size:14px}header .nav a:hover{color:#ffa500}.container{max-width:960px;margin:0 auto;padding:24px 16px}.badge{background:#ffa500;color:#000;font-size:11px;font-weight:700;padding:2px 7px;border-radius:10px;margin-left:6px}.empty{text-align:center;color:#555;padding:60px 0;font-size:15px}.card{background:#161616;border:1px solid #222;border-radius:12px;margin-bottom:16px;overflow:hidden}.card-header{padding:12px 16px;background:#1a1a1a;border-bottom:1px solid #222;display:flex;align-items:center;gap:8px;font-size:13px;color:#aaa;flex-wrap:wrap}.card-header .id{color:#ffa500;font-weight:700;font-size:14px}.tag{background:#252525;padding:2px 8px;border-radius:6px;font-size:11px}.tag-iv{background:#1a2e1a;color:#22c55e}.tag-ida{background:#1a1f2e;color:#60a5fa}.tag-exec{background:#2e1a2e;color:#c084fc}.tag-eco{background:#1a2020;color:#67e8f9}.tag-tsp{background:#2e1a00;color:#ffa500}.card-body{display:grid;grid-template-columns:1fr 1fr}.col{padding:16px}.col+.col{border-left:1px solid #222}.col-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:#444;margin-bottom:10px}.imgs-grid{display:flex;flex-wrap:wrap;gap:8px}.imgs-grid img{width:calc(50% - 4px);min-width:120px;border-radius:8px;object-fit:cover}.imgs-grid img:only-child{width:100%}.texto-orig{font-size:13px;color:#888;white-space:pre-wrap;word-break:break-word;margin-top:8px}.edit-area{width:100%;background:#0d0d0d;color:#f0f0f0;border:1px solid #2a2a2a;border-radius:8px;padding:12px;font-size:13px;font-family:inherit;line-height:1.7;resize:vertical;min-height:200px}.edit-area:focus{outline:none;border-color:#444}.card-footer{padding:12px 16px;border-top:1px solid #1a1a1a;display:flex;gap:10px;align-items:center;flex-wrap:wrap}.btn{padding:8px 20px;border-radius:8px;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}.btn:hover{opacity:.8}.btn-ap{background:#22c55e;color:#000}.btn-rej{background:#333;color:#aaa}.ok-ap{color:#22c55e;font-size:13px}.ok-rej{color:#555;font-size:13px}.buffer-bar{background:#1a1400;border:1px solid #3a2e00;border-radius:8px;padding:10px 16px;font-size:13px;color:#ffa500;margin-bottom:16px}.sep{color:#333;font-size:12px;text-transform:uppercase;letter-spacing:1px;margin:28px 0 12px}.tg-bar{background:#0d1a2e;border:1px solid #1a3a5e;border-radius:8px;padding:10px 16px;font-size:13px;margin-bottom:16px;display:flex;align-items:center;gap:8px}.tg-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}.tg-dot-on{background:#22c55e}.tg-dot-off{background:#555}.tg-dot-wait{background:#ffa500}@media(max-width:600px){.card-body{grid-template-columns:1fr}.col+.col{border-left:none;border-top:1px solid #1a1a1a}.imgs-grid img{width:100%}}`;
