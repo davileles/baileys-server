@@ -1097,3 +1097,119 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
   }
   return { prontos, descartados };
 }
+
+// ── DIAGNOSTICO DE CUPOM NA PAGINA DO PRODUTO ─────────────────────────────
+// Passo 1 da leitura de cupom no PDP. Aqui nao ha parser nem casamento com a
+// base: a funcao so despeja tudo que a pagina fala sobre cupom, para que o
+// parser definitivo (extrairCupomMl) seja escrito contra o formato REAL em vez
+// de contra um chute sobre nomes de chave.
+//
+// Tres frentes, porque o ML pode publicar o cupom em qualquer uma delas:
+//   1. JSON-LD  — contrato estavel, mas raramente carrega promocao
+//   2. estado embutido (__PRELOADED_STATE__ / __NEXT_DATA__) — onde o cupom
+//      costuma viver, inclusive com codigo que a tela nao mostra
+//   3. DOM/texto — a pilula visivel ("R$ 20 OFF com cupom")
+//
+// A query string e preservada inteira de proposito: pdp_filters=deal%3A... muda
+// o preco exibido, e dropar isso faria o diagnostico ler o preco cheio.
+
+const JANELA_CUPOM = 400;   // chars de contexto ao redor de cada ocorrencia
+const MAX_OCORRENCIAS = 40; // teto para a resposta nao virar um dump de 2 MB
+
+function janelasDeTexto(texto, regex, janela = JANELA_CUPOM, max = MAX_OCORRENCIAS) {
+  const achados = [];
+  const re = new RegExp(regex.source, regex.flags.includes('g') ? regex.flags : regex.flags + 'g');
+  let m;
+  while ((m = re.exec(texto)) !== null && achados.length < max) {
+    const ini = Math.max(0, m.index - janela);
+    const fim = Math.min(texto.length, m.index + m[0].length + janela);
+    achados.push({ pos: m.index, trecho: texto.slice(ini, fim) });
+    if (m.index === re.lastIndex) re.lastIndex++;
+  }
+  return achados;
+}
+
+/**
+ * Despeja tudo que a pagina do produto diz sobre cupom.
+ * Retorna tambem o preco lido, para conferir se o JSON-LD ja vem com o cupom
+ * abatido — se vier, subtrair de novo publicaria um preco inexistente.
+ */
+export async function dumpCupomMl(url) {
+  const cookie = cookieAff();
+  if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+
+  let alvo = String(url || '').trim();
+  if (!alvo) throw new Error('passe a url do produto');
+  if (!idDeUrl(alvo)) {
+    try { alvo = await resolverEncurtadorMl(alvo); } catch (e) { /* segue com a original */ }
+  }
+
+  const res = await fetch(alvo, {
+    headers: {
+      'Cookie': cookie,
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(25000),
+  });
+  const html = await res.text();
+
+  // Se caiu na tela antibot, todo o resto do dump seria lixo — avisa e para.
+  const bloqueado = /suspicious-traffic|Para continuar, confirme que|captcha/i.test(html);
+
+  // ── Frente 1: JSON-LD ───────────────────────────────────────────────────
+  const ld = extrairLdProduto(html);
+  const oferta = ld?.offers ? (Array.isArray(ld.offers) ? ld.offers[0] : ld.offers) : null;
+  const ldBrutos = [];
+  for (const m of html.matchAll(REGEX_LD_JSON)) {
+    if (/cupom|coupon/i.test(m[1])) ldBrutos.push(m[1].trim().slice(0, 3000));
+  }
+
+  // ── Frente 2: estado embutido ───────────────────────────────────────────
+  // Nomes de chave que contenham "coupon"/"cupom" revelam o schema sem precisar
+  // parsear o estado inteiro, que passa facil de 1 MB.
+  const chaves = [...new Set(
+    [...html.matchAll(/"([A-Za-z0-9_]*(?:coupon|cupom)[A-Za-z0-9_]*)"\s*:/gi)].map(m => m[1])
+  )].slice(0, 60);
+
+  const ocorrenciasJson = janelasDeTexto(html, /"[A-Za-z0-9_]*(?:coupon|cupom)[A-Za-z0-9_]*"\s*:/i);
+
+  // ── Frente 3: texto visivel ─────────────────────────────────────────────
+  const textoVisivel = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const ocorrenciasTexto = janelasDeTexto(textoVisivel, /cupom|coupon/i, 200, 20);
+
+  // Percentuais/valores anunciados perto da palavra cupom — o sinal que o
+  // casamento por (tipo, valor) vai usar caso o codigo nao apareca.
+  const sinais = [...new Set([
+    ...[...textoVisivel.matchAll(/(\d{1,2})\s*%\s*(?:OFF|de desconto)[^.]{0,40}cupom/gi)].map(m => m[1] + '%'),
+    ...[...textoVisivel.matchAll(/cupom[^.]{0,40}?(\d{1,2})\s*%/gi)].map(m => m[1] + '%'),
+    ...[...textoVisivel.matchAll(/R\$\s?([\d.,]+)\s*(?:OFF|de desconto)[^.]{0,40}cupom/gi)].map(m => 'R$ ' + m[1]),
+    ...[...textoVisivel.matchAll(/cupom[^.]{0,40}?R\$\s?([\d.,]+)/gi)].map(m => 'R$ ' + m[1]),
+  ])];
+
+  return {
+    url: alvo,
+    id: idDeUrl(alvo),
+    httpStatus: res.status,
+    bloqueado,
+    tamanhoHtml: html.length,
+    // Confere a armadilha do preco: se este valor ja estiver com cupom abatido,
+    // o parser NAO pode subtrair de novo.
+    precoLdJson: Number(oferta?.price ?? oferta?.lowPrice) || null,
+    descontoDeclarado: descontoDeclaradoNoHtml(html),
+    temPalavraCupom: /cupom|coupon/i.test(html),
+    chavesJsonComCupom: chaves,
+    sinaisDeValor: sinais,
+    jsonLdComCupom: ldBrutos,
+    ocorrenciasJson,
+    ocorrenciasTexto,
+  };
+}
