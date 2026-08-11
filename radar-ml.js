@@ -1522,55 +1522,73 @@ export function extrairCuponsTrackingMl(html) {
 export async function sincronizarCuponsContaMl() {
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
-  const res = await fetch(URL_CUPONS_ML, {
-    headers: {
-      'Cookie': cookie,
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'pt-BR,pt;q=0.9',
-    },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(25000),
-  });
-  const html = await res.text();
-  if (/suspicious-traffic|captcha/i.test(html)) throw new Error('pagina de cupons bloqueada (antibot)');
 
-  const lidos = extrairCuponsTrackingMl(html);
-  const gravados = [], semCodigo = [], inativos = [];
+  const buscar = async (url) => {
+    const res = await fetch(url, {
+      headers: {
+        'Cookie': cookie,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(25000),
+    });
+    const html = await res.text();
+    if (/suspicious-traffic|captcha/i.test(html)) throw new Error('pagina de cupons bloqueada (antibot)');
+    return html;
+  };
+
+  // Duas varreduras com papeis diferentes:
+  //   /active — SEUS cupons. Vai para a base, porque e de la que sai o codigo
+  //             que o membro digita.
+  //   filtros — catalogo mais amplo do ML. NAO vai para a base (encheria de
+  //             cupom que nao e seu), mas alimenta o mapa de campanhas: e como
+  //             descobrimos se a campanha que o anuncio cita tem codigo ou e
+  //             segmentada. O PDP continua sendo o filtro de elegibilidade —
+  //             ele so mostra cupom que se aplica a esta conta.
   _campanhasMl.clear();
+  const gravados = [], semCodigo = [], inativos = [], fontes = [];
 
-  for (const c of lidos) {
-    // 'collectors' preenchido = o ML escolheu a dedo quem recebe. Cupom assim
-    // nao pode ser anunciado sem codigo: o membro abre o link e nao ve o
-    // desconto. Sem collectors, a campanha vale para quem abrir o anuncio.
-    const segmentado = (c.segmentacao?.collectors || 0) > 0;
+  const registrarNoMapa = (c) => {
+    const anterior = _campanhasMl.get(c.idCampanhaLoja);
+    // Um mesmo cupom pode aparecer em varios filtros; fica a versao com codigo.
+    if (anterior && anterior.codigo && !c.codigo) return;
     _campanhasMl.set(c.idCampanhaLoja, {
       idCampanhaLoja: c.idCampanhaLoja, codigo: c.codigo, titulo: c.titulo,
       tipo: c.tipo, valor: c.valor, minimo: c.minimo, limite: c.limite,
-      segmentado, ativoNoMl: c.ativoNoMl,
+      segmentado: (c.segmentacao?.collectors || 0) > 0, ativoNoMl: c.ativoNoMl,
     });
-    if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
-    if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
-                                         tipo: c.tipo, valor: c.valor, minimo: c.minimo,
-                                         limite: c.limite, validadeAte: c.validadeAte,
-                                         segmentacao: c.segmentacao, criadoPor: c.criadoPor }); continue; }
-    const reg = registrarCupomBase({
-      loja: 'Mercado Livre',
-      codigo: c.codigo,
-      tipo: c.tipo,
-      valor: c.valor,
-      minimo: c.minimo,
-      limite: c.limite,
-      maximo: null,
-      validadeAte: c.validadeAte,
-      idCampanhaLoja: c.idCampanhaLoja,
-    });
-    if (reg) gravados.push({ codigo: reg.codigo, idCampanhaLoja: reg.idCampanhaLoja,
-                             tipo: reg.tipo, valor: reg.valor,
-                             minimo: reg.minimo, limite: reg.limite,
-                             validadeAte: reg.validadeAte });
+  };
+
+  for (const url of FILTROS_CUPONS_ML) {
+    const ehAtivos = url.endsWith('/cupons/active');
+    try {
+      const lidos = extrairCuponsTrackingMl(await buscar(url));
+      for (const c of lidos) {
+        registrarNoMapa(c);
+        if (!ehAtivos) continue;            // filtros so alimentam o mapa
+        if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
+        if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
+                                             tipo: c.tipo, valor: c.valor, minimo: c.minimo,
+                                             limite: c.limite, validadeAte: c.validadeAte,
+                                             segmentacao: c.segmentacao, criadoPor: c.criadoPor }); continue; }
+        const reg = registrarCupomBase({
+          loja: 'Mercado Livre', codigo: c.codigo, tipo: c.tipo, valor: c.valor,
+          minimo: c.minimo, limite: c.limite, maximo: null,
+          validadeAte: c.validadeAte, idCampanhaLoja: c.idCampanhaLoja,
+        });
+        if (reg) gravados.push({ codigo: reg.codigo, idCampanhaLoja: reg.idCampanhaLoja,
+                                 tipo: reg.tipo, valor: reg.valor, minimo: reg.minimo,
+                                 limite: reg.limite, validadeAte: reg.validadeAte });
+      }
+      fontes.push({ url, lidos: lidos.length });
+    } catch (e) { fontes.push({ url, erro: e.message }); }
+    await new Promise(r => setTimeout(r, 600));
   }
+
   console.log('[CUPONS-ML] ' + gravados.length + ' gravados, ' + semCodigo.length +
-              ' sem codigo, ' + inativos.length + ' inativos');
-  return { lidos: lidos.length, gravados, semCodigo, inativos };
+              ' sem codigo, ' + inativos.length + ' inativos, ' +
+              _campanhasMl.size + ' campanhas no mapa');
+  return { gravados, semCodigo, inativos, fontes, campanhas: estadoCampanhasMl() };
 }
