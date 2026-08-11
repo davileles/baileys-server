@@ -518,7 +518,12 @@ export function registrarCupomBase(c) {
     observacao: c.observacao || null,
     capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
     atualizadoEm: new Date(agora).toISOString(),
-    validadeAte: new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
+    // Quando a fonte declara a expiracao real (o ML publica expiration_date em
+    // cada cupom da conta), ela vence o padrao de 24h — que existe so para
+    // cupom capturado de grupo, onde nao ha prazo confiavel.
+    validadeAte: c.validadeAte && !isNaN(new Date(c.validadeAte))
+      ? new Date(c.validadeAte).toISOString()
+      : new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
     // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
     ativo: anterior ? anterior.ativo !== false : true,
     // Id da campanha do ML, aprendido ao casar com o cupom que a pagina do
