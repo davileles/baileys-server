@@ -6471,6 +6471,39 @@ app.post('/vitrine/nomes', async (req, res) => {
   res.json({ ok:true, ...r });
 });
 
+// Previa do disparo: monta as mensagens exatamente como sairiam, mas NAO envia
+// nem enfileira. Existe porque ate aqui a unica forma de ver o resultado de uma
+// lista era dispara-la de verdade — e cupom e preco so sao resolvidos no momento
+// do envio, entao o operador montava a lista as cegas.
+// ?cupom=auto escolhe o melhor cupom aplicavel; sem o parametro, usa o cupom
+// vinculado a cada item. Aceita ?asins=A,B,C para limitar a alguns produtos.
+app.post('/vitrine/previa', async (req, res) => {
+  try {
+    const filtro = String(req.body?.asins || req.query.asins || '').split(',')
+      .map(x => x.trim()).filter(Boolean);
+    const cupom = req.body?.cupom ?? req.query.cupom ?? null;
+    const itens = listarVitrine()
+      .filter(i => i.loja === 'Mercado Livre')
+      .filter(i => !filtro.length || filtro.includes(String(i.asin)));
+    if (!itens.length) return res.json({ ok:true, total:0, prontos:[], descartados:[],
+                                         aviso:'nenhum item do Mercado Livre na vitrine' });
+    if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
+
+    const m = await montarOfertasMlVitrine(itens, cupom);
+    res.json({
+      ok: true,
+      total: itens.length,
+      cupomPedido: cupom,
+      prontos: (m.prontos || []).map(o => ({
+        asin: o.asin, nome: o.nome,
+        preco: o.produto?.preco, precoDe: o.produto?.precoDe, precoFinal: o.precoFinal,
+        cupom: o.cupom, avisoCupom: o.avisoCupom, mensagem: o.mensagem,
+      })),
+      descartados: m.descartados || [],
+    });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.get('/vitrine', (req, res) => {
   const itens = listarVitrine();
   // O painel precisa do TTL para avisar quando o preco da Magalu venceu — a
