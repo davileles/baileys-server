@@ -106,7 +106,7 @@ import {
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
-  resolverLinhaVitrineMl, montarOfertasMlVitrine,
+  resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -6579,6 +6579,14 @@ app.get('/ml/item', async (req, res) => {
 
 app.post('/ml/testar', async (req, res) => {
   try { res.json({ ok:true, resultados: await processarTextoMl(req.body?.texto || '') }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Diagnostico: despeja tudo que a pagina do produto fala sobre cupom, para
+// escrever o parser contra o formato real. Nao aplica desconto nem publica nada.
+app.get('/ml/diagnostico-cupom', async (req, res) => {
+  if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
+  try { res.json({ ok:true, ...await dumpCupomMl(req.query.url) }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
