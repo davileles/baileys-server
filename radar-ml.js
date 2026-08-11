@@ -1100,11 +1100,22 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     if (!p.preco)      { descartados.push({ asin: salvo.asin, nome, motivo: 'sem preco na pagina' }); continue; }
     if (!p.disponivel) { descartados.push({ asin: salvo.asin, nome, motivo: 'produto pausado ou sem estoque' }); continue; }
 
-    // Cupom do disparo vence o vinculado; sem nenhum dos dois, vai sem cupom.
+    // Cupom do disparo vence o vinculado; sem nenhum dos dois, entra o do anuncio.
     const codigo = codigoCupom || salvo.cupom || null;
     let cupom = null, avisoCupom = null;
-    // 'auto': o melhor cupom do ML vigente que atenda o preco deste produto.
-    if (codigo === 'auto') {
+
+    // O cupom que o proprio anuncio declara. Vale para 'auto' e para o disparo
+    // sem cupom escolhido — nos dois casos ninguem nomeou um cupom especifico, e
+    // o anuncio e a fonte mais confiavel: o ML ja conferiu categoria, vendedor e
+    // teto para ESTE item. Um codigo escolhido a mao pelo operador nao e
+    // sobrescrito: ali a decisao e dele.
+    const daPagina = (!codigo || codigo === 'auto')
+      ? resolverCupomPaginaMl(dados.cuponsPagina, p.preco)
+      : { cupom: null, aviso: null };
+
+    if (daPagina.cupom) {
+      cupom = daPagina.cupom;
+    } else if (codigo === 'auto') {
       const m = melhorCupomAplicavel('Mercado Livre', p.preco);
       if (m) cupom = { reg: m.reg, desconto: m.desconto, citado: true };
       else avisoCupom = 'nenhum cupom do Mercado Livre vigente se aplica a este preco';
@@ -1119,9 +1130,17 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
       }
     }
 
+    if (!cupom && daPagina.aviso) avisoCupom = daPagina.aviso.motivo +
+      ' (' + daPagina.aviso.percentual + ')';
+
     prontos.push({
       asin: salvo.asin, nome, produto: p,
-      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
+      cupom: cupom
+        ? { codigo: cupom.codigo ?? cupom.reg?.codigo ?? null, desconto: cupom.desconto,
+            daPagina: !!cupom.daPagina, semCodigo: !!cupom.semCodigo,
+            segmentado: !!cupom.segmentado, naoResgatado: !!cupom.naoResgatado,
+            ambiguo: !!cupom.ambiguo, idCampanhaLoja: cupom.idCampanhaLoja || null }
+        : null,
       avisoCupom,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaMl(p, { cupom }),
