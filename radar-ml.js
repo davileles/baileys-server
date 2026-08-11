@@ -193,24 +193,6 @@ export function idProdutoMl(url) {
   return m ? m[1].toUpperCase() : idDeUrl(s);
 }
 
-/** Extrai a URL do produto destacado numa pagina de perfil de afiliado. */
-export function produtoDeLinkSocialMl(html) {
-  // Ancora estavel: o CTA "Ir para produto" do card em destaque. Contar
-  // ocorrencias de MLB no HTML nao serve — a pagina lista recomendacoes.
-  const bloco = html.match(/"id"\s*:\s*"show_product"[\s\S]{0,400}?"url"\s*:\s*"([^"]+)"/i);
-  if (bloco) {
-    const u = bloco[1].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
-    return /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
-  }
-  // Reserva: o primeiro polycard traz product_id e a url canonica.
-  const meta = html.match(/"product_id"\s*:\s*"(MLB\d{6,})"[\s\S]{0,200}?"url"\s*:\s*"([^"]+)"/i);
-  if (meta) {
-    const u = meta[2].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
-    return /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
-  }
-  return null;
-}
-
 /**
  * Converte qualquer um dos tres formatos na URL da pagina do produto.
  *
@@ -226,20 +208,8 @@ export async function resolverLinkMl(url) {
   if (RE_ENCURTADOR_ML.test(alvo)) alvo = await resolverEncurtadorMl(alvo);
 
   if (RE_SOCIAL_ML.test(alvo)) {
-    const cookie = cookieAff();
-    const res = await fetch(alvo, {
-      headers: {
-        ...(cookie ? { 'Cookie': cookie } : {}),
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9',
-      },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(25000),
-    });
-    const html = await res.text();
-    const doProduto = produtoDeLinkSocialMl(html);
-    if (doProduto) return doProduto;
+    const prod = await produtoDePerfilSocial(alvo);
+    if (prod?.url) return prod.url;
     throw new Error('link de perfil de afiliado sem produto identificavel');
   }
   return alvo;
@@ -269,12 +239,14 @@ export async function extrairIdsMl(texto) {
     .map(u => u.replace(/[)\]}.,;!]+$/, ''));
   const ids = new Set();
   for (const url of urls) {
-    let id = idDeUrl(url);
+    // idProdutoMl reconhece tambem o catalogo unificado (/up/MLBU), que o
+    // idDeUrl ignora — sem isso o link era descartado antes de virar oferta.
+    let id = idProdutoMl(url);
     if (!id) {
-      try { id = idDeUrl(await resolverEncurtadorMl(url)); }
+      try { id = idProdutoMl(await resolverLinkMl(url)); }
       catch (e) { console.warn('[ML] Falha ao resolver', url, '-', e.message); }
     }
-    if (id) ids.add(id); else console.warn('[ML] Sem MLB para', url);
+    if (id) ids.add(id); else console.warn('[ML] Sem id de produto para', url);
   }
   return [...ids];
 }
@@ -667,8 +639,19 @@ export async function produtoDePerfilSocial(urlSocial) {
   // Ancora principal: o titulo declarado pelo proprio ML para a pagina.
   const tituloAlvo = (html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']+)/i) || [])[1] || null;
 
-  // O link do botao "Ir para produto". Aceita as duas formas de URL de item.
-  const candidatos = [...html.matchAll(/href=["']([^"']*\/(?:MLB-\d{6,}[^"'?]*|p\/MLB\d{6,})[^"']*)["']/gi)]
+  // Ancora mais confiavel: o bloco JSON do CTA "Ir para produto", que traz a
+  // URL canonica do item em destaque. Os href do HTML sao o plano B — a pagina
+  // lista recomendacoes, e escolher entre elas depende do desempate por titulo.
+  const cta = html.match(/"id"\s*:\s*"show_product"[\s\S]{0,400}?"url"\s*:\s*"([^"]+)"/i);
+  if (cta) {
+    const u = cta[1].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
+    const abs = /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
+    return { url: abs, titulo: tituloAlvo };
+  }
+
+  // O link do botao "Ir para produto". Aceita item, catalogo (/p/) e catalogo
+  // unificado (/up/MLBU) — este ultimo faltava e derrubava o link inteiro.
+  const candidatos = [...html.matchAll(/href=["']([^"']*\/(?:MLB-\d{6,}[^"'?]*|p\/MLB\d{6,}|up\/MLBU\d{6,})[^"']*)["']/gi)]
     .map(m => m[1]);
   if (!candidatos.length) return null;
 
@@ -716,8 +699,8 @@ export async function processarTextoMl(texto) {
   const canonicas = [];
   for (const u of urls) {
     let alvo = u;
-    if (!idDeUrl(alvo)) {
-      try { alvo = await resolverEncurtadorMl(alvo); }
+    if (!idProdutoMl(alvo)) {
+      try { alvo = await resolverLinkMl(alvo); }
       catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); continue; }
     }
     // Caiu num perfil social de outro afiliado: extrai o produto do topo.
@@ -729,8 +712,8 @@ export async function processarTextoMl(texto) {
         alvo = prod.url;
       } catch (e) { console.warn('[ML] Falha no perfil social:', e.message); continue; }
     }
-    if (idDeUrl(alvo)) canonicas.push(urlCanonicaMl(alvo));
-    else console.warn('[ML] Sem MLB apos resolver:', u);
+    if (idProdutoMl(alvo)) canonicas.push(urlCanonicaMl(alvo));
+    else console.warn('[ML] Sem id de produto apos resolver:', u);
   }
   if (!canonicas.length) return [];
 
