@@ -1506,6 +1506,18 @@ export async function dumpCampanhasCupomMl() {
 
 const MARCA_TRACKING_CUPONS = '"coupons_list":[';
 
+// Codigo digitavel de cupom do ML: alfanumerico, curto, sem separadores
+// (OFFMELI, HORADOCUPOM, COMPRINHASPRACASA). As paginas de FILTRO devolvem em
+// 'code' um token opaco de resgate — base64 de ~88 chars com '_', '-' e '=' —
+// que NAO e digitavel e nao pode ser anunciado como cupom. Sem esta checagem a
+// mensagem sairia com o token inteiro no lugar do codigo.
+const REGEX_CODIGO_CUPOM_ML = /^[A-Z0-9]{3,25}$/i;
+
+function codigoCupomValidoMl(codigo) {
+  const c = String(codigo || '').trim();
+  return REGEX_CODIGO_CUPOM_ML.test(c) ? c.toUpperCase() : null;
+}
+
 // Campanhas do ML conhecidas, indexadas pelo id que a pagina do produto publica.
 // Alimentado pelo sync (que ja roda de hora em hora). A pagina do produto diz
 // QUE ha cupom; so a pagina de cupons diz se ele tem codigo e se e segmentado.
@@ -1545,7 +1557,7 @@ export function extrairCuponsTrackingMl(html) {
       if (!valor) continue;
       porCampanha.set(String(c.campaign_id), {
         idCampanhaLoja: String(c.campaign_id),
-        codigo: String(c.code || '').trim() || null,
+        codigo: codigoCupomValidoMl(c.code),
         titulo: c.title || null,
         tipo: pct ? 'pct' : 'reais',
         valor,
