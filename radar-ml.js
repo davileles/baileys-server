@@ -1403,8 +1403,24 @@ export function resolverCupomPaginaMl(cupons, preco) {
       aviso: null,
     };
   }
+  // Campanha que nao aparece em NENHUM dos filtros de cupom da conta. Todo
+  // cupom com codigo aplicavel a esta conta passa por /cupons/active, entao uma
+  // campanha ausente da varredura inteira nao tem codigo para digitar: e
+  // promocao do item ou do vendedor, que aplica sozinha para quem abrir o
+  // anuncio. Tratada como aberta.
+  //
+  // A trava e o mapa estar populado: logo apos um redeploy ele esta vazio e
+  // 'desconhecida' nao significa nada, entao ali o comportamento volta a ser o
+  // conservador — avisa o operador e a oferta sai pelo preco cheio.
+  if (_campanhasMl.size > 0) {
+    return {
+      cupom: { codigo: null, semCodigo: true, segmentado: false, desconto,
+               idCampanhaLoja: p.idCampanhaLoja, daPagina: true, ambiguo: false, reg: null },
+      aviso: null,
+    };
+  }
   return { cupom: null, aviso: avisoDeCupomMl(p, desconto,
-    'cupom no anúncio sem correspondente na base', false) };
+    'cupom no anúncio e mapa de campanhas ainda vazio (sync não rodou)', false) };
 
 }
 
