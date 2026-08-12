@@ -84,6 +84,15 @@ function podar() {
     .slice(0, MAX_ITENS);
 }
 
+// A URL que vem do radar e dimensionada para o thumbnail do WhatsApp: a Amazon
+// entrega _SL160_, que num card de 212px em tela retina fica visivelmente
+// borrado. O mesmo caminho serve tamanhos maiores trocando o sufixo, e 400px
+// custa ~7KB. Se a variante nao existir, o onerror do site tira a imagem.
+function imagemParaVitrine(url) {
+  if (!url) return null;
+  return url.replace(/\._SL\d+_\./, '._SL400_.');
+}
+
 function num(v) {
   const n = Number(v);
   return isFinite(n) && n > 0 ? n : null;
@@ -107,7 +116,7 @@ export function registrarPublicacao(oferta, grupos = 0) {
       loja:       d.loja || '',
       titulo:     String(d.titulo).slice(0, 180),
       link:       d.link,
-      imagem:     d.imagemUrl || null,
+      imagem:     imagemParaVitrine(d.imagemUrl),
       preco:      num(d.precoFinal ?? d.preco),
       precoDe:    num(d.precoDe),
       desconto:   num(d.desconto),
