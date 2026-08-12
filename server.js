@@ -4147,6 +4147,27 @@ async function conectar() {
       try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author); }
       catch(e) { console.error('[MEMBROS] Erro no handler:', e.message); }
     });
+    // Grupo novo (criado agora ou em que a conta acabou de entrar). Sem isto o
+    // cache NOMES_GRUPOS so era preenchido em connection==='open', entao grupo
+    // criado depois da conexao ficava invisivel em GET /grupos ate reconectar.
+    sock.ev.on('groups.upsert', (grupos) => {
+      try {
+        for (const g of (grupos || [])) {
+          if (!g?.id) continue;
+          NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
+          console.log('[GRUPOS] Novo grupo no cache: ' + (g.subject || g.id));
+        }
+      } catch(e) { console.error('[GRUPOS] Erro no handler de upsert:', e.message); }
+    });
+    // Renomeacao de grupo: mantem o nome do cache alinhado com o WhatsApp.
+    sock.ev.on('groups.update', (grupos) => {
+      try {
+        for (const g of (grupos || [])) {
+          if (!g?.id || !g.subject) continue;
+          NOMES_GRUPOS.set(g.id, g.subject);
+        }
+      } catch(e) { console.error('[GRUPOS] Erro no handler de update:', e.message); }
+    });
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       // Diagnostico: registra o evento CRU, antes de qualquer filtro. Sem isso
       // nao da para distinguir "socket nao recebe nada" de "recebe e descarta".
