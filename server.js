@@ -6253,11 +6253,37 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
            aviso:o.avisoCupom || null, preco:o.produto.preco };
 }
 
-function iniciarExecucaoLista(lista) {
+// "09:00" -> epoch ms do proximo instante HOJE, no fuso de SP. Devolve null se a
+// hora nao for valida, e um instante ja passado quando o horario ficou para tras
+// (quem chama decide se cai para "agora").
+function tsHojeSP(hhmm) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(hhmm || '').trim());
+  if (!m) return null;
+  const agora = new Date();
+  const p = {};
+  new Intl.DateTimeFormat('en-US', { timeZone: TZ_SP, year:'numeric', month:'2-digit', day:'2-digit',
+                                     hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false })
+    .formatToParts(agora).forEach(x => { p[x.type] = x.value; });
+  // Relogio de SP lido como se fosse UTC menos o instante real = deslocamento do fuso.
+  const spComoUTC = Date.UTC(+p.year, +p.month - 1, +p.day, (+p.hour) % 24, +p.minute, +p.second);
+  const offset    = spComoUTC - (agora.getTime() - agora.getMilliseconds());
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +m[1], +m[2], 0) - offset;
+}
+
+function horaSP(ts) {
+  return new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour:'2-digit', minute:'2-digit', hour12:false })
+    .format(new Date(ts));
+}
+
+// iniciarEm no futuro apenas empurra o primeiro item: o worker so acorda listas
+// cujo proximoEm ja venceu, entao "agendado" e "em disparo" usam a mesma maquina.
+function iniciarExecucaoLista(lista, iniciarEm) {
+  const alvo = Number(iniciarEm) > Date.now() ? Number(iniciarEm) : Date.now();
   return atualizarExecucaoLista(lista.id, {
     iniciadaEm: new Date().toISOString(),
     indice: 0,
-    proximoEm: Date.now(),          // primeiro sai na hora
+    proximoEm: alvo,                // agora, ou a hora marcada para hoje
+    agendadoPara: alvo > Date.now() ? alvo : null,
     pausada: false,
     enviados: [], falhas: [], pulados: [],
   });
@@ -6372,15 +6398,24 @@ app.post('/listas/:id/disparar', async (req, res) => {
   if (!lista) return res.status(404).json({ ok:false, erro:'lista nao encontrada' });
   if (lista.execucao) return res.status(409).json({ ok:false, erro:'esta lista ja esta em disparo' });
   if (!lista.produtos?.length) return res.status(400).json({ ok:false, erro:'lista sem produtos' });
-  if (!conectado || !sock) {
+
+  // iniciarHora ('HH:MM', fuso de SP) adia o primeiro item para mais tarde HOJE.
+  const inicio    = tsHojeSP(req.body?.iniciarHora);
+  const aguardando = inicio !== null && inicio > Date.now();
+
+  // Fila que so comeca daqui a horas nao precisa do WhatsApp ligado agora: o
+  // worker adia sozinho enquanto a sessao nao volta.
+  if (!aguardando && (!conectado || !sock)) {
     const ok = await aguardarSock(10000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
-  const atualizada = iniciarExecucaoLista(lista);
+  const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
   const minutos = (lista.produtos.length - 1) * lista.intervaloMin;
-  console.log('[LISTA] "' + lista.nome + '" iniciada manualmente — ' + lista.produtos.length
-    + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
-  res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos });
+  console.log('[LISTA] "' + lista.nome + '" ' + (aguardando ? 'agendada para ' + horaSP(inicio) + ' SP' : 'iniciada manualmente')
+    + ' — ' + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
+  res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos,
+             aguardando, iniciarEm: aguardando ? inicio : Date.now(),
+             iniciaAs: horaSP(aguardando ? inicio : Date.now()) });
 });
 
 // Envio unico: mesma maquina de disparo das listas salvas, so que o registro e
@@ -6389,7 +6424,13 @@ app.post('/listas/:id/disparar', async (req, res) => {
 app.post('/listas/disparo-unico', async (req, res) => {
   const produtos = Array.isArray(req.body?.produtos) ? req.body.produtos.filter(Boolean) : [];
   if (!produtos.length) return res.status(400).json({ ok:false, erro:'selecione ao menos um produto' });
-  if (!conectado || !sock) {
+
+  // Hora de inicio opcional, sempre do MESMO dia: cadastrar de madrugada e deixar
+  // a fila comecar as 9h. Horario ja vencido cai para agora, sem barrar o envio.
+  const inicio     = tsHojeSP(req.body?.iniciarHora);
+  const aguardando = inicio !== null && inicio > Date.now();
+
+  if (!aguardando && (!conectado || !sock)) {
     const ok = await aguardarSock(10000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
@@ -6397,7 +6438,8 @@ app.post('/listas/disparo-unico', async (req, res) => {
   const agora = new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, day:'2-digit', month:'2-digit',
                                                    hour:'2-digit', minute:'2-digit' }).format(new Date());
   const lista = salvarLista({
-    nome: String(req.body?.nome || '').trim() || ('Envio único · ' + agora),
+    nome: String(req.body?.nome || '').trim()
+       || ('Envio único · ' + agora + (aguardando ? ' · começa ' + horaSP(inicio) : '')),
     produtos,
     intervaloMin: req.body?.intervaloMin,
     cupomModo: req.body?.cupomModo,
@@ -6407,11 +6449,13 @@ app.post('/listas/disparo-unico', async (req, res) => {
   });
 
   try {
-    const atualizada = iniciarExecucaoLista(lista);
-    console.log('[LISTA] Envio unico iniciado — ' + produtos.length + ' produto(s), '
-      + lista.intervaloMin + ' min de intervalo.');
+    const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
+    console.log('[LISTA] Envio unico ' + (aguardando ? 'agendado para ' + horaSP(inicio) + ' SP' : 'iniciado')
+      + ' — ' + produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
     res.json({ ok:true, lista: atualizada, produtos: produtos.length,
-               duracaoMin: (produtos.length - 1) * lista.intervaloMin });
+               duracaoMin: (produtos.length - 1) * lista.intervaloMin,
+               aguardando, iniciarEm: aguardando ? inicio : Date.now(),
+               iniciaAs: horaSP(aguardando ? inicio : Date.now()) });
   } catch (e) {
     removerLista(lista.id);
     res.status(500).json({ ok:false, erro:e.message });
