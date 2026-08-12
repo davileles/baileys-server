@@ -531,6 +531,10 @@ export function registrarCupomBase(c) {
     // reaparecer num grupo apagaria o vinculo e o casamento voltaria a ser
     // por (tipo, valor), que e ambiguo quando ha dois cupons do mesmo valor.
     idCampanhaLoja: c.idCampanhaLoja || anterior?.idCampanhaLoja || null,
+    // Marca que o cupom ja foi visto (ou aceito) na conta da loja. Precisa
+    // sobreviver a recaptura: sem isso o sync do ML trata todo cupom conhecido
+    // como "nunca ativado" e nunca desativa nada.
+    confirmadoNoMl: c.confirmadoNoMl === true || anterior?.confirmadoNoMl === true,
   };
   E().cupons[chave] = reg;
   salvarCuponsBase();
@@ -546,7 +550,7 @@ export function listarCuponsBase() {
 export function atualizarCupomBase(chave, campos = {}) {
   const reg = E().cupons[chave];
   if (!reg) return null;
-  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja']) {
+  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja', 'confirmadoNoMl']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
   }
   reg.atualizadoEm = new Date().toISOString();
