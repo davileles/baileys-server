@@ -6390,6 +6390,50 @@ function iniciarExecucaoLista(lista, iniciarEm) {
   });
 }
 
+// ── JANELA DE ENVIO DAS LISTAS ───────────────────────────────────────────────
+// O monitor tem janelas proprias (podeCapturar) que governam a CAPTURA de links
+// nos grupos-fonte. O disparo de listas era outra maquina, sem hora limite: uma
+// fila de 36 itens a 20 min comecando as 08:00 termina as 20:21, fora de
+// qualquer janela. Agora a fila respeita horario — fora da janela ela ADIA o
+// item, sem consumir, e retoma na proxima abertura.
+// Padrao configuravel por env LISTA_JANELAS ('08:00-20:00' ou '08:00-12:00,14:00-20:00').
+const LISTA_JANELAS_PADRAO = (() => {
+  const js = String(process.env.LISTA_JANELAS || '08:00-20:00').split(',').map(p => {
+    const m = p.trim().match(/^([01]\d|2[0-3]):([0-5]\d)\s*-\s*([01]\d|2[0-3]):([0-5]\d)$/);
+    return m ? { inicio: m[1] + ':' + m[2], fim: m[3] + ':' + m[4] } : null;
+  }).filter(Boolean);
+  return js.length ? js : [{ inicio: '08:00', fim: '20:00' }];
+})();
+
+/** Janelas efetivas da lista: as proprias, ou o padrao do servidor. */
+function janelasDaLista(lista) {
+  const js = Array.isArray(lista?.janelas)
+    ? lista.janelas.filter(j => j && j.inicio && j.fim) : [];
+  return js.length ? js : LISTA_JANELAS_PADRAO;
+}
+
+/**
+ * { ok:true } quando pode enviar agora; { ok:false, proximoEm } com o timestamp
+ * da proxima abertura (hoje ou amanha) quando esta fora. Fila 24h continua
+ * possivel: basta configurar a janela 00:00-23:59.
+ */
+function janelaEnvioLista(lista) {
+  const janelas = janelasDaLista(lista);
+  const agora   = campPartesSP().minutos;
+  for (const j of janelas) {
+    const ini = campHhmmParaMin(j.inicio);
+    const fim = campHhmmParaMin(j.fim);
+    // Janela que vira a meia-noite (22:00-02:00) e um bloco unico partido em dois.
+    const dentro = ini <= fim ? (agora >= ini && agora <= fim) : (agora >= ini || agora <= fim);
+    if (dentro) return { ok: true, janelas: janelas.map(j2 => j2.inicio + '-' + j2.fim).join(', ') };
+  }
+  const inicios = janelas.map(j => campHhmmParaMin(j.inicio)).sort((a, b) => a - b);
+  const proximo = inicios.find(m => m > agora);
+  const faltam  = proximo !== undefined ? (proximo - agora) : (1440 - agora + inicios[0]);
+  return { ok: false, proximoEm: Date.now() + faltam * 60000 + 5000,
+           janelas: janelas.map(j => j.inicio + '-' + j.fim).join(', ') };
+}
+
 // Worker: acorda a cada 15s e envia o proximo produto de cada lista cuja hora
 // chegou. Uma lista por vez dentro do tick — se duas vencerem juntas, a segunda
 // espera o proximo ciclo, evitando dois envios no mesmo segundo.
@@ -6424,6 +6468,17 @@ setInterval(async () => {
       // Sem WhatsApp nao adianta consumir a fila: adia sem gastar o item.
       ex.proximoEm = Date.now() + 60000;
       atualizarExecucaoLista(lista.id, ex);
+      return;
+    }
+
+    // Fora da janela de envio: adia sem gastar o item. Uma fila longa demais
+    // pausa no fim do dia e retoma na abertura seguinte, em vez de varar a noite.
+    const _jan = janelaEnvioLista(lista);
+    if (!_jan.ok) {
+      ex.proximoEm = _jan.proximoEm;
+      atualizarExecucaoLista(lista.id, ex);
+      console.log('[LISTA] "' + lista.nome + '" fora da janela (' + _jan.janelas + ' SP) — item '
+        + (ex.indice + 1) + '/' + lista.produtos.length + ' adiado para ' + relogioSP(_jan.proximoEm) + '.');
       return;
     }
 
@@ -6477,6 +6532,10 @@ app.get('/listas', (req, res) => {
                                           loja: itemVitrine(a)?.loja || null,
                                           sumiu: !itemVitrine(a) })),
     restantes: l.execucao ? Math.max(0, l.produtos.length - l.execucao.indice) : null,
+    // Janelas efetivas (proprias ou padrao do servidor) para o painel exibir
+    // por que uma fila em andamento pode estar parada.
+    janelasEfetivas: janelasDaLista(l),
+    dentroDaJanela: janelaEnvioLista(l).ok,
   }));
   res.json({ ok:true, total: listas.length, listas,
              agoraSP: new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()) });
