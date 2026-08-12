@@ -2184,6 +2184,31 @@ async function avisarExtracaoFalhou(texto, canal) {
 // na base, gate de auto-envio e envio (ou fila). Antes isso vivia dentro do
 // processador do Telegram; extrair evita que uma segunda fonte reimplemente as
 // mesmas regras de seguranca com sutis diferencas.
+// Ativa na conta do ML um cupom recem-capturado, como o botao "Inserir codigo"
+// da pagina de cupons. Chamada sem await de proposito: o envio aos grupos nao
+// pode depender do ML responder.
+//
+// Recusa NAO desativa o cupom aqui. Essa decisao continua com o sync horario,
+// que tem a pagina inteira como contexto — uma resposta isolada pode ser rate
+// limit ou cupom segmentado, e desativar na captura derrubaria oferta valida.
+function ativarCupomCapturadoMl(c, reg) {
+  if (!c || c.loja !== 'Mercado Livre' || !c.codigo) return;
+  if (!tokenAffOk()) return;
+  ativarCupomMl(c.codigo).then(r => {
+    if (r.ok || r.jaTinha) {
+      // Marca o que o sync usa para nao tratar o cupom como "nunca ativado".
+      if (reg?.chave) { try { atualizarCupomBase(reg.chave, { confirmadoNoMl: true }); } catch(e) {} }
+      console.log('[CUPONS-ML] ' + c.codigo + (r.jaTinha ? ' ja estava na conta.' : ' ativado na conta na captura.'));
+    } else if (r.invalido) {
+      console.warn('[CUPONS-ML] ' + c.codigo + ' recusado pelo ML na captura: ' +
+        (r.mensagem || 'sem detalhe') + ' — o sync horario decide se desativa.');
+    } else {
+      console.warn('[CUPONS-ML] Resposta inesperada ao ativar ' + c.codigo + ' na captura: ' +
+        (r.mensagem || r.status));
+    }
+  }).catch(e => console.warn('[CUPONS-ML] Falha ao ativar ' + c.codigo + ' na captura: ' + e.message));
+}
+
 async function enfileirarCupomTSP(c, ctx = {}) {
   const {
     origem = 'desconhecida',
@@ -2219,7 +2244,13 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   registrarCupomVisto(c);
   // Mesmo ponto, mesma garantia: o cupom entra na base antes de qualquer
   // envio, para ja estar disponivel quando uma oferta do radar chegar.
-  try { registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
+  let regBase = null;
+  try { regBase = registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
+  // Cupom capturado de grupo so vale nas SUAS compras depois de ativado na
+  // conta. O sync horario ja faz isso, mas ate ele rodar o cupom fica anunciado
+  // sem estar aplicavel. Aqui a janela fecha na hora — sem await, porque o
+  // disparo nos grupos nao pode esperar pelo ML nem falhar por causa dele.
+  ativarCupomCapturadoMl(c, regBase);
 
   const veredito = avaliarAutoEnvio(c, textoOriginal, tinhaMultiplos, codigosLista);
   const rotulo   = `${nomeLojaExibicao(c.loja)} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
