@@ -1598,6 +1598,17 @@ export function salvarLista(dados = {}) {
   // reagendar numa lista que nao vai existir amanha.
   const efemera = dados.efemera !== undefined ? !!dados.efemera : !!ant.efemera;
 
+  // Janelas de envio no fuso de SP: [{inicio:'08:00', fim:'20:00'}]. Nulo/vazio
+  // = usa o padrao do servidor (LISTA_JANELAS). Fora delas o worker adia o item
+  // em vez de consumir a fila fora de hora.
+  const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  const janelasBrutas = dados.janelas !== undefined
+    ? (Array.isArray(dados.janelas) ? dados.janelas : [])
+    : (Array.isArray(ant.janelas) ? ant.janelas : []);
+  const janelas = janelasBrutas
+    .map(j => ({ inicio: String(j?.inicio || ''), fim: String(j?.fim || '') }))
+    .filter(j => HHMM.test(j.inicio) && HHMM.test(j.fim));
+
   const ag = dados.agenda !== undefined ? (dados.agenda || {}) : (ant.agenda || {});
   const agenda = {
     ativo: !efemera && !!ag.ativo,
@@ -1616,6 +1627,7 @@ export function salvarLista(dados = {}) {
     cupomCodigo: modo === 'fixo'
       ? String(dados.cupomCodigo || ant.cupomCodigo || '').trim().toUpperCase() : null,
     agenda,
+    janelas: janelas.length ? janelas : null,
     ativo: dados.ativo !== undefined ? !!dados.ativo : (ant.ativo !== false),
     execucao: ant.execucao || null,
     ultimoDisparo: ant.ultimoDisparo || null,
