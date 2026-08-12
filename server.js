@@ -8255,7 +8255,7 @@ app.listen(PORT, () => {
 
 // Vitrine publica: carrega o historico do disco e liga a varredura periodica
 // que mantem dados/feed.json e dados/cupons.json em dia no repositorio.
-iniciarFeedPublico();
+iniciarFeedPublico({ resolverLink: linkDoCupomTSP });
 
 // Bot de criacao manual no Telegram. As funcoes reais do servidor sao injetadas
 // para o bot nao guardar copia de nenhuma regra: o cupom criado no celular sai
