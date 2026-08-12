@@ -44,6 +44,11 @@ import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
 } from './sync-github.js';
 
+// ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
+import {
+  iniciarFeedPublico, registrarPublicacao, publicarAgora, estadoFeedPublico,
+} from './feed-publico.js';
+
 // ── CONFIG DA OPERACAO TSP (editavel pelo painel) ─────────────────────────────
 import {
   carregarConfigTsp, configTsp, salvarConfigTsp,
@@ -1996,6 +2001,10 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
     }
   }
   if (!enviados.length) throw new Error('Nenhum grupo recebeu a oferta.');
+  // Vitrine publica: so entra o que realmente saiu em algum grupo. Chamada aqui
+  // (e nao nos dois callers) para cobrir tanto o auto-envio quanto a aprovacao
+  // manual pelo painel, sem risco de um dos caminhos ficar de fora.
+  if (oferta) registrarPublicacao(oferta, enviados.length);
   return { enviados, falhas };
 }
 
@@ -3470,6 +3479,7 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
+  'publicadas.json',        // historico da vitrine publica
   'contas',                 // credenciais dos numeros secundarios de envio
 ]);
 
@@ -3716,6 +3726,9 @@ async function processarRadarMarketplace(jid, texto) {
         precoDe: p.precoDe,
         desconto: p.desconto,
         link: p.link,
+        // URL original da imagem: a vitrine publica precisa de um endereco
+        // hotlinkavel, e o base64 de oferta.imagens so serve ao WhatsApp.
+        imagemUrl: p.imagemUrl || null,
         vendedor: p.vendedor,
         ehDeal: p.ehDeal,
         cupom: r.cupom || null,
@@ -7022,6 +7035,19 @@ app.delete('/cupons/base/:chave', (req, res) => {
   res.json({ ok:true });
 });
 
+// ── VITRINE PUBLICA ──────────────────────────────────────────────────────────
+// O site publico le arquivos estaticos no repositorio; estes endpoints existem
+// para o operador conferir o estado e forcar uma republicacao sem esperar o
+// ciclo de 30 minutos (util depois de corrigir um cupom a mao).
+app.get('/publico/estado', (req, res) => {
+  res.json({ ok: true, ...estadoFeedPublico() });
+});
+
+app.post('/publico/publicar', async (req, res) => {
+  const r = await publicarAgora();
+  res.status(r.ok ? 200 : 500).json(r);
+});
+
 // Diagnostico: descobre quais recursos a Creators API aceita para um ASIN.
 app.post('/mkt/sonda', async (req, res) => {
   try {
@@ -8226,6 +8252,10 @@ app.get('/historico-seats/rotas', (req, res) => {
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
+
+// Vitrine publica: carrega o historico do disco e liga a varredura periodica
+// que mantem dados/feed.json e dados/cupons.json em dia no repositorio.
+iniciarFeedPublico();
 
 // Bot de criacao manual no Telegram. As funcoes reais do servidor sao injetadas
 // para o bot nao guardar copia de nenhuma regra: o cupom criado no celular sai
