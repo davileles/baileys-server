@@ -49,6 +49,11 @@ let _timer = null;
 let _ultimoErro = null;
 let _ultimaPublicacao = null;
 
+// Resolvedor do link de resgate, injetado pelo server no boot. E a MESMA funcao
+// que monta o "resgate o cupom aqui" da mensagem do WhatsApp — importar daqui
+// criaria ciclo de modulos, entao ela chega por parametro.
+let _resolverLink = null;
+
 // ── ESTADO LOCAL ─────────────────────────────────────────────────────────────
 
 export function carregarPublicadas() {
@@ -145,6 +150,11 @@ function obsPublica(obs) {
   return t && !OBS_INTERNAS.has(t.toLowerCase()) ? t : null;
 }
 
+function linkDaLoja(loja, codigo) {
+  if (!_resolverLink) return null;
+  try { return _resolverLink(loja, codigo) || null; } catch { return null; }
+}
+
 function montarCupons() {
   const itens = listarCuponsBase()
     .filter(cupomVigente)
@@ -158,6 +168,9 @@ function montarCupons() {
       limite:     c.limite ?? null,     // teto do desconto (so em percentual)
       observacao: obsPublica(c.observacao),
       validadeAte: c.validadeAte,
+      // Link de afiliado da loja. Sem link o site mostra so o botao de copiar:
+      // melhor isso do que mandar o visitante procurar a loja sozinho.
+      url: linkDaLoja(c.loja, c.codigo),
     }))
     // Maior desconto primeiro dentro de cada loja, lojas em ordem alfabetica.
     .sort((a, b) => a.loja.localeCompare(b.loja, 'pt-BR') || b.valor - a.valor);
@@ -251,7 +264,8 @@ export function agendarPublicacao() {
 }
 
 /** Liga a varredura periodica. Chamado uma vez no boot. */
-export function iniciarFeedPublico() {
+export function iniciarFeedPublico(deps = {}) {
+  _resolverLink = typeof deps.resolverLink === 'function' ? deps.resolverLink : null;
   carregarPublicadas();
   if (!ativo()) {
     console.log('[FEED] GITHUB_TOKEN ausente — vitrine publica desligada.');
@@ -274,5 +288,6 @@ export function estadoFeedPublico() {
     ultimaPublicacao: _ultimaPublicacao,
     ultimoErro: _ultimoErro,
     grupoUrl: linkGrupo(),
+    resolverLinkAtivo: !!_resolverLink,
   };
 }
