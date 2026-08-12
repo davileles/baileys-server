@@ -33,8 +33,12 @@ export function credenciaisShopeeOk() {
 /**
  * Executa uma operacao GraphQL assinada.
  * O corpo e montado UMA vez e reusado na assinatura e no envio.
+ *
+ * Exportada para a sonda de diagnostico (/shopee/sonda): a Shopee muda o schema
+ * sem aviso, e descobrir isso com uma query de introspeccao e mais barato do que
+ * descobrir com o radar quebrado em producao.
  */
-async function chamarShopee(query, variables = null) {
+export async function chamarShopee(query, variables = null) {
   const appId  = credencialTsp('SHOPEE_APP_ID');
   const secret = credencialTsp('SHOPEE_SECRET');
   if (!appId || !secret) throw new Error('SHOPEE_APP_ID / SHOPEE_SECRET nao configurados.');
