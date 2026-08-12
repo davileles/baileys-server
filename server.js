@@ -7545,13 +7545,34 @@ function _ggMeuNumero() {
   return String(id).split(':')[0].split('@')[0];
 }
 
+// Identidades da conta conectada. O WhatsApp migrou para enderecamento LID: os
+// participantes chegam como <id>@lid em vez de <numero>@s.whatsapp.net, entao
+// comparar so pelo telefone nunca casava e souAdmin ficava false ate em grupo
+// criado pela propria conta. Junta telefone + lid num Set.
+function _ggMinhasIds() {
+  const ids = new Set();
+  for (const v of [sock?.user?.id, sock?.user?.lid]) {
+    const n = String(v || '').split(':')[0].split('@')[0].trim();
+    if (n) ids.add(n);
+  }
+  return ids;
+}
+
+// Um participante pode vir identificado por qualquer um destes campos,
+// dependendo da versao do Baileys e de o grupo ja ter migrado para LID.
+function _ggIdsDoParticipante(p) {
+  return [p?.id, p?.lid, p?.jid]
+    .map(v => String(v || '').split(':')[0].split('@')[0].trim())
+    .filter(Boolean);
+}
+
 async function _ggInfoGrupo(jid, forcar) {
   const c = _ggMetaCache.get(jid);
   if (!forcar && c && (Date.now() - c.ts) < GG_META_TTL_MS) return c;
   const md = await sock.groupMetadata(jid);
-  const eu = _ggMeuNumero();
+  const meus = _ggMinhasIds();
   const meu = (md.participants || []).find(p =>
-    String(p.id || '').split(':')[0].split('@')[0] === eu);
+    _ggIdsDoParticipante(p).some(n => meus.has(n)));
   const info = {
     ts: Date.now(),
     nome: md.subject || '(sem nome)',
