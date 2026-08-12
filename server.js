@@ -6270,7 +6270,9 @@ function tsHojeSP(hhmm) {
   return Date.UTC(+p.year, +p.month - 1, +p.day, +m[1], +m[2], 0) - offset;
 }
 
-function horaSP(ts) {
+// Nome proprio: horaSP() (la em cima) devolve a hora cheia como numero e e usada
+// pela janela de envio; aqui o que se quer e o relogio HH:MM de um instante.
+function relogioSP(ts) {
   return new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour:'2-digit', minute:'2-digit', hour12:false })
     .format(new Date(ts));
 }
@@ -6411,11 +6413,11 @@ app.post('/listas/:id/disparar', async (req, res) => {
   }
   const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
   const minutos = (lista.produtos.length - 1) * lista.intervaloMin;
-  console.log('[LISTA] "' + lista.nome + '" ' + (aguardando ? 'agendada para ' + horaSP(inicio) + ' SP' : 'iniciada manualmente')
+  console.log('[LISTA] "' + lista.nome + '" ' + (aguardando ? 'agendada para ' + relogioSP(inicio) + ' SP' : 'iniciada manualmente')
     + ' — ' + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
   res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos,
              aguardando, iniciarEm: aguardando ? inicio : Date.now(),
-             iniciaAs: horaSP(aguardando ? inicio : Date.now()) });
+             iniciaAs: relogioSP(aguardando ? inicio : Date.now()) });
 });
 
 // Envio unico: mesma maquina de disparo das listas salvas, so que o registro e
@@ -6439,7 +6441,7 @@ app.post('/listas/disparo-unico', async (req, res) => {
                                                    hour:'2-digit', minute:'2-digit' }).format(new Date());
   const lista = salvarLista({
     nome: String(req.body?.nome || '').trim()
-       || ('Envio único · ' + agora + (aguardando ? ' · começa ' + horaSP(inicio) : '')),
+       || ('Envio único · ' + agora + (aguardando ? ' · começa ' + relogioSP(inicio) : '')),
     produtos,
     intervaloMin: req.body?.intervaloMin,
     cupomModo: req.body?.cupomModo,
@@ -6450,12 +6452,12 @@ app.post('/listas/disparo-unico', async (req, res) => {
 
   try {
     const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
-    console.log('[LISTA] Envio unico ' + (aguardando ? 'agendado para ' + horaSP(inicio) + ' SP' : 'iniciado')
+    console.log('[LISTA] Envio unico ' + (aguardando ? 'agendado para ' + relogioSP(inicio) + ' SP' : 'iniciado')
       + ' — ' + produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
     res.json({ ok:true, lista: atualizada, produtos: produtos.length,
                duracaoMin: (produtos.length - 1) * lista.intervaloMin,
                aguardando, iniciarEm: aguardando ? inicio : Date.now(),
-               iniciaAs: horaSP(aguardando ? inicio : Date.now()) });
+               iniciaAs: relogioSP(aguardando ? inicio : Date.now()) });
   } catch (e) {
     removerLista(lista.id);
     res.status(500).json({ ok:false, erro:e.message });
