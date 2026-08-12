@@ -5836,6 +5836,8 @@ async function processarOfertasAwin({ simular = false } = {}) {
         dadosExtraidos: {
           loja: p.loja, asin: p.asin, titulo: p.titulo, preco: p.preco, precoDe: p.precoDe,
           desconto: p.desconto, link: p.link,
+          // URL da imagem para a vitrine publica (o base64 so serve ao WhatsApp).
+          imagemUrl: p.imagemUrl || null,
           cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
           precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
           precoDeReferencia: true,
@@ -6283,6 +6285,8 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
       precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
       cupom:o.cupom, precoFinal:o.precoFinal,
       precoDeReferencia: !!o.precoDeReferencia,
+      // URL da imagem para a vitrine publica (o base64 so serve ao WhatsApp).
+      imagemUrl: o.produto.imagemUrl || null,
     },
     imagens: [],
   };
@@ -6784,6 +6788,8 @@ app.post('/vitrine/disparar', async (req, res) => {
         precoDe:o.produto.precoDe, desconto:o.produto.desconto, link:o.produto.link,
         cupom:o.cupom, precoFinal:o.precoFinal,
         precoDeReferencia: !!o.precoDeReferencia,
+        // URL da imagem para a vitrine publica (o base64 so serve ao WhatsApp).
+        imagemUrl: o.produto.imagemUrl || null,
       },
       imagens: [],
     };
