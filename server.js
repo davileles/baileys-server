@@ -170,18 +170,30 @@ async function sincronizarCuponsMlAgendado() {
       await enviarMensagem(GRUPOS['operador'], {
         text: '🎫 *Cupons do Mercado Livre desativados*\n\n'
             + d.desativados.map(c => '• ' + c).join('\n')
-            + '\n\nSaíram da sua lista de cupons ativos no ML.'
+            + '\n\nO ML recusou o código na hora de ativar — vencido ou esgotado. '
+            + 'Saíram da base e não entram mais nas ofertas. Nada a fazer.'
       }).catch(() => {});
     }
 
-    // Sem estar ativado na conta, o ML nao informa validade nem esgotamento —
-    // o cupom fica fora do monitoramento ate ser adicionado.
+    // Cupom que o sync conseguiu adicionar sozinho na conta. Vale avisar: a
+    // partir dai o ML passa a informar validade e esgotamento dele.
+    if ((d.ativadosAgora || []).length) {
+      await enviarMensagem(GRUPOS['operador'], {
+        text: '✅ *Cupons ativados na sua conta do ML*\n\n'
+            + d.ativadosAgora.map(c => '• ' + c).join('\n')
+            + '\n\nEntraram automaticamente. A validade real é lida no próximo sync.'
+      }).catch(() => {});
+    }
+
+    // Sobra so o que o ML respondeu de forma inesperada — os casos de verdade
+    // ambiguos. Cupom vencido e cupom ja ativo na conta ja foram resolvidos
+    // acima, entao esta lista tende a vir vazia.
     if ((d.pendentesAtivacao || []).length) {
       await enviarMensagem(GRUPOS['operador'], {
-        text: '➕ *Ative estes cupons no Mercado Livre*\n\n'
+        text: '➕ *Confira estes cupons no Mercado Livre*\n\n'
             + d.pendentesAtivacao.map(c => '• ' + c).join('\n')
-            + '\n\nEles estão na base mas não na sua conta, então não dá para '
-            + 'saber quando expiram. Cole em: mercadolivre.com.br/cupons → Inserir código.'
+            + '\n\nO ML não aceitou nem recusou o código. Tente em: '
+            + 'mercadolivre.com.br/cupons → Inserir código.'
       }).catch(() => {});
     }
   } catch (e) { console.warn('[CUPONS-ML] Sync agendado — erro:', e.message); }
@@ -6811,8 +6823,12 @@ app.post('/cupons/sync-ml', async (req, res) => {
 
     const mapaPagina = new Map(naPagina.map(c => [c.codigo.toUpperCase(), c]));
     const atualizados = [], desativados = [], criados = [], semMudanca = [];
-    // Cupons da base que o ML nao lista: provavelmente falta ativar na conta.
-    const pendentesAtivacao = [];
+    // Cupom da base que o ML nao lista cai em um de tres casos: ja venceu, nunca
+    // foi ativado na conta, ou esta ativo com um card cujo rotulo nao traz o
+    // codigo digitavel (a raspagem nunca o encontra). A pagina nao distingue os
+    // tres — quem distingue e o proprio ML, no "Inserir codigo". Por isso a
+    // decisao sai do loop e vai para a verificacao autoritativa mais abaixo.
+    const ausentes = [];
 
     // Percorre a NOSSA base e procura cada cupom na pagina — nao o contrario.
     // Assim os cards sem codigo digitavel deixam de ser um caso especial.
@@ -6823,17 +6839,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
       if (!naTela) {
         if (!leituraCompleta) { semMudanca.push(reg.codigo); continue; }
         if (reg.ativo === false) continue;
-
-        // Cupom capturado do Telegram ainda NAO ativado na conta do ML nunca
-        // aparece em "Meus cupons". Desativar por ausencia mataria justamente os
-        // cupons novos — o oposto do que o sync existe para fazer. So desativa
-        // quem ja foi visto na conta ao menos uma vez.
-        if (!reg.confirmadoNoMl) {
-          pendentesAtivacao.push(reg.codigo);
-          continue;
-        }
-        atualizarCupomBase(reg.chave, { ativo:false });
-        desativados.push(reg.codigo);
+        ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true });
         continue;
       }
 
@@ -6856,19 +6862,54 @@ app.post('/cupons/sync-ml', async (req, res) => {
         .map(r => String(r.codigo).toUpperCase()));
       for (const c of naPagina) {
         if (naBase.has(c.codigo.toUpperCase())) continue;
-        const reg = registrarCupomBase({ loja:'Mercado Livre', ...c });
+        const reg = registrarCupomBase({ loja:'Mercado Livre', ...c, confirmadoNoMl:true });
         const validade = c.expiraEm || validadeDeTexto(c.venceTexto);
         if (validade && reg) atualizarCupomBase(reg.chave, { validadeAte: validade });
         criados.push(c.codigo);
       }
     }
 
+    // Verificacao autoritativa do que a pagina nao mostrou. O endpoint de
+    // inserir codigo responde tres coisas diferentes, e cada uma tem um destino:
+    //   "ja foi adicionado"  -> esta na conta; o card so nao traz o codigo no
+    //                           rotulo. Confirma e para de cobrar o operador.
+    //   sucesso              -> entrou agora; a validade real vem no proximo sync.
+    //   "confira se o cupom" -> vencido/inexistente. Nao ha como o operador
+    //                           adicionar — desativa em vez de avisar para sempre.
+    const pendentesAtivacao = [], ativadosAgora = [], jaNaConta = [], indeterminados = [];
+    for (const p of ausentes) {
+      let r2 = null;
+      try { r2 = await ativarCupomMl(p.codigo); }
+      catch (e) { console.warn('[CUPONS-ML] Falha ao verificar ' + p.codigo + ':', e.message); }
+
+      if (!r2) { indeterminados.push(p.codigo); }
+      else if (r2.jaTinha) {
+        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true });
+        jaNaConta.push(p.codigo);
+      } else if (r2.ok) {
+        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true });
+        ativadosAgora.push(p.codigo);
+      } else if (r2.invalido) {
+        atualizarCupomBase(p.chave, { ativo:false,
+          observacao: 'Desativado no sync: o ML recusou o codigo (' + (r2.mensagem || 'sem detalhe') + ')' });
+        desativados.push(p.codigo);
+      } else {
+        // Resposta que nao encaixa em nenhum caso conhecido: nao mexe na base e
+        // deixa para o operador olhar.
+        pendentesAtivacao.push(p.codigo);
+        console.warn('[CUPONS-ML] Resposta inesperada para ' + p.codigo + ': ' + (r2.mensagem || r2.status));
+      }
+      await new Promise(r3 => setTimeout(r3, 800));
+    }
+
     console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
-      + criados.length + ' novo(s), ' + desativados.length + ' desativado(s)'
+      + criados.length + ' novo(s), ' + desativados.length + ' desativado(s), '
+      + jaNaConta.length + ' ja na conta, ' + ativadosAgora.length + ' ativado(s) agora'
       + (leituraCompleta ? '' : ' [leitura parcial: nada desativado]') + '.');
 
     res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
                fontes, atualizados, criados, desativados, pendentesAtivacao,
+               ativadosAgora, jaNaConta, indeterminados,
                naoAvaliados: leituraCompleta ? [] : semMudanca });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
