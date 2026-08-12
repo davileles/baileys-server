@@ -102,7 +102,7 @@ function aplicarTtlsAwin() {
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
   normalizarShopee, credenciaisShopeeOk, montarOfertasShopeeVitrine,
-  validarAtribuicao, resolverEncurtadorShopee,
+  validarAtribuicao, resolverEncurtadorShopee, chamarShopee,
 } from './radar-shopee.js';
 
 // ── RADAR MERCADO LIVRE ───────────────────────────────────────────────────────
@@ -7384,6 +7384,29 @@ app.get('/shopee/validar', async (req, res) => {
   try {
     const subId = req.query.subId || ('cdvteste' + Date.now().toString().slice(-6));
     res.json(await validarAtribuicao(req.query.url, subId));
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Sonda de schema: executa uma query GraphQL crua contra a Open API da Shopee.
+// Mesmo papel do /ml/aff/sonda — existe para descobrir o que a API expoe (ex.:
+// se ha algo de voucher com prazo real) sem chutar campo no radar e derrubar o
+// pipeline. So le: nao grava nada na base nem envia mensagem.
+//
+//   POST /shopee/sonda  { "query": "{ __schema { queryType { fields { name } } } }" }
+app.post('/shopee/sonda', async (req, res) => {
+  if (!credenciaisShopeeOk()) {
+    return res.status(400).json({ ok:false, erro:'SHOPEE_APP_ID / SHOPEE_SECRET nao configurados.' });
+  }
+  const query = req.body?.query;
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ ok:false, erro:'passe {"query":"..."} com a operacao GraphQL' });
+  }
+  // Mutation aqui seria efeito colateral disfarcado de diagnostico.
+  if (/^\s*mutation\b/i.test(query)) {
+    return res.status(400).json({ ok:false, erro:'a sonda so aceita query, nao mutation' });
+  }
+  try {
+    res.json({ ok:true, dados: await chamarShopee(query, req.body?.variables || null) });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
