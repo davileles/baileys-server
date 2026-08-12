@@ -899,6 +899,30 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
   }
 }
 
+// ── JID CANONICO ─────────────────────────────────────────────────────────────
+// O JID nao pode ser montado somando '@s.whatsapp.net' ao telefone. Contas
+// antigas (tipico em DDD >= 31) estao registradas SEM o nono digito, e contas
+// migradas podem responder por outro identificador. Enviar para o JID montado
+// na mao cria uma CONVERSA FANTASMA: o WhatsApp Web abre uma thread separada,
+// sem contato vinculado, a mensagem trava em "Aguardando mensagem" com um
+// unico check e nunca chega ao aparelho do destinatario. onWhatsApp() devolve
+// o JID que o servidor de fato reconhece — e so ele vale para sendMessage.
+async function resolverJidWhatsApp(telefone, fallback) {
+  const digitos = String(telefone || '').replace(/\D/g, '');
+  const reserva = fallback || (digitos ? digitos + '@s.whatsapp.net' : null);
+  if (!digitos) return { jid: reserva, existe: false };
+  if (!conectado || !sock) {
+    const ok = await aguardarSock(20000);
+    if (!ok) throw new Error('WhatsApp nao conectado para resolver o JID.');
+  }
+  let r;
+  try { r = await sock.onWhatsApp(digitos); }
+  catch (e) { throw new Error('onWhatsApp falhou: ' + e.message); }
+  const achado = Array.isArray(r) ? r.find(x => x && x.exists && x.jid) : null;
+  if (achado) return { jid: achado.jid, existe: true };
+  return { jid: reserva, existe: false };
+}
+
 // Timestamp do último envio — persiste entre execuções do worker
 let ultimoEnvioMs = 0;
 
@@ -4290,19 +4314,25 @@ async function campPatchContato(campanhaId, contatoId, patch) {
 async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
   const cfg = camp.config || {};
 
-  // Numero invalido nao consome tentativa: vira erro e sai da fila.
-  if (cfg.verificarNumeroAntes !== false) {
-    let existe = false;
-    try {
-      const r = await sock.onWhatsApp(ct.telefone);
-      existe = Array.isArray(r) && r.length > 0 && r[0].exists;
-    } catch (e) {
-      throw new Error('onWhatsApp falhou: ' + e.message);
-    }
-    if (!existe) {
+  // O ct.jid vem do gerador, montado como telefone + '@s.whatsapp.net'. Isso
+  // erra em conta registrada sem o nono digito e o envio vira conversa
+  // fantasma (ver resolverJidWhatsApp). A resolucao roda SEMPRE, independente
+  // de verificarNumeroAntes: aquele flag decide se numero inexistente aborta,
+  // nao se o JID deve ser confiavel.
+  let jidDestino = ct.jid;
+  {
+    const alvo = await resolverJidWhatsApp(ct.telefone, ct.jid);
+    if (!alvo.existe && cfg.verificarNumeroAntes !== false) {
       await campPatchContato(camp.id, ct.id, { status: 'erro', erro: 'numero sem WhatsApp' });
       CAMP_LOG('✗ ' + ct.nome + ' — numero sem WhatsApp.');
       return { enviado: false, contabiliza: false };
+    }
+    if (alvo.jid && alvo.jid !== jidDestino) {
+      CAMP_LOG('↪ JID corrigido — ' + ct.nome + ': ' + jidDestino + ' → ' + alvo.jid);
+      jidDestino = alvo.jid;
+      await campPatchContato(camp.id, ct.id, { jid: jidDestino });
+      ct.jid = jidDestino;   // o mapa de respostas deste ciclo ja usa o certo
+      _campJids.set(jidDestino, { campanhaId: camp.id, contatoId: ct.id });
     }
   }
 
@@ -4322,7 +4352,7 @@ async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
       conteudo = { text: txt };
     }
     // Passa pela mesma cadeia da fila de ofertas: nunca dois envios ao mesmo tempo
-    await saidaSerializada(() => enviarMensagem(ct.jid, conteudo));
+    await saidaSerializada(() => enviarMensagem(jidDestino, conteudo));
     if (i < blocos.length - 1) {
       await new Promise(r => setTimeout(r, campAleatorio(dMin * 1000, dMax * 1000)));
     }
@@ -7989,7 +8019,12 @@ app.post('/webhook/hubla', async (req, res) => {
     const numeroFormatado = formatarNumero(telefone);
     console.log(`[Hubla] Enviando boas-vindas para ${nome} (${numeroFormatado})`);
     if (!conectado || !sock) { const ok = await aguardarSock(); if (!ok) return res.status(503).json({ error: 'WhatsApp não conectado' }); }
-    await enviarMensagem(numeroFormatado, { text: MENSAGEM_BOAS_VINDAS(nome) });
+    // Mesmo motivo da campanha: quem manda no JID e o servidor do WhatsApp,
+    // nao a montagem local do telefone (ver resolverJidWhatsApp).
+    const alvoHubla = await resolverJidWhatsApp(telefone, numeroFormatado);
+    if (!alvoHubla.existe) console.warn(`[Hubla] ${numeroFormatado} nao confirmado no WhatsApp — tentando mesmo assim.`);
+    if (alvoHubla.jid !== numeroFormatado) console.log(`[Hubla] JID corrigido: ${numeroFormatado} → ${alvoHubla.jid}`);
+    await enviarMensagem(alvoHubla.jid, { text: MENSAGEM_BOAS_VINDAS(nome) });
     console.log(`[Hubla] ✅ Enviado para ${nome}`);
     return res.status(200).json({ status: 'enviado', para: nome });
   } catch (err) { console.error('[Hubla] Erro:', err); return res.status(500).json({ error: 'Erro interno' }); }
