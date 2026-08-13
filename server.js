@@ -164,7 +164,9 @@ async function sincronizarCuponsMlAgendado() {
   try {
     const r = await fetch('http://127.0.0.1:' + (process.env.PORT || 3000) + '/cupons/sync-ml', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-      signal: AbortSignal.timeout(120000),
+      // O loop de verificacao tem espera entre chamadas: ate 40 cupons x 800ms
+      // mais a latencia do ML nao cabem em 2 minutos.
+      signal: AbortSignal.timeout(300000),
     });
     const d = await r.json();
     if (!d.ok) { console.warn('[CUPONS-ML] Sync agendado falhou:', d.erro); return; }
@@ -7107,7 +7109,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
     const leituraCompleta = !totalDeclarado || vistos >= totalDeclarado;
 
     const mapaPagina = new Map(naPagina.map(c => [c.codigo.toUpperCase(), c]));
-    const atualizados = [], desativados = [], criados = [], semMudanca = [];
+    const atualizados = [], desativados = [], criados = [];
     // Cupom da base que o ML nao lista cai em um de tres casos: ja venceu, nunca
     // foi ativado na conta, ou esta ativo com um card cujo rotulo nao traz o
     // codigo digitavel (a raspagem nunca o encontra). A pagina nao distingue os
@@ -7122,7 +7124,10 @@ app.post('/cupons/sync-ml', async (req, res) => {
       const naTela = mapaPagina.get(String(reg.codigo).toUpperCase());
 
       if (!naTela) {
-        if (!leituraCompleta) { semMudanca.push(reg.codigo); continue; }
+        // Leitura parcial nao barra mais a verificacao. O input-code responde por
+        // cupom, individualmente, e nao depende de a pagina ter vindo inteira —
+        // um unico card que o parser nao entende travava o bloco para sempre.
+        // Quem protege contra desativacao indevida agora e o canalAtivacaoOk.
         if (reg.ativo === false) continue;
         ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true,
                         observacao: reg.observacao || null });
@@ -7178,6 +7183,12 @@ app.post('/cupons/sync-ml', async (req, res) => {
     //   sucesso              -> entrou agora; a validade real vem no proximo sync.
     //   INVALID_1 / SOLD_OUT  -> nao existe ou acabou — MAS so vale como prova se o
     //                           canal responder outra coisa para algum codigo.
+    // Teto por passada: o loop tem espera de 800ms entre chamadas e nao pode
+    // estourar o timeout do agendador. O que sobrar volta na proxima hora.
+    const MAX_VERIFICACOES = 40;
+    const adiados = ausentes.slice(MAX_VERIFICACOES).map(p => p.codigo);
+    const paraVerificar = ausentes.slice(0, MAX_VERIFICACOES);
+
     const pendentesAtivacao = [], ativadosAgora = [], jaNaConta = [], indeterminados = [];
     // Recusa NAO desativa na hora. Quando o canal de ativacao cai, o ML responde
     // "codigo invalido" para tudo — inclusive para cupom que esta ativo na conta
@@ -7185,7 +7196,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
     // em lote. As recusas ficam em quarentena ate o fim do loop, e so viram
     // desativacao se alguma outra resposta provar que o canal responde de verdade.
     const recusados = [];
-    for (const p of ausentes) {
+    for (const p of paraVerificar) {
       let r2 = null;
       try { r2 = await ativarCupomMl(p.codigo); }
       catch (e) { console.warn('[CUPONS-ML] Falha ao verificar ' + p.codigo + ':', e.message); }
@@ -7235,14 +7246,15 @@ app.post('/cupons/sync-ml', async (req, res) => {
     console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
       + criados.length + ' novo(s), ' + desativados.length + ' desativado(s), '
       + jaNaConta.length + ' ja na conta, ' + ativadosAgora.length + ' ativado(s) agora'
-      + (leituraCompleta ? '' : ' [leitura parcial: nada desativado]')
+      + (leituraCompleta ? '' : ' [leitura parcial da pagina]')
+      + (adiados.length ? ' [' + adiados.length + ' adiado(s) para a proxima passada]' : '')
       + (canalAtivacaoOk ? '' : ' [canal de ativacao mudo: recusas ignoradas]') + '.');
 
     res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
                canalAtivacaoOk, recusasIgnoradas: canalAtivacaoOk ? 0 : recusados.length,
                fontes, atualizados, criados, desativados, pendentesAtivacao,
                ativadosAgora, jaNaConta, indeterminados,
-               naoAvaliados: leituraCompleta ? [] : semMudanca });
+               naoAvaliados: adiados });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
