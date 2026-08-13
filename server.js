@@ -5411,6 +5411,32 @@ app.get('/operacao/fila', async (req, res) => {
     // Campanha e da operacao principal: nao ha campanha por operador hoje.
     const campanha = req.tenantId === TENANT_PADRAO ? await resumoCampanhaFila() : null;
 
+    // Enviados recentes: rastro do que ja saiu e DE ONDE veio. Sem isto a aba
+    // Fila so mostrava o que espera a vez; capturas de grupo com auto-envio
+    // ligado saem na hora e nunca apareciam — parecia que nada era enviado
+    // (incidente de 13/08/2026: horas de duvida sobre represamento vs captura).
+    const enviados = filaPendentes
+      .filter(o => (o.tenant || TENANT_PADRAO) === req.tenantId)
+      .filter(o => o.status === 'enviado')
+      .sort((a, b) => new Date(b.enviadoEm || b.timestamp) - new Date(a.enviadoEm || a.timestamp))
+      .slice(0, 20)
+      .map(o => {
+        const d = o.dadosExtraidos || {};
+        const origem = o.grupoOrigem || o.origem || null;
+        const rotuloCupom = `${nomeLojaExibicao(d.loja)} ${d.valor ?? ''}${d.tipo === 'pct' ? '%' : (d.valor ? ' R$' : '')}${d.codigo ? ' \u00b7 ' + d.codigo : ''}`;
+        return {
+          id:            o.id,
+          tipoConteudo:  o.tipoConteudo,
+          titulo:        (o.tipoConteudo === 'cupom_tsp' ? rotuloCupom : (d.titulo || nomeLojaExibicao(d.loja) || 'Oferta')).trim(),
+          loja:          d.loja || null,
+          origem,
+          origemNome:    (origem && origem.endsWith && origem.endsWith('@g.us')) ? (NOMES_GRUPOS.get(origem) || null) : null,
+          capturadoEm:   o.timestamp || null,
+          enviadoEm:     o.enviadoEm || null,
+          gruposDestino: Array.isArray(o.gruposEnviados) ? o.gruposEnviados.length : null,
+        };
+      });
+
     const totalNaFila = itens.length
       + listas.reduce((s, l) => s + l.restantes, 0)
       + (campanha ? campanha.naFila : 0);
@@ -5428,6 +5454,7 @@ app.get('/operacao/fila', async (req, res) => {
       totalNaFila,
       itens,
       listas,
+      enviados,
       campanha,
     });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
