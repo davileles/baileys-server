@@ -596,7 +596,18 @@ function carregarFila() {
 
 // Tipos que o painel Gestao TSP trata como oferta de marketplace. Amazon hoje;
 // ML e Shopee entram aqui sem mudar mais nada no roteamento.
-const TIPOS_OFERTA_MARKETPLACE = new Set(['oferta_amazon', 'oferta_ml', 'oferta_shopee', 'oferta_magalu']);
+const TIPOS_OFERTA_MARKETPLACE = new Set(['oferta_amazon', 'oferta_ml', 'oferta_shopee', 'oferta_magalu', 'oferta_awin']);
+
+// Rede de seguranca: qualquer tipo 'oferta_*' e conteudo TSP e vai para os
+// grupos de destino do TSP. Sem isso, uma loja nova (foi o caso da Awin) cai no
+// fallback de emissao e vaza no grupo Emissoes CDV.
+function ehOfertaMarketplace(tipo) {
+  const t = String(tipo || '');
+  return TIPOS_OFERTA_MARKETPLACE.has(t) || t.indexOf('oferta_') === 0;
+}
+function ehConteudoTsp(tipo) {
+  return String(tipo || '') === 'cupom_tsp' || ehOfertaMarketplace(tipo);
+}
 
 function limparFila() {
   const agora = Date.now();
@@ -5324,6 +5335,12 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   if (req.body.dados) salvarFila();
 
   if (agendarEm) {
+    // Agendamento por esta rota sempre aponta para cdv_emissao. Conteudo TSP
+    // (cupom ou oferta de loja) nao pode passar por aqui — usar o agendamento
+    // do painel TSP, que respeita os grupos de destino.
+    if (ehConteudoTsp(oferta.tipoConteudo)) {
+      return res.status(400).json({ ok:false, erro:'Item TSP não pode ser agendado por esta rota (iria para o grupo de emissões).' });
+    }
     const dispararEm = new Date(agendarEm).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
     const agId = gerarId();
@@ -5343,7 +5360,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     return;
   }
 
-  if (TIPOS_OFERTA_MARKETPLACE.has(oferta.tipoConteudo)) {
+  if (ehOfertaMarketplace(oferta.tipoConteudo)) {
     try {
       const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
