@@ -662,6 +662,12 @@ function horaSP() {
   return parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: 'numeric', hour12: false }).format(new Date()), 10);
 }
 
+// Irma de horaSP(): o minuto cheio no fuso de SP. Usada pelo censo, que dispara
+// num minuto especifico (00:10) e nao numa hora inteira.
+function minutoSP() {
+  return parseInt(new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, minute: 'numeric', hour12: false }).format(new Date()), 10);
+}
+
 function msAteJanela() {
   const hora = horaSP();
   if (hora >= HORA_INICIO_ENVIO && hora < HORA_FIM_ENVIO) return 0;
@@ -7757,8 +7763,10 @@ app.get('/grupos/convite', async (req, res) => {
 
 // ── CENSO DE MEMBROS DOS GRUPOS DE DESTINO ───────────────────────────────────
 // Fotografia diaria de quantas pessoas ha em cada grupo marcado como destino.
-// Roda as 06:00 (SP) e fica gravada em disco: a leitura do painel e instantanea
+// Roda as 00:10 (SP) e fica gravada em disco: a leitura do painel e instantanea
 // e nao depende de consultar 12+ grupos no WhatsApp a cada abertura da aba.
+// A medicao logo depois da meia-noite fecha o ciclo do dia que terminou — por
+// isso o ponto gravado pertence a ONTEM, e nao ao dia que esta comecando.
 const CENSO_FILE = SESSAO_DIR + '/grupos_censo.json';
 // Serie historica: uma linha por dia (SP), para o grafico de evolucao. Vive num
 // arquivo separado porque e append-only e sobe para o GitHub — o censo do dia
@@ -7774,6 +7782,18 @@ function _censoDia(iso) {
   if (!iso) return null;
   try { return new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date(iso)); }
   catch(_) { return null; }
+}
+
+// Dia a que a medicao pertence. Antes das 03:00 (SP) a foto ainda e o
+// fechamento do dia anterior: o total das 00:10 de 15/03 e o saldo com que o
+// dia 14/03 terminou, entao ele e gravado em 14/03. Medicao manual feita ao
+// longo do dia continua caindo no dia corrente — e provisoria e sera
+// sobrescrita pelo fechamento da madrugada seguinte.
+const CENSO_HORA_FECHAMENTO = 3;
+function _censoDiaRef() {
+  const agora = new Date();
+  const alvo  = horaSP() < CENSO_HORA_FECHAMENTO ? new Date(agora.getTime() - 86400000) : agora;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(alvo);
 }
 
 (function carregarCenso() {
@@ -7797,7 +7817,7 @@ function salvarCenso() {
 // Uma medicao por dia: rodar o censo duas vezes no mesmo dia sobrescreve o
 // ponto em vez de criar um segundo, senao o grafico ganharia degraus falsos.
 function registrarHistoricoCenso(grupos) {
-  const dia = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date());
+  const dia = _censoDiaRef();
   const porGrupo = {};
   for (const g of grupos) if (typeof g.membros === 'number') porGrupo[g.jid] = g.membros;
   _censoHist.dias[dia] = {
@@ -7854,17 +7874,22 @@ async function recensearGrupos() {
   } finally { _censoRodando = false; }
 }
 
-// Agendador das 06:00 (SP). Checa de minuto em minuto e guarda o dia ja medido,
-// entao um restart do container no meio da manha nao dispara o censo de novo.
+// Agendador das 00:10 (SP). Checa de minuto em minuto e guarda o dia ja medido,
+// entao um restart do container na madrugada nao dispara o censo de novo.
+// A janela vai ate as 02:59 so como rede de seguranca: se o container estiver
+// fora do ar as 00:10, a medicao ainda acontece e ainda conta como fechamento
+// do dia anterior (CENSO_HORA_FECHAMENTO).
 let _censoUltimoDia = _censoDia(_censo.atualizadoEm);
 setInterval(() => {
-  if (horaSP() !== 6) return;
+  const h = horaSP(), m = minutoSP();
+  const naJanela = (h === 0 && m >= 10) || h === 1 || h === 2;
+  if (!naJanela) return;
   const dia = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date());
   if (_censoUltimoDia === dia) return;
   _censoUltimoDia = dia;
   recensearGrupos().catch(e => {
-    console.error('[CENSO] Falha no censo das 6h:', e.message);
-    _censoUltimoDia = null;   // libera nova tentativa ainda dentro da hora
+    console.error('[CENSO] Falha no censo da meia-noite:', e.message);
+    _censoUltimoDia = null;   // libera nova tentativa ainda dentro da janela
   });
 }, 60 * 1000);
 
@@ -7885,7 +7910,7 @@ app.get('/grupos/censo', async (req, res) => {
   res.json({
     ok: true,
     atualizadoEm: _censo.atualizadoEm,
-    proximaMedicao: '06:00 (SP)',
+    proximaMedicao: '00:10 (SP)',
     total: lista.reduce((s, g) => s + (g.membros || 0), 0),
     grupos: lista,
   });
