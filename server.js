@@ -5159,6 +5159,66 @@ app.get('/painel-json', (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// ── FILA DE ENVIO DO TSP (somente leitura) ───────────────────────────────────
+// O que ja passou por TODAS as regras de conteudo e so espera a hora de sair:
+// bloqueio temporal (janela de horario ou intervalo minimo entre mensagens).
+// Sao os cupons marcados com autoAgendado pelo gate — ou seja, itens que VAO
+// para o grupo sem nova decisao humana. A aba Fila do painel so exibe; quem
+// aprova ou rejeita e a aba Aprovacao, que continua em /painel-json.
+app.get('/operacao/fila', (req, res) => {
+  try {
+    const agora        = Date.now();
+    const janela       = dentroDaJanelaCupom();
+    const intervaloMs  = intervaloAutoEnvioMs();
+    // Sem envio anterior nesta instancia, o proximo esta liberado agora.
+    const liberadoEm   = _ultimoAutoEnvio ? _ultimoAutoEnvio + intervaloMs : agora;
+
+    const aguardando = filaPendentes
+      .filter(o => (o.tenant || TENANT_PADRAO) === req.tenantId)
+      .filter(o => o.autoAgendado && (o.status === 'pendente' || o.status === 'enviando'))
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    // Previsao em cascata: o primeiro sai quando o intervalo liberar, os demais
+    // um intervalo depois do anterior. Fora da janela nao ha previsao honesta
+    // (a janela pode virar o dia), entao devolve null e o painel diz o motivo.
+    let cursor = Math.max(agora, liberadoEm);
+    const itens = aguardando.map(o => {
+      const d  = o.dadosExtraidos || {};
+      const ts = new Date(o.timestamp).getTime();
+      const previsao = janela.ok ? cursor : null;
+      if (janela.ok) cursor += intervaloMs;
+      const rotuloCupom = `${nomeLojaExibicao(d.loja)} ${d.valor ?? ''}${d.tipo === 'pct' ? '%' : (d.valor ? ' R$' : '')}${d.codigo ? ' · ' + d.codigo : ''}`;
+      return {
+        id:           o.id,
+        tipoConteudo: o.tipoConteudo,
+        titulo:       (o.tipoConteudo === 'cupom_tsp' ? rotuloCupom : (d.titulo || nomeLojaExibicao(d.loja) || 'Oferta')).trim(),
+        loja:         d.loja || null,
+        codigo:       d.codigo || null,
+        origem:       o.grupoOrigem || o.origem || null,
+        status:       o.status,
+        timestamp:    o.timestamp,
+        motivo:       (o.autoAvaliacao && o.autoAvaliacao.motivo) || '',
+        mensagem:     String(o.mensagemFormatada || '').slice(0, 600),
+        previsaoEm:   previsao ? new Date(previsao).toISOString() : null,
+        expiraEm:     ts && !isNaN(ts) ? new Date(ts + AUTO_ENVIO_MAX_ESPERA).toISOString() : null,
+      };
+    });
+
+    res.json({
+      ok:                true,
+      agoraSP:           new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()),
+      modo:              AUTO_ENVIO_MODO,
+      janela:            { ...janelaCupom(), ok: janela.ok, motivo: janela.motivo },
+      intervaloSeg:      Math.round(intervaloMs / 1000),
+      ultimoEnvioEm:     _ultimoAutoEnvio ? new Date(_ultimoAutoEnvio).toISOString() : null,
+      proximoLiberadoEm: new Date(Math.max(agora, liberadoEm)).toISOString(),
+      maxEsperaMin:      Math.round(AUTO_ENVIO_MAX_ESPERA / 60000),
+      total:             itens.length,
+      itens,
+    });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.post('/painel/aprovar/:id', async (req, res) => {
   const id     = parseInt(req.params.id);
   const oferta = filaPendentes.find(o => String(o.id)===String(id));
