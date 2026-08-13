@@ -826,7 +826,11 @@ const URL_CUPONS_ML = 'https://www.mercadolivre.com.br/cupons/active';
 export async function ativarCupomMl(codigo) {
   const r = await chamarAff('https://www.mercadolivre.com.br/cupons/api/input-code', {
     method: 'POST',
-    body: JSON.stringify({ code: String(codigo || '').trim().toUpperCase() }),
+    // A chave e coupon_input_code, capturada do proprio botao "Adicionar cupom".
+    // Com "code" o ML responde INVALID_6 para QUALQUER entrada — inclusive para
+    // cupom que esta ativo na conta, e ate para corpo vazio. O sync lia essa
+    // recusa generica como prova de cupom vencido e desativava cupom bom.
+    body: JSON.stringify({ coupon_input_code: String(codigo || '').trim().toUpperCase() }),
     headers: {
       'Origin': 'https://www.mercadolivre.com.br',
       'Referer': 'https://www.mercadolivre.com.br/cupons',
@@ -835,12 +839,23 @@ export async function ativarCupomMl(codigo) {
   });
   const msg = r.corpo?.responseMessage || {};
   const texto = msg.text || '';
+  // O texto e traduzido e muda; response_code e estavel e distingue os casos.
+  // Todos vem com type:'error', ate o "ja adicionado" — o texto sozinho engana.
+  //   PENDING    -> ja esta na conta (o que importa)
+  //   SOLD_OUT   -> acabou; nao ha o que ativar
+  //   INVALID_1  -> codigo nao existe
+  //   INVALID_6  -> o ML nao entendeu o payload: problema nosso, nao do cupom
+  const rc = r.corpo?.tracking?.event?.eventData?.response_code || '';
   return {
     codigo,
+    rc,
     ok: msg.type === 'success',
     // "ja foi adicionado" nao e falha: o cupom esta ativo, e o que importa.
-    jaTinha: /já foi adicionad/i.test(texto),
-    invalido: /Confira se o cupom/i.test(texto),
+    jaTinha: rc === 'PENDING' || /já foi adicionad/i.test(texto),
+    esgotado: rc === 'SOLD_OUT' || /cupom esgotou/i.test(texto),
+    invalido: rc === 'INVALID_1' || (!rc && /Confira se o cupom/i.test(texto)),
+    // Nunca pode virar desativacao: nao diz nada sobre o cupom.
+    payloadRejeitado: rc === 'INVALID_6',
     mensagem: texto,
     status: r.status,
   };
