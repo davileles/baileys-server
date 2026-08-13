@@ -153,6 +153,9 @@ async function sincronizarCampanhasMlAgendado() {
   } catch (e) { console.warn('[CAMPANHAS-ML] Sync agendado — erro:', e.message); }
 }
 
+// Throttle do aviso de canal de ativacao fora do ar (12h).
+let _avisoCanalMl = 0;
+
 async function sincronizarCuponsMlAgendado() {
   if (!tokenAffOk()) return;
   // O mapa de campanhas nao depende do resultado abaixo: roda antes e em
@@ -193,7 +196,20 @@ async function sincronizarCuponsMlAgendado() {
     // Sobra so o que o ML respondeu de forma inesperada — os casos de verdade
     // ambiguos. Cupom vencido e cupom ja ativo na conta ja foram resolvidos
     // acima, entao esta lista tende a vir vazia.
-    if ((d.pendentesAtivacao || []).length) {
+    // Canal de ativacao mudo: o ML recusou todos os codigos, entao a lista de
+    // pendentes e so ruido — seria a base inteira, de hora em hora. Um aviso a
+    // cada 12h basta, porque a correcao e no cookie/payload, nao no cupom.
+    if (d.canalAtivacaoOk === false && d.recusasIgnoradas) {
+      if (Date.now() - _avisoCanalMl > 12 * 3600 * 1000) {
+        _avisoCanalMl = Date.now();
+        await enviarMensagem(GRUPOS['operador'], {
+          text: '⚠️ *Ativação de cupom no ML fora do ar*\n\n'
+              + 'O ML recusou os ' + d.recusasIgnoradas + ' código(s) testados nesta passada, '
+              + 'inclusive os que estão ativos na conta. Nenhum cupom foi desativado.\n\n'
+              + 'Cupom novo do Telegram não está entrando na sua conta até isso voltar.'
+        }).catch(() => {});
+      }
+    } else if ((d.pendentesAtivacao || []).length) {
       await enviarMensagem(GRUPOS['operador'], {
         text: '➕ *Confira estes cupons no Mercado Livre*\n\n'
             + d.pendentesAtivacao.map(c => '• ' + c).join('\n')
@@ -7102,19 +7118,33 @@ app.post('/cupons/sync-ml', async (req, res) => {
       if (!naTela) {
         if (!leituraCompleta) { semMudanca.push(reg.codigo); continue; }
         if (reg.ativo === false) continue;
-        ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true });
+        ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true,
+                        observacao: reg.observacao || null });
         continue;
       }
 
       const campos = { tipo:naTela.tipo, valor:naTela.valor,
                        minimo:naTela.minimo, limite:naTela.limite, ativo:true,
                        confirmadoNoMl:true };
+      // Recusa antiga que o proprio sync escreveu perde o sentido no momento em
+      // que o cupom reaparece na conta. Observacao do operador nao e tocada.
+      if (/^Desativado no sync/.test(reg.observacao || '')) campos.observacao = null;
       // Validade real: contador tem prioridade sobre o texto ("quarta-feira").
       const validade = naTela.expiraEm || validadeDeTexto(naTela.venceTexto);
       if (validade) campos.validadeAte = validade;
+      else {
+        // Card sem linha "Vence ...": acontece quando o ML mostra "Esta esgotando"
+        // no lugar do prazo. O cupom esta na conta AGORA, entao vale pelo menos
+        // hoje — deixar a validade congelada no TTL de 24h da captura o mata em
+        // silencio (cupomVigente reprova e ele some das ofertas).
+        const atual = Date.parse(reg.validadeAte || '');
+        if (!atual || atual < Date.now()) campos.validadeAte = validadeDeTexto('amanha');
+      }
       atualizarCupomBase(reg.chave, campos);
       atualizados.push({ codigo:reg.codigo, valor:naTela.valor, minimo:naTela.minimo,
-                         limite:naTela.limite, validadeAte:validade || null,
+                         limite:naTela.limite,
+                         validadeAte:campos.validadeAte || reg.validadeAte || null,
+                         prazoInferido: !validade && !!campos.validadeAte,
                          esgotando:naTela.esgotando });
     }
 
@@ -7126,7 +7156,10 @@ app.post('/cupons/sync-ml', async (req, res) => {
       for (const c of naPagina) {
         if (naBase.has(c.codigo.toUpperCase())) continue;
         const reg = registrarCupomBase({ loja:'Mercado Livre', ...c, confirmadoNoMl:true });
-        const validade = c.expiraEm || validadeDeTexto(c.venceTexto);
+        // Mesmo fallback do loop acima: card "esgotando" nao traz prazo, e um
+        // cupom recem-lido da conta nao pode nascer com validade menor que a do
+        // proprio card.
+        const validade = c.expiraEm || validadeDeTexto(c.venceTexto) || validadeDeTexto('amanha');
         if (validade && reg) atualizarCupomBase(reg.chave, { validadeAte: validade });
         criados.push(c.codigo);
       }
@@ -7137,25 +7170,32 @@ app.post('/cupons/sync-ml', async (req, res) => {
     //   "ja foi adicionado"  -> esta na conta; o card so nao traz o codigo no
     //                           rotulo. Confirma e para de cobrar o operador.
     //   sucesso              -> entrou agora; a validade real vem no proximo sync.
-    //   "confira se o cupom" -> vencido/inexistente. Nao ha como o operador
-    //                           adicionar — desativa em vez de avisar para sempre.
+    //   "confira se o cupom" -> vencido/inexistente — MAS so vale como prova se o
+    //                           canal responder outra coisa para algum codigo.
     const pendentesAtivacao = [], ativadosAgora = [], jaNaConta = [], indeterminados = [];
+    // Recusa NAO desativa na hora. Quando o canal de ativacao cai, o ML responde
+    // "codigo invalido" para tudo — inclusive para cupom que esta ativo na conta
+    // neste exato momento. Tratar isso como prova de vencimento derruba cupom bom
+    // em lote. As recusas ficam em quarentena ate o fim do loop, e so viram
+    // desativacao se alguma outra resposta provar que o canal responde de verdade.
+    const recusados = [];
     for (const p of ausentes) {
       let r2 = null;
       try { r2 = await ativarCupomMl(p.codigo); }
       catch (e) { console.warn('[CUPONS-ML] Falha ao verificar ' + p.codigo + ':', e.message); }
 
+      // Reapareceu na conta: recusa antiga escrita pelo sync perde o sentido.
+      const limpar = /^Desativado no sync/.test(p.observacao || '') ? { observacao:null } : {};
+
       if (!r2) { indeterminados.push(p.codigo); }
       else if (r2.jaTinha) {
-        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true });
+        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar });
         jaNaConta.push(p.codigo);
       } else if (r2.ok) {
-        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true });
+        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar });
         ativadosAgora.push(p.codigo);
       } else if (r2.invalido) {
-        atualizarCupomBase(p.chave, { ativo:false,
-          observacao: 'Desativado no sync: o ML recusou o codigo (' + (r2.mensagem || 'sem detalhe') + ')' });
-        desativados.push(p.codigo);
+        recusados.push({ ...p, mensagem: r2.mensagem });
       } else {
         // Resposta que nao encaixa em nenhum caso conhecido: nao mexe na base e
         // deixa para o operador olhar.
@@ -7165,12 +7205,30 @@ app.post('/cupons/sync-ml', async (req, res) => {
       await new Promise(r3 => setTimeout(r3, 800));
     }
 
+    // Sinal de vida do canal: pelo menos um cupom que o ML reconheceu (entrou
+    // agora ou ja estava na conta). Sem isso, "invalido" nao distingue cupom
+    // vencido de endpoint fora do ar, e a base fica como esta.
+    const canalAtivacaoOk = ativadosAgora.length > 0 || jaNaConta.length > 0;
+    if (canalAtivacaoOk) {
+      for (const p of recusados) {
+        atualizarCupomBase(p.chave, { ativo:false,
+          observacao: 'Desativado no sync: o ML recusou o codigo (' + (p.mensagem || 'sem detalhe') + ')' });
+        desativados.push(p.codigo);
+      }
+    } else if (recusados.length) {
+      for (const p of recusados) pendentesAtivacao.push(p.codigo);
+      console.warn('[CUPONS-ML] ' + recusados.length + ' recusa(s) ignorada(s): o ML nao reconheceu '
+        + 'nenhum codigo nesta passada — canal de ativacao provavelmente fora do ar. Nada desativado.');
+    }
+
     console.log('[CUPONS-ML] Sync — ' + atualizados.length + ' atualizado(s), '
       + criados.length + ' novo(s), ' + desativados.length + ' desativado(s), '
       + jaNaConta.length + ' ja na conta, ' + ativadosAgora.length + ' ativado(s) agora'
-      + (leituraCompleta ? '' : ' [leitura parcial: nada desativado]') + '.');
+      + (leituraCompleta ? '' : ' [leitura parcial: nada desativado]')
+      + (canalAtivacaoOk ? '' : ' [canal de ativacao mudo: recusas ignoradas]') + '.');
 
     res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
+               canalAtivacaoOk, recusasIgnoradas: canalAtivacaoOk ? 0 : recusados.length,
                fontes, atualizados, criados, desativados, pendentesAtivacao,
                ativadosAgora, jaNaConta, indeterminados,
                naoAvaliados: leituraCompleta ? [] : semMudanca });
