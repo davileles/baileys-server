@@ -54,6 +54,7 @@
         "app.get('/ml/status'",
         "app.get('/ml/webhook'",
         "app.get('/monitor'",
+        "app.get('/operacao/fila'",
         "app.get('/painel'",
         "app.get('/painel-json'",
         "app.get('/qr'",
