@@ -6417,9 +6417,9 @@ function janelasDaLista(lista) {
  * da proxima abertura (hoje ou amanha) quando esta fora. Fila 24h continua
  * possivel: basta configurar a janela 00:00-23:59.
  */
-function janelaEnvioLista(lista) {
+function janelaEnvioLista(lista, quando = Date.now()) {
   const janelas = janelasDaLista(lista);
-  const agora   = campPartesSP().minutos;
+  const agora   = campPartesSP(quando).minutos;
   for (const j of janelas) {
     const ini = campHhmmParaMin(j.inicio);
     const fim = campHhmmParaMin(j.fim);
@@ -6430,8 +6430,34 @@ function janelaEnvioLista(lista) {
   const inicios = janelas.map(j => campHhmmParaMin(j.inicio)).sort((a, b) => a - b);
   const proximo = inicios.find(m => m > agora);
   const faltam  = proximo !== undefined ? (proximo - agora) : (1440 - agora + inicios[0]);
-  return { ok: false, proximoEm: Date.now() + faltam * 60000 + 5000,
+  return { ok: false, proximoEm: quando + faltam * 60000 + 5000,
            janelas: janelas.map(j => j.inicio + '-' + j.fim).join(', ') };
+}
+
+/**
+ * Simula a fila item a item respeitando as janelas e devolve quando ela termina.
+ * Existe porque "36 produtos x 20 min" nao cabe numa janela de 12h: o operador
+ * precisa ver, na hora de disparar, que a fila vai virar o dia — antes que o
+ * ultimo item saia as 20h de um dia que nem era o combinado.
+ */
+function previsaoTerminoLista(lista, inicioTs, qtd) {
+  const passo = (lista.intervaloMin || 20) * 60000;
+  const total = Math.min(Number(qtd) || 0, 2000);   // trava de seguranca
+  let t = Number(inicioTs) || Date.now();
+  let adiados = 0;
+  for (let i = 0; i < total; i++) {
+    const j = janelaEnvioLista(lista, t);
+    if (!j.ok) { t = j.proximoEm; adiados++; }
+    if (i < total - 1) t += passo;
+  }
+  return { terminaEm: t, adiados, cabeNoDia: adiados === 0 };
+}
+
+/** Data+hora curta no fuso de SP: previsao que vira o dia precisa mostrar o dia. */
+function dataHoraSP(ts) {
+  return new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, day:'2-digit', month:'2-digit',
+                                            hour:'2-digit', minute:'2-digit', hour12:false })
+    .format(new Date(ts));
 }
 
 // Worker: acorda a cada 15s e envia o proximo produto de cada lista cuja hora
@@ -6536,6 +6562,11 @@ app.get('/listas', (req, res) => {
     // por que uma fila em andamento pode estar parada.
     janelasEfetivas: janelasDaLista(l),
     dentroDaJanela: janelaEnvioLista(l).ok,
+    // Fila em andamento: quando o ultimo item sai, ja contando as pausas.
+    terminaAs: l.execucao
+      ? dataHoraSP(previsaoTerminoLista(l, Math.max(l.execucao.proximoEm, Date.now()),
+          Math.max(0, l.produtos.length - l.execucao.indice)).terminaEm)
+      : null,
   }));
   res.json({ ok:true, total: listas.length, listas,
              agoraSP: new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()) });
@@ -6570,12 +6601,22 @@ app.post('/listas/:id/disparar', async (req, res) => {
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
   const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
-  const minutos = (lista.produtos.length - 1) * lista.intervaloMin;
+  const minutos  = (lista.produtos.length - 1) * lista.intervaloMin;
+  const inicioTs = aguardando ? inicio : Date.now();
+  const prev     = previsaoTerminoLista(lista, inicioTs, lista.produtos.length);
   console.log('[LISTA] "' + lista.nome + '" ' + (aguardando ? 'agendada para ' + relogioSP(inicio) + ' SP' : 'iniciada manualmente')
-    + ' — ' + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
+    + ' — ' + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo, termina '
+    + dataHoraSP(prev.terminaEm) + ' SP' + (prev.cabeNoDia ? '' : ' (fila vira o dia)') + '.');
   res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos,
-             aguardando, iniciarEm: aguardando ? inicio : Date.now(),
-             iniciaAs: relogioSP(aguardando ? inicio : Date.now()) });
+             aguardando, iniciarEm: inicioTs,
+             iniciaAs: relogioSP(inicioTs),
+             janelas: janelasDaLista(lista),
+             terminaEm: prev.terminaEm, terminaAs: dataHoraSP(prev.terminaEm),
+             cabeNoDia: prev.cabeNoDia,
+             aviso: prev.cabeNoDia ? null
+               : lista.produtos.length + ' itens a ' + lista.intervaloMin + ' min nao cabem na janela '
+                 + janelasDaLista(lista).map(j => j.inicio + '-' + j.fim).join(', ')
+                 + ' — a fila pausa e continua ate ' + dataHoraSP(prev.terminaEm) + ' SP.' });
 });
 
 // Envio unico: mesma maquina de disparo das listas salvas, so que o registro e
@@ -6606,16 +6647,26 @@ app.post('/listas/disparo-unico', async (req, res) => {
     cupomCodigo: req.body?.cupomCodigo,
     efemera: true,
     agenda: { ativo:false },
+    janelas: req.body?.janelas,
   });
 
   try {
     const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
     console.log('[LISTA] Envio unico ' + (aguardando ? 'agendado para ' + relogioSP(inicio) + ' SP' : 'iniciado')
       + ' — ' + produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
+    const inicioTs = aguardando ? inicio : Date.now();
+    const prev     = previsaoTerminoLista(lista, inicioTs, produtos.length);
     res.json({ ok:true, lista: atualizada, produtos: produtos.length,
                duracaoMin: (produtos.length - 1) * lista.intervaloMin,
-               aguardando, iniciarEm: aguardando ? inicio : Date.now(),
-               iniciaAs: relogioSP(aguardando ? inicio : Date.now()) });
+               aguardando, iniciarEm: inicioTs,
+               iniciaAs: relogioSP(inicioTs),
+               janelas: janelasDaLista(lista),
+               terminaEm: prev.terminaEm, terminaAs: dataHoraSP(prev.terminaEm),
+               cabeNoDia: prev.cabeNoDia,
+               aviso: prev.cabeNoDia ? null
+                 : produtos.length + ' itens a ' + lista.intervaloMin + ' min nao cabem na janela '
+                   + janelasDaLista(lista).map(j => j.inicio + '-' + j.fim).join(', ')
+                   + ' — a fila pausa e continua ate ' + dataHoraSP(prev.terminaEm) + ' SP.' });
   } catch (e) {
     removerLista(lista.id);
     res.status(500).json({ ok:false, erro:e.message });
