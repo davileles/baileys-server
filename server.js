@@ -42,6 +42,7 @@ import {
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
+  flushPushesPendentes, pushesPendentes,
 } from './sync-github.js';
 
 // ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
@@ -287,6 +288,39 @@ if (credenciaisAwinOk()) {
 
 process.on('uncaughtException',  (err) => console.error('[FATAL] uncaughtException:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledRejection:', err?.message || err));
+
+// ── ENCERRAMENTO: FLUSH DO PUSH PENDENTE ─────────────────────────────────────
+// O push tem debounce de 10s. No redeploy o Railway manda SIGTERM e mata o
+// processo logo depois, entao toda gravacao dos ultimos 10s fica so no disco do
+// container. No boot seguinte baixarDoGitHub() reescreve o disco com a versao
+// do repositorio e a gravacao desaparece — o registro reaparece num estado
+// anterior, com atualizadoEm no passado. Era esta a origem das edicoes perdidas
+// na base de cupons durante os redeploys, e nao uma segunda rotina escrevendo
+// por cima.
+let _encerrando = false;
+async function encerrarComFlush(sinal) {
+  if (_encerrando) return;                 // SIGTERM seguido de SIGINT nao reentra
+  _encerrando = true;
+  const pendentes = pushesPendentes();
+  if (!pendentes.length) { console.log('[SYNC] ' + sinal + ' — nada no debounce.'); process.exit(0); }
+
+  console.log('[SYNC] ' + sinal + ' — enviando ' + pendentes.length + ' arquivo(s) do debounce: '
+    + pendentes.join(', '));
+  // Teto proprio: se o GitHub estiver lento, e melhor perder a gravacao do que
+  // ficar pendurado ate o SIGKILL, que perderia do mesmo jeito e sem log.
+  const estourou = Symbol('timeout');
+  try {
+    const r = await Promise.race([
+      flushPushesPendentes(),
+      new Promise(res => setTimeout(() => res(estourou), 20000)),
+    ]);
+    if (r === estourou) console.error('[SYNC] Flush nao terminou em 20s — pode haver perda: ' + pendentes.join(', '));
+    else console.log('[SYNC] Flush concluido no encerramento.');
+  } catch (e) { console.error('[SYNC] Falha no flush de encerramento:', e.message); }
+  process.exit(0);
+}
+process.on('SIGTERM', () => encerrarComFlush('SIGTERM'));
+process.on('SIGINT',  () => encerrarComFlush('SIGINT'));
 
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
 // Os grupos do TSP (padrao, so-cupons e operador) vem da config editavel pelo
