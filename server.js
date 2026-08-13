@@ -590,8 +590,37 @@ function carregarFila() {
       const dados = JSON.parse(readFileSync(FILA_PATH, 'utf-8'));
       filaPendentes.push(...dados);
       console.log('[FILA] Carregadas ' + dados.length + ' ofertas do disco.');
+      retomarEnviosInterrompidos();
     }
   } catch(e) { console.log('[FILA] Erro ao carregar fila:', e.message); }
+}
+
+// Um envio tem tres desfechos, nao dois: concluiu, deu erro — ou o processo
+// sumiu no meio. Os dois primeiros o worker trata; o terceiro deixava o item
+// parado em 'enviando' para sempre, invisivel tanto para o worker (que so olha
+// 'pendente') quanto para a aba Aprovacao. Aqui ele volta para aprovacao
+// manual, NUNCA para auto-envio: o cupom pode ter saido em parte dos grupos, e
+// reenviar sozinho duplicaria a mensagem em quem ja recebeu. O rastro de
+// enviadosParciais garante que o reenvio manual pule esses grupos.
+function retomarEnviosInterrompidos() {
+  let n = 0;
+  for (const o of filaPendentes) {
+    if (o.status !== 'enviando') continue;
+    const entregues = Array.isArray(o.enviadosParciais) ? o.enviadosParciais.length : 0;
+    o.status = 'pendente';
+    o.envioInterrompido = true;
+    o.gruposEntregues = entregues;
+    delete o.autoAgendado;
+    delete o.enviandoDesde;
+    if (o.autoAvaliacao) {
+      o.autoAvaliacao.motivo += ' — envio interrompido'
+        + (entregues ? ` apos ${entregues} grupo(s)` : '') + ', requer conferencia manual';
+    }
+    n++;
+    console.warn(`[FILA] Cupom #${o.id} estava em envio quando o processo parou`
+      + (entregues ? ` (${entregues} grupo(s) ja receberam)` : '') + ' — devolvido para aprovacao manual.');
+  }
+  if (n) salvarFila();
 }
 
 // Tipos que o painel Gestao TSP trata como oferta de marketplace. Amazon hoje;
@@ -1965,16 +1994,23 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
 // mais os grupos so-cupons. Todos recebem exatamente a mesma mensagem — a
 // regra do rodape de convite cruzado foi removida. Falha isolada em um grupo
 // NAO derruba os outros: loga, segue para o proximo e avisa o operador ao final.
-async function enviarCupomParaGrupos(mensagem, imagem) {
+// `oferta` e opcional e serve so ao rastro de entrega: com ela, cada grupo que
+// recebe fica gravado em disco na hora (oferta.enviadosParciais). Distribuir
+// para todos os grupos leva cerca de um minuto — se o processo cair no meio, e
+// esse rastro que permite retomar sem mandar o mesmo cupom duas vezes para quem
+// ja recebeu.
+async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
   // Mesma conta em todos os grupos: o cupom e as copias dele saem juntos, e
   // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
   const op = { conta: contaDoTurno() };
   const destinos = radarDestinos();
   const soCupons = GRUPOS['tsp_cupons'];
   const alvos = [...new Set([...destinos, ...soCupons])];
-  const enviados = [], falhas = [];
+  const jaRecebeu = new Set(Array.isArray(oferta?.enviadosParciais) ? oferta.enviadosParciais : []);
+  const enviados = [], falhas = [], pulados = [];
 
   for (const jid of alvos) {
+    if (jaRecebeu.has(jid)) { pulados.push(jid); continue; }
     const texto = mensagem;
     try {
       if (imagem?.imagemBase64) {
@@ -1987,6 +2023,12 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
         await enviarMensagem(jid, { text: texto }, 0, op);
       }
       enviados.push(jid);
+      // Grava o progresso a cada grupo, nao no fim: o valor do rastro esta
+      // justamente em sobreviver a uma queda no meio da distribuicao.
+      if (oferta) {
+        oferta.enviadosParciais = [...jaRecebeu, ...enviados];
+        salvarFila();
+      }
       // Espacamento entre grupos: mesmo padrao das ofertas do radar, evita
       // rajada identica em varios grupos no mesmo segundo.
       if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
@@ -1996,14 +2038,16 @@ async function enviarCupomParaGrupos(mensagem, imagem) {
     }
   }
 
-  if (!enviados.length) throw new Error('Nenhum grupo recebeu o cupom.');
+  // Reenvio em que todos os grupos ja tinham recebido nao e falha: nao ha o que
+  // mandar, e o item deve seguir para 'enviado' normalmente.
+  if (!enviados.length && !pulados.length) throw new Error('Nenhum grupo recebeu o cupom.');
   if (falhas.length) {
     try {
       await enviarMensagem(GRUPOS.operador, { text: '*Cupom nao entregue em ' + falhas.length + ' grupo(s)* \u26a0\ufe0f\n\n'
         + falhas.map(f => (NOMES_GRUPOS.get(f.jid) || f.jid) + ': ' + f.erro).join('\n') });
     } catch(_) {}
   }
-  return { enviados, falhas };
+  return { enviados, falhas, pulados };
 }
 
 // Envia uma oferta de marketplace para os grupos marcados como 'destino' no
@@ -2169,13 +2213,15 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
 // Envia um cupom aprovado pelo gate para os grupos de cupons e marca a oferta
 // como enviada. Lanca excecao se o envio principal falhar (caller decide o fallback).
 async function despacharCupomAuto(oferta) {
-  await enviarCupomParaGrupos(oferta.mensagemFormatada, oferta.imagens?.[0]);
+  await enviarCupomParaGrupos(oferta.mensagemFormatada, oferta.imagens?.[0], oferta);
   _ultimoAutoEnvio     = Date.now();
   oferta.status        = 'enviado';
   oferta.mensagemFinal = oferta.mensagemFormatada;
   oferta.autoEnviado   = true;
   delete oferta.autoAgendado;
   delete oferta.enviandoDesde;
+  delete oferta.enviadosParciais;
+  delete oferta.envioInterrompido;
 }
 
 // ── WORKER DE ESPACAMENTO DO AUTO-ENVIO ──────────────────────────────────────
@@ -2383,10 +2429,19 @@ async function enfileirarCupomTSP(c, ctx = {}) {
     console.log(`[AUTO-SOMBRA] ${veredito.auto ? 'ENVIARIA' : 'BLOQUEADO'} — ${rotulo} — ${veredito.motivo}`);
   }
 
+  // Entra na fila ANTES de comecar a distribuicao (e nao depois, como era):
+  // sao ~1 min passando por todos os grupos, e um processo que morre no meio
+  // deixava o cupom sem nenhum registro em disco — parcialmente publicado e
+  // invisivel para o operador.
+  let jaNaFila = false;
   if (AUTO_ENVIO_MODO === 'on' && veredito.auto && !somenteFila) {
+    oferta.status        = 'enviando';
+    oferta.enviandoDesde = new Date().toISOString();
+    filaPendentes.unshift(oferta);
+    salvarFila();
+    jaNaFila = true;
     try {
       await despacharCupomAuto(oferta);
-      filaPendentes.unshift(oferta);
       salvarFila();
       console.log(`[AUTO] Cupom #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
       try {
@@ -2397,11 +2452,14 @@ async function enfileirarCupomTSP(c, ctx = {}) {
       return { oferta, veredito, enviado: true };
     } catch(err) {
       // Falha no envio: cai para a fila manual em vez de perder o cupom.
+      oferta.status = 'pendente';
+      delete oferta.enviandoDesde;
+      salvarFila();
       console.error(`[AUTO] Falha no envio automatico, caindo para fila: ${err.message}`);
     }
   }
 
-  filaPendentes.unshift(oferta);
+  if (!jaNaFila) filaPendentes.unshift(oferta);
   salvarFila();
   console.log(`[FILA] Cupom #${oferta.id} adicionado à fila — ${rotulo} (${veredito.motivo}) — origem ${origem}`);
 
@@ -5353,8 +5411,10 @@ app.post('/painel/aprovar/:id', async (req, res) => {
 
   if (oferta.tipoConteudo === 'cupom_tsp') {
     try {
-      await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0]);
-      oferta.status = 'enviado'; oferta.mensagemFinal = mensagem; salvarFila();
+      await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0], oferta);
+      oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
+      delete oferta.enviadosParciais; delete oferta.envioInterrompido; delete oferta.enviandoDesde;
+      salvarFila();
       res.json({ ok:true });
     } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
     return;
