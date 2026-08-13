@@ -363,13 +363,12 @@ const GRUPOS_MONITORADOS      = [
   '120363229682219999@g.us',
   '120363212151306916@g.us',
   '120363211235070904@g.us',
-  '120363318399199070@g.us',
   '120363230586056001@g.us',
   '120363211276624072@g.us',
   '120363416996630307@g.us',
   '120363427410900900@g.us',
   '120363423603571989@g.us',
-  '120363280292009756@g.us',
+  '120363428018752970@g.us', // TSM - ALERTAS CAMPO GRANDE #2 (grupo antigo 120363280292009756 foi recriado pelo TSM)
 ];
 const GRUPO_DESTINO_PASSAGENS = 'cdv_emissao';
 const JANELA_AGRUPAMENTO_MS   = 3 * 60 * 1000;
@@ -382,13 +381,12 @@ const GRUPOS_FILTRO_DATAS_MIN = {
   '120363229682219999@g.us': 5, // TSM - ALERTAS CURITIBA
   '120363212151306916@g.us': 5, // TSM - ALERTAS POA
   '120363211235070904@g.us': 5, // TSM - ALERTAS FLORIPA/NAVEGANTES
-  '120363318399199070@g.us': 5, // TSM - (sem nome na lista)
   '120363230586056001@g.us': 5, // TSM - ALERTAS FORTALEZA
   '120363211276624072@g.us': 5, // TSM - ALERTAS SALVADOR
   '120363416996630307@g.us': 5, // TSM - ALERTAS BRASÍLIA #3
   '120363427410900900@g.us': 5, // TSM - ALERTAS RECIFE #2
   '120363423603571989@g.us': 5, // TSM - ALERTAS UBERLÂNDIA
-  '120363280292009756@g.us': 5, // TSM - ALERTAS CAMPO GRANDE
+  '120363428018752970@g.us': 5, // TSM - ALERTAS CAMPO GRANDE #2
 };
 
 const PORT          = process.env.PORT || 3001;
@@ -2871,7 +2869,6 @@ const GRUPOS_TEXTO_ESTRUTURADO = new Set([
   '120363230402728347@g.us',
   '120363229682219999@g.us',
   '120363212151306916@g.us',
-  '120363318399199070@g.us',
   '120363230586056001@g.us',
   '120363211235070904@g.us',
 ]);
@@ -4172,6 +4169,54 @@ function guardarMensagemEnviada(info) {
 
 // Última mensagem capturada por grupo monitorado (observabilidade em /status).
 const ultimaCapturaPorGrupo = new Map();
+
+// ── WATCHDOG DE INBOUND ────────────────────────────────────────────────────────
+// Incidente de 13/08/2026: o registro do device no servidor do WhatsApp viciou
+// e TODAS as mensagens de grupo pararam de chegar (zero upserts), com a conexao
+// aparentando saude total — envio ok, /status ok, errosDescripto zerado (esse
+// contador so incrementa dentro do messages.upsert, que nunca disparava).
+// O sistema ficou 24h+ surdo em dois pipelines criticos sem emitir um unico
+// alerta. Este watchdog cobre exatamente esse modo de falha: dentro do horario
+// em que os grupos monitorados SEMPRE postam (08h-20h SP), silencio total de
+// captura por muito tempo denota que algo falhou.
+const WATCHDOG_INICIO_H    = 8;                     // inicio da janela vigiada (hora SP)
+const WATCHDOG_FIM_H       = 20;                    // fim da janela vigiada (hora SP)
+const WATCHDOG_SILENCIO_MS = 60 * 60 * 1000;        // 60 min sem NENHUMA captura = alerta
+const WATCHDOG_REAVISO_MS  = 2 * 60 * 60 * 1000;    // reavisa a cada 2h enquanto persistir
+// Referencia inicial = boot: evita alerta falso logo apos deploy/restart,
+// quando o Map ainda esta vazio por definicao.
+let _watchdogRefEm   = Date.now();
+let _watchdogAvisoEm = 0;
+
+function _ultimaCapturaGlobal() {
+  let max = 0;
+  for (const t of ultimaCapturaPorGrupo.values()) if (t > max) max = t;
+  return max || _watchdogRefEm;
+}
+
+setInterval(async () => {
+  try {
+    const h = horaSP();
+    if (h < WATCHDOG_INICIO_H || h >= WATCHDOG_FIM_H) return;
+    if (!conectado || !sock) return;   // queda de conexao ja tem tratamento proprio
+    const agora    = Date.now();
+    const silencio = agora - _ultimaCapturaGlobal();
+    if (silencio < WATCHDOG_SILENCIO_MS) return;
+    if (agora - _watchdogAvisoEm < WATCHDOG_REAVISO_MS) return;
+    _watchdogAvisoEm = agora;
+    const min = Math.round(silencio / 60000);
+    console.warn('[WATCHDOG] Nenhuma captura de grupos monitorados ha ' + min + ' min (janela 08-20h SP). Avisando operador.');
+    const texto = '*Watchdog de monitoramento* \u26a0\ufe0f\n\n'
+      + 'Nenhuma mensagem capturada dos grupos monitorados ha *' + min + ' min* '
+      + '(dentro da janela 08h-20h).\n\n'
+      + 'A conexao parece ativa, mas o inbound pode estar morto '
+      + '(sessao viciada / device degradado no servidor do WhatsApp).\n\n'
+      + 'Verifique /debug-upserts. Se estiver zerado, um novo pareamento '
+      + '(reset-sessao-completo + QR) costuma resolver.';
+    try { await enviarMensagem(GRUPOS.operador, { text: texto }); }
+    catch (e) { console.error('[WATCHDOG] Falha ao avisar operador:', e.message); }
+  } catch (e) { console.error('[WATCHDOG] Erro no ciclo:', e.message); }
+}, 10 * 60 * 1000);
 
 // ── WHATSAPP ──────────────────────────────────────────────────────────────────
 var isConnecting = false; // evita instâncias duplas de conexão
