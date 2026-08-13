@@ -1835,6 +1835,7 @@ const AUTO_ENVIO_OFERTA     = (process.env.AUTO_ENVIO_OFERTA || 'off').toLowerCa
 function intervaloAutoEnvioMs() { return (janelaCupom().intervaloSeg ?? 90) * 1000; }
 const AUTO_ENVIO_TEXTO_MIN  = 20;        // texto curto demais = info provavelmente na imagem
 const AUTO_ENVIO_MAX_ESPERA = 30 * 60 * 1000; // agendado ha mais que isso = cupom provavelmente vencido, vira aprovacao manual
+const ENVIANDO_TRAVADO_MS   = 5 * 60 * 1000;  // preso em 'enviando' por mais que isso = envio pendurado, nao envio em curso
 let   _ultimoAutoEnvio      = 0;
 
 // Lojas elegiveis: precisam ter link de afiliado em LINKS_TSP, senao a mensagem
@@ -2163,6 +2164,7 @@ async function despacharCupomAuto(oferta) {
   oferta.mensagemFinal = oferta.mensagemFormatada;
   oferta.autoEnviado   = true;
   delete oferta.autoAgendado;
+  delete oferta.enviandoDesde;
 }
 
 // ── WORKER DE ESPACAMENTO DO AUTO-ENVIO ──────────────────────────────────────
@@ -2213,7 +2215,11 @@ setInterval(async () => {
 
     // Marca como 'enviando' antes do await para o card sumir do painel e
     // reduzir a janela de corrida com uma aprovacao manual simultanea.
-    oferta.status = 'enviando';
+    // O carimbo permite a aba Fila distinguir "saindo agora" de um envio que
+    // travou: sem ele, um item preso em 'enviando' ficaria eternamente com
+    // cara de normal.
+    oferta.status        = 'enviando';
+    oferta.enviandoDesde = new Date().toISOString();
     try {
       await despacharCupomAuto(oferta);
       salvarFila();
@@ -2226,6 +2232,7 @@ setInterval(async () => {
     } catch(err) {
       oferta.status = 'pendente';
       delete oferta.autoAgendado;
+      delete oferta.enviandoDesde;
       if (oferta.autoAvaliacao) oferta.autoAvaliacao.motivo += ' — falha no envio automatico, requer aprovacao manual';
       salvarFila();
       console.error(`[AUTO-FILA] Falha no envio do cupom #${oferta.id}: ${err.message} — caindo para aprovacao manual`);
@@ -5159,13 +5166,49 @@ app.get('/painel-json', (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// Resumo da campanha ativa para a aba Fila. Cache de 60s porque a aba recarrega
+// a cada poucos segundos e cada leitura aqui e uma ida ao proxy CDV — sem o
+// cache, abrir a aba viraria uma rajada de requisicoes no proxy.
+let _cacheCampFila = { em: 0, dados: null };
+async function resumoCampanhaFila() {
+  if (!CAMPANHAS_KEY) return null;
+  if (Date.now() - _cacheCampFila.em < 60000) return _cacheCampFila.dados;
+  let dados = null;
+  try {
+    const { campanha } = await campApi('/campanhas/ativa');
+    if (campanha) {
+      const cfg = campanha.config || {};
+      const por = { fila:0, enviado:0, respondido:0, erro:0, optout:0 };
+      (campanha.contatos || []).forEach(ct => { if (por[ct.status] !== undefined) por[ct.status]++; });
+      dados = {
+        id:             campanha.id,
+        nome:           campanha.nome,
+        naFila:         por.fila,
+        enviados:       por.enviado,
+        respondidos:    por.respondido,
+        enviosHoje:     campEnviosHoje(campanha),
+        limiteDiario:   cfg.limiteDiario || null,
+        dentroDaJanela: campDentroDaJanela(cfg),
+        janelas:        Array.isArray(cfg.janelas) ? cfg.janelas.map(j => j[0] + '-' + j[1]).join(', ') : '',
+        pausaLongaAte:  _campPausaAte > Date.now() ? new Date(_campPausaAte).toISOString() : null,
+      };
+    }
+  } catch (e) {
+    // Campanha e um extra desta aba: se o proxy nao responder, os cupons e as
+    // listas ainda precisam aparecer.
+    console.warn('[OPERACAO] Resumo de campanha indisponivel:', e.message);
+  }
+  _cacheCampFila = { em: Date.now(), dados };
+  return dados;
+}
+
 // ── FILA DE ENVIO DO TSP (somente leitura) ───────────────────────────────────
 // O que ja passou por TODAS as regras de conteudo e so espera a hora de sair:
 // bloqueio temporal (janela de horario ou intervalo minimo entre mensagens).
 // Sao os cupons marcados com autoAgendado pelo gate — ou seja, itens que VAO
 // para o grupo sem nova decisao humana. A aba Fila do painel so exibe; quem
 // aprova ou rejeita e a aba Aprovacao, que continua em /painel-json.
-app.get('/operacao/fila', (req, res) => {
+app.get('/operacao/fila', async (req, res) => {
   try {
     const agora        = Date.now();
     const janela       = dentroDaJanelaCupom();
@@ -5185,8 +5228,13 @@ app.get('/operacao/fila', (req, res) => {
     const itens = aguardando.map(o => {
       const d  = o.dadosExtraidos || {};
       const ts = new Date(o.timestamp).getTime();
-      const previsao = janela.ok ? cursor : null;
-      if (janela.ok) cursor += intervaloMs;
+      const saindo = o.status === 'enviando';
+      const previsao = (janela.ok && !saindo) ? cursor : null;
+      if (janela.ok && !saindo) cursor += intervaloMs;
+      // Envio que passou de ENVIANDO_TRAVADO_MS nao esta saindo: alguma coisa
+      // ficou pendurada no meio do caminho e ninguem seria avisado.
+      const desde = o.enviandoDesde ? Date.parse(o.enviandoDesde) : null;
+      const travado = saindo && (!desde || agora - desde > ENVIANDO_TRAVADO_MS);
       const rotuloCupom = `${nomeLojaExibicao(d.loja)} ${d.valor ?? ''}${d.tipo === 'pct' ? '%' : (d.valor ? ' R$' : '')}${d.codigo ? ' · ' + d.codigo : ''}`;
       return {
         id:           o.id,
@@ -5196,6 +5244,8 @@ app.get('/operacao/fila', (req, res) => {
         codigo:       d.codigo || null,
         origem:       o.grupoOrigem || o.origem || null,
         status:       o.status,
+        travado,
+        enviandoDesde: o.enviandoDesde || null,
         timestamp:    o.timestamp,
         motivo:       (o.autoAvaliacao && o.autoAvaliacao.motivo) || '',
         mensagem:     String(o.mensagemFormatada || '').slice(0, 600),
@@ -5203,6 +5253,38 @@ app.get('/operacao/fila', (req, res) => {
         expiraEm:     ts && !isNaN(ts) ? new Date(ts + AUTO_ENVIO_MAX_ESPERA).toISOString() : null,
       };
     });
+
+    // Listas em disparo: a outra origem de mensagem que ja esta liberada e so
+    // espera a hora. Vem daqui (e nao de /listas no painel) para a aba fazer uma
+    // chamada so — ela recarrega a cada poucos segundos.
+    const listas = listarListas()
+      .filter(l => l.execucao)
+      .map(l => {
+        const ex        = l.execucao;
+        const total     = (l.produtos || []).length;
+        const restantes = Math.max(0, total - (ex.indice || 0));
+        const proximoEm = Math.max(Number(ex.proximoEm) || agora, agora);
+        const jan       = janelaEnvioLista(l);
+        return {
+          id:             l.id,
+          nome:           l.nome,
+          total,
+          restantes,
+          pausada:        !!ex.pausada,
+          proximoEm:      new Date(proximoEm).toISOString(),
+          intervaloMin:   l.intervaloMin || null,
+          dentroDaJanela: jan.ok,
+          janelas:        jan.janelas,
+          terminaAs:      dataHoraSP(previsaoTerminoLista(l, proximoEm, restantes).terminaEm),
+        };
+      });
+
+    // Campanha e da operacao principal: nao ha campanha por operador hoje.
+    const campanha = req.tenantId === TENANT_PADRAO ? await resumoCampanhaFila() : null;
+
+    const totalNaFila = itens.length
+      + listas.reduce((s, l) => s + l.restantes, 0)
+      + (campanha ? campanha.naFila : 0);
 
     res.json({
       ok:                true,
@@ -5214,7 +5296,10 @@ app.get('/operacao/fila', (req, res) => {
       proximoLiberadoEm: new Date(Math.max(agora, liberadoEm)).toISOString(),
       maxEsperaMin:      Math.round(AUTO_ENVIO_MAX_ESPERA / 60000),
       total:             itens.length,
+      totalNaFila,
       itens,
+      listas,
+      campanha,
     });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
