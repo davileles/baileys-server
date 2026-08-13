@@ -845,7 +845,12 @@ export async function ativarCupomMl(codigo) {
   //   SOLD_OUT   -> acabou; nao ha o que ativar
   //   INVALID_1  -> codigo nao existe
   //   INVALID_6  -> o ML nao entendeu o payload: problema nosso, nao do cupom
+  //   EXPIRED_ACTION -> venceu, e a mensagem traz data e hora exatas
   const rc = r.corpo?.tracking?.event?.eventData?.response_code || '';
+  // HTTP 403 sem response_code e limite de taxa, nao veredito sobre o cupom:
+  // ~13 chamadas seguidas derrubam o endpoint, e ate cupom ativo na conta passa
+  // a responder "Tivemos um problema". Tratar isso como recusa apagaria a base.
+  const bloqueado = r.status === 403 || (!rc && /Tivemos um problema/i.test(texto));
   return {
     codigo,
     rc,
@@ -853,9 +858,14 @@ export async function ativarCupomMl(codigo) {
     // "ja foi adicionado" nao e falha: o cupom esta ativo, e o que importa.
     jaTinha: rc === 'PENDING' || /já foi adicionad/i.test(texto),
     esgotado: rc === 'SOLD_OUT' || /cupom esgotou/i.test(texto),
-    invalido: rc === 'INVALID_1' || (!rc && /Confira se o cupom/i.test(texto)),
-    // Nunca pode virar desativacao: nao diz nada sobre o cupom.
+    expirado: rc === 'EXPIRED_ACTION',
+    // Validade real vinda do proprio ML, com data e hora. Melhor fonte que a
+    // pagina: funciona ate para card que esconde o prazo atras de "esgotando".
+    venceuEm: rc === 'EXPIRED_ACTION' ? validadeDeVencimento(texto) : null,
+    invalido: rc === 'INVALID_1' || (!rc && !bloqueado && /Confira se o cupom/i.test(texto)),
+    // Nenhum destes diz nada sobre o cupom — nunca podem virar desativacao.
     payloadRejeitado: rc === 'INVALID_6',
+    bloqueado,
     mensagem: texto,
     status: r.status,
   };
@@ -1039,6 +1049,30 @@ export function validadeDeTexto(txt, agora = new Date()) {
     return fim(d);
   }
   return null;
+}
+
+
+/**
+ * "O cupom venceu em 12 de agosto às 23:59." -> ISO absoluto.
+ * Vem do input-code quando o codigo ja passou do prazo. E a unica fonte que da
+ * hora exata, entao vale mais que o texto da pagina.
+ */
+export function validadeDeVencimento(txt) {
+  const t = semAcento(txt);
+  const m = t.match(/venceu em (\d{1,2}) de ([a-z]+)(?:\s+as\s+(\d{1,2}):(\d{2}))?/);
+  if (!m) return null;
+  const mes = MESES.findIndex(x => semAcento(x).startsWith(m[2].slice(0, 4)));
+  if (mes < 0) return null;
+
+  const agora = new Date();
+  // Data e hora sao de Sao Paulo (UTC-3) e o servidor roda em UTC.
+  const montar = (ano) => new Date(Date.UTC(ano, mes, Number(m[1]),
+    Number(m[3] ?? 23) + 3, Number(m[4] ?? 59), 0, 0));
+
+  let d = montar(agora.getUTCFullYear());
+  // "Venceu" e sempre passado: data no futuro so pode ser do ano anterior.
+  if (d.getTime() > agora.getTime() + 86400e3) d = montar(agora.getUTCFullYear() - 1);
+  return d.toISOString();
 }
 
 
