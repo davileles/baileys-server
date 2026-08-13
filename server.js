@@ -2245,9 +2245,15 @@ function ativarCupomCapturadoMl(c, reg) {
       // Marca o que o sync usa para nao tratar o cupom como "nunca ativado".
       if (reg?.chave) { try { atualizarCupomBase(reg.chave, { confirmadoNoMl: true }); } catch(e) {} }
       console.log('[CUPONS-ML] ' + c.codigo + (r.jaTinha ? ' ja estava na conta.' : ' ativado na conta na captura.'));
+    } else if (r.esgotado) {
+      console.warn('[CUPONS-ML] ' + c.codigo + ' ja esgotado no ML na captura — ' +
+        'o sync horario decide se desativa.');
     } else if (r.invalido) {
       console.warn('[CUPONS-ML] ' + c.codigo + ' recusado pelo ML na captura: ' +
         (r.mensagem || 'sem detalhe') + ' — o sync horario decide se desativa.');
+    } else if (r.payloadRejeitado) {
+      console.error('[CUPONS-ML] ' + c.codigo + ': INVALID_6 na captura — o formato do ' +
+        'input-code mudou de novo. Nenhum cupom esta entrando na conta.');
     } else {
       console.warn('[CUPONS-ML] Resposta inesperada ao ativar ' + c.codigo + ' na captura: ' +
         (r.mensagem || r.status));
@@ -7170,7 +7176,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
     //   "ja foi adicionado"  -> esta na conta; o card so nao traz o codigo no
     //                           rotulo. Confirma e para de cobrar o operador.
     //   sucesso              -> entrou agora; a validade real vem no proximo sync.
-    //   "confira se o cupom" -> vencido/inexistente — MAS so vale como prova se o
+    //   INVALID_1 / SOLD_OUT  -> nao existe ou acabou — MAS so vale como prova se o
     //                           canal responder outra coisa para algum codigo.
     const pendentesAtivacao = [], ativadosAgora = [], jaNaConta = [], indeterminados = [];
     // Recusa NAO desativa na hora. Quando o canal de ativacao cai, o ML responde
@@ -7194,8 +7200,13 @@ app.post('/cupons/sync-ml', async (req, res) => {
       } else if (r2.ok) {
         atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar });
         ativadosAgora.push(p.codigo);
-      } else if (r2.invalido) {
+      } else if (r2.invalido || r2.esgotado) {
         recusados.push({ ...p, mensagem: r2.mensagem });
+      } else if (r2.payloadRejeitado) {
+        // INVALID_6: o ML nao entendeu a chamada. Nao diz nada sobre o cupom.
+        pendentesAtivacao.push(p.codigo);
+        console.warn('[CUPONS-ML] ' + p.codigo + ': o ML rejeitou o payload (INVALID_6) — '
+          + 'a chamada esta quebrada, o cupom nao esta em julgamento.');
       } else {
         // Resposta que nao encaixa em nenhum caso conhecido: nao mexe na base e
         // deixa para o operador olhar.
