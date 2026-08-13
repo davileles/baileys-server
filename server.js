@@ -7130,7 +7130,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
         // Quem protege contra desativacao indevida agora e o canalAtivacaoOk.
         if (reg.ativo === false) continue;
         ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true,
-                        observacao: reg.observacao || null });
+                        observacao: reg.observacao || null, validadeAte: reg.validadeAte || null });
         continue;
       }
 
@@ -7205,13 +7205,19 @@ app.post('/cupons/sync-ml', async (req, res) => {
 
       // Reapareceu na conta: recusa antiga escrita pelo sync perde o sentido.
       const limpar = /^Desativado no sync/.test(p.observacao || '') ? { observacao:null } : {};
+      // PENDING prova que o cupom esta na conta e utilizavel AGORA. Se a base
+      // ainda carrega uma validade vencida (cupom que nunca aparece na pagina com
+      // codigo legivel, entao nunca teve o prazo atualizado), confirmar sem mexer
+      // nela devolve um cupom que cupomVigente reprova na hora seguinte.
+      const revalidar = Date.parse(p.validadeAte || '') > Date.now()
+        ? {} : { validadeAte: validadeDeTexto('amanha') };
 
       if (!r2) { indeterminados.push(p.codigo); }
       else if (r2.jaTinha) {
-        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar });
+        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar, ...revalidar });
         jaNaConta.push(p.codigo);
       } else if (r2.ok) {
-        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar });
+        atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar, ...revalidar });
         ativadosAgora.push(p.codigo);
       } else if (r2.expirado) {
         // O ML devolve data e hora do vencimento: melhor fonte de validade que
