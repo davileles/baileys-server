@@ -461,19 +461,13 @@ export function carregarCuponsBase() {
   try {
     if (existsSync(cT('cupons_base.json'))) {
       E().cupons = JSON.parse(readFileSync(cT('cupons_base.json'), 'utf-8'));
-      // A validade padrao caiu de 48h para 24h: recalcula quem foi gravado com a
-      // janela antiga, para a base nao ficar com dois criterios convivendo.
-      let migrados = 0;
-      for (const reg of Object.values(E().cupons)) {
-        const base = new Date(reg.capturadoEm).getTime();
-        if (!isFinite(base)) continue;
-        const alvo = base + CUPOM_VALIDADE_PADRAO_MS;
-        if (new Date(reg.validadeAte).getTime() > alvo + 60e3) {
-          reg.validadeAte = new Date(alvo).toISOString();
-          migrados++;
-        }
-      }
-      if (migrados) { salvarCuponsBase(); console.log('[CUPONS] ' + migrados + ' cupom(ns) migrado(s) para validade de 24h.'); }
+      // NAO recalcular validade aqui. Existiu uma migracao de 48h para 24h que
+      // truncava toda validadeAte maior que capturadoEm + 24h. Como rodava em
+      // TODO boot e nao distinguia TTL padrao de prazo real, ela destruia a
+      // validade verdadeira: cupom lido da conta do ML com prazo ate domingo
+      // voltava para captura+24h a cada reinicio, e o sync passava a trata-lo
+      // como vencido. O prazo real vem da conta do ML (expiration_date, texto do
+      // card ou EXPIRED_ACTION do input-code) e e a unica fonte que manda.
       console.log('[CUPONS] Base carregada — ' + Object.keys(E().cupons).length + ' cupom(ns).');
     }
   } catch (e) { console.log('[CUPONS] Erro ao carregar base:', e.message); E().cupons = {}; }
