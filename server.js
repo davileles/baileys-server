@@ -212,13 +212,28 @@ async function sincronizarCuponsMlAgendado() {
               + 'Cupom novo do Telegram não está entrando na sua conta até isso voltar.'
         }).catch(() => {});
       }
-    } else if ((d.pendentesAtivacao || []).length) {
-      await enviarMensagem(GRUPOS['operador'], {
-        text: '➕ *Confira estes cupons no Mercado Livre*\n\n'
-            + d.pendentesAtivacao.map(c => '• ' + c).join('\n')
-            + '\n\nO ML não aceitou nem recusou o código. Tente em: '
-            + 'mercadolivre.com.br/cupons → Inserir código.'
-      }).catch(() => {});
+    } else if ((d.pendentesDetalhe || d.pendentesAtivacao || []).length) {
+      const detalhe = d.pendentesDetalhe
+        || (d.pendentesAtivacao || []).map(c => ({ codigo: c }));
+      // Pedir para adicionar a mao um cupom que o proprio ML ja disse estar
+      // vencido ou esgotado gasta o tempo do operador para nada. So vale a pena
+      // quando a resposta e realmente desconhecida.
+      const semSentido = /venceu|esgot|expirou|encerrad/i;
+      const vale = detalhe.filter(x => !semSentido.test(x.mensagem || '')
+        && !(Date.parse(x.validadeAte || '') < Date.now()));
+
+      for (const x of detalhe.filter(x => !vale.includes(x))) {
+        console.log('[CUPONS-ML] ' + x.codigo + ' nao vai para o operador: ' + (x.mensagem || 'ja vencido na base'));
+      }
+
+      if (vale.length) {
+        await enviarMensagem(GRUPOS['operador'], {
+          text: '➕ *Confira estes cupons no Mercado Livre*\n\n'
+              + vale.map(x => '• ' + x.codigo + (x.mensagem ? ' — _' + x.mensagem + '_' : '')).join('\n')
+              + '\n\nO ML respondeu algo que o sync não reconhece. Tente em: '
+              + 'mercadolivre.com.br/cupons → Inserir código.'
+        }).catch(() => {});
+      }
     }
   } catch (e) { console.warn('[CUPONS-ML] Sync agendado — erro:', e.message); }
 }
@@ -7445,6 +7460,10 @@ app.post('/cupons/sync-ml', async (req, res) => {
     const adiados = ausentes.slice(MAX_VERIFICACOES).map(p => p.codigo);
     const paraVerificar = ausentes.slice(0, MAX_VERIFICACOES);
 
+    // Detalhe do que o ML respondeu. Sem isso a mensagem ao operador vira uma
+    // lista de codigos sem explicacao, e ele precisa abrir o navegador e testar
+    // um por um so para descobrir o que o sync ja sabia.
+    const pendentesDetalhe = [];
     const pendentesAtivacao = [], ativadosAgora = [], jaNaConta = [], indeterminados = [];
     // Recusa NAO desativa na hora. Quando o canal de ativacao cai, o ML responde
     // "codigo invalido" para tudo — inclusive para cupom que esta ativo na conta
@@ -7490,15 +7509,17 @@ app.post('/cupons/sync-ml', async (req, res) => {
           + (paraVerificar.length - i) + ' cupom(ns) adiado(s) para a proxima passada.');
         break;
       } else if (r2.payloadRejeitado) {
-        // INVALID_6: o ML nao entendeu a chamada. Nao diz nada sobre o cupom.
-        pendentesAtivacao.push(p.codigo);
-        console.warn('[CUPONS-ML] ' + p.codigo + ': o ML rejeitou o payload (INVALID_6) — '
+        // INVALID_6: o ML nao entendeu a chamada. Nao diz nada sobre o cupom, e
+        // tambem nao e tarefa manual — nenhum operador resolve payload errado.
+        console.error('[CUPONS-ML] ' + p.codigo + ': o ML rejeitou o payload (INVALID_6) — '
           + 'a chamada esta quebrada, o cupom nao esta em julgamento.');
       } else {
-        // Resposta que nao encaixa em nenhum caso conhecido: nao mexe na base e
-        // deixa para o operador olhar.
+        // Resposta que nao encaixa em nenhum caso conhecido: nao mexe na base.
         pendentesAtivacao.push(p.codigo);
-        console.warn('[CUPONS-ML] Resposta inesperada para ' + p.codigo + ': ' + (r2.mensagem || r2.status));
+        pendentesDetalhe.push({ codigo: p.codigo, rc: r2.rc || null, mensagem: r2.mensagem || null,
+                                validadeAte: p.validadeAte || null });
+        console.warn('[CUPONS-ML] Resposta inesperada para ' + p.codigo + ': '
+          + (r2.rc ? r2.rc + ' — ' : '') + (r2.mensagem || r2.status));
       }
       // 800ms derrubava o endpoint por volta da 13a chamada seguida.
       await new Promise(r3 => setTimeout(r3, 2500));
@@ -7517,7 +7538,11 @@ app.post('/cupons/sync-ml', async (req, res) => {
         desativados.push(p.codigo);
       }
     } else if (recusados.length) {
-      for (const p of recusados) pendentesAtivacao.push(p.codigo);
+      for (const p of recusados) {
+        pendentesAtivacao.push(p.codigo);
+        pendentesDetalhe.push({ codigo: p.codigo, rc: null, mensagem: p.mensagem || null,
+                                validadeAte: p.validadeAte || null });
+      }
       console.warn('[CUPONS-ML] ' + recusados.length + ' recusa(s) ignorada(s): o ML nao reconheceu '
         + 'nenhum codigo nesta passada — canal de ativacao provavelmente fora do ar. Nada desativado.');
     }
@@ -7533,7 +7558,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
     res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
                canalAtivacaoOk, bloqueioTaxa: bloqueio,
                recusasIgnoradas: canalAtivacaoOk ? 0 : recusados.length,
-               fontes, atualizados, criados, desativados, pendentesAtivacao,
+               fontes, atualizados, criados, desativados, pendentesAtivacao, pendentesDetalhe,
                ativadosAgora, jaNaConta, indeterminados,
                naoAvaliados: adiados });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
