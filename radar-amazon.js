@@ -515,15 +515,25 @@ export function registrarCupomBase(c) {
     // Confundir os dois faz o cupom ser anunciado para uma faixa de preco em que
     // ele nem se aplica.
     maximo: c.maximo === null || c.maximo === undefined ? null : Number(c.maximo),
-    observacao: c.observacao || null,
+    // Nota do operador sobrevive a recaptura. Antes qualquer reaparicao do cupom
+    // num grupo apagava a anotacao — inclusive a que explicava por que ele tinha
+    // sido desativado, deixando o registro sem historia.
+    observacao: c.observacao !== undefined ? c.observacao : (anterior?.observacao ?? null),
     capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
     atualizadoEm: new Date(agora).toISOString(),
     // Quando a fonte declara a expiracao real (o ML publica expiration_date em
     // cada cupom da conta), ela vence o padrao de 24h — que existe so para
     // cupom capturado de grupo, onde nao ha prazo confiavel.
-    validadeAte: c.validadeAte && !isNaN(new Date(c.validadeAte))
-      ? new Date(c.validadeAte).toISOString()
-      : new Date(agora + CUPOM_VALIDADE_PADRAO_MS).toISOString(),
+    validadeAte: (() => {
+      if (c.validadeAte && !isNaN(new Date(c.validadeAte))) return new Date(c.validadeAte).toISOString();
+      // Sem prazo declarado, o padrao de 24h NAO pode encurtar um prazo real ja
+      // conhecido. O padrao existe para cupom de grupo, onde nao ha prazo
+      // confiavel; aplicado por cima da validade lida da conta do ML, matava em
+      // 24h um cupom que valia ate domingo so porque ele reapareceu num canal.
+      const anteriorMs = Date.parse(anterior?.validadeAte || '');
+      const padraoMs = agora + CUPOM_VALIDADE_PADRAO_MS;
+      return new Date(anteriorMs > padraoMs ? anteriorMs : padraoMs).toISOString();
+    })(),
     // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
     ativo: anterior ? anterior.ativo !== false : true,
     // Id da campanha do ML, aprendido ao casar com o cupom que a pagina do
