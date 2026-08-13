@@ -4173,15 +4173,35 @@ const RETRY_LIMITE_AUTOCURA = 2;
 // bundle novo e reabrir a sessao do zero no proximo envio. E cirurgico: nao
 // derruba a conexao, nao pede QR e nao mexe nas sessoes dos outros contatos —
 // ao contrario de /reset-sessao, que custa reconexao inteira.
+// Desde a migracao de identidade do WhatsApp, a sessao Signal de um contato
+// pode estar gravada sob o LID dele (identificador interno) em vez do telefone.
+// Apagar so por telefone entao nao encontra nada e o problema continua: por isso
+// resolvemos o LID via onWhatsApp e limpamos os dois enderecos.
+async function lidDoContato(digitos) {
+  try {
+    if (!conectado || !sock) return null;
+    const r = await sock.onWhatsApp(digitos);
+    const achado = Array.isArray(r) ? r.find(x => x && x.exists) : null;
+    const lid = achado?.lid ? String(achado.lid).split('@')[0].split(':')[0] : null;
+    return lid && /^\d+$/.test(lid) ? lid : null;
+  } catch (e) {
+    console.warn('[SESSAO] Nao foi possivel resolver o LID de ' + digitos + ':', e.message);
+    return null;
+  }
+}
+
 async function resetarSessaoContato(alvo) {
   const digitos = String(alvo || '').replace(/\D/g, '');
-  if (!digitos) return { apagados: 0, arquivos: [] };
+  if (!digitos) return { apagados: 0, arquivos: [], users: [] };
+  const users = new Set([digitos]);
+  const lid = await lidDoContato(digitos);
+  if (lid) users.add(lid);
   const arquivos = [];
   try {
     // O id da sessao e `<user>.<device>` (ProtocolAddress), entao o prefixo com
     // ponto pega todos os aparelhos do contato sem pegar numero parecido.
     for (const arq of await readdir(SESSAO_DIR)) {
-      if (arq.startsWith('session-' + digitos + '.')) {
+      if ([...users].some(u => arq.startsWith('session-' + u + '.'))) {
         await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
         arquivos.push(arq);
       }
@@ -4189,9 +4209,10 @@ async function resetarSessaoContato(alvo) {
   } catch (e) {
     console.error('[SESSAO] Erro ao resetar contato ' + digitos + ':', e.message);
   }
-  _retriesPorUser.delete(digitos);
-  console.log('[SESSAO] Contato ' + digitos + ': ' + arquivos.length + ' registro(s) de sessao apagado(s) — proxima mensagem abre sessao nova.');
-  return { apagados: arquivos.length, arquivos };
+  users.forEach(u => _retriesPorUser.delete(u));
+  console.log('[SESSAO] Contato ' + digitos + (lid ? ' (lid ' + lid + ')' : '') + ': ' +
+    arquivos.length + ' registro(s) de sessao apagado(s) — proxima mensagem abre sessao nova.');
+  return { apagados: arquivos.length, arquivos, users: [...users], lid };
 }
 
 // ── RETRY RECEIPT = AVISO DE NAO-ENTREGA ─────────────────────────────────────
@@ -8749,10 +8770,46 @@ app.post('/reset-sessao-contato', async (req, res) => {
     ok: true,
     apagados: r.apagados,
     arquivos: r.arquivos,
+    lid: r.lid || null,
+    enderecosLimpos: r.users,
     mensagem: r.apagados
       ? 'Sessao apagada. Reenvie a mensagem: ela abrira uma sessao nova e chegara decifravel.'
       : 'Nenhum registro de sessao encontrado para esse numero (ja estava limpo — reenvie normalmente).',
   });
+});
+
+// Diagnostico do diretorio de sessao: mostra COMO as sessoes estao endereçadas
+// (telefone ou LID) e o que existe para um contato. Devolve apenas nomes de
+// arquivo e contagens — nunca conteudo de chave.
+app.get('/sessao/diagnostico', async (req, res) => {
+  try {
+    const alvo = String(req.query.telefone || '').replace(/\D/g, '');
+    const arquivos = await readdir(SESSAO_DIR);
+    const sessions = arquivos.filter(a => a.startsWith('session-'));
+    const porTipo = {};
+    for (const a of arquivos) {
+      const t = a.split('-').slice(0, 2).join('-');
+      porTipo[t] = (porTipo[t] || 0) + 1;
+    }
+    let contato = null;
+    if (alvo) {
+      const lid = await lidDoContato(alvo);
+      const users = [alvo, lid].filter(Boolean);
+      contato = {
+        telefone: alvo,
+        lid,
+        sessoes: sessions.filter(a => users.some(u => a.startsWith('session-' + u + '.'))),
+      };
+    }
+    res.json({
+      ok: true,
+      totalArquivos: arquivos.length,
+      totalSessoes: sessions.length,
+      porTipo,
+      amostraSessoes: sessions.slice(0, 25),
+      contato,
+    });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 // Diagnostico: quem pediu reenvio (ou seja, nao conseguiu decifrar) e quando.
