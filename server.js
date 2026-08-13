@@ -7196,7 +7196,9 @@ app.post('/cupons/sync-ml', async (req, res) => {
     // em lote. As recusas ficam em quarentena ate o fim do loop, e so viram
     // desativacao se alguma outra resposta provar que o canal responde de verdade.
     const recusados = [];
-    for (const p of paraVerificar) {
+    let bloqueio = false;
+    for (let i = 0; i < paraVerificar.length; i++) {
+      const p = paraVerificar[i];
       let r2 = null;
       try { r2 = await ativarCupomMl(p.codigo); }
       catch (e) { console.warn('[CUPONS-ML] Falha ao verificar ' + p.codigo + ':', e.message); }
@@ -7211,8 +7213,20 @@ app.post('/cupons/sync-ml', async (req, res) => {
       } else if (r2.ok) {
         atualizarCupomBase(p.chave, { ativo:true, confirmadoNoMl:true, ...limpar });
         ativadosAgora.push(p.codigo);
+      } else if (r2.expirado) {
+        // O ML devolve data e hora do vencimento: melhor fonte de validade que
+        // a pagina, que esconde o prazo em card "esgotando".
+        recusados.push({ ...p, mensagem: r2.mensagem, validadeAte: r2.venceuEm });
       } else if (r2.invalido || r2.esgotado) {
         recusados.push({ ...p, mensagem: r2.mensagem });
+      } else if (r2.bloqueado) {
+        // Limite de taxa. Insistir so aprofunda o bloqueio e nenhuma resposta
+        // seguinte valeria nada: para a passada e devolve o resto para a proxima.
+        bloqueio = true;
+        for (const resto of paraVerificar.slice(i)) adiados.push(resto.codigo);
+        console.warn('[CUPONS-ML] HTTP 403 em ' + p.codigo + ' — limite de taxa do ML. '
+          + (paraVerificar.length - i) + ' cupom(ns) adiado(s) para a proxima passada.');
+        break;
       } else if (r2.payloadRejeitado) {
         // INVALID_6: o ML nao entendeu a chamada. Nao diz nada sobre o cupom.
         pendentesAtivacao.push(p.codigo);
@@ -7224,7 +7238,8 @@ app.post('/cupons/sync-ml', async (req, res) => {
         pendentesAtivacao.push(p.codigo);
         console.warn('[CUPONS-ML] Resposta inesperada para ' + p.codigo + ': ' + (r2.mensagem || r2.status));
       }
-      await new Promise(r3 => setTimeout(r3, 800));
+      // 800ms derrubava o endpoint por volta da 13a chamada seguida.
+      await new Promise(r3 => setTimeout(r3, 2500));
     }
 
     // Sinal de vida do canal: pelo menos um cupom que o ML reconheceu (entrou
@@ -7233,8 +7248,10 @@ app.post('/cupons/sync-ml', async (req, res) => {
     const canalAtivacaoOk = ativadosAgora.length > 0 || jaNaConta.length > 0;
     if (canalAtivacaoOk) {
       for (const p of recusados) {
-        atualizarCupomBase(p.chave, { ativo:false,
-          observacao: 'Desativado no sync: o ML recusou o codigo (' + (p.mensagem || 'sem detalhe') + ')' });
+        const campos = { ativo:false,
+          observacao: 'Desativado no sync: ' + (p.mensagem || 'o ML recusou o codigo') };
+        if (p.validadeAte) campos.validadeAte = p.validadeAte;
+        atualizarCupomBase(p.chave, campos);
         desativados.push(p.codigo);
       }
     } else if (recusados.length) {
@@ -7247,11 +7264,13 @@ app.post('/cupons/sync-ml', async (req, res) => {
       + criados.length + ' novo(s), ' + desativados.length + ' desativado(s), '
       + jaNaConta.length + ' ja na conta, ' + ativadosAgora.length + ' ativado(s) agora'
       + (leituraCompleta ? '' : ' [leitura parcial da pagina]')
-      + (adiados.length ? ' [' + adiados.length + ' adiado(s) para a proxima passada]' : '')
+      + (adiados.length ? ' [' + adiados.length + ' adiado(s) para a proxima passada'
+                        + (bloqueio ? ' por limite de taxa' : '') + ']' : '')
       + (canalAtivacaoOk ? '' : ' [canal de ativacao mudo: recusas ignoradas]') + '.');
 
     res.json({ ok:true, naPagina:naPagina.length, semCodigo, totalDeclarado, leituraCompleta,
-               canalAtivacaoOk, recusasIgnoradas: canalAtivacaoOk ? 0 : recusados.length,
+               canalAtivacaoOk, bloqueioTaxa: bloqueio,
+               recusasIgnoradas: canalAtivacaoOk ? 0 : recusados.length,
                fontes, atualizados, criados, desativados, pendentesAtivacao,
                ativadosAgora, jaNaConta, indeterminados,
                naoAvaliados: adiados });
