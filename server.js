@@ -4156,6 +4156,70 @@ async function limparSenderKeys() {
   } catch(e) { console.error('[WA] Erro na cura cirúrgica:', e.message); }
 }
 
+const _retriesPorUser = new Map();   // user (so digitos) -> { n, ultimoEm }
+const RETRY_LIMITE_AUTOCURA = 2;
+
+// ── SESSAO E2E POR CONTATO ───────────────────────────────────────────────────
+// "Aguardando mensagem. Essa acao pode levar alguns instantes." no aparelho do
+// destinatario NAO e falha de envio: o sendMessage retorna sucesso, a mensagem
+// sai com um check e o aparelho dele simplesmente nao consegue decifrar. A
+// causa e o registro de sessao Signal daquele contato ter ficado velho do nosso
+// lado — ele trocou de aparelho, reinstalou o WhatsApp, ou o ratchet
+// dessincronizou depois de um restart. Enquanto a sessao velha existir, TODA
+// mensagem para ele sai cifrada com chave que ele nao tem: reenviar o mesmo
+// texto nao adianta.
+//
+// Apagar session-<numero>.<device>.json obriga o Baileys a buscar um pre-key
+// bundle novo e reabrir a sessao do zero no proximo envio. E cirurgico: nao
+// derruba a conexao, nao pede QR e nao mexe nas sessoes dos outros contatos —
+// ao contrario de /reset-sessao, que custa reconexao inteira.
+async function resetarSessaoContato(alvo) {
+  const digitos = String(alvo || '').replace(/\D/g, '');
+  if (!digitos) return { apagados: 0, arquivos: [] };
+  const arquivos = [];
+  try {
+    // O id da sessao e `<user>.<device>` (ProtocolAddress), entao o prefixo com
+    // ponto pega todos os aparelhos do contato sem pegar numero parecido.
+    for (const arq of await readdir(SESSAO_DIR)) {
+      if (arq.startsWith('session-' + digitos + '.')) {
+        await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+        arquivos.push(arq);
+      }
+    }
+  } catch (e) {
+    console.error('[SESSAO] Erro ao resetar contato ' + digitos + ':', e.message);
+  }
+  _retriesPorUser.delete(digitos);
+  console.log('[SESSAO] Contato ' + digitos + ': ' + arquivos.length + ' registro(s) de sessao apagado(s) — proxima mensagem abre sessao nova.');
+  return { apagados: arquivos.length, arquivos };
+}
+
+// ── RETRY RECEIPT = AVISO DE NAO-ENTREGA ─────────────────────────────────────
+// Quando o destinatario nao decifra, o aparelho dele pede reenvio (receipt
+// type=retry). Esse e o UNICO sinal que temos de que a mensagem travou em
+// "Aguardando mensagem" — o sendMessage ja retornou sucesso ha muito tempo.
+// Um retry isolado e normal (o Baileys reenvia via getMessage e resolve). A
+// partir do segundo, a sessao esta viciada: apagamos ela na hora, para que a
+// PROXIMA mensagem para esse contato ja saia por uma sessao limpa.
+function registrarRetryReceipt(node) {
+  try {
+    const de = node?.attrs?.from || '';
+    const user = String(de).split('@')[0].split(':')[0].replace(/\D/g, '');
+    if (!user) return;
+    // Retry vindo de grupo e outro problema (sender key), ja tratado em /reset-sender-keys.
+    if (String(de).includes('@g.us')) return;
+    const reg = _retriesPorUser.get(user) || { n: 0, ultimoEm: 0 };
+    reg.n++;
+    reg.ultimoEm = Date.now();
+    _retriesPorUser.set(user, reg);
+    console.warn('[ENTREGA] Retry #' + reg.n + ' de ' + user + ' — ele nao conseguiu decifrar nossa mensagem.');
+    if (reg.n >= RETRY_LIMITE_AUTOCURA) {
+      console.warn('[ENTREGA] ' + user + ' atingiu ' + reg.n + ' retries — apagando a sessao dele (autocura).');
+      resetarSessaoContato(user).catch(() => {});
+    }
+  } catch (e) {}
+}
+
 // Guarda as últimas mensagens ENVIADAS para responder retry receipts (getMessage).
 const mensagensEnviadas = new Map();
 function guardarMensagemEnviada(info) {
@@ -4302,6 +4366,14 @@ async function conectar() {
     });
     sock = novaSock;
     sock.ev.on('creds.update', saveCreds);
+    // Escuta o no bruto de retry: e o aviso de que alguem nao decifrou o que
+    // mandamos. Sem isso, uma campanha inteira pode nao chegar sem deixar
+    // rastro nenhum no log — todo sendMessage tera retornado sucesso.
+    try {
+      if (typeof novaSock.ws?.on === 'function') {
+        novaSock.ws.on('CB:receipt,type:retry', (node) => registrarRetryReceipt(node));
+      }
+    } catch (e) { console.warn('[ENTREGA] Nao foi possivel escutar retry receipts:', e.message); }
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       if (qr) { qrAtual = await QRCode.toDataURL(qr); }
@@ -5088,7 +5160,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -8666,6 +8738,30 @@ app.post('/webhook/hubla', async (req, res) => {
   } catch (err) { console.error('[Hubla] Erro:', err); return res.status(500).json({ error: 'Erro interno' }); }
 });
 
+
+// Cura cirurgica de UM contato: use quando o cliente relata "Aguardando
+// mensagem". Nao derruba a conexao nem pede QR.
+app.post('/reset-sessao-contato', async (req, res) => {
+  const alvo = req.body?.telefone || req.body?.jid || '';
+  if (!alvo) return res.status(400).json({ ok: false, erro: 'informe telefone ou jid' });
+  const r = await resetarSessaoContato(alvo);
+  res.json({
+    ok: true,
+    apagados: r.apagados,
+    arquivos: r.arquivos,
+    mensagem: r.apagados
+      ? 'Sessao apagada. Reenvie a mensagem: ela abrira uma sessao nova e chegara decifravel.'
+      : 'Nenhum registro de sessao encontrado para esse numero (ja estava limpo — reenvie normalmente).',
+  });
+});
+
+// Diagnostico: quem pediu reenvio (ou seja, nao conseguiu decifrar) e quando.
+app.get('/entregas-suspeitas', (req, res) => {
+  const itens = [..._retriesPorUser].map(([user, r]) => ({
+    user, retries: r.n, ultimoEm: new Date(r.ultimoEm).toISOString(),
+  })).sort((a, b) => b.retries - a.retries);
+  res.json({ ok: true, total: itens.length, limiteAutocura: RETRY_LIMITE_AUTOCURA, itens });
+});
 
 app.post('/reset-sender-keys', async (req, res) => {
   console.log('[RESET] Cura cirúrgica de sender keys solicitada via endpoint.');
