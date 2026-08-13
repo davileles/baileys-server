@@ -224,6 +224,27 @@ export function agendarPush(local) {
   }, DEBOUNCE_MS));
 }
 
+/** Arquivos gravados no disco que ainda nao subiram (estao no debounce). */
+export function pushesPendentes() { return [..._timers.keys()]; }
+
+/**
+ * Envia AGORA so o que esta no debounce. Existe para o encerramento: o Railway
+ * manda SIGTERM e derruba o processo em seguida, entao gravacao feita nos
+ * ultimos DEBOUNCE_MS so existe no disco do container. No boot seguinte
+ * baixarDoGitHub() reescreve o disco com a versao do repositorio e a gravacao
+ * some — o registro volta a um estado anterior, com atualizadoEm no passado.
+ * Diferente de pushImediato(), nao varre todos os arquivos: no encerramento ha
+ * poucos segundos, e cada arquivo custa um GET mais um PUT.
+ */
+export async function flushPushesPendentes() {
+  const pendentes = pushesPendentes();
+  // Cancela os timers antes de enviar: se o processo sobreviver, o envio ja
+  // aconteceu e o timer dispararia um segundo PUT identico.
+  for (const local of pendentes) { clearTimeout(_timers.get(local)); _timers.delete(local); }
+  for (const local of pendentes) await enviar(local);
+  return pendentes;
+}
+
 /** Envia tudo imediatamente, ignorando o debounce. Usado pelo endpoint manual. */
 export async function pushImediato() {
   const feitos = [];
