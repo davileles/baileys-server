@@ -1667,13 +1667,30 @@ function precoForaDaCurva(pontos, hist180, tipoVoo) {
 // hist180: origem|destino|programa|cabine|cia). Sem histórico (count < 1) ou
 // acima do teto → fila de aprovação (fluxo atual). O filtro precoForaDaCurva
 // continua rodando ANTES: muito acima da média nem chega aqui.
-const AUTO_ENVIO_ALERTA_MODO = (process.env.AUTO_ENVIO_ALERTA || 'sombra').toLowerCase();
+const AUTO_ENVIO_ALERTA_MODO = (process.env.AUTO_ENVIO_ALERTA || 'on').toLowerCase();
+
+// Campo só conta como preenchido se tiver valor real: vazio, '?', '-', 'N/A',
+// 'desconhecido(a)', 'não identificado(a)', 'indefinido(a)' etc. reprovam.
+function campoAlertaValido(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return false;
+  const n = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (/^[-?.]+$/.test(n)) return false;
+  if (/desconhecid|nao identificad|nao informad|indefinid|indisponivel|^n\/?a$|^nd$|^null$|^undefined$/.test(n)) return false;
+  return true;
+}
 
 function avaliarAutoEnvioAlerta(oferta, hist180) {
   const de  = oferta?.dadosExtraidos || {};
   const pts = Number(de.pontos) || 0;
-  if (!hist180 || !hist180.mediaPts || hist180.count < 1) return { auto: false, motivo: 'sem histórico' };
+  // Completude: auto-envio só com TODOS os campos identificados de fato —
+  // origem, destino, cia, programa, pontos, cabine e datas de ida. Qualquer
+  // campo vazio ou "desconhecido" derruba para a fila de aprovação.
+  const obrigatorios = { origem: de.origem, destino: de.destino, cia: de.cia, programa: de.programa, cabine: de.cabine, datas: de.datasIda };
+  const faltando = Object.keys(obrigatorios).filter(k => !campoAlertaValido(obrigatorios[k]));
+  if (faltando.length) return { auto: false, motivo: 'campo(s) incompleto(s): ' + faltando.join(', ') };
   if (pts <= 0) return { auto: false, motivo: 'pontos inválidos' };
+  if (!hist180 || !hist180.mediaPts || hist180.count < 1) return { auto: false, motivo: 'sem histórico' };
   const cab = String(de.cabine || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   const tol  = cab === 'executiva' ? 0.05 : 0.10;
   const teto = Math.round(hist180.mediaPts * (1 + tol));
