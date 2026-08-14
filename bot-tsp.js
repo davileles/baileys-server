@@ -63,6 +63,22 @@ async function tg(metodo, body) {
   return d;
 }
 
+// Canal de alerta operacional independente do WhatsApp: manda `texto` (plain
+// text, sem parse_mode — Markdown malformado faria o Telegram recusar o aviso)
+// para todos os TELEGRAM_BOT_ADMINS. Usado pelo watchdog do server.js: se o
+// sock do WhatsApp morrer por inteiro, este e o unico canal que ainda chega.
+export async function notificarAdminsTelegram(texto) {
+  if (!TOKEN || !ADMINS.size) return false;
+  let algum = false;
+  for (const chatId of ADMINS) {
+    try {
+      const d = await tg('sendMessage', { chat_id: chatId, text: texto });
+      if (d && d.ok) algum = true;
+    } catch (e) { console.warn('[BOT-TSP] Alerta a admin ' + chatId + ' falhou:', e.message); }
+  }
+  return algum;
+}
+
 function teclado(linhas) {
   return { inline_keyboard: linhas.map(l => l.map(([texto, data]) => ({ text: texto, callback_data: data }))) };
 }
