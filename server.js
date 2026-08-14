@@ -1187,7 +1187,7 @@ async function despacharAgendamento(ag, grupoId) {
 
   let lp = null;
   if (ag.preview?.link) {
-    try { lp = await montarLinkPreviewManual(ag.preview); }
+    try { lp = await montarLinkPreviewManual(ag.preview, ag.mensagem); }
     catch (e) { console.warn('[AGEND] Nao montou o preview de #' + ag.id + ':', e.message); }
   }
   return enviarMensagem(grupoId, lp ? { text: ag.mensagem, linkPreview: lp } : { text: ag.mensagem });
@@ -2078,9 +2078,26 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
 // imagem; melhor mandar preview sem foto do que a mensagem falhar.
 const THUMB_MAX_BYTES = 100 * 1024;
 
+// O rastreio troca a marcacao de afiliado na hora de montar a mensagem (pool
+// rotativo da Amazon, sub_id da Shopee), entao a URL no texto pode diferir da
+// URL registrada na oferta. O WhatsApp so renderiza o card quando o
+// matched-text aparece EXATAMENTE no corpo — por isso o preview precisa usar a
+// URL que esta de fato na mensagem, e o link original vira apenas reserva.
+function urlNaMensagem(url, mensagem) {
+  try {
+    const alvo = new URL(url);
+    const candidatas = String(mensagem || '').match(/https?:\/\/[^\s`"'<>]+/g) || [];
+    const achada = candidatas.find(u => {
+      try { const x = new URL(u); return x.hostname === alvo.hostname && x.pathname === alvo.pathname; }
+      catch { return false; }
+    });
+    return achada || url;
+  } catch { return url; }
+}
+
 function montarLinkPreview(oferta, mensagem) {
   const d = oferta.dadosExtraidos || {};
-  const url = d.link;
+  const url = d.link ? urlNaMensagem(d.link, mensagem) : null;
   if (!url) return null;
 
   const preview = {
@@ -2108,9 +2125,10 @@ function montarLinkPreview(oferta, mensagem) {
 // manual nao tem uma oferta na fila, so o produto que o operador acabou de
 // consultar. A thumbnail passa pelo baixarImagemProduto para herdar a conversao
 // de webp -> jpg do Mercado Livre.
-async function montarLinkPreviewManual(dados) {
-  const url = String(dados?.link || '').trim();
+async function montarLinkPreviewManual(dados, mensagem) {
+  let url = String(dados?.link || '').trim();
   if (!url) return null;
+  if (mensagem) url = urlNaMensagem(url, mensagem);
   const preview = {
     'canonical-url': url,
     'matched-text': url,
@@ -2187,7 +2205,7 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
   // Card de link so vale quando nao ha imagem — o WhatsApp mostra um ou outro.
   let lp = null;
   if (!imagem?.imagemBase64 && preview?.link) {
-    try { lp = await montarLinkPreviewManual(preview); }
+    try { lp = await montarLinkPreviewManual(preview, mensagem); }
     catch (e) { console.warn('[MANUAL] Nao montou o preview:', e.message); }
   }
 
@@ -6217,7 +6235,7 @@ app.post('/enviar', async (req, res) => {
     res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
   } else {
     try {
-      const lp = preview?.link ? await montarLinkPreviewManual(preview) : null;
+      const lp = preview?.link ? await montarLinkPreviewManual(preview, mensagem) : null;
       await enviarMensagem(grupoId, lp ? { text:mensagem, linkPreview:lp } : { text:mensagem });
       res.json({ ok:true, comPreview: !!lp });
     }
