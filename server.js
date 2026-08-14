@@ -901,7 +901,7 @@ async function conectarConta(id) {
       // aqui roubaria a presenca dele e mudaria o comportamento de notificacao
       // no celular do operador — nao vale, ja que esta conta so envia.
       markOnlineOnConnect: false,
-      getMessage: async (key) => c.enviadas.get(key?.id),
+      getMessage: async (key) => c.enviadas.get(key?.id) || obterMensagemEnviada(key?.id),
       shouldIgnoreJid: (jid) => jid === 'status@broadcast' || (typeof jid === 'string' && jid.endsWith('@newsletter')),
       keepAliveIntervalMs: 30000,
     });
@@ -950,6 +950,7 @@ async function enviarPelaConta(id, destino, conteudo) {
       if (c.enviadas.size > 300) c.enviadas.delete(c.enviadas.keys().next().value);
     }
   } catch (e) {}
+  guardarMensagemEnviada(r);
   c.ultimoEnvio = new Date().toISOString();
   return r;
 }
@@ -4229,8 +4230,8 @@ function registrarRetryReceipt(node) {
     const de = node?.attrs?.from || '';
     const user = String(de).split('@')[0].split(':')[0].replace(/\D/g, '');
     if (!user) return;
-    // Retry vindo de grupo e outro problema (sender key), ja tratado em /reset-sender-keys.
-    if (String(de).includes('@g.us')) return;
+    // Retry vindo de grupo: participante sem a nossa sender key — autocura própria.
+    if (String(de).includes('@g.us')) { registrarRetryGrupo(String(de), node?.attrs?.participant); return; }
     const reg = _retriesPorUser.get(user) || { n: 0, ultimoEm: 0 };
     reg.n++;
     reg.ultimoEm = Date.now();
@@ -4244,14 +4245,101 @@ function registrarRetryReceipt(node) {
 }
 
 // Guarda as últimas mensagens ENVIADAS para responder retry receipts (getMessage).
-const mensagensEnviadas = new Map();
+// PERSISTENTE EM DISCO (sessao/enviadas.json): o Map puro em memória zerava a
+// cada restart/redeploy do Railway. Retry receipt costuma chegar MINUTOS ou
+// HORAS depois do envio (destinatário offline na hora). Se chegasse após um
+// restart, getMessage devolvia undefined, o reenvio do Baileys falhava e o
+// destinatário ficava preso em "Aguardando mensagem" PARA SEMPRE. Agora o
+// store sobrevive a restarts, com TTL de 48h e escrita atômica (tmp + rename),
+// no mesmo padrão do auth state. Cobre a conta principal e as contas extras.
+const ENVIADAS_PATH   = SESSAO_DIR + '/enviadas.json';
+const ENVIADAS_TTL_MS = 48 * 60 * 60 * 1000;
+const ENVIADAS_MAX    = 4000;
+const mensagensEnviadas = new Map(); // id -> { m: mensagem, em: ms }
+
+function obterMensagemEnviada(id) {
+  const reg = id ? mensagensEnviadas.get(id) : null;
+  return reg ? reg.m : undefined;
+}
+
+let _enviadasSaveTimer = null;
+function _agendarSalvarEnviadas() {
+  if (_enviadasSaveTimer) return;
+  _enviadasSaveTimer = setTimeout(async () => {
+    _enviadasSaveTimer = null;
+    try {
+      const agora = Date.now();
+      for (const [id, r] of mensagensEnviadas) {
+        if (agora - (r.em || 0) > ENVIADAS_TTL_MS) mensagensEnviadas.delete(id);
+      }
+      while (mensagensEnviadas.size > ENVIADAS_MAX) {
+        mensagensEnviadas.delete(mensagensEnviadas.keys().next().value);
+      }
+      const obj = {};
+      for (const [id, r] of mensagensEnviadas) obj[id] = { em: r.em, m: r.m };
+      const tmp = ENVIADAS_PATH + '.tmp';
+      await writeFileAsync(tmp, JSON.stringify(obj, BufferJSON.replacer));
+      await renameAsync(tmp, ENVIADAS_PATH);
+    } catch (e) { console.error('[ENTREGA] Erro ao persistir enviadas.json:', e.message); }
+  }, 3000);
+}
+
+// Restaura o store no boot: é isto que faz o retry receipt pós-redeploy
+// encontrar a mensagem e o reenvio funcionar.
+(async () => {
+  try {
+    const raw = await readFileAsync(ENVIADAS_PATH, 'utf-8');
+    const obj = JSON.parse(raw, BufferJSON.reviver);
+    const agora = Date.now();
+    let n = 0;
+    for (const id in obj) {
+      const r = obj[id];
+      if (r?.m && agora - (r.em || 0) <= ENVIADAS_TTL_MS) { mensagensEnviadas.set(id, r); n++; }
+    }
+    if (n) console.log('[ENTREGA] ' + n + ' mensagens enviadas restauradas do disco (getMessage sobrevive a restart).');
+  } catch {}
+})();
+
 function guardarMensagemEnviada(info) {
   try {
     if (info?.key?.id && info.message) {
-      mensagensEnviadas.set(info.key.id, info.message);
-      if (mensagensEnviadas.size > 300) mensagensEnviadas.delete(mensagensEnviadas.keys().next().value);
+      mensagensEnviadas.set(info.key.id, { m: info.message, em: Date.now() });
+      _agendarSalvarEnviadas();
     }
   } catch(e) {}
+}
+
+// ── AUTOCURA DE GRUPO ────────────────────────────────────────────────────────
+// "Aguardando mensagem" DENTRO de grupo (caso do concierge, que envia para o
+// grupo do cliente): um participante não tem a NOSSA sender key — ele trocou
+// de aparelho, entrou depois, ou a sessão 1:1 pela qual o SKDM viaja viciou.
+// O Baileys reenvia via getMessage no primeiro retry; se o MESMO grupo acumula
+// retries, apagamos sender-key-memory-<grupo> (o próximo envio redistribui a
+// nossa chave a TODOS os participantes) e resetamos a sessão 1:1 do
+// participante que reclamou (o SKDM novo viaja por ela).
+const _retriesPorGrupo = new Map(); // grupoJid -> { n, ultimoEm }
+const RETRY_GRUPO_AUTOCURA = 2;
+
+async function curarSenderKeyGrupo(grupoJid) {
+  try {
+    const nome = ('sender-key-memory-' + grupoJid + '.json').replace(/\//g, '__').replace(/:/g, '-');
+    await unlink(SESSAO_DIR + '/' + nome).catch(() => {});
+    console.warn('[ENTREGA] sender-key-memory de ' + grupoJid + ' apagado — próximo envio redistribui a sender key a todos.');
+  } catch (e) { console.error('[ENTREGA] Falha ao curar sender key de ' + grupoJid + ':', e.message); }
+}
+
+function registrarRetryGrupo(grupoJid, participante) {
+  const reg = _retriesPorGrupo.get(grupoJid) || { n: 0, ultimoEm: 0 };
+  reg.n++;
+  reg.ultimoEm = Date.now();
+  _retriesPorGrupo.set(grupoJid, reg);
+  const quem = String(participante || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+  console.warn('[ENTREGA] Retry de GRUPO #' + reg.n + ' em ' + grupoJid + (quem ? ' (participante ' + quem + ')' : '') + '.');
+  if (reg.n >= RETRY_GRUPO_AUTOCURA) {
+    _retriesPorGrupo.delete(grupoJid);
+    curarSenderKeyGrupo(grupoJid);
+    if (quem) resetarSessaoContato(quem).catch(() => {});
+  }
 }
 
 // Última mensagem capturada por grupo monitorado (observabilidade em /status).
@@ -4380,7 +4468,7 @@ async function conectar() {
       // getMessage real: quando um destinatário não consegue decifrar uma mensagem
       // NOSSA, o WhatsApp pede reenvio (retry receipt). Devolver undefined fazia o
       // reenvio falhar e o destinatário ficar preso em "aguardando mensagem".
-      getMessage: async (key) => mensagensEnviadas.get(key?.id),
+      getMessage: async (key) => obterMensagemEnviada(key?.id),
       // Ignora status e newsletters: reduz drasticamente o volume de decodificação
       // (e de erros Bad MAC) de conteúdo que o servidor nunca usa.
       shouldIgnoreJid: (jid) => jid === 'status@broadcast' || (typeof jid === 'string' && jid.endsWith('@newsletter')),
