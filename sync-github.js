@@ -47,6 +47,10 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // push continua, so a restauracao automatica no boot deixa de funcionar
   // (o local e mantido, nao corrompido). Perto do limite, virar shard por ano.
   'grupos_membros_log.json',
+  // Ledger ref -> produto do rastreio de desempenho. Precisa sobreviver a
+  // deploy: sem ele o relatorio da Amazon fica ilegivel, porque a tag
+  // sozinha nao diz qual produto foi divulgado naquele dia.
+  'rastreio.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
