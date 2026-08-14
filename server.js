@@ -4169,6 +4169,45 @@ const RETRY_LIMITE_AUTOCURA = 2;
 const _avisosEntrega = new Map();    // alvo -> ultimoAvisoEm (ms)
 const AVISO_ENTREGA_DEDUP_MS = 6 * 60 * 60 * 1000;
 
+// Cooldown pós-autocura: o WhatsApp manda UM retry receipt POR MENSAGEM
+// travada. Um contato com 10 mensagens presas gera uma rajada de 10 retries —
+// e cada um, sem isto, disparava autocura + alerta de novo (dezenas de avisos
+// no operador). Depois da cura, os retries seguintes do mesmo alvo são ecos
+// das mensagens antigas: a sessão nova só vale a partir do PRÓXIMO envio.
+// Ignoramos o alvo por 10 min.
+const _autocuraEm = new Map();       // alvo -> ts da última autocura
+const AUTOCURA_COOLDOWN_MS = 10 * 60 * 1000;
+
+function _emCooldownAutocura(alvo) {
+  return Date.now() - (_autocuraEm.get(alvo) || 0) < AUTOCURA_COOLDOWN_MS;
+}
+
+// Válvula global: independente do dedup por alvo, nunca mais que 5 avisos de
+// entrega por hora no grupo do operador. Ao estourar, UM aviso de supressão.
+let _avisosEntregaJanela = { inicio: 0, n: 0, suprimidos: 0, avisou: false };
+const AVISOS_ENTREGA_MAX_HORA = 5;
+
+function _passaValvulaAvisos() {
+  const agora = Date.now();
+  if (agora - _avisosEntregaJanela.inicio > 60 * 60 * 1000) {
+    _avisosEntregaJanela = { inicio: agora, n: 0, suprimidos: 0, avisou: false };
+  }
+  if (_avisosEntregaJanela.n < AVISOS_ENTREGA_MAX_HORA) {
+    _avisosEntregaJanela.n++;
+    return true;
+  }
+  _avisosEntregaJanela.suprimidos++;
+  if (!_avisosEntregaJanela.avisou) {
+    _avisosEntregaJanela.avisou = true;
+    enviarMensagem(GRUPOS.operador, { text: '*Avisos de entrega silenciados por 1h* \ud83d\udd15\n\n'
+      + 'Limite de ' + AVISOS_ENTREGA_MAX_HORA + ' avisos/hora atingido. As autocuras '
+      + 'continuam rodando normalmente — só os avisos estão suprimidos. Detalhe completo em /entregas-suspeitas e nos logs [ENTREGA].' })
+      .catch(() => {});
+  }
+  console.warn('[ENTREGA] Aviso suprimido pela válvula (' + _avisosEntregaJanela.suprimidos + ' na janela).');
+  return false;
+}
+
 function _podeAvisarEntrega(alvo) {
   const ultimo = _avisosEntrega.get(alvo) || 0;
   if (Date.now() - ultimo < AVISO_ENTREGA_DEDUP_MS) return false;
@@ -4177,6 +4216,7 @@ function _podeAvisarEntrega(alvo) {
 }
 
 function notificarOperadorEntrega(texto) {
+  if (!_passaValvulaAvisos()) return;
   // Fire-and-forget: aviso nunca pode derrubar o handler de retry.
   enviarMensagem(GRUPOS.operador, { text: texto })
     .catch(e => console.error('[ENTREGA] Falha ao avisar operador:', e.message));
@@ -4252,6 +4292,8 @@ function registrarRetryReceipt(node) {
     if (!user) return;
     // Retry vindo de grupo: participante sem a nossa sender key — autocura própria.
     if (String(de).includes('@g.us')) { registrarRetryGrupo(String(de), node?.attrs?.participant); return; }
+    // Rajada pós-autocura: ecos de mensagens antigas travadas. Ignorar.
+    if (_emCooldownAutocura('user:' + user)) return;
     const reg = _retriesPorUser.get(user) || { n: 0, ultimoEm: 0 };
     reg.n++;
     reg.ultimoEm = Date.now();
@@ -4259,7 +4301,12 @@ function registrarRetryReceipt(node) {
     console.warn('[ENTREGA] Retry #' + reg.n + ' de ' + user + ' — ele nao conseguiu decifrar nossa mensagem.');
     if (reg.n >= RETRY_LIMITE_AUTOCURA) {
       console.warn('[ENTREGA] ' + user + ' atingiu ' + reg.n + ' retries — apagando a sessao dele (autocura).');
+      // Zera o contador AGORA (síncrono) e arma o cooldown: o delete que existe
+      // dentro do resetarSessaoContato é async e chegava tarde numa rajada.
+      _retriesPorUser.delete(user);
+      _autocuraEm.set('user:' + user, Date.now());
       resetarSessaoContato(user).catch(() => {});
+      if (!_podeAvisarEntrega('cura:user:' + user)) return;
       notificarOperadorEntrega('*Entrega suspeita — autocura aplicada* \u26a0\ufe0f\n\n'
         + 'O contato *' + user + '* nao conseguiu decifrar nossas mensagens '
         + '(' + reg.n + ' pedidos de reenvio — "Aguardando mensagem" do lado dele).\n\n'
@@ -4359,6 +4406,8 @@ async function curarSenderKeyGrupo(grupoJid) {
 }
 
 function registrarRetryGrupo(grupoJid, participante) {
+  // Rajada pós-autocura: ecos das mensagens antigas travadas do grupo. Ignorar.
+  if (_emCooldownAutocura('grupo:' + grupoJid)) return;
   const reg = _retriesPorGrupo.get(grupoJid) || { n: 0, ultimoEm: 0 };
   reg.n++;
   reg.ultimoEm = Date.now();
@@ -4371,9 +4420,10 @@ function registrarRetryGrupo(grupoJid, participante) {
   const nomeGrupo = NOMES_GRUPOS.get(grupoJid) || grupoJid;
   if (reg.n >= RETRY_GRUPO_AUTOCURA) {
     _retriesPorGrupo.delete(grupoJid);
+    _autocuraEm.set('grupo:' + grupoJid, Date.now());
     curarSenderKeyGrupo(grupoJid);
     if (quem) resetarSessaoContato(quem).catch(() => {});
-    if (!ehGrupoOperador) {
+    if (!ehGrupoOperador && _podeAvisarEntrega('cura:grupo:' + grupoJid)) {
       notificarOperadorEntrega('*Entrega suspeita em grupo — autocura aplicada* \u26a0\ufe0f\n\n'
         + 'Grupo: *' + nomeGrupo + '*'
         + (quem ? '\nParticipante: *' + quem + '*' : '') + '\n\n'
