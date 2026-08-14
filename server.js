@@ -32,6 +32,7 @@ import {
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   buscarProdutos, normalizar,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
+  listarPoolRastreio, salvarPoolRastreio, listarAtribuicoes,
   listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
@@ -7196,6 +7197,46 @@ async function resolverNomesProvisorios(asins) {
   }
   return { resolvidos, restantes: alvo.length - resolvidos };
 }
+
+// ── POOL DE IDS DE RASTREAMENTO (AMAZON) ────────────────────────────────────
+// A Amazon nao reporta clique por link, so por ID de rastreamento, e a conta
+// tem teto de IDs. Estes IDs sao criados A MAO no painel Associados — nao ha
+// API para isso — e cadastrados aqui para o disparo poder rodizia-los.
+
+app.get('/rastreio/pool', (_req, res) => {
+  res.json({ ok:true, ...listarPoolRastreio() });
+});
+
+// Aceita { tags:[...] } ou { prefixo, de, ate, digitos } para gerar a serie.
+// A geracao existe so por conveniencia de digitacao: o que vale e o ID existir
+// de verdade na conta Associados. ID inexistente = link sem afiliado valido =
+// comissao perdida, entao o formato e recusado, nunca corrigido.
+app.post('/rastreio/pool', (req, res) => {
+  let tags = Array.isArray(req.body?.tags) ? req.body.tags : null;
+  if (!tags && req.body?.prefixo) {
+    const de = Number(req.body.de || 1);
+    const ate = Number(req.body.ate || de);
+    const dig = Number(req.body.digitos || 3);
+    if (!(ate >= de) || (ate - de) > 500) {
+      return res.status(400).json({ ok:false, erro:'intervalo invalido' });
+    }
+    tags = [];
+    for (let i = de; i <= ate; i++) {
+      tags.push(String(req.body.prefixo) + String(i).padStart(dig, '0') + '-20');
+    }
+  }
+  if (!tags) return res.status(400).json({ ok:false, erro:'informe { tags } ou { prefixo, de, ate }' });
+  const r = salvarPoolRastreio(tags);
+  res.json({ ok:true, total:r.pool.length, pool:r.pool, recusados:r.recusados });
+});
+
+// Ledger ref -> produto. O coletor de comissoes le este mesmo conteudo pelo
+// arquivo sincronizado; aqui serve para conferencia rapida no painel.
+app.get('/rastreio/atribuicoes', (req, res) => {
+  const desde = String(req.query?.desde || '') || null;
+  const lista = listarAtribuicoes(desde);
+  res.json({ ok:true, total:lista.length, atribuicoes:lista.slice(-500) });
+});
 
 // Repara a base inteira de uma vez. Existe porque os itens cadastrados antes
 // desta correcao continuam com o nome provisorio gravado.
