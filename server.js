@@ -4162,6 +4162,26 @@ async function limparSenderKeys() {
 const _retriesPorUser = new Map();   // user (so digitos) -> { n, ultimoEm }
 const RETRY_LIMITE_AUTOCURA = 2;
 
+// ── AVISO DE ENTREGA SUSPEITA AO OPERADOR ────────────────────────────────────
+// Retry receipt é o único sinal de "Aguardando mensagem" do outro lado — sem
+// aviso, o operador só descobre quando o cliente reclama. Dedup de 6h por alvo
+// para um contato problemático não virar spam no grupo do operador.
+const _avisosEntrega = new Map();    // alvo -> ultimoAvisoEm (ms)
+const AVISO_ENTREGA_DEDUP_MS = 6 * 60 * 60 * 1000;
+
+function _podeAvisarEntrega(alvo) {
+  const ultimo = _avisosEntrega.get(alvo) || 0;
+  if (Date.now() - ultimo < AVISO_ENTREGA_DEDUP_MS) return false;
+  _avisosEntrega.set(alvo, Date.now());
+  return true;
+}
+
+function notificarOperadorEntrega(texto) {
+  // Fire-and-forget: aviso nunca pode derrubar o handler de retry.
+  enviarMensagem(GRUPOS.operador, { text: texto })
+    .catch(e => console.error('[ENTREGA] Falha ao avisar operador:', e.message));
+}
+
 // ── SESSAO E2E POR CONTATO ───────────────────────────────────────────────────
 // "Aguardando mensagem. Essa acao pode levar alguns instantes." no aparelho do
 // destinatario NAO e falha de envio: o sendMessage retorna sucesso, a mensagem
@@ -4240,6 +4260,16 @@ function registrarRetryReceipt(node) {
     if (reg.n >= RETRY_LIMITE_AUTOCURA) {
       console.warn('[ENTREGA] ' + user + ' atingiu ' + reg.n + ' retries — apagando a sessao dele (autocura).');
       resetarSessaoContato(user).catch(() => {});
+      notificarOperadorEntrega('*Entrega suspeita — autocura aplicada* \u26a0\ufe0f\n\n'
+        + 'O contato *' + user + '* nao conseguiu decifrar nossas mensagens '
+        + '(' + reg.n + ' pedidos de reenvio — "Aguardando mensagem" do lado dele).\n\n'
+        + 'A sessao E2E dele foi resetada: a proxima mensagem sai por sessao nova. '
+        + 'Se era mensagem importante (concierge/campanha), vale *reenviar agora*.');
+    } else if (_podeAvisarEntrega('user:' + user)) {
+      notificarOperadorEntrega('*Entrega suspeita* \u26a0\ufe0f\n\n'
+        + 'O contato *' + user + '* pediu reenvio de uma mensagem nossa '
+        + '(possivel "Aguardando mensagem" do lado dele).\n\n'
+        + 'O reenvio automatico ja foi feito. Se acumular, a sessao sera resetada sozinha.');
     }
   } catch (e) {}
 }
@@ -4335,10 +4365,28 @@ function registrarRetryGrupo(grupoJid, participante) {
   _retriesPorGrupo.set(grupoJid, reg);
   const quem = String(participante || '').split('@')[0].split(':')[0].replace(/\D/g, '');
   console.warn('[ENTREGA] Retry de GRUPO #' + reg.n + ' em ' + grupoJid + (quem ? ' (participante ' + quem + ')' : '') + '.');
+  // Retry vindo do PROPRIO grupo do operador jamais gera aviso: o aviso sairia
+  // para o mesmo grupo com problema e poderia realimentar o ciclo de retries.
+  const ehGrupoOperador = grupoJid === GRUPOS.operador;
+  const nomeGrupo = NOMES_GRUPOS.get(grupoJid) || grupoJid;
   if (reg.n >= RETRY_GRUPO_AUTOCURA) {
     _retriesPorGrupo.delete(grupoJid);
     curarSenderKeyGrupo(grupoJid);
     if (quem) resetarSessaoContato(quem).catch(() => {});
+    if (!ehGrupoOperador) {
+      notificarOperadorEntrega('*Entrega suspeita em grupo — autocura aplicada* \u26a0\ufe0f\n\n'
+        + 'Grupo: *' + nomeGrupo + '*'
+        + (quem ? '\nParticipante: *' + quem + '*' : '') + '\n\n'
+        + 'Participante(s) sem a nossa sender key ("Aguardando mensagem" no aparelho deles). '
+        + 'A chave sera redistribuida a todos no proximo envio ao grupo. '
+        + 'Se era mensagem importante (ex.: concierge), vale *reenviar agora*.');
+    }
+  } else if (!ehGrupoOperador && _podeAvisarEntrega('grupo:' + grupoJid)) {
+    notificarOperadorEntrega('*Entrega suspeita em grupo* \u26a0\ufe0f\n\n'
+      + 'Grupo: *' + nomeGrupo + '*'
+      + (quem ? '\nParticipante: *' + quem + '*' : '') + '\n\n'
+      + 'Um participante pediu reenvio de mensagem nossa (possivel "Aguardando mensagem"). '
+      + 'O reenvio automatico ja foi feito. Se acumular, a sender key do grupo sera redistribuida sozinha.');
   }
 }
 
