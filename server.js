@@ -2310,6 +2310,35 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
   }
   console.log('[MANUAL] ' + (ehCupom ? 'Cupom' : 'Oferta') + ' manual enviado em '
     + enviados.length + '/' + alvos.length + ' grupo(s).');
+
+  // Rastro na filaPendentes: sem isto o envio manual saia sem deixar registro
+  // e a secao "Enviados recentemente" da aba Fila so mostrava o fluxo
+  // automatico — parecia que o disparo manual nunca tinha acontecido.
+  // Status 'enviado' entra no mesmo ciclo de limpeza dos processados (24h /
+  // teto de 20 em limparFila), entao nao acumula.
+  try {
+    const agoraIso = new Date().toISOString();
+    const primeiraLinha = String(mensagem || '').split('\n').find(l => l.trim()) || '';
+    filaPendentes.push({
+      id:                gerarId(),
+      tipoConteudo:      'manual_tsp',
+      status:            'enviado',
+      timestamp:         agoraIso,
+      enviadoEm:         agoraIso,
+      gruposEnviados:    enviados.slice(),
+      origem:            null, // origem vazia = etiqueta "manual" no painel
+      mensagemFormatada: String(mensagem || '').slice(0, 1200),
+      dadosExtraidos: {
+        titulo:  (primeiraLinha.replace(/[*_~`]/g, '').trim().slice(0, 90))
+                   || (imagem ? 'Imagem sem legenda' : 'Mensagem'),
+        subtipo: ehCupom ? 'cupom'
+               : String(tipo || '').toLowerCase() === 'oferta' ? 'oferta'
+               : 'mensagem',
+      },
+    });
+    salvarFila();
+  } catch (e) { console.warn('[MANUAL] Nao registrou rastro na fila:', e.message); }
+
   return { enviados, falhas };
 }
 
@@ -5898,10 +5927,11 @@ app.get('/operacao/fila', async (req, res) => {
     const enviados = filaPendentes
       .filter(o => (o.tenant || TENANT_PADRAO) === req.tenantId)
       .filter(o => o.status === 'enviado')
-      // Aba Fila do TSP: rastro so de conteudo TSP (cupom/oferta de loja).
+      // Aba Fila do TSP: rastro so de conteudo TSP (cupom/oferta de loja)
+      // mais os disparos manuais feitos pelo proprio painel (manual_tsp).
       // Emissoes CDV e campanhas aprovadas no gerador tambem viram 'enviado'
       // na filaPendentes, mas nao pertencem a este painel.
-      .filter(o => ehConteudoTsp(o.tipoConteudo))
+      .filter(o => ehConteudoTsp(o.tipoConteudo) || o.tipoConteudo === 'manual_tsp')
       .sort((a, b) => new Date(b.enviadoEm || b.timestamp) - new Date(a.enviadoEm || a.timestamp))
       .slice(0, 20)
       .map(o => {
@@ -5911,6 +5941,7 @@ app.get('/operacao/fila', async (req, res) => {
         return {
           id:            o.id,
           tipoConteudo:  o.tipoConteudo,
+          subtipo:       d.subtipo || null,
           titulo:        (o.tipoConteudo === 'cupom_tsp' ? rotuloCupom : (d.titulo || nomeLojaExibicao(d.loja) || 'Oferta')).trim(),
           loja:          d.loja || null,
           origem,
