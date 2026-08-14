@@ -994,7 +994,10 @@ function encurtarTitulo(t, max = 80) {
 export function formatarOfertaAmazon(p, opcoes = {}) {
   const cupom = opcoes.cupom || null;
   const tpl   = opcoes.template || templateDaLoja(p.loja);
-  const vars  = varsDoProduto(p, cupom);
+  // Ponto unico onde o link entra na mensagem — e portanto o unico lugar que
+  // precisa marcar o rastreio. `rastrear: false` serve ao preview de template,
+  // que monta a mensagem com um produto de exemplo e nao deve sujar o ledger.
+  const vars  = varsDoProduto(opcoes.rastrear === false ? p : comRastreio(p), cupom);
   if (opcoes.gatilho ?? E().cfg.gatilhoPadrao) vars.gatilho = opcoes.gatilho ?? E().cfg.gatilhoPadrao;
   return renderTemplate(tpl?.corpo || TEMPLATE_PADRAO, vars);
 }
@@ -1558,6 +1561,197 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
 }
 
 carregarVitrine();
+
+// ── RASTREIO DE DESEMPENHO POR PRODUTO ──────────────────────────────────────
+// Objetivo: saber, produto a produto, quantos cliques e quantas vendas cada
+// oferta gerou — sem trocar o dominio do link (o cliente continua vendo
+// amazon.com.br / shopee.com.br, que e o que sustenta a taxa de clique).
+//
+// Cada loja expoe uma granularidade diferente, entao a marcacao muda de forma:
+//
+//   Amazon  Nao ha relatorio por link, so por ID de rastreamento — e a conta
+//           tem teto de 100 IDs. A saida e um POOL rotativo: cada produto pega
+//           um ID emprestado no dia do disparo e o par (id + data) vira a chave
+//           que identifica o produto no relatorio. O ID volta pro pool depois.
+//   Shopee  sub_id1 e texto livre e sem teto: o ref e deterministico a partir
+//           do proprio item, entao o mesmo produto acumula cliques ao longo do
+//           tempo em vez de recomecar do zero a cada disparo.
+//   ML      O link curto de afiliado nao aceita parametro extra sem risco de
+//           quebrar a atribuicao. Nao mexemos na URL: o registro do disparo
+//           fica no ledger e o coletor casa por MLB no relatorio por link.
+//
+// O ledger (rastreio.json) e a fonte de verdade da traducao ref -> produto.
+// Sem ele o relatorio da Amazon e ilegivel, porque 'tsp007-20' sozinho nao
+// diz nada. Por isso ele e sincronizado com o repo de dados.
+
+const RASTREIO_PADRAO = { pool: [], cursor: 0, atribuicoes: [], atualizadoEm: null };
+
+// Quantos dias de atribuicao ficam no arquivo. O relatorio da Amazon so e
+// consultavel retroativamente por alguns meses e o coletor varre uma janela
+// curta; guardar mais que isso so engorda o JSON.
+const RASTREIO_RETENCAO_DIAS = 120;
+
+export function carregarRastreio() {
+  try {
+    if (existsSync(cT('rastreio.json'))) {
+      E().rastreio = { ...RASTREIO_PADRAO, ...JSON.parse(readFileSync(cT('rastreio.json'), 'utf-8')) };
+    } else E().rastreio = { ...RASTREIO_PADRAO };
+  } catch (e) {
+    console.log('[RASTREIO] Erro ao carregar:', e.message);
+    E().rastreio = { ...RASTREIO_PADRAO };
+  }
+  return E().rastreio;
+}
+
+function rastreio() {
+  if (!E().rastreio) carregarRastreio();
+  return E().rastreio;
+}
+
+function salvarRastreio() {
+  const r = rastreio();
+  r.atualizadoEm = new Date().toISOString();
+  const limite = Date.now() - RASTREIO_RETENCAO_DIAS * 86400000;
+  r.atribuicoes = (r.atribuicoes || []).filter(a => new Date(a.ts || a.data).getTime() >= limite);
+  try {
+    writeFileSync(cT('rastreio.json'), JSON.stringify(r, null, 1), 'utf-8');
+    agendarPush(pT('rastreio.json'));
+  } catch (e) { console.log('[RASTREIO] Erro ao salvar:', e.message); }
+}
+
+/** Pool de IDs de rastreamento da Amazon (criados a mao no painel Associados). */
+export function listarPoolRastreio() {
+  const r = rastreio();
+  return { pool: [...(r.pool || [])], cursor: r.cursor || 0 };
+}
+
+// O pool so aceita ID no formato que a Amazon emite. Um ID com erro de digitacao
+// nao existe na conta: o link sai sem afiliado valido e a comissao daquele
+// disparo se perde — por isso a validacao e recusa, nao normalizacao.
+const RE_TAG_AMAZON = /^[a-z0-9][a-z0-9-]{1,40}-\d{2}$/i;
+
+export function salvarPoolRastreio(tags) {
+  const limpos = [], recusados = [];
+  for (const t of (Array.isArray(tags) ? tags : [])) {
+    const v = String(t || '').trim().toLowerCase();
+    if (!v) continue;
+    if (!RE_TAG_AMAZON.test(v)) { recusados.push(v); continue; }
+    if (!limpos.includes(v)) limpos.push(v);
+  }
+  const r = rastreio();
+  r.pool = limpos;
+  if ((r.cursor || 0) >= limpos.length) r.cursor = 0;
+  salvarRastreio();
+  return { pool: limpos, recusados };
+}
+
+function hojeSP() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+}
+
+function atribuicaoDoDia(asin, data) {
+  return (rastreio().atribuicoes || []).find(a => a.asin === asin && a.data === data) || null;
+}
+
+// Ref deterministico para lojas sem teto de identificador. Mesmo produto =
+// mesmo sub_id sempre, entao o relatorio acumula em vez de fragmentar.
+function refDeterministico(asin) {
+  return String(asin || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
+}
+
+// Proximo ID livre do pool. Contagem continua 1..N com volta ao inicio: o que
+// separa um produto do outro no relatorio e o par (id + data), entao reciclar
+// so e problema se o mesmo ID cair duas vezes no MESMO dia — e isso a busca
+// abaixo impede, pulando quem ja foi usado hoje. Pool esgotado no dia devolve
+// null e o link sai com a tag padrao da conta (perde o rastreio, nao a venda).
+function proximaTagAmazon(data) {
+  const r = rastreio();
+  const pool = r.pool || [];
+  if (!pool.length) return null;
+  const usadasHoje = new Set((r.atribuicoes || []).filter(a => a.data === data).map(a => a.ref));
+  for (let i = 0; i < pool.length; i++) {
+    const idx = ((r.cursor || 0) + i) % pool.length;
+    const tag = pool[idx];
+    if (usadasHoje.has(tag)) continue;
+    r.cursor = (idx + 1) % pool.length;
+    return tag;
+  }
+  return null;
+}
+
+/**
+ * Marca o produto para rastreio e devolve { ref, link }.
+ * Idempotente por (asin, dia): chamar duas vezes no mesmo dia — o preview do
+ * gerador e o disparo de verdade, por exemplo — devolve a mesma marcacao e
+ * nao consome um segundo ID do pool.
+ */
+export function refDoDisparo(p) {
+  if (!p || !p.asin) return null;
+  const loja = String(p.loja || '').toLowerCase();
+  const data = hojeSP();
+
+  const ja = atribuicaoDoDia(p.asin, data);
+  if (ja) return ja.ref;
+
+  let ref = null;
+  if (loja.includes('amazon')) ref = proximaTagAmazon(data);
+  else if (loja.includes('shopee')) ref = refDeterministico(p.asin);
+  else ref = refDeterministico(p.asin); // ML e demais: so registra, nao altera a URL
+
+  rastreio().atribuicoes.push({
+    ref, data, asin: p.asin, loja: p.loja || '',
+    nome: p.titulo || '', preco: p.preco ?? null,
+    ts: new Date().toISOString(),
+  });
+  salvarRastreio();
+  return ref;
+}
+
+/** Injeta a marcacao na URL, preservando dominio e caminho do produto. */
+export function aplicarRefNoLink(url, loja, ref) {
+  if (!url || !ref) return url;
+  const l = String(loja || '').toLowerCase();
+  try {
+    const u = new URL(url);
+    if (l.includes('amazon')) {
+      // Tag valida so vem do pool; sem ela a URL fica exatamente como veio da
+      // API (que ja traz a tag padrao da conta).
+      if (!RE_TAG_AMAZON.test(ref)) return url;
+      u.searchParams.set('tag', ref);
+      return u.toString();
+    }
+    if (l.includes('shopee')) {
+      u.searchParams.set('sub_id1', ref);
+      return u.toString();
+    }
+    // Mercado Livre, Magalu e Awin: parametro extra pode quebrar a atribuicao
+    // da rede. A URL sai intacta e o vinculo fica so no ledger.
+    return url;
+  } catch { return url; }
+}
+
+/** Produto com o link ja marcado — usado na hora de montar a mensagem. */
+export function comRastreio(p) {
+  try {
+    const ref = refDoDisparo(p);
+    if (!ref) return p;
+    const link = aplicarRefNoLink(p.link, p.loja, ref);
+    return link === p.link ? p : { ...p, link };
+  } catch (e) {
+    // Rastreio e acessorio: se falhar, a oferta sai sem marcacao, nunca sem link.
+    console.log('[RASTREIO] Falha ao marcar produto:', e.message);
+    return p;
+  }
+}
+
+/** Ledger para o coletor de comissoes traduzir (ref + data) -> produto. */
+export function listarAtribuicoes(desde = null) {
+  const todas = rastreio().atribuicoes || [];
+  if (!desde) return todas;
+  return todas.filter(a => a.data >= desde);
+}
+
+carregarRastreio();
 
 // ── LISTAS DE REENVIO ───────────────────────────────────────────────────────
 // Conjunto nomeado de produtos da vitrine que o operador dispara de tempos em
