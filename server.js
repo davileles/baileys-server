@@ -3687,6 +3687,7 @@ const PRESERVAR_NO_RESET = new Set([
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
   'publicadas.json',        // historico da vitrine publica
+  'rastreio.json',          // ledger ref -> produto (rastreio de desempenho)
   'contas',                 // credenciais dos numeros secundarios de envio
 ]);
 
