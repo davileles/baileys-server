@@ -5832,6 +5832,10 @@ app.get('/operacao/fila', async (req, res) => {
     const enviados = filaPendentes
       .filter(o => (o.tenant || TENANT_PADRAO) === req.tenantId)
       .filter(o => o.status === 'enviado')
+      // Aba Fila do TSP: rastro so de conteudo TSP (cupom/oferta de loja).
+      // Emissoes CDV e campanhas aprovadas no gerador tambem viram 'enviado'
+      // na filaPendentes, mas nao pertencem a este painel.
+      .filter(o => ehConteudoTsp(o.tipoConteudo))
       .sort((a, b) => new Date(b.enviadoEm || b.timestamp) - new Date(a.enviadoEm || a.timestamp))
       .slice(0, 20)
       .map(o => {
