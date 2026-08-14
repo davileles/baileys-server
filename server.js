@@ -87,7 +87,7 @@ import {
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
-import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH } from './bot-tsp.js';
+import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram } from './bot-tsp.js';
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
@@ -3690,6 +3690,7 @@ const PRESERVAR_NO_RESET = new Set([
   'msgs-enviadas.json',     // dedup de mensagens enviadas
   'publicadas.json',        // historico da vitrine publica
   'rastreio.json',          // ledger ref -> produto (rastreio de desempenho)
+  'health.json',            // marcos de saude do inbound (regua do watchdog)
   'contas',                 // credenciais dos numeros secundarios de envio
 ]);
 
@@ -4030,6 +4031,7 @@ async function processarMensagem(msg) {
 
     console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo, texto ? '| texto: '+texto.slice(0,60) : '| imagem');
     ultimaCapturaPorGrupo.set(jid, Date.now());
+    registrarCapturaHealth();
 
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
@@ -4443,51 +4445,156 @@ function registrarRetryGrupo(grupoJid, participante) {
 // Última mensagem capturada por grupo monitorado (observabilidade em /status).
 const ultimaCapturaPorGrupo = new Map();
 
-// ── WATCHDOG DE INBOUND ────────────────────────────────────────────────────────
-// Incidente de 13/08/2026: o registro do device no servidor do WhatsApp viciou
-// e TODAS as mensagens de grupo pararam de chegar (zero upserts), com a conexao
-// aparentando saude total — envio ok, /status ok, errosDescripto zerado (esse
-// contador so incrementa dentro do messages.upsert, que nunca disparava).
-// O sistema ficou 24h+ surdo em dois pipelines criticos sem emitir um unico
-// alerta. Este watchdog cobre exatamente esse modo de falha: dentro do horario
-// em que os grupos monitorados SEMPRE postam (08h-20h SP), silencio total de
-// captura por muito tempo denota que algo falhou.
-const WATCHDOG_INICIO_H    = 8;                     // inicio da janela vigiada (hora SP)
-const WATCHDOG_FIM_H       = 20;                    // fim da janela vigiada (hora SP)
-const WATCHDOG_SILENCIO_MS = 60 * 60 * 1000;        // 60 min sem NENHUMA captura = alerta
-const WATCHDOG_REAVISO_MS  = 2 * 60 * 60 * 1000;    // reavisa a cada 2h enquanto persistir
-// Referencia inicial = boot: evita alerta falso logo apos deploy/restart,
-// quando o Map ainda esta vazio por definicao.
-let _watchdogRefEm   = Date.now();
+// ── WATCHDOG DE INBOUND 2.0 ───────────────────────────────────────────────────
+// Incidentes de 13-14/08/2026 (2x em 24h): o registro do device no servidor do
+// WhatsApp vicia e TODAS as mensagens param de chegar (zero upserts), com a
+// conexao aparentando saude total — envio ok, /status ok. A v1 deste watchdog
+// falhou em avisar porque (a) so olhava capturas de grupos monitorados na
+// janela 08-20h e a surdez comecou 19h59, (b) a referencia era o boot, entao
+// cada restart renovava a carencia inteira, e (c) o aviso saia apenas pelo
+// proprio WhatsApp. A v2 corrige os tres pontos:
+//   1. Sinal primario: upserts CRUS de QUALQUER conversa (trafego quase
+//      continuo em horario util). 20 min de silencio total = socket surdo.
+//   2. Marcos persistidos em sessao/health.json — restart nao zera a regua.
+//   3. Autocura: 1 reconexao soft automatica; se 10 min depois continuar
+//      surdo, alerta CRITICO por Telegram (bot admins) + WhatsApp operador,
+//      reaviso a cada 60 min e mensagem de recuperacao quando voltar.
+// O sinal de capturas (60 min sem captura de monitorados, 08-20h) permanece
+// como secundario: pega pipeline quebrado com socket vivo.
+const HEALTH_PATH = SESSAO_DIR + '/health.json';
+
+const WATCHDOG_INICIO_H    = 8;                  // janela do sinal de capturas (hora SP)
+const WATCHDOG_FIM_H       = 20;
+const WATCHDOG_SILENCIO_MS = 60 * 60 * 1000;     // 60 min sem captura de monitorados
+const WATCHDOG_REAVISO_MS  = 2 * 60 * 60 * 1000;
+
+const SURDEZ_INICIO_H      = 7;                  // janela do sinal de upserts crus (hora SP)
+const SURDEZ_FIM_H         = 22;
+const SURDEZ_SILENCIO_MS   = 20 * 60 * 1000;     // 20 min sem NENHUM upsert = surdo
+const SURDEZ_POS_CURA_MS   = 10 * 60 * 1000;     // espera pos-reconexao antes de alertar
+const SURDEZ_REAVISO_MS    = 60 * 60 * 1000;
+
+const _bootEm = Date.now();
 let _watchdogAvisoEm = 0;
 
-function _ultimaCapturaGlobal() {
-  let max = 0;
-  for (const t of ultimaCapturaPorGrupo.values()) if (t > max) max = t;
-  return max || _watchdogRefEm;
+// Marcos persistidos: sobrevivem a restart para o deploy nao renovar carencia.
+let _health = { ultimoUpsertEm: 0, ultimaCapturaEm: 0 };
+try { _health = { ..._health, ...JSON.parse(readFileSync(HEALTH_PATH, 'utf-8')) }; }
+catch (e) { /* primeira execucao — arquivo ainda nao existe */ }
+
+let _healthGravadoEm = 0;
+function _salvarHealth() {
+  const agora = Date.now();
+  if (agora - _healthGravadoEm < 60 * 1000) return; // throttle: 1 write/min
+  _healthGravadoEm = agora;
+  try { writeFileSync(HEALTH_PATH, JSON.stringify(_health), 'utf-8'); }
+  catch (e) { console.warn('[WATCHDOG] Falha ao gravar health.json:', e.message); }
 }
 
+// Maquina de estados da surdez: ok -> autocura -> alertado -> (upsert) -> ok
+let _surdezEstado  = 'ok';
+let _surdezCuraEm  = 0;
+let _surdezAvisoEm = 0;
+
+async function _avisarOperador(texto) {
+  // Telegram primeiro: e o unico canal que sobrevive se o sock morrer de vez.
+  let entregue = false;
+  try { entregue = (await notificarAdminsTelegram(texto)) || entregue; }
+  catch (e) { console.error('[WATCHDOG] Telegram falhou:', e.message); }
+  try { await enviarMensagem(GRUPOS.operador, { text: texto }); entregue = true; }
+  catch (e) { console.error('[WATCHDOG] WhatsApp operador falhou:', e.message); }
+  return entregue;
+}
+
+function registrarUpsertHealth() {
+  _health.ultimoUpsertEm = Date.now();
+  _salvarHealth();
+  if (_surdezEstado !== 'ok') {
+    const estadoAnterior = _surdezEstado;
+    _surdezEstado = 'ok';
+    console.log('[WATCHDOG] Inbound recebendo upserts de novo (estava: ' + estadoAnterior + ').');
+    if (estadoAnterior === 'alertado') {
+      _avisarOperador('OK — Watchdog: inbound do WhatsApp voltou a receber mensagens. Sistema normalizado.').catch(() => {});
+    }
+  }
+}
+
+function registrarCapturaHealth() {
+  _health.ultimaCapturaEm = Date.now();
+  _salvarHealth();
+}
+
+function _ultimaCapturaGlobal() {
+  let max = _health.ultimaCapturaEm || 0;
+  for (const t of ultimaCapturaPorGrupo.values()) if (t > max) max = t;
+  return max || _bootEm;
+}
+
+// Ciclo da surdez (sinal primario): a cada 5 min.
+setInterval(async () => {
+  try {
+    const h = horaSP();
+    if (h < SURDEZ_INICIO_H || h >= SURDEZ_FIM_H) return;
+    if (!conectado || !sock) return;              // queda real tem tratamento proprio
+    const agora = Date.now();
+    if (agora - _bootEm < 10 * 60 * 1000) return; // carencia de aquecimento pos-boot
+    const ref      = Math.max(_health.ultimoUpsertEm || 0, _bootEm);
+    const silencio = agora - ref;
+    if (silencio < SURDEZ_SILENCIO_MS) return;
+
+    if (_surdezEstado === 'ok') {
+      _surdezEstado = 'autocura';
+      _surdezCuraEm = agora;
+      console.warn('[WATCHDOG] Socket surdo ha ' + Math.round(silencio / 60000) + ' min (zero upserts). Tentando reconexao automatica...');
+      try { forcarReconexao('watchdog-surdez'); } catch (e) { console.error('[WATCHDOG] Autocura falhou:', e.message); }
+      return;
+    }
+    if (_surdezEstado === 'autocura') {
+      if (agora - _surdezCuraEm < SURDEZ_POS_CURA_MS) return;
+      _surdezEstado  = 'alertado';
+      _surdezAvisoEm = agora;
+    } else if (agora - _surdezAvisoEm < SURDEZ_REAVISO_MS) {
+      return;
+    } else {
+      _surdezAvisoEm = agora;
+    }
+    const min = Math.round((Date.now() - ref) / 60000);
+    console.warn('[WATCHDOG] Surdez persiste apos autocura (' + min + ' min). Alertando operador.');
+    await _avisarOperador(
+      'CRITICO — WhatsApp SURDO\n\n'
+      + 'O servidor nao recebe NENHUMA mensagem ha ' + min + ' min '
+      + '(zero upserts crus), mesmo apos 1 reconexao automatica. '
+      + 'O envio pode continuar funcionando, mas captura de grupos e radar estao MORTOS.\n\n'
+      + 'Correcao: novo pareamento.\n'
+      + '1) POST /reset-sessao-completo\n'
+      + '2) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n\n'
+      + '(Este aviso se repete a cada 60 min enquanto persistir.)'
+    );
+  } catch (e) { console.error('[WATCHDOG] Erro no ciclo de surdez:', e.message); }
+}, 5 * 60 * 1000);
+
+// Ciclo de capturas (sinal secundario): a cada 10 min.
 setInterval(async () => {
   try {
     const h = horaSP();
     if (h < WATCHDOG_INICIO_H || h >= WATCHDOG_FIM_H) return;
-    if (!conectado || !sock) return;   // queda de conexao ja tem tratamento proprio
-    const agora    = Date.now();
+    if (!conectado || !sock) return;
+    const agora = Date.now();
+    if (agora - _bootEm < 10 * 60 * 1000) return;
     const silencio = agora - _ultimaCapturaGlobal();
     if (silencio < WATCHDOG_SILENCIO_MS) return;
     if (agora - _watchdogAvisoEm < WATCHDOG_REAVISO_MS) return;
+    if (_surdezEstado !== 'ok') return;           // surdez total ja esta alertando
     _watchdogAvisoEm = agora;
     const min = Math.round(silencio / 60000);
     console.warn('[WATCHDOG] Nenhuma captura de grupos monitorados ha ' + min + ' min (janela 08-20h SP). Avisando operador.');
-    const texto = '*Watchdog de monitoramento* \u26a0\ufe0f\n\n'
-      + 'Nenhuma mensagem capturada dos grupos monitorados ha *' + min + ' min* '
-      + '(dentro da janela 08h-20h).\n\n'
-      + 'A conexao parece ativa, mas o inbound pode estar morto '
-      + '(sessao viciada / device degradado no servidor do WhatsApp).\n\n'
-      + 'Verifique /debug-upserts. Se estiver zerado, um novo pareamento '
-      + '(reset-sessao-completo + QR) costuma resolver.';
-    try { await enviarMensagem(GRUPOS.operador, { text: texto }); }
-    catch (e) { console.error('[WATCHDOG] Falha ao avisar operador:', e.message); }
+    await _avisarOperador(
+      'Watchdog de monitoramento\n\n'
+      + 'Nenhuma mensagem capturada dos grupos monitorados ha ' + min + ' min '
+      + '(janela 08h-20h), embora o socket receba trafego de outras conversas.\n\n'
+      + 'Possiveis causas: grupos sem postagem (raro nesse intervalo) ou pipeline de captura quebrado. '
+      + 'Verifique /debug-upserts e /debug-fila.'
+    );
   } catch (e) { console.error('[WATCHDOG] Erro no ciclo:', e.message); }
 }, 10 * 60 * 1000);
 
@@ -4667,6 +4774,7 @@ async function conectar() {
           if (_debugUpserts.length > 60) _debugUpserts.shift();
         }
       } catch (e) {}
+      registrarUpsertHealth();
       if (conectado) resetarHealthTimer();
       if (type !== 'notify') {
         // Upserts 'append' (sync/reconexão) eram descartados sem rastro.
@@ -5334,8 +5442,11 @@ app.get('/contas/:id/grupos', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
-app.post('/reconectar', async (req, res) => {
-  console.log('[MANUAL] Reconexão forçada via /reconectar');
+// Nucleo da reconexao soft: usado pelo endpoint manual e pela autocura do
+// watchdog de surdez. Declarada como function para valer por hoisting no
+// watchdog, que fica acima neste arquivo.
+function forcarReconexao(motivo) {
+  console.log('[RECONEXAO] Forçada (' + (motivo || 'manual') + ')');
   conectado = false;
   isConnecting = false;
   _reconectarTentativas = 0;
@@ -5343,8 +5454,12 @@ app.post('/reconectar', async (req, res) => {
   const sockRef = sock;
   sock = null;
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
-  if (sockRef) { try { sockRef.end(new Error('manual-reconnect')); } catch(e) {} }
+  if (sockRef) { try { sockRef.end(new Error(motivo || 'manual-reconnect')); } catch(e) {} }
   _agendarReconexao(1000);
+}
+
+app.post('/reconectar', async (req, res) => {
+  forcarReconexao('endpoint-/reconectar');
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
 });
 
@@ -5369,7 +5484,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente').length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
