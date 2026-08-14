@@ -1659,6 +1659,59 @@ function precoForaDaCurva(pontos, hist180, tipoVoo) {
   return false;
 }
 
+// ── AUTO-ENVIO DE ALERTAS DE PASSAGEM ────────────────────────────────────────
+// AUTO_ENVIO_ALERTA: 'off' (tudo vai para fila) | 'sombra' (avalia e loga o
+// veredito, mas tudo vai para fila) | 'on' (dentro do teto → envia sem
+// aprovação manual).
+// Teto: média 180d × 1.10 em Econômica, × 1.05 em Executiva (mesma chave do
+// hist180: origem|destino|programa|cabine|cia). Sem histórico (count < 1) ou
+// acima do teto → fila de aprovação (fluxo atual). O filtro precoForaDaCurva
+// continua rodando ANTES: muito acima da média nem chega aqui.
+const AUTO_ENVIO_ALERTA_MODO = (process.env.AUTO_ENVIO_ALERTA || 'sombra').toLowerCase();
+
+function avaliarAutoEnvioAlerta(oferta, hist180) {
+  const de  = oferta?.dadosExtraidos || {};
+  const pts = Number(de.pontos) || 0;
+  if (!hist180 || !hist180.mediaPts || hist180.count < 1) return { auto: false, motivo: 'sem histórico' };
+  if (pts <= 0) return { auto: false, motivo: 'pontos inválidos' };
+  const cab = String(de.cabine || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const tol  = cab === 'executiva' ? 0.05 : 0.10;
+  const teto = Math.round(hist180.mediaPts * (1 + tol));
+  const det  = pts.toLocaleString('pt-BR') + ' pts vs teto ' + teto.toLocaleString('pt-BR')
+    + ' (média ' + hist180.mediaPts.toLocaleString('pt-BR') + ' +' + Math.round(tol * 100) + '%, ' + hist180.count + ' reg(s))';
+  return pts <= teto ? { auto: true, motivo: det } : { auto: false, motivo: 'acima do teto — ' + det };
+}
+
+// Ponto único de entrega de oferta de alerta de passagem. A oferta SEMPRE
+// entra em filaPendentes (auditoria no painel, mesmo padrão do auto-envio de
+// ofertas de marketplace). Com AUTO_ENVIO_ALERTA=on e veredito positivo, é
+// marcada 'aprovado' e enfileirada — o worker envia e registra em
+// passagens.json (único ponto de gravação definitiva), exatamente como na
+// aprovação manual.
+function entregarOfertaAlerta(oferta, hist180) {
+  filaPendentes.unshift(oferta);
+  try {
+    if (!ehConteudoTsp(oferta.tipoConteudo) && AUTO_ENVIO_ALERTA_MODO !== 'off') {
+      const v    = avaliarAutoEnvioAlerta(oferta, hist180);
+      const de   = oferta.dadosExtraidos || {};
+      const rota = (de.origem || '?') + '->' + (de.destino || '?') + ' ' + (de.programa || '') + '/' + (de.cabine || '');
+      if (AUTO_ENVIO_ALERTA_MODO === 'sombra') {
+        console.log('[AUTO-ALERTA][SOMBRA] ' + (v.auto ? 'ENVIARIA' : 'FILA') + ': ' + rota + ' — ' + v.motivo);
+      } else if (AUTO_ENVIO_ALERTA_MODO === 'on' && v.auto) {
+        console.log('[AUTO-ALERTA] Envio automático: ' + rota + ' — ' + v.motivo);
+        oferta.status = 'aprovado';
+        oferta.autoEnviado = true;
+        enfileirarEnvio(oferta.id, oferta.mensagemFormatada, null, oferta.dadosExtraidos || null);
+      } else if (AUTO_ENVIO_ALERTA_MODO === 'on') {
+        console.log('[AUTO-ALERTA] Para aprovação: ' + rota + ' — ' + v.motivo);
+      }
+    }
+  } catch (e) {
+    console.error('[AUTO-ALERTA] Falha na avaliação (oferta segue na fila):', e.message);
+  }
+  salvarFila();
+}
+
 // ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
 // Os links agora vem da config editavel pelo painel (aba Configuracoes). O
 // Proxy mantem a leitura LINKS_TSP['Loja'] usada em todo o arquivo, sempre
@@ -3529,8 +3582,7 @@ async function aguardarParIdaVolta(oferta, grupoId) {
     }
     mesclada.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV({ ...mesclada.dadosExtraidos }), hist180Par);
     mesclada.tipoConteudo = mesclada.imagens.length > 1 ? mesclada.imagens.length+' imagens' : mesclada.imagens.length === 1 ? 'imagem' : 'texto';
-    filaPendentes.unshift(mesclada);
-    salvarFila();
+    entregarOfertaAlerta(mesclada, hist180Par);
     console.log('[PAR-BUFFER] Mesclado ida/volta entre buffers: ' + (mesclada.dadosExtraidos?.origemCodigo) + '↔' + (mesclada.dadosExtraidos?.destinoCodigo));
     return true; // consumido
   }
@@ -3547,10 +3599,9 @@ async function aguardarParIdaVolta(oferta, grupoId) {
             return;
           }
           if (hist180) oferta.mensagemFormatada = appendHistoricoMensagem(oferta.mensagemFormatada, hist180);
-          filaPendentes.unshift(oferta);
-          salvarFila();
+          entregarOfertaAlerta(oferta, hist180);
         })
-        .catch(() => { filaPendentes.unshift(oferta); salvarFila(); });
+        .catch(() => { entregarOfertaAlerta(oferta, null); });
       console.log('[PAR-BUFFER] Timeout — liberando somente-ida: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
     }
   }, 5 * 60 * 1000);
@@ -3607,8 +3658,7 @@ async function processarBuffer(grupoId) {
         // buffers viravam duas ofertas separadas)
         const parEsperandoBypass = await aguardarParIdaVolta(oferta, grupoId);
         if (!parEsperandoBypass) {
-          filaPendentes.unshift(oferta);
-          salvarFila();
+          entregarOfertaAlerta(oferta, hist180Bypass);
           console.log('[BYPASS] Oferta criada direto: '+v.origemCodigo+'->'+v.destinoCodigo+' ('+v.programa+')');
         }
       }
@@ -3664,8 +3714,7 @@ async function processarBuffer(grupoId) {
       // Aguarda par ida/volta de buffer diferente (até 5 min)
       const parEsperando = await aguardarParIdaVolta(oferta, grupoId);
       if (!parEsperando) {
-        filaPendentes.unshift(oferta);
-        salvarFila();
+        entregarOfertaAlerta(oferta, hist180Normal);
       }
     }
   } catch (err) { console.error('Erro ao processar buffer:', err.message); }
