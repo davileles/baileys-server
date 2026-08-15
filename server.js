@@ -1714,6 +1714,8 @@ function entregarOfertaAlerta(oferta, hist180) {
       const rota = (de.origem || '?') + '->' + (de.destino || '?') + ' ' + (de.programa || '') + '/' + (de.cabine || '');
       if (AUTO_ENVIO_ALERTA_MODO === 'sombra') {
         console.log('[AUTO-ALERTA][SOMBRA] ' + (v.auto ? 'ENVIARIA' : 'FILA') + ': ' + rota + ' — ' + v.motivo);
+        // Persiste o motivo para o painel exibir por que o alerta caiu na fila
+        oferta.motivoFila = v.auto ? 'modo sombra — seria enviado automaticamente (' + v.motivo + ')' : v.motivo;
       } else if (AUTO_ENVIO_ALERTA_MODO === 'on' && v.auto) {
         console.log('[AUTO-ALERTA] Envio automático: ' + rota + ' — ' + v.motivo);
         oferta.status = 'aprovado';
@@ -1721,10 +1723,15 @@ function entregarOfertaAlerta(oferta, hist180) {
         enfileirarEnvio(oferta.id, oferta.mensagemFormatada, null, oferta.dadosExtraidos || null);
       } else if (AUTO_ENVIO_ALERTA_MODO === 'on') {
         console.log('[AUTO-ALERTA] Para aprovação: ' + rota + ' — ' + v.motivo);
+        // Persiste o motivo para o painel exibir por que o alerta caiu na fila
+        oferta.motivoFila = v.motivo;
       }
+    } else if (!ehConteudoTsp(oferta.tipoConteudo) && AUTO_ENVIO_ALERTA_MODO === 'off') {
+      oferta.motivoFila = 'auto-envio de alertas desativado (AUTO_ENVIO_ALERTA=off)';
     }
   } catch (e) {
     console.error('[AUTO-ALERTA] Falha na avaliação (oferta segue na fila):', e.message);
+    oferta.motivoFila = 'falha na avaliação do auto-envio: ' + e.message;
   }
   salvarFila();
 }
