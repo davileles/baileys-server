@@ -2082,6 +2082,62 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   return { auto:true, motivo:'aprovado' };
 }
 
+// ── SENTINELA: grupo so-admins sem a conta do turno como admin ───────────────
+// O WhatsApp descarta EM SILENCIO mensagem de nao-admin em grupo "somente
+// admins": o sendMessage nao lanca erro, entao nem o fallback pela principal
+// nem o alerta de "cupom nao entregue" disparam — o grupo fica seco e o
+// servidor acredita que entregou (foi exatamente o que aconteceu com o
+// SO CUPONS #11). Esta checagem roda ANTES do despacho e avisa o operador.
+// Nunca bloqueia o envio: metadados indisponiveis ou grupo aberto seguem o
+// fluxo normal. Throttle de 30 min por grupo para nao inundar o operador.
+const _alertaAdminCache = new Map();   // jid -> ts do ultimo alerta
+const ALERTA_ADMIN_INTERVALO_MS = 30 * 60 * 1000;
+
+function _idsDaContaSock(s) {
+  const ids = new Set();
+  for (const v of [s?.user?.id, s?.user?.lid]) {
+    const n = String(v || '').split(':')[0].split('@')[0].trim();
+    if (n) ids.add(n);
+  }
+  return ids;
+}
+
+async function verificarAdminGruposCupons(contaId) {
+  const grupos = GRUPOS['tsp_cupons'] || [];
+  if (!grupos.length) return;
+  const s = (contaId && contaId !== 'principal')
+    ? contasExtras.get(contaId)?.sock
+    : sock;
+  if (!s) return;
+  const meus = _idsDaContaSock(s);
+  for (const jid of grupos) {
+    try {
+      const md = await s.groupMetadata(jid);
+      if (!md?.announce) continue;   // grupo aberto: qualquer membro posta
+      const eu = (md.participants || []).find(p =>
+        _ggIdsDoParticipante(p).some(n => meus.has(n)));
+      if (eu && eu.admin) continue;
+      const agora = Date.now();
+      if (agora - (_alertaAdminCache.get(jid) || 0) < ALERTA_ADMIN_INTERVALO_MS) continue;
+      _alertaAdminCache.set(jid, agora);
+      const nome = NOMES_GRUPOS.get(jid) || md.subject || jid;
+      console.warn('[CUPONS] Grupo "' + nome + '" em modo so-admins e conta '
+        + (contaId || 'principal') + ' sem admin — o WhatsApp vai descartar o envio.');
+      try {
+        await enviarMensagem(GRUPOS.operador, { text:
+          '*Cupom pode nao chegar em "' + nome + '"* \u26a0\ufe0f\n\n'
+          + 'O grupo esta em modo *somente admins* e a conta do turno ('
+          + (contaId || 'principal') + ') NAO e admin dele. O WhatsApp descarta a '
+          + 'mensagem sem acusar erro — o cupom sai nos outros grupos, mas nesse nao.\n\n'
+          + 'Promova o numero a admin do grupo para resolver.' });
+      } catch(_) {}
+    } catch (e) {
+      // Checagem nunca pode impedir o despacho: metadados fora do ar, so loga.
+      console.warn('[CUPONS] Nao deu para checar admin em ' + jid + ': ' + e.message);
+    }
+  }
+}
+
 // Envia um cupom para TODOS os grupos de destino configurados (radarDestinos)
 // mais os grupos so-cupons. Todos recebem exatamente a mesma mensagem — a
 // regra do rodape de convite cruzado foi removida. Falha isolada em um grupo
@@ -2095,6 +2151,8 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
   // Mesma conta em todos os grupos: o cupom e as copias dele saem juntos, e
   // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
   const op = { conta: contaDoTurno() };
+  // Sentinela do modo so-admins: detecta o descarte silencioso antes do despacho.
+  await verificarAdminGruposCupons(op.conta);
   const destinos = radarDestinos();
   const soCupons = GRUPOS['tsp_cupons'];
   const alvos = [...new Set([...destinos, ...soCupons])];
