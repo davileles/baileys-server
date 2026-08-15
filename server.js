@@ -3918,7 +3918,7 @@ const _TIPOS_IGNORADOS = new Set(['protocolMessage','reactionMessage','pollUpdat
 const AVISOS_CUPOM_SEM_BASE = new Map();
 const AVISO_CUPOM_SEM_BASE_TTL_MS = 6 * 60 * 60 * 1000;
 
-async function avisarCupomDesconhecido(loja, codigos, p, jid) {
+async function avisarCupomDesconhecido(loja, codigos, p, jid, foiParaFila = false) {
   const agora = Date.now();
   const novos = codigos.filter(cod => {
     const k = loja + ':' + cod;
@@ -3938,8 +3938,11 @@ async function avisarCupomDesconhecido(loja, codigos, p, jid) {
     + (preco ? '*Preço sem cupom* R$ ' + preco.toFixed(2).replace('.', ',') + '\n' : '')
     + (p.link ? '*Link* ' + p.link + '\n' : '')
     + '*Grupo de origem* ' + grupo + '\n\n'
-    + 'A oferta saiu pelo preço cheio. Cadastre o cupom na base para o radar '
-    + 'aplicar o desconto nas próximas.';
+    + (foiParaFila
+        ? 'A oferta foi para a fila de aprovação — pelo preço cheio ela não sai sem revisão. '
+          + 'Cadastre o cupom na base antes de aprovar para o radar aplicar o desconto.'
+        : 'Outro cupom da base já cobriu esta oferta. Cadastre o citado para o radar '
+          + 'considerar nas próximas.');
 
   try {
     await enviarMensagem(GRUPOS['operador'], { text: texto });
@@ -3955,7 +3958,7 @@ async function avisarCupomDesconhecido(loja, codigos, p, jid) {
 const AVISOS_CUPOM_ANUNCIO = new Map();
 const AVISO_CUPOM_ANUNCIO_TTL_MS = 6 * 3600e3;
 
-async function avisarCupomAnuncioSemBase(aviso, p, jid) {
+async function avisarCupomAnuncioSemBase(aviso, p, jid, foiParaFila = false) {
   const chave = 'anuncio:' + (aviso.idCampanhaLoja || aviso.percentual);
   const agora = Date.now();
   const visto = AVISOS_CUPOM_ANUNCIO.get(chave);
@@ -3973,14 +3976,87 @@ async function avisarCupomAnuncioSemBase(aviso, p, jid) {
     + (preco && aviso.desconto ? '*Sairia por* ' + brl(Math.max(0, preco - aviso.desconto)) + '\n' : '')
     + (p.link ? '*Link* ' + p.link + '\n' : '')
     + '*Grupo de origem* ' + grupo + '\n\n'
-    + 'A oferta saiu pelo preço cheio: o anúncio confirma o desconto, mas sem o '
-    + 'código na base não há o que passar ao membro. Rode /ml/sync-cupons-conta '
-    + 'para importar os cupons da conta com código e campanha.';
+    + (foiParaFila
+        ? 'A oferta foi para a fila de aprovação: o anúncio confirma o desconto, mas sem o '
+          + 'código na base não há o que passar ao membro. Rode /ml/sync-cupons-conta '
+          + 'para importar os cupons da conta com código e campanha.'
+        : 'Outro cupom da base já cobriu esta oferta. Rode /ml/sync-cupons-conta '
+          + 'para importar os cupons da conta com código e campanha.');
 
   try {
     await enviarMensagem(GRUPOS['operador'], { text: texto });
     console.log('[CUPOM-ANUNCIO] ' + aviso.percentual + ' campanha ' + (aviso.idCampanhaLoja || '—'));
   } catch (e) { console.error('[CUPOM-ANUNCIO] Falha ao avisar operador:', e.message); }
+}
+
+// ── CUPOM ML CITADO FORA DA BASE: TENTAR INCORPORAR ANTES DO PIPELINE ────────
+// Regra da operacao: oferta de grupo com cupom que a base nao conhece NAO sai
+// pelo preco cheio. Para o ML da para resolver sozinho: ativa o codigo na conta
+// (mesmo canal do botao "Inserir codigo"), le a regra (tipo, valor, minimo,
+// teto) na pagina de cupons e grava na base ANTES do processarTextoMl rodar —
+// que entao aplica o desconto e formata a mensagem normalmente. Se qualquer
+// etapa falhar, o codigo continua fora da base e a oferta cai para a fila de
+// aprovacao pelo gate de auto-envio (cupomForaDaBase).
+//
+// Throttle de 30 min por codigo: o mesmo cupom aparece em dezenas de posts no
+// mesmo dia, e reativar/reler a pagina a cada mensagem estouraria o limite de
+// taxa do ML (o sync horario ja usa espera de 2,5s por chamada).
+const _TENTATIVAS_CUPOM_ML = new Map();
+const TENTATIVA_CUPOM_ML_TTL_MS = 30 * 60 * 1000;
+
+async function incorporarCupomMlDesconhecido(texto) {
+  const codigos = cupomCitadoDesconhecido('Mercado Livre', texto);
+  if (!codigos.length) return;
+  if (!tokenAffOk()) {
+    console.warn('[CUPONS-ML] Cupom citado fora da base (' + codigos.join(', ')
+      + ') mas o token de afiliados esta fora do ar — oferta vai para aprovacao.');
+    return;
+  }
+
+  const agora = Date.now();
+  const ativados = [];
+  for (const codigo of codigos) {
+    const visto = _TENTATIVAS_CUPOM_ML.get(codigo);
+    if (visto && agora - visto < TENTATIVA_CUPOM_ML_TTL_MS) continue; // tentativa recente falhou
+    _TENTATIVAS_CUPOM_ML.set(codigo, agora);
+    let r = null;
+    try { r = await ativarCupomMl(codigo); }
+    catch (e) { console.warn('[CUPONS-ML] Falha ao ativar ' + codigo + ' na captura do radar:', e.message); }
+    if (r && (r.ok || r.jaTinha)) ativados.push(codigo);
+    else if (r) console.warn('[CUPONS-ML] ' + codigo + ' recusado na captura do radar: '
+      + (r.mensagem || r.status || 'sem detalhe') + ' — oferta vai para aprovacao.');
+    if (codigos.length > 1) await new Promise(r2 => setTimeout(r2, 2500));
+  }
+  if (!ativados.length) return;
+
+  // A ativacao so confirma que o codigo existe; a regra (percentual, minimo,
+  // teto, validade) vem da pagina de cupons da conta.
+  let pagina = null;
+  try { pagina = await lerTodosCuponsMl(); }
+  catch (e) {
+    console.warn('[CUPONS-ML] Ativei ' + ativados.join(', ') + ' mas nao consegui ler a regra: '
+      + e.message + ' — oferta vai para aprovacao.');
+    return;
+  }
+  const porCodigo = new Map((pagina.cupons || []).map(x => [String(x.codigo).toUpperCase(), x]));
+  for (const codigo of ativados) {
+    const card = porCodigo.get(codigo);
+    if (!card || card.valor == null) {
+      console.warn('[CUPONS-ML] ' + codigo + ' ativado, mas a pagina nao mostrou a regra — oferta vai para aprovacao.');
+      continue;
+    }
+    let reg = null;
+    try { reg = registrarCupomBase({ loja: 'Mercado Livre', ...card, confirmadoNoMl: true }); }
+    catch (e) { console.warn('[CUPONS-ML] Falha ao gravar ' + codigo + ' na base:', e.message); continue; }
+    // Mesmo fallback do sync: card "esgotando" nao traz prazo, e cupom recem-
+    // lido da conta nao pode nascer com validade menor que a do proprio card.
+    const validade = card.expiraEm || validadeDeTexto(card.venceTexto) || validadeDeTexto('amanha');
+    if (validade && reg) { try { atualizarCupomBase(reg.chave, { validadeAte: validade }); } catch (e) {} }
+    console.log('[CUPONS-ML] ' + codigo + ' incorporado na captura do radar — '
+      + card.valor + (card.tipo === 'pct' ? '%' : ' R$')
+      + (card.minimo != null ? ', min R$ ' + card.minimo : '')
+      + (card.limite != null ? ', teto R$ ' + card.limite : '') + '.');
+  }
 }
 
 // enfileira em filaPendentes com tipoConteudo 'oferta_amazon'. A partir dai
@@ -4041,6 +4117,10 @@ async function processarRadarMarketplace(jid, texto) {
     } else if (!credenciaisMlOk()) {
       console.warn('[ML] Link detectado mas ML_CLIENT_ID/ML_CLIENT_SECRET nao configurados.');
     } else {
+      // Cupom ML citado que a base nao conhece: tentar ativar na conta e gravar
+      // a regra ANTES do pipeline, para a oferta ja sair com o desconto.
+      try { await incorporarCupomMlDesconhecido(texto); }
+      catch (e) { console.warn('[CUPONS-ML] Incorporacao de cupom citado falhou:', e.message); }
       try { resultados.push(...await processarTextoMl(texto)); }
       catch (e) { console.error('[ML] Falha no pipeline:', e.message); }
     }
@@ -4092,10 +4172,17 @@ async function processarRadarMarketplace(jid, texto) {
     // (percentual, minimo, teto) o radar nao calcula o desconto e a oferta sai
     // pelo preco cheio. Aviso ao operador, sem travar o envio.
     const _cupSemBase = cupomCitadoDesconhecido(p.loja, texto);
-    if (_cupSemBase.length) avisarCupomDesconhecido(p.loja, _cupSemBase, p, jid).catch(() => {});
+    // Regra da operacao: oferta com cupom nao rastreado (citado no post ou
+    // declarado no anuncio) que sairia pelo PRECO CHEIO nunca e auto-enviada.
+    // No ML a incorporacao automatica ja tentou resolver antes do pipeline; se
+    // o codigo continua fora da base, o destino e a fila de aprovacao. Se um
+    // OUTRO cupom da base ja cobriu a oferta (r.cupom), ela nao esta cheia e o
+    // fluxo normal segue.
+    const _cupomForaDaBase = !r.cupom && (_cupSemBase.length > 0 || !!r.avisoCupomPagina);
+    if (_cupSemBase.length) avisarCupomDesconhecido(p.loja, _cupSemBase, p, jid, _cupomForaDaBase).catch(() => {});
 
     // Cupom declarado pelo proprio anuncio sem correspondente na base.
-    if (r.avisoCupomPagina) avisarCupomAnuncioSemBase(r.avisoCupomPagina, p, jid).catch(() => {});
+    if (r.avisoCupomPagina) avisarCupomAnuncioSemBase(r.avisoCupomPagina, p, jid, _cupomForaDaBase).catch(() => {});
 
     const imagem = await baixarImagemProduto(p.imagemUrl);
 
@@ -4136,6 +4223,12 @@ async function processarRadarMarketplace(jid, texto) {
       timestamp: new Date().toISOString(),
     };
 
+    // Marca visivel no card da fila: explica por que a oferta nao auto-enviou
+    // mesmo com AUTO_ENVIO_OFERTA ligado.
+    if (_cupomForaDaBase) {
+      oferta.cupomForaDaBase = { codigos: _cupSemBase, anuncio: !!r.avisoCupomPagina };
+    }
+
     // Cruzamento com os desejos de compra registrados. Fire-and-forget: roda em
     // paralelo e nunca lanca, para nao interferir no pipeline de ofertas.
     casarDesejosComOferta(oferta, {
@@ -4150,7 +4243,7 @@ async function processarRadarMarketplace(jid, texto) {
     // Excecao: precoDeReferencia marca oferta cujo preco veio do TEXTO do grupo
     // e nao de fonte verificavel (caso da Magalu). Anunciar valor nao conferido
     // sem revisao humana ja produziu 'De/Por' inexistente — essas vao para a fila.
-    if (AUTO_ENVIO_OFERTA === 'on' && !oferta.dadosExtraidos.precoDeReferencia) {
+    if (AUTO_ENVIO_OFERTA === 'on' && !oferta.dadosExtraidos.precoDeReferencia && !oferta.cupomForaDaBase) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
         oferta.status = 'enviado';
@@ -4171,8 +4264,10 @@ async function processarRadarMarketplace(jid, texto) {
 
     filaPendentes.unshift(oferta);
     salvarFila();
-    const _motivoFila = (AUTO_ENVIO_OFERTA === 'on' && oferta.dadosExtraidos.precoDeReferencia)
-      ? ' — preco nao verificado, exige aprovacao manual' : '';
+    const _motivoFila = AUTO_ENVIO_OFERTA !== 'on' ? ''
+      : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
+      : oferta.dadosExtraidos.precoDeReferencia ? ' — preco nao verificado, exige aprovacao manual'
+      : '';
     console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)' + _motivoFila);
   }
 }
