@@ -6132,6 +6132,10 @@ app.get('/operacao/fila', async (req, res) => {
           capturadoEm:   o.timestamp || null,
           enviadoEm:     o.enviadoEm || null,
           gruposDestino: Array.isArray(o.gruposEnviados) ? o.gruposEnviados.length : null,
+          // Previa da aba Fila tambem vale para o que ja saiu: mesma mensagem
+          // e mesma flag de imagem dos itens aguardando.
+          mensagem:      String(o.mensagemFormatada || '').slice(0, 4096),
+          temImagem:     Array.isArray(o.imagens) && o.imagens.length > 0,
         };
       });
 
