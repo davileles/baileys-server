@@ -57,16 +57,26 @@ export const NOMES_SINCRONIZAVEIS = new Set([
 export const ARQUIVOS_SINCRONIZADOS = Object.fromEntries(
   [...NOMES_SINCRONIZAVEIS].map(n => [n, pastaDados() + '/' + n]));
 
+// Shards mensais do historico de envios (historico_envios_2026-08.json).
+// Nome dinamico por natureza — nao cabe no Set fixo. Sao shardados por mes
+// justamente por causa do limite de ~1MB da Contents API na leitura: um unico
+// arquivo de historico cresceria alem disso em poucos meses e a restauracao
+// pos-deploy pararia de funcionar.
+const RE_NOME_HISTORICO = /^historico_envios_\d{4}-\d{2}\.json$/;
+function nomeSincronizavel(nome) {
+  return NOMES_SINCRONIZAVEIS.has(nome) || RE_NOME_HISTORICO.test(nome);
+}
+
 // Caminho relativo valido: nome permitido na raiz, ou tenants/<id>/<nome>.
 // Recusa qualquer coisa fora disso — este modulo escreve em disco e no repo,
 // entao a validacao do caminho e inegociavel.
 const RE_TENANT_SEG = /^[a-z0-9][a-z0-9-]{1,30}$/;
 function caminhoValido(local) {
   const partes = String(local || '').split('/');
-  if (partes.length === 1) return NOMES_SINCRONIZAVEIS.has(partes[0]);
+  if (partes.length === 1) return nomeSincronizavel(partes[0]);
   return partes.length === 3 && partes[0] === 'tenants'
       && RE_TENANT_SEG.test(partes[1])
-      && NOMES_SINCRONIZAVEIS.has(partes[2])
+      && nomeSincronizavel(partes[2])
       && partes[2] !== 'tenants.json';
 }
 // Dinamico de proposito: o repositorio/pasta podem mudar pelo painel.
@@ -174,6 +184,30 @@ export async function baixarDoGitHub() {
   console.log('[SYNC] Boot — ' + baixados + ' arquivo(s) do GitHub, ' + ausentes.length +
     ' ausente(s) no repo' + (erros.length ? ', ' + erros.length + ' erro(s): ' + erros.join('; ') : '') + '.');
   return { baixados, ausentes, erros };
+}
+
+/**
+ * Baixa UM arquivo do repositorio para ./sessao, sob demanda. Existe para os
+ * shards de historico: eles nao entram na varredura do boot (nome dinamico),
+ * entao quem for dar append precisa restaurar o shard do mes antes da primeira
+ * gravacao num volume novo — senao o primeiro envio do mes sobrescreveria o
+ * historico ja acumulado no repo.
+ */
+export async function baixarArquivoDoGitHub(local) {
+  if (!sincronizacaoAtiva() || !caminhoValido(local)) return false;
+  try {
+    const res = await api(remotoDe(local));
+    if (!res.ok) return false;
+    const dados = await res.json();
+    _shas.set(remotoDe(local), dados.sha);
+    const conteudo = Buffer.from(dados.content, 'base64').toString('utf-8');
+    JSON.parse(conteudo);                       // nao grava lixo no disco
+    const destino = SESSAO_DIR + '/' + local;
+    const dir = destino.slice(0, destino.lastIndexOf('/'));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(destino, conteudo, 'utf-8');
+    return true;
+  } catch { return false; }
 }
 
 async function enviar(local) {
