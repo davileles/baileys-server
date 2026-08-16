@@ -6011,6 +6011,21 @@ async function resumoCampanhaFila() {
 // Sao os cupons marcados com autoAgendado pelo gate — ou seja, itens que VAO
 // para o grupo sem nova decisao humana. A aba Fila do painel so exibe; quem
 // aprova ou rejeita e a aba Aprovacao, que continua em /painel-json.
+// Imagem de um item da fila, buscada so quando o operador abre a previa.
+// Fica fora do payload de /operacao/fila porque a aba recarrega a cada 12s e
+// base64 de imagem em cada ciclo pesaria o polling sem necessidade.
+app.get('/operacao/fila/imagem/:id', (req, res) => {
+  try {
+    const id = String(req.params.id || '');
+    const o = filaPendentes.find(x =>
+      String(x.id) === id && (x.tenant || TENANT_PADRAO) === req.tenantId);
+    if (!o) return res.status(404).json({ ok:false, erro:'item não encontrado' });
+    const img = Array.isArray(o.imagens) && o.imagens[0] ? o.imagens[0] : null;
+    if (!img || !img.imagemBase64) return res.json({ ok:true, temImagem:false });
+    res.json({ ok:true, temImagem:true, mime: img.mime || 'image/jpeg', base64: img.imagemBase64 });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.get('/operacao/fila', async (req, res) => {
   try {
     const agora        = Date.now();
@@ -6051,7 +6066,10 @@ app.get('/operacao/fila', async (req, res) => {
         enviandoDesde: o.enviandoDesde || null,
         timestamp:    o.timestamp,
         motivo:       (o.autoAvaliacao && o.autoAvaliacao.motivo) || '',
-        mensagem:     String(o.mensagemFormatada || '').slice(0, 600),
+        // Mensagem completa (limite de seguranca 4096): a previa da aba Fila
+        // precisa mostrar exatamente o que vai sair no grupo, sem corte.
+        mensagem:     String(o.mensagemFormatada || '').slice(0, 4096),
+        temImagem:    Array.isArray(o.imagens) && o.imagens.length > 0,
         previsaoEm:   previsao ? new Date(previsao).toISOString() : null,
         expiraEm:     ts && !isNaN(ts) ? new Date(ts + AUTO_ENVIO_MAX_ESPERA).toISOString() : null,
       };
