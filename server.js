@@ -6141,6 +6141,10 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   // Dono: agir em item de outro operador e proibido (defesa alem do filtro de listagem).
   if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  // Clique duplo ou aba desatualizada: item ja saindo ou ja enviado nao pode
+  // ser aprovado de novo — duplicaria a mensagem nos grupos.
+  if (oferta.status === 'enviando') return res.status(409).json({ ok:false, erro:'Este item ja esta sendo enviado agora.' });
+  if (oferta.status === 'enviado')  return res.status(409).json({ ok:false, erro:'Este item ja foi enviado.' });
   if (!conectado || !sock) {
     const ok = await aguardarSock();
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
@@ -6172,24 +6176,46 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   }
 
   if (oferta.tipoConteudo === 'cupom_tsp') {
+    // Mesmo padrao do auto-envio: 'enviando' ANTES do await tira o card do
+    // painel na hora (o envio com espacamento entre grupos pode levar minutos,
+    // e com o item ainda 'pendente' ele continuava na tela apos aprovar).
+    // Se o processo cair no meio, retomarEnviosInterrompidos() devolve para
+    // aprovacao manual com o rastro de enviadosParciais.
+    oferta.status = 'enviando';
+    oferta.enviandoDesde = new Date().toISOString();
+    salvarFila();
     try {
       await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0], oferta);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
       delete oferta.enviadosParciais; delete oferta.envioInterrompido; delete oferta.enviandoDesde;
       salvarFila();
       res.json({ ok:true });
-    } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
+    } catch(err) {
+      oferta.status = 'pendente';
+      delete oferta.enviandoDesde;
+      salvarFila();
+      res.status(500).json({ ok:false, erro: err.message });
+    }
     return;
   }
 
   if (ehOfertaMarketplace(oferta.tipoConteudo)) {
+    oferta.status = 'enviando';
+    oferta.enviandoDesde = new Date().toISOString();
+    salvarFila();
     try {
       const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
       oferta.destinos = r.enviados; oferta.falhas = r.falhas;
+      delete oferta.enviandoDesde;
       salvarFila();
       res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
-    } catch(err) { res.status(500).json({ ok:false, erro: err.message }); }
+    } catch(err) {
+      oferta.status = 'pendente';
+      delete oferta.enviandoDesde;
+      salvarFila();
+      res.status(500).json({ ok:false, erro: err.message });
+    }
     return;
   }
 
