@@ -43,7 +43,7 @@ import {
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
-  flushPushesPendentes, pushesPendentes,
+  flushPushesPendentes, pushesPendentes, baixarArquivoDoGitHub,
 } from './sync-github.js';
 
 // ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
@@ -2384,7 +2384,7 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
   try {
     const agoraIso = new Date().toISOString();
     const primeiraLinha = String(mensagem || '').split('\n').find(l => l.trim()) || '';
-    filaPendentes.push({
+    const rastroManual = {
       id:                gerarId(),
       tipoConteudo:      'manual_tsp',
       status:            'enviado',
@@ -2400,8 +2400,10 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
                : String(tipo || '').toLowerCase() === 'oferta' ? 'oferta'
                : 'mensagem',
       },
-    });
+    };
+    filaPendentes.push(rastroManual);
     salvarFila();
+    registrarEnvioHistorico(rastroManual);
   } catch (e) { console.warn('[MANUAL] Nao registrou rastro na fila:', e.message); }
 
   return { enviados, falhas };
@@ -2419,6 +2421,81 @@ async function despacharCupomAuto(oferta) {
   delete oferta.enviandoDesde;
   delete oferta.enviadosParciais;
   delete oferta.envioInterrompido;
+  registrarEnvioHistorico(oferta);
+}
+
+// ── HISTÓRICO DURÁVEL DE ENVIOS TSP ──────────────────────────────────────────
+// filaPendentes é operacional: limparFila() descarta processados em 24h (teto
+// de 20) e o rastro some. Este registro é o que FICA — a base para avaliar no
+// futuro se uma oferta/cupom foi bom, cruzando com rastreio.json (cliques) e
+// comissoes-afiliados.json (vendas). Shard mensal para nunca passar do ~1MB
+// que a Contents API devolve na leitura; persistência via sync-github com o
+// mesmo debounce dos demais JSONs do repositório de dados.
+const _histEnvioCache = new Map(); // caminho local -> array de registros
+
+function shardHistoricoAtual(tenant) {
+  const ym = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year: 'numeric', month: '2-digit' })
+    .format(new Date()); // "2026-08"
+  const nome = 'historico_envios_' + ym + '.json';
+  return (!tenant || tenant === TENANT_PADRAO) ? nome : 'tenants/' + tenant + '/' + nome;
+}
+
+async function _registrosDoShard(local) {
+  if (_histEnvioCache.has(local)) return _histEnvioCache.get(local);
+  const caminho = SESSAO_DIR + '/' + local;
+  let regs = null;
+  try { if (existsSync(caminho)) regs = JSON.parse(readFileSync(caminho, 'utf-8')).registros || []; } catch {}
+  if (!regs) {
+    // Volume novo (deploy zerou o disco): restaura o shard do mês antes do
+    // primeiro append, senão o envio sobrescreveria o histórico já no repo.
+    try {
+      if (await baixarArquivoDoGitHub(local) && existsSync(caminho)) {
+        regs = JSON.parse(readFileSync(caminho, 'utf-8')).registros || [];
+      }
+    } catch {}
+  }
+  if (!regs) regs = [];
+  _histEnvioCache.set(local, regs);
+  return regs;
+}
+
+async function registrarEnvioHistorico(oferta) {
+  try {
+    if (!oferta || oferta.status !== 'enviado') return;
+    const d = oferta.dadosExtraidos || {};
+    const local = shardHistoricoAtual(oferta.tenant);
+    const regs = await _registrosDoShard(local);
+    // Idempotente por id: aprovação manual e worker podem disputar o mesmo item.
+    if (regs.some(r => String(r.id) === String(oferta.id))) return;
+    regs.push({
+      id:            oferta.id,
+      enviadoEm:     oferta.enviadoEm || new Date().toISOString(),
+      tipoConteudo:  oferta.tipoConteudo,
+      subtipo:       d.subtipo || null,
+      loja:          d.loja || null,
+      titulo:        String(d.titulo || '').slice(0, 120) || null,
+      codigo:        d.codigo || (d.cupom && d.cupom.codigo) || null,
+      valor:         d.valor ?? null,           // cupom: 12 / 'pct' ou 30 / 'reais'
+      tipo:          d.tipo ?? null,
+      preco:         d.preco ?? null,
+      precoFinal:    d.precoFinal ?? null,
+      desconto:      (d.cupom && d.cupom.desconto) ?? d.desconto ?? null,
+      asin:          d.asin || null,
+      link:          d.link || d.urlLoja || null,
+      origem:        oferta.grupoOrigem || oferta.origem || null,
+      gruposDestino: Array.isArray(oferta.gruposEnviados) ? oferta.gruposEnviados.length
+                   : Array.isArray(oferta.destinos)       ? oferta.destinos.length : null,
+      autoEnviado:   !!oferta.autoEnviado,
+      temImagem:     Array.isArray(oferta.imagens) && oferta.imagens.length > 0,
+    });
+    const caminho = SESSAO_DIR + '/' + local;
+    const dir = caminho.slice(0, caminho.lastIndexOf('/'));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(caminho, JSON.stringify({ registros: regs }), 'utf-8');
+    agendarPush(local);
+  } catch (e) {
+    console.warn('[HIST-ENVIOS] Falha ao registrar #' + (oferta && oferta.id) + ':', e.message);
+  }
 }
 
 // ── WORKER DE ESPACAMENTO DO AUTO-ENVIO ──────────────────────────────────────
@@ -4253,6 +4330,7 @@ async function processarRadarMarketplace(jid, texto) {
         // preserva o rastro de tudo que saiu.
         filaPendentes.unshift(oferta);
         salvarFila();
+        registrarEnvioHistorico(oferta);
         console.log('[MKT] Oferta #' + oferta.id + ' ENVIADA direto — ' + p.asin
           + ' R$ ' + p.preco + ' -> ' + r.enviados.length + ' grupo(s)');
         continue;
@@ -6026,6 +6104,20 @@ app.get('/operacao/fila/imagem/:id', (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// Leitura do histórico durável de envios. ?mes=YYYY-MM (padrão: mês atual SP).
+// Serve o painel e qualquer análise futura de desempenho de ofertas.
+app.get('/operacao/historico-envios', async (req, res) => {
+  try {
+    const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || ''))
+      ? String(req.query.mes)
+      : new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year:'numeric', month:'2-digit' }).format(new Date());
+    const nome = 'historico_envios_' + mes + '.json';
+    const local = (req.tenantId === TENANT_PADRAO) ? nome : 'tenants/' + req.tenantId + '/' + nome;
+    const regs = await _registrosDoShard(local);
+    res.json({ ok: true, mes, total: regs.length, registros: regs });
+  } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
+});
+
 app.get('/operacao/fila', async (req, res) => {
   try {
     const agora        = Date.now();
@@ -6214,8 +6306,10 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     try {
       await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0], oferta);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
+      oferta.enviadoEm = new Date().toISOString();
       delete oferta.enviadosParciais; delete oferta.envioInterrompido; delete oferta.enviandoDesde;
       salvarFila();
+      registrarEnvioHistorico(oferta);
       res.json({ ok:true });
     } catch(err) {
       oferta.status = 'pendente';
@@ -6233,9 +6327,11 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     try {
       const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
+      oferta.enviadoEm = new Date().toISOString();
       oferta.destinos = r.enviados; oferta.falhas = r.falhas;
       delete oferta.enviandoDesde;
       salvarFila();
+      registrarEnvioHistorico(oferta);
       res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
     } catch(err) {
       oferta.status = 'pendente';
@@ -7012,6 +7108,7 @@ async function processarOfertasAwin({ simular = false } = {}) {
           oferta.enviadoEm = new Date().toISOString();
           oferta.gruposEnviados = env.enviados;
           filaPendentes.unshift(oferta); salvarFila();
+          registrarEnvioHistorico(oferta);
           saida.enviadas.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
           console.log('[AWIN-OFERTAS] Enviada — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
           // Espacamento so quando a rodada leva mais de uma: com maxRodada=1 o
