@@ -601,11 +601,14 @@ export function normalizarMl(it) {
 
 import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
          calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto,
-         casarCupomDaPagina, registrarCupomBase } from './radar-amazon.js';
+         casarCupomDaPagina, registrarCupomBase, comRastreio } from './radar-amazon.js';
 
+// Rastreio identico ao da Amazon: registra o produto no ledger; para esta
+// loja a URL sai intacta (parametro extra pode quebrar a atribuicao da rede).
+// `rastrear: false` protege previews/simulacoes de sujar o ledger.
 export function formatarOfertaMl(p, opcoes = {}) {
   const tpl = opcoes.template || templateDaLoja('Mercado Livre');
-  const vars = varsDoProduto(p, opcoes.cupom || null);
+  const vars = varsDoProduto(opcoes.rastrear === false ? p : comRastreio(p), opcoes.cupom || null);
   vars.vendas = p.vendas || '';
   vars.codigo_busca = p.codigoBusca || '';
   return renderTemplate(tpl?.corpo || '', vars);
