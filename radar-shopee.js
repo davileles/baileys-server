@@ -22,6 +22,7 @@ import { resolverPrecoDe, FONTE_API } from './preco-de.js';
 import {
   melhorCupom, cupomPorCodigo, cupomVigente, calcularDesconto,
   templateDaLoja, renderTemplate, varsDoProduto, melhorCupomAplicavel,
+  refDoDisparo, aplicarRefNoLink,
 } from './radar-amazon.js';
 
 const API_URL = 'https://open-api.affiliate.shopee.com.br/graphql';
@@ -239,6 +240,25 @@ export function normalizarShopee(n) {
   };
 }
 
+// ── RASTREIO ──────────────────────────────────────────────────────────────
+// Registra o produto no ledger (ref deterministico por itemId) e troca o link
+// por um shortlink gerado JA com o subId embutido — e o subId passado ao
+// generateShortLink que reaparece no utmContent do conversionReport e no
+// relatorio de cliques. Query param acrescentado a um shortlink pronto pode se
+// perder no redirect, entao so serve de ultimo recurso quando a geracao falha:
+// rastreio pior, mesmo afiliado. Sem este passo a oferta sai sem marcacao
+// nenhuma — era o furo que deixava o ledger sem refs da Shopee.
+async function marcarRastreio(p, node) {
+  try {
+    const ref = refDoDisparo(p);
+    if (!ref) return;
+    const marcado = await gerarLinkAfiliado(node?.productLink || p.link, [ref]).catch(() => null);
+    p.link = marcado || aplicarRefNoLink(p.link, 'shopee', ref);
+  } catch (e) {
+    console.log('[SHOPEE] rastreio falhou (oferta segue sem marcação):', e.message);
+  }
+}
+
 export function formatarOfertaShopee(p, opcoes = {}) {
   const tpl  = opcoes.template || templateDaLoja('Shopee');
   const vars = varsDoProduto(p, opcoes.cupom || null);
@@ -273,6 +293,8 @@ export async function processarTextoShopee(texto, opcoes = {}) {
     const p = normalizarShopee(node);
     if (!p.preco) { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
     if (!p.link)  { saida.push({ produto: p, descartadoPor: 'sem link de afiliado' }); continue; }
+
+    await marcarRastreio(p, node);
 
     const cupom = melhorCupom('Shopee', p.preco, texto);
     if (cupom) {
@@ -393,6 +415,7 @@ export async function montarOfertasShopeeVitrine(itens, codigoCupom = null) {
 
     const p = normalizarShopee(node);
     if (!p.preco) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'sem preço disponível' }); continue; }
+    if (p.link) await marcarRastreio(p, node);
 
     const codigo = codigoCupom || salvo.cupom || null;
     let cupom = null, avisoCupom = null;
