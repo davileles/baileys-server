@@ -252,7 +252,7 @@ export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
     } catch (e) { console.log('[AWIN-OFERTAS] Falha na loja ' + id + ': ' + e.message); continue; }
 
     const nomeCru = achados[0]?.anunciante || String(id);
-    const loja = nomeCru.replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const loja = nomeCru.replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim();
     const aproveitados = achados
       .filter(p => !jaOfertado(loja + '|' + p.chave, cfg.repetirDias))
       .map(p => ({ ...p, loja, chaveHistorico: loja + '|' + p.chave }));
