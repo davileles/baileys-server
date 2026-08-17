@@ -37,7 +37,7 @@ import {
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
-  recarregarRadarTenants,
+  recarregarRadarTenants, refDeterministico,
 } from './radar-amazon.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -7050,13 +7050,17 @@ async function processarOfertasAwin({ simular = false } = {}) {
     for (const c of r.escolhidos) {
       // Link curto (tidd.ly) via Link Builder; o aw_deep_link do feed (longo)
       // fica de plano B se a quota estourar ou o anunciante nao liberar.
+      // Identidade por PRODUTO (antes era 'AWIN-{id}-feed', uma chave coletiva
+      // por anunciante): sem isso o ledger nao distingue os itens do feed.
+      const asinFeed = chaveVitrineAwin(c.advertiserId, c.urlLoja || c.linkAfiliado || '');
+      const refFeed = refDeterministico(asinFeed);
       let linkEnvio = c.linkAfiliado;
       try {
-        const l = await gerarLinkAwin({ url: c.urlLoja, advertiserId: c.advertiserId, clickref: 'feed' });
+        const l = await gerarLinkAwin({ url: c.urlLoja, advertiserId: c.advertiserId, clickref: refFeed });
         linkEnvio = l.shortUrl || l.url || linkEnvio;
       } catch {}
       const p = {
-        asin: 'AWIN-' + c.advertiserId + '-feed',
+        asin: asinFeed,
         codigo: c.urlLoja || '',
         titulo: c.titulo || '',
         preco: c.preco,
