@@ -4226,7 +4226,7 @@ async function processarRadarMarketplace(jid, texto) {
   }
   if (ehLinkAwin(texto)) {
     const prog = programaAwinPorUrl((texto.match(/https?:\/\/[^\s]+/) || [''])[0]);
-    const lojaAwin = String(prog?.name || 'Awin').replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const lojaAwin = String(prog?.name || 'Awin').replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim();
     const podeAwin = podeCapturar(jid, lojaAwin);
     if (!podeAwin.ok) {
       console.log('[MONITOR] ' + lojaAwin + ' ignorada em ' + jid.split('@')[0] + ' — ' + podeAwin.motivo);
@@ -7048,6 +7048,13 @@ async function processarOfertasAwin({ simular = false } = {}) {
       enviadas: [], naFila: [], previa: [] };
 
     for (const c of r.escolhidos) {
+      // Link curto (tidd.ly) via Link Builder; o aw_deep_link do feed (longo)
+      // fica de plano B se a quota estourar ou o anunciante nao liberar.
+      let linkEnvio = c.linkAfiliado;
+      try {
+        const l = await gerarLinkAwin({ url: c.urlLoja, advertiserId: c.advertiserId, clickref: 'feed' });
+        linkEnvio = l.shortUrl || l.url || linkEnvio;
+      } catch {}
       const p = {
         asin: 'AWIN-' + c.advertiserId + '-feed',
         codigo: c.urlLoja || '',
@@ -7058,11 +7065,11 @@ async function processarOfertasAwin({ simular = false } = {}) {
         precoDeTexto: c.precoDe ? 'R$ ' + c.precoDe.toFixed(2).replace('.', ',') : null,
         desconto: c.desconto,
         disponivel: true,
-        link: c.linkAfiliado,
+        link: linkEnvio,
         imagemUrl: c.imagem || null,
         vendedor: null, marca: c.marca || '', nota: null, avaliacoes: null,
         dealTermina: null, ehDeal: false,
-        loja: c.loja.replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+        loja: c.loja.replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim(),
         precoDeReferencia: true,   // preco de feed, nao lido do site agora
       };
 
@@ -7208,7 +7215,7 @@ app.get('/awin/ofertas/candidatos', (req, res) => {
 // loja existe para segurar o robo, nao o operador. Mas o produto sai da fila de
 // candidatos e entra no historico de ofertados, senao o publicador automatico
 // mandaria o mesmo item por conta propria depois.
-app.post('/awin/ofertas/cadastrar', (req, res) => {
+app.post('/awin/ofertas/cadastrar', async (req, res) => {
   try {
     const chaves = Array.isArray(req.body?.chaves) ? req.body.chaves : [];
     if (!chaves.length) return res.status(400).json({ ok:false, erro:'nenhum produto selecionado' });
@@ -7225,12 +7232,18 @@ app.post('/awin/ofertas/cadastrar', (req, res) => {
     for (const c of escolhidos) {
       const asin = chaveVitrineAwin(c.advertiserId, c.urlLoja);
       const jaTinha = !!itemVitrine(asin);
+      // Link curto (tidd.ly) primeiro; aw_deep_link/deeplink manual de plano B.
+      let linkVitrine = c.linkAfiliado || deeplinkAwin(c.advertiserId, c.urlLoja);
+      try {
+        const l = await gerarLinkAwin({ url: c.urlLoja, advertiserId: c.advertiserId, clickref: 'vitrine' });
+        linkVitrine = l.shortUrl || l.url || linkVitrine;
+      } catch {}
       salvos.push({ ...salvarItemVitrine({
         asin, loja: c.loja,
         nome: (c.titulo || (c.loja + ' — produto')).slice(0, 140),
         // 'url' e o link de afiliado que vai na mensagem; 'urlProduto' e a
         // pagina da loja, que permite reconsultar o preco no disparo.
-        url: c.linkAfiliado || deeplinkAwin(c.advertiserId, c.urlLoja),
+        url: linkVitrine,
         urlProduto: c.urlLoja,
         advertiserId: c.advertiserId,
         // Preco do feed serve de plano B se a loja bloquear a leitura na hora
@@ -8779,7 +8792,7 @@ function pipelineDoLink(texto) {
   // fallback da Amazon, que so deve pegar o que ninguem reconheceu.
   const progAwin = programaAwinPorUrl((String(texto).match(/https?:\/\/[^\s]+/) || [''])[0]);
   if (progAwin) return {
-    loja: String(progAwin.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+    loja: String(progAwin.name).replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim(),
     run: t => processarTextoAwin(t),
   };
   return { loja: 'Amazon', run: t => processarTextoAmazon(t, { ignorarDedup: true, ignorarMinimo: true }) };
