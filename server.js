@@ -25,6 +25,7 @@ import {
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
   cupomCitadoDesconhecido,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
+  espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   templateCupom, templateAwin, templateProprioDaLoja,
@@ -2181,7 +2182,7 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
       }
       // Espacamento entre grupos: mesmo padrao das ofertas do radar, evita
       // rajada identica em varios grupos no mesmo segundo.
-      if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+      if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
     } catch(e) {
       console.error('[CUPONS] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
@@ -2300,7 +2301,7 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
     try {
       await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem }, 0, op);
       enviados.push(jid);
-      if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+      if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
     } catch (e) {
       console.error('[MKT] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
@@ -2359,7 +2360,7 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
       enviados.push(jid);
       // Espacamento entre grupos: mesmo padrao do radar. Disparo simultaneo em
       // varios grupos e justamente o que o WhatsApp usa para achar automacao.
-      if (alvos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+      if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
     } catch (e) {
       console.error('[MANUAL] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
@@ -6823,6 +6824,7 @@ app.get('/mkt/config', (req, res) => {
     matchDesejos: MODO_DESEJOS,
     autoEnvioCupom: AUTO_ENVIO_MODO,
     janelaCupom: janelaCupom(),
+    espacamentoGrupos: espacamentoGrupos(),
     turnosTsp: turnosTsp(),
     contaAgora: contaDoTurno(),
   });
@@ -6842,6 +6844,13 @@ app.post('/mkt/config', (req, res) => {
       console.log('[CUPONS] Janela de publicacao — ' + janela.inicio + '-' + janela.fim
         + ' (' + janela.dias + '), intervalo ' + janela.intervaloSeg + 's.');
     }
+    // Espacamento entre grupos: gravacao propria porque a faixa precisa ser
+    // validada (max < min viraria pausa zero sem ninguem perceber).
+    let espac = espacamentoGrupos();
+    if (req.body.espacamentoGrupos !== undefined) {
+      espac = salvarEspacamentoGrupos(req.body.espacamentoGrupos || {});
+      console.log('[MKT] Espacamento entre grupos — ' + espac.minSeg + 's a ' + espac.maxSeg + 's.');
+    }
     let turnos = turnosTsp();
     if (req.body.turnosTsp !== undefined) {
       turnos = salvarTurnosTsp(req.body.turnosTsp || {});
@@ -6850,7 +6859,8 @@ app.post('/mkt/config', (req, res) => {
     }
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos(),
-               janelaCupom: janela, turnosTsp: turnos, contaAgora: contaDoTurno() });
+               janelaCupom: janela, espacamentoGrupos: espac,
+               turnosTsp: turnos, contaAgora: contaDoTurno() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
@@ -8226,7 +8236,7 @@ app.post('/vitrine/disparar', async (req, res) => {
     }
     // Mesmo espacamento do radar: rajada em varios grupos e o padrao que o
     // WhatsApp usa para identificar automacao.
-    if (montado.prontos.length > 1) await new Promise(r => setTimeout(r, 3000 + Math.random() * 2000));
+    if (montado.prontos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
   }
 
   console.log('[VITRINE] Disparo — ' + enviados.length + ' enviada(s), '
