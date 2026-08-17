@@ -17,7 +17,8 @@
 import { credencialTsp } from './config-tsp.js';
 import { tenantContexto } from './tenants.js';
 import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
-         calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto } from './radar-amazon.js';
+         calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto,
+         comRastreio } from './radar-amazon.js';
 import { resolverPrecoDe, FONTE_TEXTO, FONTE_MANUAL } from './preco-de.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
@@ -128,9 +129,12 @@ function tituloDoTexto(texto, slug) {
   return (slug || '').replace(/[-_]+/g, ' ').trim().slice(0, 140) || 'Oferta Magazine Luiza';
 }
 
+// Rastreio identico ao da Amazon: registra o produto no ledger; para esta
+// loja a URL sai intacta (parametro extra pode quebrar a atribuicao da rede).
+// `rastrear: false` protege previews/simulacoes de sujar o ledger.
 export function formatarOfertaMagalu(p, opcoes = {}) {
   const tpl = opcoes.template || templateDaLoja('Magazine Luiza');
-  return renderTemplate(tpl?.corpo || '', varsDoProduto(p, opcoes.cupom || null));
+  return renderTemplate(tpl?.corpo || '', varsDoProduto(opcoes.rastrear === false ? p : comRastreio(p), opcoes.cupom || null));
 }
 
 /**
