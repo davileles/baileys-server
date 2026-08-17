@@ -3121,6 +3121,10 @@ setTimeout(() => {
   }
 }, 15000);
 
+// Prefixos dos avisos que o proprio servidor publica no grupo do operador.
+// Ver filtro em processarMensagem: sem isto o sistema le os proprios recados.
+const _EH_AVISO_DO_SISTEMA = /^\s*(\*?(Entrega suspeita|Cupom nao entregue|Envio manual nao entregue|Watchdog)|CRITICO —|OK — Watchdog|\u26a0\ufe0f Watchdog|Heartbeat)/;
+
 // ── GRUPOS COM REGRAS ESPECIAIS DE EXTRAÇÃO ───────────────────────────────────
 const GRUPO_APENAS_IMAGEM = '120363430801699326@g.us';
 const GRUPO_EXECUTIVA     = '120363410708080270@g.us';
@@ -3915,6 +3919,30 @@ async function processarBuffer(grupoId) {
 // Grupos diferentes processam em paralelo entre si.
 const _filaGrupo = new Map(); // jid → Promise (última tarefa na fila)
 
+// Dedup de mensagens ja processadas. Necessario desde que upserts 'append'
+// (sync/reconexao) tambem alimentam o pipeline: a MESMA mensagem pode chegar
+// como 'append' e depois como 'notify', e sem isto seria extraida duas vezes
+// (duas chamadas de IA, duas ofertas na fila).
+const _idsVistos = new Map();          // key.id -> timestamp
+const IDS_VISTOS_TTL_MS = 15 * 60 * 1000;
+const IDS_VISTOS_MAX    = 800;
+
+function _jaProcessado(msg) {
+  const id = msg?.key?.id;
+  if (!id) return false;               // sem id nao da para deduplicar: deixa passar
+  const agora = Date.now();
+  if (_idsVistos.has(id)) return true;
+  _idsVistos.set(id, agora);
+  if (_idsVistos.size > IDS_VISTOS_MAX) {
+    for (const [k, t] of _idsVistos) if (agora - t > IDS_VISTOS_TTL_MS) _idsVistos.delete(k);
+    while (_idsVistos.size > IDS_VISTOS_MAX) {
+      const k = _idsVistos.keys().next().value;
+      _idsVistos.delete(k);
+    }
+  }
+  return false;
+}
+
 // Buffer circular de diagnostico dos ultimos upserts recebidos (ver /debug-upserts).
 const _debugUpserts = [];
 
@@ -4385,6 +4413,15 @@ async function processarMensagem(msg) {
     ultimaCapturaPorGrupo.set(jid, Date.now());
     registrarCapturaHealth();
 
+    // Avisos que o PROPRIO servidor publica no grupo do operador chegam de
+    // volta como mensagem (fromMe) e entravam no pipeline de emissoes: cada
+    // alerta operacional virava uma chamada de IA inutil. Filtramos pelo texto,
+    // e nao por fromMe puro, para NAO bloquear teste manual do proprio numero.
+    if (msg.key?.fromMe && texto && _EH_AVISO_DO_SISTEMA.test(texto)) {
+      console.log('[MSG] Aviso do proprio sistema em ' + jid.split('@')[0] + ' — ignorado (nao vai para a IA).');
+      return;
+    }
+
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
       texto.includes('Dica de emissão encontrada por @davileles') ||
@@ -4499,15 +4536,26 @@ async function limparSessaoEReconectar() {
 // sem derrubar a conexão e sem tocar em sessions/pre-keys. Como o auth state lê as
 // chaves do disco sob demanda, o efeito é imediato: na próxima mensagem de cada
 // grupo o Baileys envia retry receipt e o remetente redistribui a chave nova.
+// Teto da cura cirurgica. Em 17/08/2026 uma rajada de indecifraveis disparou o
+// apagamento de 72 sender keys de uma vez; segundos depois o stream caiu com
+// erro 500 e o socket ficou surdo por 2h. Apagar o chaveiro inteiro nao e
+// cirurgia — e trauma. Acima do teto, o problema nao e de chave de grupo:
+// escalamos para reset de sessao, que reconstroi o estado de forma ordenada.
+const SENDER_KEYS_TETO = 25;
+
 async function limparSenderKeys() {
   try {
     const arquivos = await readdir(SESSAO_DIR);
+    const chaves = arquivos.filter(a => a.startsWith('sender-key'));
+    if (chaves.length > SENDER_KEYS_TETO) {
+      console.warn('[WA] Cura cirúrgica ABORTADA: ' + chaves.length + ' sender keys (teto ' + SENDER_KEYS_TETO + '). Apagar tudo degrada o socket — escalando para reset de sessão.');
+      await limparSessaoEReconectar();
+      return;
+    }
     let n = 0;
-    for (const arq of arquivos) {
-      if (arq.startsWith('sender-key')) {
-        await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
-        n++;
-      }
+    for (const arq of chaves) {
+      await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+      n++;
     }
     console.log('[WA] Cura cirúrgica: ' + n + ' sender keys apagadas (conexão mantida, remetentes redistribuirão as chaves).');
   } catch(e) { console.error('[WA] Erro na cura cirúrgica:', e.message); }
@@ -4843,18 +4891,63 @@ function _salvarHealth() {
   catch (e) { console.warn('[WATCHDOG] Falha ao gravar health.json:', e.message); }
 }
 
-// Maquina de estados da surdez: ok -> autocura -> alertado -> (upsert) -> ok
+// Escada de autocura da surdez (17/08/2026: 4 tentativas manuais de socket novo
+// falharam; so o novo pareamento resolveu). Cada degrau alcanca uma camada mais
+// profunda, e so escala se o anterior nao resolveu em SURDEZ_POS_CURA_MS:
+//   ok -> cura1 (reconexao de socket)
+//      -> cura2 (limparSessaoEReconectar: apaga sessions + sender keys)
+//      -> (process.exit no proprio degrau 2+: Railway sobe container novo)
+//      -> alertado (esgotou o automatico; so novo QR resolve)
+// Voltar a receber upsert em qualquer degrau derruba o estado para 'ok'.
 let _surdezEstado  = 'ok';
 let _surdezCuraEm  = 0;
 let _surdezAvisoEm = 0;
 
-async function _avisarOperador(texto) {
-  // Telegram primeiro: e o unico canal que sobrevive se o sock morrer de vez.
+// Guarda contra restart em loop: se o creds.json estiver mesmo morto, o degrau
+// o degrau 3 se repetiria a cada ciclo eternamente. Um exit por hora, no maximo —
+// depois disso a escada para em 'alertado' e espera intervencao humana.
+const EXIT_COOLDOWN_MS = 60 * 60 * 1000;
+
+// E-mail: terceiro canal, e o unico que NAO depende de nenhum dos dois sistemas
+// que podem estar quebrados. Em 17/08/2026 o alerta saiu apenas pelo WhatsApp
+// (o bot do Telegram estava sem TELEGRAM_BOT_TOKEN, entao notificarAdmins
+// retornava false silenciosamente) e ficou 2h sem ser visto no grupo.
+const ALERTA_EMAIL = process.env.ALERTA_EMAIL || 'davileles@gmail.com';
+
+async function _avisarPorEmail(texto) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key || !ALERTA_EMAIL) return false;
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+      body: JSON.stringify({
+        from:    'CDV Servidor <alertas@clubedoviajante.com.br>',
+        to:      [ALERTA_EMAIL],
+        subject: 'CDV — alerta do servidor WhatsApp',
+        text:    texto,
+      }),
+    });
+    if (!res.ok) { console.error('[WATCHDOG] Resend HTTP ' + res.status); return false; }
+    return true;
+  } catch (e) { console.error('[WATCHDOG] E-mail falhou:', e.message); return false; }
+}
+
+async function _avisarOperador(texto, opcoes = {}) {
+  // Tres canais independentes. O e-mail so entra em alertas criticos para nao
+  // virar ruido — mas nesses, ele e o que garante que a mensagem chega mesmo
+  // com WhatsApp surdo e bot do Telegram desligado.
   let entregue = false;
-  try { entregue = (await notificarAdminsTelegram(texto)) || entregue; }
+  let viaTelegram = false, viaWhats = false, viaEmail = false;
+  try { viaTelegram = !!(await notificarAdminsTelegram(texto)); entregue = entregue || viaTelegram; }
   catch (e) { console.error('[WATCHDOG] Telegram falhou:', e.message); }
-  try { await enviarMensagem(GRUPOS.operador, { text: texto }); entregue = true; }
+  try { await enviarMensagem(GRUPOS.operador, { text: texto }); viaWhats = true; entregue = true; }
   catch (e) { console.error('[WATCHDOG] WhatsApp operador falhou:', e.message); }
+  if (opcoes.critico) {
+    viaEmail = await _avisarPorEmail(texto);
+    entregue = entregue || viaEmail;
+  }
+  console.log('[WATCHDOG] Alerta — telegram:' + viaTelegram + ' whatsapp:' + viaWhats + ' email:' + viaEmail);
   return entregue;
 }
 
@@ -4894,36 +4987,113 @@ setInterval(async () => {
     const silencio = agora - ref;
     if (silencio < SURDEZ_SILENCIO_MS) return;
 
+    // ── Degrau 1: socket novo ────────────────────────────────────────────
     if (_surdezEstado === 'ok') {
-      _surdezEstado = 'autocura';
+      _surdezEstado = 'cura1';
       _surdezCuraEm = agora;
-      console.warn('[WATCHDOG] Socket surdo ha ' + Math.round(silencio / 60000) + ' min (zero upserts). Tentando reconexao automatica...');
-      try { forcarReconexao('watchdog-surdez'); } catch (e) { console.error('[WATCHDOG] Autocura falhou:', e.message); }
+      console.warn('[WATCHDOG] Socket surdo ha ' + Math.round(silencio / 60000) + ' min (zero upserts). Degrau 1: reconexao de socket...');
+      try { forcarReconexao('watchdog-surdez'); } catch (e) { console.error('[WATCHDOG] Degrau 1 falhou:', e.message); }
       return;
     }
-    if (_surdezEstado === 'autocura') {
+
+    // ── Degrau 2: sessions + sender keys ─────────────────────────────────
+    if (_surdezEstado === 'cura1') {
       if (agora - _surdezCuraEm < SURDEZ_POS_CURA_MS) return;
-      _surdezEstado  = 'alertado';
-      _surdezAvisoEm = agora;
+      _surdezEstado = 'cura2';
+      _surdezCuraEm = agora;
+      console.warn('[WATCHDOG] Reconexao nao resolveu. Degrau 2: limpando sessions e sender keys...');
+      _avisarOperador('Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min. Reconexao nao resolveu — limpando sessao (degrau 2 de 3). Sem acao necessaria por enquanto.').catch(() => {});
+      try { await limparSessaoEReconectar(); } catch (e) { console.error('[WATCHDOG] Degrau 2 falhou:', e.message); }
+      return;
+    }
+
+    // ── Degrau 3: processo novo (Railway ressuscita o container) ──────────
+    if (_surdezEstado === 'cura2') {
+      if (agora - _surdezCuraEm < SURDEZ_POS_CURA_MS) return;
+      const ultimoExit = _health.ultimoExitEm || 0;
+      if (agora - ultimoExit < EXIT_COOLDOWN_MS) {
+        console.warn('[WATCHDOG] Degrau 3 pulado: ja houve restart ha menos de 60 min. Indo direto para alerta.');
+        _surdezEstado  = 'alertado';
+        _surdezAvisoEm = agora;
+      } else {
+        console.warn('[WATCHDOG] Reset de sessao nao resolveu. Degrau 3: encerrando o processo para o Railway subir um container novo.');
+        _health.ultimoExitEm = agora;
+        _healthGravadoEm = 0;              // forca o write, ignorando o throttle
+        _salvarHealth();
+        await _avisarOperador(
+          'Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min.\n\n'
+          + 'Reconexao e reset de sessao nao resolveram. Reiniciando o processo '
+          + '(degrau 3 de 3) — o Railway sobe um container novo em segundos.\n\n'
+          + 'Se ainda assim nao voltar, sera necessario novo pareamento (QR).',
+          { critico: true }
+        ).catch(() => {});
+        // encerrarComFlush faz o flush da fila e chama process.exit.
+        setTimeout(() => { encerrarComFlush('watchdog-surdez-degrau3'); }, 1500);
+        return;
+      }
     } else if (agora - _surdezAvisoEm < SURDEZ_REAVISO_MS) {
       return;
     } else {
       _surdezAvisoEm = agora;
     }
     const min = Math.round((Date.now() - ref) / 60000);
-    console.warn('[WATCHDOG] Surdez persiste apos autocura (' + min + ' min). Alertando operador.');
+    console.warn('[WATCHDOG] Surdez persiste apos a escada completa (' + min + ' min). Alertando operador.');
     await _avisarOperador(
       'CRITICO — WhatsApp SURDO\n\n'
-      + 'O servidor nao recebe NENHUMA mensagem ha ' + min + ' min '
-      + '(zero upserts crus), mesmo apos 1 reconexao automatica. '
+      + 'O servidor nao recebe NENHUMA mensagem ha ' + min + ' min (zero upserts crus). '
+      + 'A escada automatica ja tentou TUDO: reconexao de socket, reset de sessao '
+      + 'e restart do processo.\n\n'
       + 'O envio pode continuar funcionando, mas captura de grupos e radar estao MORTOS.\n\n'
-      + 'Correcao: novo pareamento.\n'
-      + '1) POST /reset-sessao-completo\n'
-      + '2) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n\n'
-      + '(Este aviso se repete a cada 60 min enquanto persistir.)'
+      + 'Correcao (exige celular em maos):\n'
+      + '1) No WhatsApp do celular, desconecte o dispositivo antigo em Dispositivos conectados\n'
+      + '2) POST /reset-sessao-completo\n'
+      + '3) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n\n'
+      + '(Este aviso se repete a cada 60 min enquanto persistir.)',
+      { critico: true }
     );
   } catch (e) { console.error('[WATCHDOG] Erro no ciclo de surdez:', e.message); }
 }, 5 * 60 * 1000);
+
+// ── HEARTBEAT ATIVO (opt-in) ─────────────────────────────────────────────────
+// A surdez so e detectada pela AUSENCIA de upserts — sinal ambiguo: grupo
+// parado de madrugada parece socket morto. O heartbeat remove a ambiguidade:
+// uma conta secundaria manda uma mensagem curta no grupo do operador e o
+// socket principal PRECISA receber o upsert dela. Se dois ciclos seguidos nao
+// voltarem, a surdez e certa e a escada e acionada sem esperar os 20 min.
+// Desligado por padrao: definir HEARTBEAT_MIN (ex.: 15) para ligar.
+const HEARTBEAT_MIN   = parseInt(process.env.HEARTBEAT_MIN || '0', 10);
+const HEARTBEAT_CONTA = process.env.HEARTBEAT_CONTA || 'paulo';
+let _hbFalhasSeguidas = 0;
+
+if (HEARTBEAT_MIN > 0) {
+  console.log('[HEARTBEAT] Ligado — ' + HEARTBEAT_MIN + ' min, via conta "' + HEARTBEAT_CONTA + '".');
+  setInterval(async () => {
+    try {
+      if (!conectado || !sock) return;
+      const h = horaSP();
+      if (h < SURDEZ_INICIO_H || h >= SURDEZ_FIM_H) return;
+      const marco = Date.now();
+      const destino = GRUPOS.operador;
+      if (!destino) return;
+      await enviarMensagem(destino, { text: 'Heartbeat ' + new Date().toISOString() }, 0, { conta: HEARTBEAT_CONTA });
+      // Espera a volta: o socket principal deve ver o upsert desta mensagem.
+      await new Promise(r => setTimeout(r, 45 * 1000));
+      if ((_health.ultimoUpsertEm || 0) >= marco) {
+        if (_hbFalhasSeguidas > 0) console.log('[HEARTBEAT] Voltou a fechar o ciclo (ida e volta ok).');
+        _hbFalhasSeguidas = 0;
+        return;
+      }
+      _hbFalhasSeguidas++;
+      console.warn('[HEARTBEAT] Mensagem enviada mas nao retornou como upsert (' + _hbFalhasSeguidas + ' seguida(s)).');
+      if (_hbFalhasSeguidas >= 2 && _surdezEstado === 'ok') {
+        console.warn('[HEARTBEAT] Duas falhas seguidas — acionando a escada de autocura sem esperar o silencio de 20 min.');
+        _surdezEstado = 'cura1';
+        _surdezCuraEm = Date.now();
+        try { forcarReconexao('heartbeat-sem-volta'); } catch (e) { console.error('[HEARTBEAT] Reconexao falhou:', e.message); }
+      }
+    } catch (e) { console.error('[HEARTBEAT] Erro no ciclo:', e.message); }
+  }, HEARTBEAT_MIN * 60 * 1000);
+}
 
 // Ciclo de capturas (sinal secundario): a cada 10 min.
 setInterval(async () => {
@@ -5129,11 +5299,25 @@ async function conectar() {
       registrarUpsertHealth();
       if (conectado) resetarHealthTimer();
       if (type !== 'notify') {
-        // Upserts 'append' (sync/reconexão) eram descartados sem rastro.
-        // Loga quando envolvem grupos monitorados para diagnóstico de sumiços.
+        // Upserts 'append' (sync/reconexao) eram DESCARTADOS — e com eles:
+        //   a) toda mensagem que chegava durante uma reconexao (janela em que
+        //      os grupos mais postam, porque a reconexao costuma vir depois de
+        //      instabilidade), e
+        //   b) qualquer mensagem enviada pelo PROPRIO celular vinculado, que o
+        //      WhatsApp entrega como 'append' — o que tornava impossivel testar
+        //      o pipeline mandando mensagem a mao (incidente de 17/08/2026).
+        // Agora processamos os de grupos monitorados; o dedup por key.id evita
+        // processar de novo se a mesma mensagem voltar como 'notify'.
         const dosMonitorados = (messages || []).filter(mm => GRUPOS_MONITORADOS.includes(mm.key?.remoteJid));
         if (dosMonitorados.length > 0) {
-          console.log('[WA] Upsert tipo "' + type + '" com ' + dosMonitorados.length + ' msg(s) de grupos monitorados DESCARTADA(S): ' + dosMonitorados.map(mm => mm.key?.remoteJid?.split('@')[0] + (mm.message ? ' [' + Object.keys(mm.message).join(',') + ']' : ' [sem message]')).join(' | '));
+          const comConteudo = dosMonitorados.filter(mm => mm.message);
+          console.log('[WA] Upsert tipo "' + type + '" com ' + dosMonitorados.length + ' msg(s) de grupos monitorados: ' + comConteudo.length + ' processada(s), ' + (dosMonitorados.length - comConteudo.length) + ' sem conteudo.');
+          for (const msg of comConteudo) {
+            if (_jaProcessado(msg)) continue;
+            const jid = msg.key?.remoteJid;
+            if (jid) enfileirarPorGrupo(jid, () => processarMensagem(msg));
+            else await processarMensagem(msg);
+          }
         }
         return;
       }
@@ -5152,6 +5336,7 @@ async function conectar() {
         campanhaMarcarResposta(msg).catch(() => {});
         // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos = paralelo
         const jid = msg.key?.remoteJid;
+        if (_jaProcessado(msg)) continue;   // ja veio via 'append'
         if (jid) {
           enfileirarPorGrupo(jid, () => processarMensagem(msg));
         } else {
