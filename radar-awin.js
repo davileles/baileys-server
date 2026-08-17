@@ -317,7 +317,7 @@ export function normalizarOfertaAwin(oferta) {
   return {
     origem: 'awin',
     promotionId: oferta?.promotionId || null,
-    loja: String(oferta?.advertiser?.name || '').replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim(),
+    loja: String(oferta?.advertiser?.name || '').replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim(),
     advertiserId: oferta?.advertiser?.id || null,
     codigo: oferta?.voucher?.code || null,
     exclusivo: !!oferta?.voucher?.exclusive,
@@ -520,20 +520,18 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
     if (vistos.has(url)) continue;
     vistos.add(url);
 
-    const loja = String(prog.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+    const loja = String(prog.name).replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim();
     const dados = await extrairProdutoAwin(url, prog.id);
 
-    // O feed ja traz o link de afiliado pronto: usar o dele poupa uma chamada e
-    // a quota diaria de shortlinks.
-    let link = dados.linkAfiliado || null;
-    if (!link) {
-      try {
-        const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref });
-        link = l.shortUrl || l.url;
-      } catch (e) {
-        link = deeplinkAwin(prog.id, url, clickref);
-        console.log('[AWIN] Deeplink manual para ' + loja + ': ' + e.message);
-      }
+    // Link curto (tidd.ly) primeiro: o cache do gerarLinkAwin evita gastar a
+    // quota diaria em reenvio. O aw_deep_link do feed (longo) fica de plano B.
+    let link = null;
+    try {
+      const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref });
+      link = l.shortUrl || l.url;
+    } catch (e) {
+      link = dados.linkAfiliado || deeplinkAwin(prog.id, url, clickref);
+      console.log('[AWIN] Link Builder indisponivel para ' + loja + ': ' + e.message);
     }
 
     if (dados.erro || !dados.preco) {
@@ -632,7 +630,7 @@ export async function resolverLinhaVitrineAwin(linha) {
 
   const prog = programaAwinPorUrl(urlProduto);
   if (!prog) return { erro: 'loja nao esta entre os anunciantes afiliados da Awin', linha: bruto };
-  const loja = String(prog.name).replace(/\s*\(?(BR|Global)\)?\s*$/i, '').trim();
+  const loja = String(prog.name).replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim();
 
   const resto = bruto.replace(m[0], ' ');
   const manual = precosDaLinha(resto);
@@ -644,14 +642,13 @@ export async function resolverLinhaVitrineAwin(linha) {
   // Pagina primeiro, feed como plano B.
   const lido = await extrairProdutoAwin(urlProduto, prog.id);
 
-  let link = lido.linkAfiliado || null;
-  if (!link) {
-    try {
-      const l = await gerarLinkAwin({ url: urlProduto, advertiserId: prog.id });
-      link = l.shortUrl || l.url;
-    } catch (e) {
-      link = deeplinkAwin(prog.id, urlProduto);
-    }
+  // Link curto (tidd.ly) primeiro; aw_deep_link do feed de plano B.
+  let link = null;
+  try {
+    const l = await gerarLinkAwin({ url: urlProduto, advertiserId: prog.id });
+    link = l.shortUrl || l.url;
+  } catch (e) {
+    link = lido.linkAfiliado || deeplinkAwin(prog.id, urlProduto);
   }
 
   const nome = nomeManual || lido.titulo || (loja + ' — produto');
