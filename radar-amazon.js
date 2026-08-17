@@ -110,6 +110,11 @@ const CFG_PADRAO = {
   // conta principal (comportamento historico). Fora de qualquer turno tambem
   // cai na principal: a mensagem nunca deixa de sair por causa da escala.
   turnosTsp: { ativo: false, turnos: [] },
+  // Pausa entre um grupo e outro quando a MESMA mensagem e replicada para
+  // varios destinos. Era 3-5s fixo no server.js: virou config porque o ritmo
+  // seguro muda conforme o numero de grupos e a idade da conta, e ajustar isso
+  // nao pode depender de redeploy.
+  espacamentoGrupos: { minSeg: 3, maxSeg: 5 },
 };
 
 
@@ -225,6 +230,42 @@ export function dentroDaJanelaCupom(quando = new Date()) {
     : (agora >= inicio || agora < fim);
   if (!dentro) return { ok: false, motivo: `fora da janela ${j.inicio}-${j.fim} SP` };
   return { ok: true, motivo: 'dentro da janela' };
+}
+
+// ── ESPACAMENTO ENTRE GRUPOS ──────────────────────────────────────────────
+// Distinto do intervaloSeg da janela de cupons: aquele separa DUAS PUBLICACOES
+// diferentes; este separa o mesmo conteudo saindo de um grupo para o proximo.
+// Rajada identica em varios grupos no mesmo segundo e o padrao que o WhatsApp
+// usa para identificar automacao — por isso a pausa e aleatoria dentro da faixa,
+// e nao um valor fixo que se repete a cada envio.
+
+export function espacamentoGrupos() {
+  const e = { ...CFG_PADRAO.espacamentoGrupos, ...(E().cfg.espacamentoGrupos || {}) };
+  let min = Number(e.minSeg);
+  let max = Number(e.maxSeg);
+  if (!Number.isFinite(min) || min < 0) min = CFG_PADRAO.espacamentoGrupos.minSeg;
+  if (!Number.isFinite(max) || max < 0) max = CFG_PADRAO.espacamentoGrupos.maxSeg;
+  if (max < min) max = min;
+  return { minSeg: min, maxSeg: max };
+}
+
+export function salvarEspacamentoGrupos(dados = {}) {
+  const atual = espacamentoGrupos();
+  const lim = v => Math.max(0, Math.min(600, Number(v) || 0));
+  const min = dados.minSeg !== undefined ? lim(dados.minSeg) : atual.minSeg;
+  const max = dados.maxSeg !== undefined ? lim(dados.maxSeg) : atual.maxSeg;
+  // Faixa invertida sairia como pausa negativa (= zero) e o operador acharia
+  // que salvou um espacamento maior justo quando tirou o espacamento todo.
+  if (max < min) throw new Error('o maximo nao pode ser menor que o minimo');
+  const nova = { minSeg: min, maxSeg: max };
+  salvarRadarConfig({ espacamentoGrupos: nova });
+  return nova;
+}
+
+/** Pausa em ms para o proximo grupo — sorteada dentro da faixa configurada. */
+export function msEntreGrupos() {
+  const { minSeg, maxSeg } = espacamentoGrupos();
+  return Math.round((minSeg + Math.random() * (maxSeg - minSeg)) * 1000);
 }
 
 // ── ESCALA DE NUMEROS DO TSP ──────────────────────────────────────────────
