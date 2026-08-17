@@ -7077,7 +7077,8 @@ async function processarOfertasAwin({ simular = false } = {}) {
       // ganho de juntar as duas pontas: os cupons da Awin ja estao na base.
       const mc = melhorCupomAplicavel(p.loja, p.preco);
       const cupom = mc ? { reg: mc.reg, desconto: mc.desconto, citado: true } : null;
-      const mensagem = formatarOfertaAwin(p, { cupom });
+      // Simulacao nao pode sujar o ledger de rastreio com produtos nao enviados.
+      const mensagem = formatarOfertaAwin(p, { cupom, rastrear: !simular });
 
       if (simular) {
         saida.previa.push({ loja: p.loja, titulo: p.titulo, preco: p.preco, precoDe: p.precoDe,
