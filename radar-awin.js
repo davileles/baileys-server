@@ -356,6 +356,7 @@ import {
   templateDaLoja, templateProprioDaLoja, templateAwin,
   renderTemplate, varsDoProduto, melhorCupom,
   melhorCupomAplicavel, cupomPorCodigo, cupomVigente, calcularDesconto,
+  comRastreio,
 } from './radar-amazon.js';
 import { createHash } from 'crypto';
 import { credenciaisFeedOk, buscarProdutoNoFeed } from './awin-feed.js';
@@ -497,9 +498,12 @@ async function lerPaginaProduto(url) {
 // criou um para ela) -> template 'Awin' -> padrao das ofertas. Antes caia
 // direto no padrao, entao nao havia como dar um formato proprio ao que vem da
 // rede sem mexer no formato de TODAS as ofertas.
+// Rastreio identico ao da Amazon: registra o produto no ledger; para esta
+// loja a URL sai intacta (parametro extra pode quebrar a atribuicao da rede).
+// `rastrear: false` protege previews/simulacoes de sujar o ledger.
 export function formatarOfertaAwin(p, opcoes = {}) {
   const tpl = opcoes.template || templateProprioDaLoja(p.loja) || templateAwin();
-  return renderTemplate(tpl?.corpo || '', varsDoProduto(p, opcoes.cupom || null));
+  return renderTemplate(tpl?.corpo || '', varsDoProduto(opcoes.rastrear === false ? p : comRastreio(p), opcoes.cupom || null));
 }
 
 /**
