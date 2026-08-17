@@ -1655,7 +1655,7 @@ function atribuicaoDoDia(asin, data) {
 
 // Ref deterministico para lojas sem teto de identificador. Mesmo produto =
 // mesmo sub_id sempre, entao o relatorio acumula em vez de fragmentar.
-function refDeterministico(asin) {
+export function refDeterministico(asin) {
   return String(asin || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
 }
 
