@@ -356,7 +356,7 @@ import {
   templateDaLoja, templateProprioDaLoja, templateAwin,
   renderTemplate, varsDoProduto, melhorCupom,
   melhorCupomAplicavel, cupomPorCodigo, cupomVigente, calcularDesconto,
-  comRastreio,
+  comRastreio, refDeterministico,
 } from './radar-amazon.js';
 import { createHash } from 'crypto';
 import { credenciaisFeedOk, buscarProdutoNoFeed } from './awin-feed.js';
@@ -527,14 +527,21 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
     const loja = String(prog.name).replace(/\s*\(?(BR(\s*&\s*LATAM)?|LATAM|Global)\)?\s*$/i, '').trim();
     const dados = await extrairProdutoAwin(url, prog.id);
 
+    // Identidade estavel do produto (mesma chave da vitrine) e ref do rastreio
+    // calculados ANTES do link: o clickref precisa nascer DENTRO do link curto,
+    // porque parametro acrescentado depois nao sobrevive ao tidd.ly. O mesmo
+    // ref e o que refDoDisparo registrara no ledger na hora de formatar.
+    const asin = chaveVitrineAwin(prog.id, url);
+    const ref = clickref || refDeterministico(asin);
+
     // Link curto (tidd.ly) primeiro: o cache do gerarLinkAwin evita gastar a
     // quota diaria em reenvio. O aw_deep_link do feed (longo) fica de plano B.
     let link = null;
     try {
-      const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref });
+      const l = await gerarLinkAwin({ url, advertiserId: prog.id, clickref: ref });
       link = l.shortUrl || l.url;
     } catch (e) {
-      link = dados.linkAfiliado || deeplinkAwin(prog.id, url, clickref);
+      link = dados.linkAfiliado || deeplinkAwin(prog.id, url, ref);
       console.log('[AWIN] Link Builder indisponivel para ' + loja + ': ' + e.message);
     }
 
@@ -549,7 +556,7 @@ export async function processarTextoAwin(texto, { clickref = '' } = {}) {
     }
 
     const p = {
-      asin: null,
+      asin,
       codigo: url,
       titulo: dados.titulo || loja,
       preco: dados.preco,
@@ -716,6 +723,18 @@ export async function montarOfertasAwinVitrine(itens, codigoCupom = null) {
       continue;
     }
 
+    // O link salvo na vitrine foi gerado sem clickref; regenera com o ref do
+    // produto (uma chamada por produto — depois o cache do gerarLinkAwin
+    // devolve o mesmo link). Falhou, vai o salvo: mesmo afiliado, sem ref.
+    let linkMarcado = salvo.url;
+    if (salvo.urlProduto && salvo.advertiserId) {
+      try {
+        const lm = await gerarLinkAwin({ url: salvo.urlProduto, advertiserId: salvo.advertiserId,
+          clickref: refDeterministico(salvo.asin) });
+        linkMarcado = lm.shortUrl || lm.url || salvo.url;
+      } catch (_) { /* segue com o salvo */ }
+    }
+
     const p = {
       asin: salvo.asin,
       codigo: salvo.urlProduto || salvo.asin,
@@ -726,7 +745,7 @@ export async function montarOfertasAwinVitrine(itens, codigoCupom = null) {
       precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
       desconto: precoDe && precoDe > preco ? Math.round((1 - preco / precoDe) * 100) : 0,
       disponivel: true,
-      link: salvo.url,
+      link: linkMarcado,
       imagemUrl: lido.imagem || null,
       vendedor: null, marca: lido.marca || '', nota: null, avaliacoes: null,
       dealTermina: null, ehDeal: false,
