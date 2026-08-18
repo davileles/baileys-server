@@ -50,6 +50,10 @@ export function credenciaisMlOk() {
 }
 export function tagMl() { return credencialTsp('ML_TAG') || null; }
 
+// Tag por produto (pool criado a mao no painel do ML). Sem pool devolve null e
+// tudo segue com a tag unica da conta.
+import { tagMlDoProduto } from './radar-amazon.js';
+
 function carregarToken() {
   try { if (existsSync(tokenPath())) tokDef(JSON.parse(readFileSync(tokenPath(), 'utf-8'))); }
   catch (e) { tokDef(null); }
@@ -398,9 +402,7 @@ export async function buscarDadosProdutoMl(url) {
  * Gera links de afiliado em lote pelo painel. Uma chamada resolve varias URLs.
  * error_code 111 = produto fora do programa (nao e falha nossa).
  */
-export async function gerarLinksAfiliadoMl(urls) {
-  const tag = tagMl();
-  if (!tag) throw new Error('ML_TAG nao configurado');
+async function chamarCreateLink(urls, tag) {
   const r = await chamarAff('https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink', {
     method: 'POST',
     body: JSON.stringify({ urls, tag }),
@@ -410,16 +412,58 @@ export async function gerarLinksAfiliadoMl(urls) {
     },
   });
   if (!r.ok || typeof r.corpo !== 'object') throw new Error('createLink respondeu HTTP ' + r.status);
+  return r.corpo.urls || [];
+}
+
+export async function gerarLinksAfiliadoMl(urls) {
+  const tagConta = tagMl();
+  if (!tagConta) throw new Error('ML_TAG nao configurado');
+
+  // Uma chamada por tag: o createLink aceita varias URLs, mas uma unica tag por
+  // requisicao. Sem pool configurado todo mundo cai no mesmo balde e o numero
+  // de chamadas continua sendo um, como antes.
+  const porTag = new Map();
+  for (const u of urls) {
+    const t = tagMlDoProduto(idDeUrl(u)) || tagConta;
+    if (!porTag.has(t)) porTag.set(t, []);
+    porTag.get(t).push(u);
+  }
+
+  const respostas = [];
+  for (const [t, lote] of porTag) {
+    let saida;
+    try { saida = await chamarCreateLink(lote, t); }
+    catch (e) {
+      if (t === tagConta) throw e;
+      console.warn('[ML] createLink falhou com a tag ' + t + ' — repetindo com a tag da conta:', e.message);
+      saida = await chamarCreateLink(lote, tagConta);
+    }
+    // error_code 109 = a tag nao existe na conta de afiliado. Acontece quando
+    // alguem poe no pool uma tag que nao foi criada no painel do ML. O link
+    // NAO pode sair sem afiliado valido, entao refaz com a tag da conta e
+    // avisa — perde-se a segmentacao daquele item, nunca a comissao.
+    const semTag = saida.filter((u) => !u.created && Number(u.error_code) === 109);
+    if (semTag.length && t !== tagConta) {
+      console.warn(`[ML] tag "${t}" nao esta associada a conta — ${semTag.length} link(s) refeitos com a tag da conta`);
+      const refeitos = await chamarCreateLink(semTag.map((u) => u.entity || u.origin_url), tagConta);
+      const chavesRefeitas = new Set(semTag.map((u) => u.entity || u.origin_url));
+      respostas.push(...saida.filter((u) => !chavesRefeitas.has(u.origin_url || u.entity)), ...refeitos);
+      continue;
+    }
+    respostas.push(...saida);
+  }
+
   const mapa = new Map();
-  for (const u of (r.corpo.urls || [])) {
+  for (const u of respostas) {
     const valor = u.created
       ? { link: u.short_url, linkLongo: u.long_url, codigoBusca: u.regex }
       : { erro: u.message || ('error_code ' + u.error_code) };
-    mapa.set(u.origin_url, valor);
+    const chave = u.origin_url || u.entity;
+    mapa.set(chave, valor);
     // Indexa tambem pelo MLB: o painel pode devolver a origin_url normalizada
     // (barra final, maiusculas, parametro a mais) e o casamento por string
     // exata falharia em silencio, virando 'sem resposta do painel'.
-    const id = idDeUrl(u.origin_url);
+    const id = idDeUrl(chave);
     if (id && !mapa.has(id)) mapa.set(id, valor);
   }
   return mapa;
