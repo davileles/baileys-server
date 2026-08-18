@@ -64,7 +64,6 @@ import {
   carregarConfigTsp, configTsp, salvarConfigTsp,
   linksTsp,
   gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
-  modoAutoEnvioCupom, modoAutoEnvioOferta, origemAutoEnvio,
   estadoCredenciais, aplicarCredenciais,
 } from './config-tsp.js';
 
@@ -752,21 +751,49 @@ setInterval(() => {
   if (removidos > 0) console.log('[FILA] Varredura automática removeu ' + removidos + ' item(ns) expirado(s).');
 }, 15 * 60 * 1000);
 
-// Recolocar na fila de envio ofertas que foram aprovadas mas não enviadas (survives restart)
-function requeueAprovadas() {
-  const aprovadas = filaPendentes.filter(o => o.status === 'aprovado' && o.mensagemFinal);
-  if (aprovadas.length === 0) return;
-  console.log('[FILA] Reenfileirando ' + aprovadas.length + ' oferta(s) aprovada(s) após restart...');
+// Recolocar na fila de envio ofertas que foram aprovadas mas nao enviadas.
+// Roda no boot E em varredura periodica: filaEnvio vive so em memoria, entao
+// todo restart do Railway (deploy, crash, sleep) apagava a fila e as ofertas ja
+// marcadas 'aprovado' ficavam presas nesse estado para sempre — nada as devolvia.
+// Tres cuidados alem do requeue em si:
+//  - aceita mensagemFormatada como fallback: o auto-envio de alerta
+//    (entregarOfertaAlerta) marca 'aprovado' sem passar por /painel/aprovar,
+//    entao a oferta nao tinha mensagemFinal e o filtro antigo a ignorava —
+//    era a razao de TODA injecao manual e todo alerta auto-aprovado morrer
+//    em 'aprovado' depois de um restart;
+//  - deduplica contra a filaEnvio, senao a varredura periodica reenfileiraria
+//    o mesmo item a cada rodada e a mensagem sairia repetida no grupo;
+//  - ignora conteudo TSP (cupom/oferta de loja), que tem grupos de destino
+//    proprios e nunca pode cair no grupo de emissoes do CDV.
+function requeueAprovadas(motivo = 'após restart') {
+  const naFila = new Set(filaEnvio.map(i => String(i.ofertaId)));
+  const aprovadas = filaPendentes.filter(o =>
+    o.status === 'aprovado'
+    && !ehConteudoTsp(o.tipoConteudo)
+    && !ehOfertaMarketplace(o.tipoConteudo)
+    && (o.mensagemFinal || o.mensagemFormatada)
+    && !naFila.has(String(o.id)));
+  if (aprovadas.length === 0) return 0;
+  console.log('[FILA] Reenfileirando ' + aprovadas.length + ' oferta(s) aprovada(s) ' + motivo + '...');
   for (const o of aprovadas) {
-    filaEnvio.push({ ofertaId: o.id, mensagem: o.mensagemFinal, destino: GRUPOS[GRUPO_DESTINO_PASSAGENS] });
+    if (!o.mensagemFinal) o.mensagemFinal = o.mensagemFormatada;
+    filaEnvio.push({ ofertaId: o.id, mensagem: o.mensagemFinal,
+                     destino: GRUPOS[GRUPO_DESTINO_PASSAGENS],
+                     dados: o.dadosExtraidos || null });
     console.log('[FILA] Reenfileirada oferta #' + o.id);
   }
+  try { salvarFila(); } catch(_) {}
   workerFila().catch(e => { console.error('[FILA] Worker erro:', e.message); workerRodando = false; });
+  return aprovadas.length;
 }
 const bufferAgrupamento = new Map();
 
 // ── FILA DE ENVIO CDV (intervalo de 5 min, janela 08h–21h, fuso SP) ──────────
 const INTERVALO_ENVIO_MS = 10 * 60 * 1000;
+// Teto de tentativas por item. Sem isto, um item que falha sempre (grupo
+// invalido, mensagem rejeitada) fica na CABECA da fila em retry eterno e
+// bloqueia todas as ofertas atras dele — a fila inteira para de andar.
+const FILA_MAX_TENTATIVAS = 5;
 const HORA_INICIO_ENVIO  = 8;
 const HORA_FIM_ENVIO     = 21;
 const TZ_SP              = 'America/Sao_Paulo';
@@ -1131,7 +1158,19 @@ async function workerFila() {
 
       console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada.');
     } catch(e) {
-      console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId + ':', e.message);
+      item.tentativas = (item.tentativas || 0) + 1;
+      console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId
+        + ' (tentativa ' + item.tentativas + '/' + FILA_MAX_TENTATIVAS + '):', e.message);
+      if (item.tentativas >= FILA_MAX_TENTATIVAS) {
+        filaEnvio.shift();
+        const ofertaFalha = filaPendentes.find(o => String(o.id) === String(item.ofertaId));
+        if (ofertaFalha && ofertaFalha.status === 'aprovado') {
+          ofertaFalha.status = 'pendente';
+          ofertaFalha.motivoFila = 'falha no envio após ' + item.tentativas + ' tentativas: ' + e.message;
+          salvarFila();
+        }
+        console.error('[FILA] Oferta #' + item.ofertaId + ' removida da fila e devolvida para aprovação manual.');
+      }
       await new Promise(r => setTimeout(r, 10000));
       continue;
     }
@@ -1154,6 +1193,15 @@ function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados) {
 }
 
 requeueAprovadas();
+
+// Rede de seguranca: a cada 5 min devolve para a fila de envio qualquer oferta
+// que esteja 'aprovado' sem estar enfileirada. Cobre restart do Railway no meio
+// do caminho, worker encerrado por erro e auto-aprovacao que nao chegou a
+// enfileirar. Idempotente (dedup por ofertaId), entao rodar de novo nao duplica.
+setInterval(() => {
+  try { requeueAprovadas('em varredura periódica'); }
+  catch (e) { console.warn('[FILA] Varredura de aprovados falhou:', e.message); }
+}, 5 * 60 * 1000);
 
 // ── AGENDAMENTOS ──────────────────────────────────────────────────────────────
 const AGEND_PATH = SESSAO_DIR + '/agendamentos.json';
@@ -1733,6 +1781,10 @@ function entregarOfertaAlerta(oferta, hist180) {
         console.log('[AUTO-ALERTA] Envio automático: ' + rota + ' — ' + v.motivo);
         oferta.status = 'aprovado';
         oferta.autoEnviado = true;
+        // mensagemFinal e o que requeueAprovadas() usa para recuperar a oferta
+        // apos um restart. Sem gravar aqui, o auto-envio ficava dependente de a
+        // filaEnvio (em memoria) sobreviver ate o disparo.
+        oferta.mensagemFinal = oferta.mensagemFormatada;
         enfileirarEnvio(oferta.id, oferta.mensagemFormatada, null, oferta.dadosExtraidos || null);
       } else if (AUTO_ENVIO_ALERTA_MODO === 'on') {
         console.log('[AUTO-ALERTA] Para aprovação: ' + rota + ' — ' + v.motivo);
@@ -1971,14 +2023,10 @@ Regras:
 // AUTO_ENVIO_CUPOM: 'off' (tudo vai para fila) | 'sombra' (avalia e loga, mas
 // continua indo para fila) | 'on' (envia direto quando passa em todos os gates).
 // Default 'sombra': ligar em producao exige acao explicita no Railway.
-// Deixaram de ser const de modulo: o valor vem da aba Configuracoes (secao
-// Negocio) e cai na env do Railway so quando a config esta vazia. Const
-// congelaria a decisao no boot e obrigaria redeploy para mudar de modo — que e
-// exatamente o que esta mudanca elimina.
-const AUTO_ENVIO_MODO_FN    = () => modoAutoEnvioCupom();
+const AUTO_ENVIO_MODO       = (process.env.AUTO_ENVIO_CUPOM || 'sombra').toLowerCase();
 // Ofertas de marketplace (Amazon/Shopee/ML/Magalu). Diferente dos cupons, aqui
 // nao ha modo 'sombra': ou vai direto, ou vai para a fila.
-const AUTO_ENVIO_OFERTA_FN  = () => modoAutoEnvioOferta();
+const AUTO_ENVIO_OFERTA     = (process.env.AUTO_ENVIO_OFERTA || 'off').toLowerCase();
 // Intervalo minimo entre auto-envios. Vem da janela de cupons (aba Cupons do
 // painel) para o operador ajustar o ritmo sem redeploy.
 function intervaloAutoEnvioMs() { return (janelaCupom().intervaloSeg ?? 90) * 1000; }
@@ -2037,7 +2085,7 @@ function escopoDoCupom(texto, codigo, todosCodigos) {
 function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = []) {
   let t = textoOriginal || '';
 
-  if (AUTO_ENVIO_MODO_FN() === 'off')          return { auto:false, motivo:'modo off' };
+  if (AUTO_ENVIO_MODO === 'off')          return { auto:false, motivo:'modo off' };
   if (t.trim().length < AUTO_ENVIO_TEXTO_MIN) return { auto:false, motivo:'texto curto demais (info pode estar na imagem)' };
 
   // Mensagem com varios cupons: restringe a validacao cruzada ao bloco deste
@@ -2550,7 +2598,7 @@ async function registrarEnvioHistorico(oferta) {
 // AUTO_ENVIO_MAX_ESPERA viram aprovacao manual (provavelmente ja venceram).
 let _workerAutoRodando = false;
 setInterval(async () => {
-  if (AUTO_ENVIO_MODO_FN() !== 'on') return;
+  if (AUTO_ENVIO_MODO !== 'on') return;
   if (_workerAutoRodando) return;
   _workerAutoRodando = true;
   try {
@@ -2731,7 +2779,7 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   oferta.autoAvaliacao = {
     auto: veredito.auto,
     motivo: veredito.motivo,
-    modo: AUTO_ENVIO_MODO_FN(),
+    modo: AUTO_ENVIO_MODO,
     avaliadoEm: new Date().toISOString(),
   };
 
@@ -2739,11 +2787,11 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   // passaram. Em modo 'on', em vez de exigir aprovacao manual, o cupom entra
   // agendado e o worker de espacamento envia quando a condicao liberar.
   const bloqueioTemporal = !veredito.auto && /^(fora da janela|intervalo minimo)/.test(veredito.motivo);
-  if (AUTO_ENVIO_MODO_FN() === 'on' && bloqueioTemporal && !somenteFila) oferta.autoAgendado = true;
+  if (AUTO_ENVIO_MODO === 'on' && bloqueioTemporal && !somenteFila) oferta.autoAgendado = true;
 
   // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
   // acerto do gate contra a aprovacao manual antes de ligar 'on'.
-  if (AUTO_ENVIO_MODO_FN() === 'sombra') {
+  if (AUTO_ENVIO_MODO === 'sombra') {
     console.log(`[AUTO-SOMBRA] ${veredito.auto ? 'ENVIARIA' : 'BLOQUEADO'} — ${rotulo} — ${veredito.motivo}`);
   }
 
@@ -2752,7 +2800,7 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   // deixava o cupom sem nenhum registro em disco — parcialmente publicado e
   // invisivel para o operador.
   let jaNaFila = false;
-  if (AUTO_ENVIO_MODO_FN() === 'on' && veredito.auto && !somenteFila) {
+  if (AUTO_ENVIO_MODO === 'on' && veredito.auto && !somenteFila) {
     oferta.status        = 'enviando';
     oferta.enviandoDesde = new Date().toISOString();
     filaPendentes.unshift(oferta);
@@ -4390,7 +4438,7 @@ async function processarRadarMarketplace(jid, texto) {
     if (espelhaNoOperador(_cls)) espelharCategoriaNoOperador(oferta, _cls).catch(() => {});
 
     // Marca visivel no card da fila: explica por que a oferta nao auto-enviou
-    // mesmo com o auto-envio de oferta ligado.
+    // mesmo com AUTO_ENVIO_OFERTA ligado.
     if (_cupomForaDaBase) {
       oferta.cupomForaDaBase = { codigos: _cupSemBase, anuncio: !!r.avisoCupomPagina };
     }
@@ -4401,7 +4449,7 @@ async function processarRadarMarketplace(jid, texto) {
       enviarAviso: (texto) => enviarMensagem(GRUPOS['operador'], { text: texto })
     }).catch(() => {});
 
-    // Auto-envio de oferta: 'off' (tudo para a fila, padrao) | 'on' (dispara direto
+    // AUTO_ENVIO_OFERTA: 'off' (tudo para a fila, padrao) | 'on' (dispara direto
     // nos destinos). Existe para validar o fluxo completo com grupo de teste;
     // apontar para grupo de cliente exige voltar para 'off' no Railway.
     // Uma oferta so chega aqui depois de passar por TODOS os filtros: preco
@@ -4409,7 +4457,7 @@ async function processarRadarMarketplace(jid, texto) {
     // Excecao: precoDeReferencia marca oferta cujo preco veio do TEXTO do grupo
     // e nao de fonte verificavel (caso da Magalu). Anunciar valor nao conferido
     // sem revisao humana ja produziu 'De/Por' inexistente — essas vao para a fila.
-    if (AUTO_ENVIO_OFERTA_FN() === 'on' && !oferta.dadosExtraidos.precoDeReferencia && !oferta.cupomForaDaBase) {
+    if (AUTO_ENVIO_OFERTA === 'on' && !oferta.dadosExtraidos.precoDeReferencia && !oferta.cupomForaDaBase) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
         oferta.status = 'enviado';
@@ -4431,7 +4479,7 @@ async function processarRadarMarketplace(jid, texto) {
 
     filaPendentes.unshift(oferta);
     salvarFila();
-    const _motivoFila = AUTO_ENVIO_OFERTA_FN() !== 'on' ? ''
+    const _motivoFila = AUTO_ENVIO_OFERTA !== 'on' ? ''
       : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
       : oferta.dadosExtraidos.precoDeReferencia ? ' — preco nao verificado, exige aprovacao manual'
       : '';
@@ -6081,7 +6129,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO_FN(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:AUTO_ENVIO_MODO, telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -6119,6 +6167,14 @@ app.delete('/fila-envio', (req, res) => {
   filaEnvio.splice(0, filaEnvio.length);
   console.log('[FILA] Fila de envio limpa manualmente. ' + total + ' itens removidos.');
   res.json({ ok: true, removidos: total });
+});
+
+// Forca o reenfileiramento de tudo que esta 'aprovado' e nao esta na fila.
+// A automacao (Cowork) pode chamar como ultimo passo, depois de injetar, para
+// nao depender da varredura de 5 min.
+app.post('/fila-envio/reenfileirar', (req, res) => {
+  const n = requeueAprovadas('por chamada manual');
+  res.json({ ok: true, reenfileiradas: n, total: filaEnvio.length, workerAtivo: workerRodando });
 });
 
 app.post('/fila-envio/marcar-enviado/:ofertaId', (req, res) => {
@@ -6484,7 +6540,7 @@ app.get('/operacao/fila', async (req, res) => {
     res.json({
       ok:                true,
       agoraSP:           new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()),
-      modo:              AUTO_ENVIO_MODO_FN(),
+      modo:              AUTO_ENVIO_MODO,
       janela:            { ...janelaCupom(), ok: janela.ok, motivo: janela.motivo },
       intervaloSeg:      Math.round(intervaloMs / 1000),
       ultimoEnvioEm:     _ultimoAutoEnvio ? new Date(_ultimoAutoEnvio).toISOString() : null,
@@ -7066,10 +7122,9 @@ app.get('/mkt/config', (req, res) => {
     destinos: radarDestinos(),
     credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
     credenciaisShopeeOk: credenciaisShopeeOk(),
-    autoEnvioOferta: AUTO_ENVIO_OFERTA_FN(),
-    autoEnvioOrigem: origemAutoEnvio(),
+    autoEnvioOferta: AUTO_ENVIO_OFERTA,
     matchDesejos: MODO_DESEJOS,
-    autoEnvioCupom: AUTO_ENVIO_MODO_FN(),
+    autoEnvioCupom: AUTO_ENVIO_MODO,
     janelaCupom: janelaCupom(),
     espacamentoGrupos: espacamentoGrupos(),
     turnosTsp: turnosTsp(),
@@ -7124,14 +7179,6 @@ app.get('/config-tsp', (req, res) => {
     tenant: t ? { id: t.id, nome: t.nome } : null,
     config: cfg,
     credenciais: estadoCredenciais(req.tenantId),
-    // Modo efetivo + de onde ele veio. Sem isso o painel mostraria o campo
-    // vazio da config e o operador acharia que o auto-envio esta desligado
-    // quando na verdade a env do Railway ainda manda.
-    autoEnvio: {
-      cupom:  modoAutoEnvioCupom(req.tenantId),
-      oferta: modoAutoEnvioOferta(req.tenantId),
-      origem: origemAutoEnvio(req.tenantId),
-    },
   });
 });
 
@@ -7161,12 +7208,7 @@ app.post('/config-tsp', (req, res) => {
     }
     const saida = { ...cfg };
     delete saida.credenciais;
-    res.json({ ok: true, config: saida, credenciais: estadoCredenciais(),
-      autoEnvio: {
-        cupom:  modoAutoEnvioCupom(req.tenantId),
-        oferta: modoAutoEnvioOferta(req.tenantId),
-        origem: origemAutoEnvio(req.tenantId),
-      } });
+    res.json({ ok: true, config: saida, credenciais: estadoCredenciais() });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
   }
@@ -7732,7 +7774,7 @@ app.get('/awin/feeds/amostra', async (req, res) => {
 // AWIN_CUPONS:
 //   'off'  (padrao) — poller desligado
 //   'fila'          — coleta e manda para aprovacao manual, nunca auto-envia
-//   'on'            — coleta e passa pelo gate; auto-envia se o modo de cupom estiver em 'on'
+//   'on'            — coleta e passa pelo gate; auto-envia se AUTO_ENVIO_CUPOM=on
 // AWIN_POLL_MIN: intervalo em minutos (minimo 5, padrao 20).
 function awinCuponsModo()  { return configOfertasAwin().cupons; }
 function awinCuponsAtivo() { return ['on', 'fila'].includes(awinCuponsModo()); }
@@ -7875,7 +7917,7 @@ app.get('/awin/cupons/estado', (req, res) => {
     ok: true,
     modo: awinCuponsModo(),
     intervaloMin: awinPollMs() / 60000,
-    autoEnvio: AUTO_ENVIO_MODO_FN(),
+    autoEnvio: AUTO_ENVIO_MODO,
     promocoesConhecidas: Object.keys(_awinVistos).length,
     coletando: _awinRodando,
   });
