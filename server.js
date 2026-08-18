@@ -20,6 +20,7 @@ import QRCode from 'qrcode';
 import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
+  categoriasDoDestino, destinosGerais, destinosDaCategoria, categoriaDaFonte,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
@@ -2233,7 +2234,10 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
   const op = { conta: contaDoTurno() };
   // Sentinela do modo so-admins: detecta o descarte silencioso antes do despacho.
   await verificarAdminGruposCupons(op.conta);
-  const destinos = radarDestinos();
+  // Cupom e de LOJA, nao de produto: nao tem categoria para casar com nicho.
+  // Vai para os destinos gerais mais os so-cupons — mandar cupom generico no
+  // grupo de bebidas descaracterizaria o nicho.
+  const destinos = destinosGerais();
   const soCupons = GRUPOS['tsp_cupons'];
   const alvos = [...new Set([...destinos, ...soCupons])];
   const jaRecebeu = new Set(Array.isArray(oferta?.enviadosParciais) ? oferta.enviadosParciais : []);
@@ -2393,8 +2397,23 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
   // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
   // uma mensagem que diz o que fazer — antes isso caia num grupo fixo que o
   // operador nao tinha escolhido.
-  const alvos = radarDestinos();
-  if (!alvos.length) throw new Error('Nenhum grupo marcado como destino na aba Grupos.');
+  // Roteamento por nicho: os destinos GERAIS recebem tudo, e os grupos de
+  // categoria recebem so o que a classificacao confirmou ser deles. Categoria
+  // indefinida ou com confianca abaixo do limiar nao entra em nicho nenhum —
+  // grupo de bebidas nao recebe "produto que talvez seja bebida".
+  const _cat = oferta?.dadosExtraidos?.categoria || null;
+  const _catOk = categoriaConfiavel({ categoria: _cat, confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0 });
+  const alvos = _catOk ? destinosDaCategoria(_cat) : destinosGerais();
+  if (!alvos.length) {
+    throw new Error(radarDestinos().length
+      ? 'Nenhum grupo GERAL marcado como destino na aba Grupos — todos os destinos tem categoria.'
+      : 'Nenhum grupo marcado como destino na aba Grupos.');
+  }
+  if (_catOk) {
+    const nicho = alvos.filter(j => categoriasDoDestino(j).length);
+    if (nicho.length) console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' categoria "' + _cat
+      + '" -> ' + nicho.length + ' grupo(s) de nicho + ' + (alvos.length - nicho.length) + ' geral(is).');
+  }
   // Grupo so-cupons nao recebe oferta de produto, mesmo que esteja marcado
   // como destino por engano.
   const soCupons = new Set(GRUPOS['tsp_cupons']);
@@ -2433,7 +2452,10 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
 // no fluxo da fila.
 async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
   const ehCupom  = String(tipo || '').toLowerCase() === 'cupom';
-  const destinos = radarDestinos();
+  // Mensagem escrita a mao vai para os GERAIS. Nicho e alimentado pelo radar,
+  // que sabe a categoria do produto; aqui nao ha classificacao nenhuma e todo
+  // texto livre cairia em todos os grupos de nicho ao mesmo tempo.
+  const destinos = destinosGerais();
   const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
   const alvos = ehCupom
     ? [...new Set([...destinos, ...soCupons])]
@@ -4441,7 +4463,15 @@ async function processarRadarMarketplace(jid, texto) {
     // A classificacao entra na oferta ANTES de qualquer decisao de destino:
     // roteamento por nicho, vitrine publica e relatorio leem daqui. Nunca lanca
     // e nunca faz rede — categoria indefinida e um resultado valido e esperado.
-    const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
+    let _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
+    // Fonte com categoria fixa manda: um grupo que so publica bebida ja diz
+    // qual e a prateleira, e isso vale mais que palavra-chave no titulo (que
+    // erra em "taca de vinho"). Confianca 1: decide roteamento sozinha.
+    const _catFonte = categoriaDaFonte(jid);
+    if (_catFonte) {
+      _cls = { categoria: _catFonte, confianca: 1, sinal: 'fonte-fixa',
+               nome: (categoriasConfig().categorias?.[_catFonte]?.nome || _catFonte) };
+    }
     oferta.dadosExtraidos.categoria          = _cls.categoria;
     oferta.dadosExtraidos.categoriaNome      = _cls.nome;
     oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
@@ -7135,6 +7165,11 @@ app.get('/mkt/config', (req, res) => {
     gatilhoPadrao: cfg.gatilhoPadrao || '',
     fontes: radarFontes(),
     destinos: radarDestinos(),
+    // Grupos de nicho: quem recebe so uma categoria e qual fonte ja nasce
+    // classificada. Ausente = geral, que e o padrao de todo destino antigo.
+    categoriasDestino: cfg.categoriasDestino || {},
+    categoriaFonte: cfg.categoriaFonte || {},
+    destinosGerais: destinosGerais(),
     credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
     credenciaisShopeeOk: credenciaisShopeeOk(),
     autoEnvioOferta: autoEnvioModoOferta(),
@@ -7150,8 +7185,32 @@ app.get('/mkt/config', (req, res) => {
 app.post('/mkt/config', (req, res) => {
   try {
     const permitido = {};
-    for (const k of ['papeis','ativo','descontoMinimo','dedupHoras','partnerTag','gatilhoPadrao']) {
+    for (const k of ['papeis','ativo','descontoMinimo','dedupHoras','partnerTag','gatilhoPadrao',
+                     'categoriasDestino','categoriaFonte']) {
       if (req.body[k] !== undefined) permitido[k] = req.body[k];
+    }
+    // Higiene dos mapas de nicho: categoria so vale em grupo de DESTINO e
+    // categoria fixa so vale em grupo FONTE. Sem isso, um grupo que trocou de
+    // papel deixaria para tras uma regra invisivel que ninguem consegue achar
+    // na tela — e que continuaria valendo no dia que ele voltasse ao papel.
+    const _papeis = permitido.papeis || radarConfig().papeis || {};
+    if (permitido.categoriasDestino) {
+      const limpo = {};
+      for (const [jid, cats] of Object.entries(permitido.categoriasDestino)) {
+        if (_papeis[jid] !== 'destino') continue;
+        const lista = (Array.isArray(cats) ? cats : [cats]).map(x => String(x || '').trim()).filter(Boolean);
+        if (lista.length) limpo[jid] = [...new Set(lista)];
+      }
+      permitido.categoriasDestino = limpo;
+    }
+    if (permitido.categoriaFonte) {
+      const limpo = {};
+      for (const [jid, cat] of Object.entries(permitido.categoriaFonte)) {
+        if (_papeis[jid] !== 'fonte') continue;
+        const v = String(cat || '').trim();
+        if (v) limpo[jid] = v;
+      }
+      permitido.categoriaFonte = limpo;
     }
     const cfg = salvarRadarConfig(permitido);
     // Janela de cupons tem gravacao propria (valida os horarios antes de salvar).
@@ -7176,6 +7235,8 @@ app.post('/mkt/config', (req, res) => {
     }
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
     res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos(),
+               categoriasDestino: cfg.categoriasDestino || {}, categoriaFonte: cfg.categoriaFonte || {},
+               destinosGerais: destinosGerais(),
                janelaCupom: janela, espacamentoGrupos: espac,
                turnosTsp: turnos, contaAgora: contaDoTurno() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
