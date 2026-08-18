@@ -51,6 +51,10 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // deploy: sem ele o relatorio da Amazon fica ilegivel, porque a tag
   // sozinha nao diz qual produto foi divulgado naquele dia.
   'rastreio.json',
+  // Taxonomia dos grupos de nicho e o cache asin -> trilha. A taxonomia e
+  // editada a mao no repo (nao exige deploy); o cache e escrito pelo servidor.
+  'categorias.json',
+  'categorias_cache.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
