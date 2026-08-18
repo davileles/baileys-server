@@ -823,6 +823,19 @@ export async function processarTextoMl(texto) {
 const URL_CUPONS_ML = 'https://www.mercadolivre.com.br/cupons/active';
 
 /**
+ * Converte dinheiro escrito no padrao BR para numero.
+ * "1.000" -> 1000 | "1.234,56" -> 1234.56 | "9,90" -> 9.9
+ * Number() nativo le "1.000" como 1 (ponto = decimal em JS): foi assim que um
+ * cupom de 30% com teto de R$ 1.000 entrou na base com teto de R$ 1 e passou a
+ * ser anunciado como se nao descontasse nada.
+ */
+function numeroBr(txt) {
+  if (txt === null || txt === undefined) return null;
+  const n = Number(String(txt).replace(/\./g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * Ativa um cupom na conta, como o botao "Inserir codigo" da pagina de cupons.
  * Cupom capturado num grupo so vale nas suas compras depois de ativado.
  */
@@ -932,10 +945,10 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
     achados.push({
       codigo,
       tipo: m[1] ? 'pct' : 'reais',
-      valor: Number(String(m[1] || m[2]).replace(/\./g, '').replace(',', '.')),
+      valor: numeroBr(m[1] || m[2]),
       minimo: /Sem compra mínima/i.test(trecho) ? 0
-            : (Number((trecho.match(/Compra mínima R\$\s?([\d.]+)/) || [])[1]) || null),
-      limite: Number((trecho.match(/Limite de R\$\s?([\d.]+)/) || [])[1]) || null,
+            : (numeroBr((trecho.match(/Compra mínima R\$\s?([\d.,]+)/) || [])[1]) || null),
+      limite: numeroBr((trecho.match(/Limite de R\$\s?([\d.,]+)/) || [])[1]) || null,
       expiraEm: hhmmss
         ? new Date(Date.now() + ((+hhmmss[1]) * 3600 + (+hhmmss[2]) * 60 + (+hhmmss[3])) * 1000).toISOString()
         : null,
