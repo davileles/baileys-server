@@ -451,23 +451,56 @@ function carregarVistos() {
 }
 function salvarVistos() {
   try {
-    const limite = Date.now() - (E().cfg.dedupHoras || 24) * 3600e3;
+    const limite = Date.now() - horasDedup() * 3600e3;
     for (const k of Object.keys(E().vistos)) if (E().vistos[k].ts < limite) delete E().vistos[k];
     writeFileSync(cT('radar_vistos.json'), JSON.stringify(E().vistos), 'utf-8');
   } catch (e) {}
 }
 carregarVistos();
 
-function jaDivulgado(p) {
-  const ant = E().vistos[p.asin];
+// Horas de janela do dedup. Configuravel na aba Configuracoes do painel
+// (POST /mkt/config -> dedupHoras). O 24 aqui e so o piso de seguranca para
+// config corrompida — o valor de verdade nasce em CFG_PADRAO e vive no
+// radar_config.json de cada tenant.
+export function horasDedup() {
+  const h = Number(E().cfg.dedupHoras);
+  return isFinite(h) && h > 0 ? h : 24;
+}
+
+// Piso de desconto do radar automatico, tambem vindo da config.
+export function descontoMinimoRadar() {
+  const d = Number(E().cfg.descontoMinimo);
+  return isFinite(d) && d >= 0 ? d : 5;
+}
+
+// Identidade estavel do produto para o dedup. Antes a chave era o ASIN cru, o
+// que so funcionava para Amazon — ML, Shopee, Magalu e Awin ficavam sem dedup
+// nenhum e o mesmo produto postado em tres grupos-fonte saia tres vezes.
+// A chave e prefixada pela loja porque itemId da Shopee e codigo da Magalu sao
+// numericos e podem colidir entre si.
+export function chaveDedupProduto(p) {
+  if (!p) return null;
+  const loja = normalizarTexto(p.loja) || 'outros';
+  const id = p.asin || p.itemId || p.codigo || p.id
+          || (p.link ? String(p.link).split('?')[0] : '');
+  const idn = String(id || '').trim().toLowerCase();
+  return idn ? loja + ':' + idn : null;
+}
+
+export function jaDivulgado(p) {
+  const k = chaveDedupProduto(p);
+  if (!k) return false;               // sem identidade nao da para dedupar
+  const ant = E().vistos[k];
   if (!ant) return false;
-  if (Date.now() - ant.ts > (E().cfg.dedupHoras || 24) * 3600e3) return false;
+  if (Date.now() - ant.ts > horasDedup() * 3600e3) return false;
   // Se caiu mais de 5% desde a ultima vez, vale repostar
   if (ant.preco && p.preco && p.preco < ant.preco * 0.95) return false;
   return true;
 }
-function registrarVisto(p) {
-  E().vistos[p.asin] = { preco: p.preco, ts: Date.now() };
+export function registrarVisto(p) {
+  const k = chaveDedupProduto(p);
+  if (!k) return;
+  E().vistos[k] = { preco: p.preco ?? null, ts: Date.now(), loja: p.loja || null };
   salvarVistos();
 }
 
@@ -1355,7 +1388,8 @@ export const VARIAVEIS_CUPOM = [
  * texto do grupo de origem — e o que evita repassar oferta que ja morreu.
  *
  * @param {string} texto
- * @param {object} opcoes  { ignorarDedup: bool, gatilho: string }
+ * @param {object} opcoes  { gatilho: string }
+ * Dedup e piso de desconto sao aplicados pelo chamador (server.js).
  * @returns {Promise<Array<{ produto, mensagem, descartadoPor? }>>}
  */
 export async function processarTextoAmazon(texto, opcoes = {}) {
@@ -1370,17 +1404,10 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto esgotado' }); continue; }
-    // ignorarMinimo: montagem manual pelo gerador. Quando o operador cola o
-    // link ele ja decidiu que quer aquele produto — o piso de desconto existe
-    // para o radar automatico, que escolhe sozinho o que divulgar.
-    if (p.desconto < (E().cfg.descontoMinimo ?? 5) && !p.ehDeal && !opcoes.ignorarMinimo) {
-      saida.push({ produto: p, descartadoPor: 'desconto de ' + p.desconto + '% abaixo do mínimo' });
-      continue;
-    }
-    if (!opcoes.ignorarDedup && jaDivulgado(p)) {
-      saida.push({ produto: p, descartadoPor: 'já divulgado nas últimas ' + (E().cfg.dedupHoras || 24) + 'h' });
-      continue;
-    }
+    // Piso de desconto e deduplicacao NAO ficam mais aqui: subiram para o gate
+    // central de processarRadarMarketplace (server.js), que vale para todas as
+    // lojas. Este pipeline e reusado por /mkt/montar e /mkt/testar, onde quem
+    // escolheu o produto foi o operador — ali nada pode ser barrado.
 
     // A API devolve sempre o preco de tabela; o cupom vem da base alimentada
     // pelo pipeline de cupons e e aplicado aqui sobre esse preco cheio.
@@ -1397,7 +1424,6 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaAmazon(p, { ...opcoes, cupom }),
     });
-    if (!opcoes.ignorarDedup) registrarVisto(p);
   }
   return saida;
 }
