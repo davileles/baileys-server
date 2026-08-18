@@ -35,6 +35,7 @@ import {
   buscarProdutos, normalizar,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarPoolRastreio, salvarPoolRastreio, listarAtribuicoes,
+  listarPoolMl, salvarPoolMl,
   listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
@@ -8540,6 +8541,27 @@ app.post('/rastreio/pool', (req, res) => {
   if (!tags) return res.status(400).json({ ok:false, erro:'informe { tags } ou { prefixo, de, ate }' });
   const r = salvarPoolRastreio(tags);
   res.json({ ok:true, total:r.pool.length, pool:r.pool, recusados:r.recusados });
+});
+
+// Pool de tags do Mercado Livre. Diferente da Amazon, a tag NAO gira por dia:
+// ela e grudada no produto na primeira geracao de link e fica, porque o
+// relatorio do ML nao separa resultado por data de disparo.
+//
+// A tag precisa existir na conta de afiliado — criada a mao no painel do ML.
+// Tag inventada faz o createLink devolver error_code 109 e o link e refeito
+// com a tag da conta (perde segmentacao, nunca a comissao).
+//
+// Pool vazio = comportamento anterior. Enquanto ninguem POSTar tags aqui,
+// nada muda no disparo.
+app.get('/rastreio/pool-ml', (_req, res) => {
+  res.json({ ok:true, ...listarPoolMl() });
+});
+
+app.post('/rastreio/pool-ml', (req, res) => {
+  const tags = Array.isArray(req.body?.tags) ? req.body.tags : null;
+  if (!tags) return res.status(400).json({ ok:false, erro:'informe { tags: [...] }' });
+  const r = salvarPoolMl(tags);
+  res.json({ ok:true, total:r.pool.length, pool:r.pool, recusados:r.recusados, mapa:r.mapa });
 });
 
 // Ledger ref -> produto. O coletor de comissoes le este mesmo conteudo pelo
