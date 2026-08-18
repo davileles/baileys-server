@@ -41,6 +41,13 @@ import {
   recarregarRadarTenants, refDeterministico,
 } from './radar-amazon.js';
 
+// ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
+import {
+  carregarCategorias, categoriasConfig, salvarCategorias,
+  classificarProduto, categoriaConfiavel, espelhaNoOperador,
+  explicarClassificacao, semearCacheTrilhas,
+} from './categorizador.js';
+
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
@@ -281,6 +288,7 @@ const baileysLogger = pino({ level: 'silent' });
     if (r.baixados) {
       carregarTenants(); carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
+      carregarCategorias();
       recarregarRadarTenants();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
@@ -2285,6 +2293,33 @@ async function montarLinkPreviewManual(dados, mensagem) {
   return preview;
 }
 
+// ── ESPELHO DE CATEGORIA NO GRUPO DO OPERADOR ────────────────────────────────
+// Copia de diagnostico das categorias em observacao (categorias.json ->
+// espelhoOperador). Mostra a mensagem como ela sairia num grupo de nicho, mais
+// o rodape com o que decidiu a classificacao. Serve para medir o acerto do
+// classificador ANTES de existir grupo de nicho de verdade — nao altera em nada
+// o destino das ofertas nos grupos de cliente.
+async function espelharCategoriaNoOperador(oferta, cls) {
+  try {
+    const jid = GRUPOS['operador'];
+    if (!jid) return;
+    const d = oferta.dadosExtraidos || {};
+    const cabecalho =
+        '\u{1F9EA} *TESTE DE CATEGORIA \u2014 ' + String(cls.nome || cls.categoria).toUpperCase() + '*\n'
+      + '`' + explicarClassificacao(cls) + '`\n'
+      + '`origem: ' + (oferta.grupoOrigemNome || oferta.grupoOrigem || 'radar') + ' \u00b7 ' + (d.loja || '?') + '`\n'
+      + '`' + (categoriaConfiavel(cls)
+                ? 'acima do limiar \u2014 iria para o grupo de nicho'
+                : 'abaixo do limiar \u2014 ficaria so no grupo geral') + '`\n\n';
+    const preview = montarLinkPreview(oferta, oferta.mensagemFormatada);
+    const corpo = cabecalho + oferta.mensagemFormatada;
+    await enviarMensagem(jid, preview ? { text: corpo, linkPreview: preview } : { text: corpo });
+    console.log('[CAT] Espelho "' + cls.categoria + '" enviado ao operador \u2014 oferta #' + oferta.id);
+  } catch (e) {
+    console.warn('[CAT] Falha ao espelhar no operador:', e.message);
+  }
+}
+
 async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
   // Sem fallback: oferta vai para os grupos marcados como DESTINO na aba
   // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
@@ -3978,6 +4013,8 @@ const PRESERVAR_NO_RESET = new Set([
   'publicadas.json',        // historico da vitrine publica
   'rastreio.json',          // ledger ref -> produto (rastreio de desempenho)
   'health.json',            // marcos de saude do inbound (regua do watchdog)
+  'categorias.json',        // taxonomia de categorias (grupos de nicho)
+  'categorias_cache.json',  // cache asin -> trilha de categoria
   'contas',                 // credenciais dos numeros secundarios de envio
 ]);
 
@@ -4331,6 +4368,21 @@ async function processarRadarMarketplace(jid, texto) {
       tenant: tenantContexto() || TENANT_PADRAO,
       timestamp: new Date().toISOString(),
     };
+
+    // ── CATEGORIA DO PRODUTO (grupos de nicho) ─────────────────────────────
+    // A classificacao entra na oferta ANTES de qualquer decisao de destino:
+    // roteamento por nicho, vitrine publica e relatorio leem daqui. Nunca lanca
+    // e nunca faz rede — categoria indefinida e um resultado valido e esperado.
+    const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
+    oferta.dadosExtraidos.categoria          = _cls.categoria;
+    oferta.dadosExtraidos.categoriaNome      = _cls.nome;
+    oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
+    oferta.dadosExtraidos.categoriaSinal     = _cls.sinal;
+    console.log('[CAT] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' -> ' + explicarClassificacao(_cls));
+
+    // Modo observacao (fase 1): categoria listada em espelhoOperador sai tambem
+    // no grupo interno. Fire-and-forget para nunca segurar o pipeline.
+    if (espelhaNoOperador(_cls)) espelharCategoriaNoOperador(oferta, _cls).catch(() => {});
 
     // Marca visivel no card da fila: explica por que a oferta nao auto-enviou
     // mesmo com AUTO_ENVIO_OFERTA ligado.
@@ -7130,9 +7182,94 @@ app.post('/sync/pull', async (req, res) => {
     const r = await baixarDoGitHub();
     carregarTenants(); carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
+    carregarCategorias();
     recarregarRadarTenants();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── CATEGORIAS / GRUPOS DE NICHO ─────────────────────────────────────────────
+// Estado da taxonomia e do modo observacao.
+app.get('/tsp/categorias', (req, res) => {
+  const cfg = categoriasConfig();
+  res.json({
+    ok: true,
+    versao: cfg.versao,
+    limiarConfianca: cfg.limiarConfianca,
+    espelhoOperador: cfg.espelhoOperador || [],
+    categorias: Object.fromEntries(Object.entries(cfg.categorias || {}).map(([id, d]) => [id, {
+      nome: d.nome, emoji: d.emoji,
+      keywords: (d.keywords || []).length,
+      bloqueio: (d.bloqueio || []).length,
+    }])),
+  });
+});
+
+// Classifica sem enviar nada. Serve para conferir a taxonomia contra titulos
+// reais antes de confiar nela para rotear grupo.
+app.post('/tsp/categorizar', (req, res) => {
+  const { titulo, titulos, asin, loja } = req.body || {};
+  const lista = Array.isArray(titulos) ? titulos : (titulo ? [titulo] : []);
+  if (!lista.length) return res.status(400).json({ ok:false, erro:'Informe "titulo" ou "titulos".' });
+  const itens = lista.slice(0, 300).map(t => {
+    const alvo = typeof t === 'string' ? { titulo: t, asin, loja } : t;
+    const cls = classificarProduto(alvo);
+    return { titulo: alvo.titulo, categoria: cls.categoria, nome: cls.nome,
+             confianca: cls.confianca, sinal: cls.sinal, confiavel: categoriaConfiavel(cls) };
+  });
+  res.json({ ok:true, total: itens.length, itens });
+});
+
+// Liga/desliga o espelho no grupo do operador sem deploy.
+app.post('/tsp/categorias/espelho', (req, res) => {
+  const { categorias } = req.body || {};
+  if (!Array.isArray(categorias)) return res.status(400).json({ ok:false, erro:'"categorias" deve ser um array.' });
+  const validas = Object.keys(categoriasConfig().categorias || {});
+  const desconhecidas = categorias.filter(x => !validas.includes(x));
+  if (desconhecidas.length) return res.status(400).json({ ok:false, erro:'Categoria desconhecida: ' + desconhecidas.join(', ') });
+  salvarCategorias({ espelhoOperador: categorias });
+  res.json({ ok:true, espelhoOperador: categorias });
+});
+
+// Retrato imediato: reclassifica o que ja passou pela fila e manda o resumo no
+// grupo do operador. Existe para nao ter que esperar novas capturas para ver o
+// classificador trabalhando sobre o material real da operacao.
+app.post('/tsp/categorias/simular', async (req, res) => {
+  const alvo  = String(req.body?.categoria || '').trim();
+  const envia = req.body?.enviar !== false;
+  if (!alvo) return res.status(400).json({ ok:false, erro:'Informe "categoria".' });
+  if (!categoriasConfig().categorias?.[alvo]) return res.status(400).json({ ok:false, erro:'Categoria desconhecida: ' + alvo });
+
+  const vistos = new Set();
+  const casados = [], indefinidos = [];
+  for (const o of filaPendentes) {
+    const d = o.dadosExtraidos || {};
+    if (!d.titulo || vistos.has(d.titulo)) continue;
+    vistos.add(d.titulo);
+    const cls = classificarProduto({ titulo: d.titulo, asin: d.asin, loja: d.loja });
+    if (cls.categoria === alvo) casados.push({ titulo: d.titulo, loja: d.loja, preco: d.precoFinal ?? d.preco, sinal: cls.sinal, confiavel: categoriaConfiavel(cls) });
+    else if (!cls.categoria && cls.confianca > 0) indefinidos.push({ titulo: d.titulo, sinal: cls.sinal });
+  }
+
+  if (envia && GRUPOS['operador']) {
+    const nome = categoriasConfig().categorias[alvo].nome || alvo;
+    const linhas = casados.length
+      ? casados.slice(0, 30).map(x => '\u2022 ' + String(x.titulo).slice(0, 70)
+          + (x.preco != null ? ' \u2014 R$ ' + Number(x.preco).toFixed(2).replace('.', ',') : '')
+          + '\n  `' + x.sinal + (x.confiavel ? '' : ' \u00b7 abaixo do limiar') + '`').join('\n')
+      : '_nenhuma oferta da fila atual caiu nesta categoria._';
+    const rodape = indefinidos.length
+      ? '\n\n\u26a0\ufe0f *' + indefinidos.length + ' item(ns) barrado(s) por bloqueio* (acessorio, nao o produto):\n'
+        + indefinidos.slice(0, 8).map(x => '\u2022 ' + String(x.titulo).slice(0, 60) + '\n  `' + x.sinal + '`').join('\n')
+      : '';
+    const texto = '\u{1F9EA} *SIMULACAO DE CATEGORIA \u2014 ' + String(nome).toUpperCase() + '*\n'
+      + '`' + vistos.size + ' titulo(s) analisado(s) da fila \u00b7 ' + casados.length + ' casado(s)`\n\n'
+      + linhas + rodape;
+    try { await enviarMensagem(GRUPOS['operador'], { text: texto }); }
+    catch (e) { return res.status(500).json({ ok:false, erro:'Classificou mas nao enviou: ' + e.message, analisados: vistos.size, casados }); }
+  }
+
+  res.json({ ok:true, categoria: alvo, analisados: vistos.size, casados, indefinidos });
 });
 
 // ── AWIN (rede de afiliados) ─────────────────────────────────────────────────
