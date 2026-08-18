@@ -175,6 +175,16 @@ export async function processarTextoMagalu(texto) {
       continue;
     }
 
+    // Sem preco nenhum a mensagem sai com o campo vazio e o card da fila nao
+    // tem o que aprovar. Amazon, ML e Shopee ja descartavam nesse caso; a
+    // Magalu era a unica que deixava passar, porque o preco dela vem do TEXTO
+    // do grupo e nao de fonte verificavel.
+    if (!preco) {
+      saida.push({ produto: { loja: 'Magazine Luiza', codigo: conv.partes.codigo, link: conv.link },
+                   descartadoPor: 'sem preço identificável no texto do grupo' });
+      continue;
+    }
+
     const p = {
       asin: conv.partes.codigo,
       codigo: conv.partes.codigo,
