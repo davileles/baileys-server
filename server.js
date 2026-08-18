@@ -39,7 +39,6 @@ import {
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
   recarregarRadarTenants, refDeterministico,
-  jaDivulgado, registrarVisto, horasDedup, descontoMinimoRadar, chaveDedupProduto,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -4315,41 +4314,6 @@ async function processarRadarMarketplace(jid, texto) {
     }
     const p = r.produto;
 
-    // ── GATES COMUNS A TODAS AS LOJAS ────────────────────────────────────────
-    // Ate aqui cada radar aplicava as proprias regras e so a Amazon tinha
-    // deduplicacao e piso de desconto: o mesmo produto chegando por tres
-    // grupos-fonte saia tres vezes em ML, Shopee, Magalu e Awin.
-    // Os gates ficam AQUI e nao dentro dos pipelines porque /mkt/montar e
-    // /mkt/testar reusam os mesmos pipelines — ali quem escolheu o produto foi
-    // o operador e nada pode ser barrado.
-
-    // Estoque: ML ja checava, Awin trazia o campo e ninguem olhava.
-    if (p.disponivel === false) {
-      console.log('[MKT] ' + (p.asin || p.itemId || '?') + ' descartado — esgotado ou pausado ('
-        + (p.loja || '?') + ')');
-      continue;
-    }
-
-    // Piso de desconto: so vale quando existe preco de lista confiavel. Magalu
-    // e parte da Awin nao expoem 'De' — ali desconto 0 significa "nao sei", nao
-    // "sem promocao", e barrar por isso mataria a captura inteira dessas lojas.
-    const _minDesc = descontoMinimoRadar();
-    if (p.precoDe && (p.desconto || 0) < _minDesc && !p.ehDeal) {
-      console.log('[MKT] ' + (p.asin || p.itemId || '?') + ' descartado — desconto de '
-        + (p.desconto || 0) + '% abaixo do minimo de ' + _minDesc + '% (' + (p.loja || '?') + ')');
-      continue;
-    }
-
-    // Deduplicacao por produto (nao por grupo): tres grupos-fonte postando o
-    // mesmo item resultam em UMA publicacao dentro da janela configurada.
-    // Excecao ja existente: queda de mais de 5% no preco libera o repost.
-    if (jaDivulgado(p)) {
-      console.log('[MKT] ' + (p.asin || p.itemId || '?') + ' descartado — ja divulgado nas ultimas '
-        + horasDedup() + 'h (' + (p.loja || '?') + ', chave ' + chaveDedupProduto(p) + ')');
-      continue;
-    }
-    registrarVisto(p);
-
     // Cupom citado no post original que nao existe na base: sem a regra
     // (percentual, minimo, teto) o radar nao calcula o desconto e a oferta sai
     // pelo preco cheio. Aviso ao operador, sem travar o envio.
@@ -7228,17 +7192,64 @@ app.post('/sync/pull', async (req, res) => {
 // Estado da taxonomia e do modo observacao.
 app.get('/tsp/categorias', (req, res) => {
   const cfg = categoriasConfig();
+  // Taxonomia inteira: a aba Configuracoes edita keyword a keyword, entao a
+  // versao resumida nao serve. Nao ha segredo aqui — sao termos de negocio.
   res.json({
     ok: true,
-    versao: cfg.versao,
-    limiarConfianca: cfg.limiarConfianca,
+    versao: cfg.versao || 0,
+    atualizadoEm: cfg.atualizadoEm || null,
+    limiarConfianca: cfg.limiarConfianca ?? 0.7,
     espelhoOperador: cfg.espelhoOperador || [],
-    categorias: Object.fromEntries(Object.entries(cfg.categorias || {}).map(([id, d]) => [id, {
-      nome: d.nome, emoji: d.emoji,
-      keywords: (d.keywords || []).length,
-      bloqueio: (d.bloqueio || []).length,
-    }])),
+    categorias: cfg.categorias || {},
   });
+});
+
+// Grava a taxonomia editada no painel. Substitui o conjunto inteiro: a tela
+// manda sempre o estado completo, entao merge parcial so criaria divergencia
+// entre o que o operador ve e o que o classificador usa.
+app.post('/tsp/categorias', (req, res) => {
+  const { categorias, limiarConfianca, espelhoOperador } = req.body || {};
+  if (!categorias || typeof categorias !== 'object' || Array.isArray(categorias)) {
+    return res.status(400).json({ ok:false, erro:'"categorias" deve ser um objeto id -> definicao.' });
+  }
+
+  const RE_ID = /^[a-z][a-z0-9_]{1,30}$/;
+  const limpo = {};
+  for (const [id, def] of Object.entries(categorias)) {
+    if (!RE_ID.test(id)) {
+      return res.status(400).json({ ok:false, erro:'Identificador invalido: "' + id
+        + '". Use minusculas, numeros e _ (ex: bebidas, pet_shop).' });
+    }
+    if (!def || typeof def !== 'object') return res.status(400).json({ ok:false, erro:'Definicao invalida em "' + id + '".' });
+    const lista = (v) => [...new Set((Array.isArray(v) ? v : [])
+      .map(x => String(x || '').trim()).filter(Boolean))];
+    const nome = String(def.nome || '').trim();
+    if (!nome) return res.status(400).json({ ok:false, erro:'A categoria "' + id + '" precisa de um nome.' });
+    limpo[id] = {
+      nome,
+      emoji:             String(def.emoji || '').trim(),
+      segmentosAmazon:   lista(def.segmentosAmazon),
+      segmentosBloqueio: lista(def.segmentosBloqueio),
+      keywords:          lista(def.keywords),
+      bloqueio:          lista(def.bloqueio),
+    };
+  }
+
+  let limiar = Number(limiarConfianca);
+  if (!Number.isFinite(limiar) || limiar <= 0 || limiar > 1) limiar = categoriasConfig().limiarConfianca ?? 0.7;
+
+  const espelho = (Array.isArray(espelhoOperador) ? espelhoOperador : []).filter(x => limpo[x]);
+
+  const cfg = salvarCategorias({
+    categorias: limpo,
+    limiarConfianca: limiar,
+    espelhoOperador: espelho,
+    versao: (categoriasConfig().versao || 0) + 1,
+  });
+  console.log('[CAT] Taxonomia salva pelo painel — ' + Object.keys(limpo).length
+    + ' categoria(s), espelho: ' + (espelho.join(', ') || 'nenhum'));
+  res.json({ ok:true, versao: cfg.versao, categorias: cfg.categorias,
+             limiarConfianca: cfg.limiarConfianca, espelhoOperador: cfg.espelhoOperador });
 });
 
 // Classifica sem enviar nada. Serve para conferir a taxonomia contra titulos
