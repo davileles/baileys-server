@@ -95,6 +95,16 @@ const LINK_CONVITE_OFERTAS = 'https://chat.whatsapp.com/Ia5ZTqeTJdXHG5OT9LUwz8';
 const CFG_PADRAO = {
   // jid -> 'fonte' | 'destino'. Gravado pela aba Grupos do painel.
   papeis: {},
+  // Grupos de nicho. jid de DESTINO -> ['bebidas', 'infantil', ...]. Lista
+  // vazia (ou jid ausente) = destino GERAL: recebe tudo, como sempre recebeu.
+  // Destino com categoria so recebe oferta daquelas categorias — e o geral
+  // continua recebendo essa mesma oferta, porque nicho aqui e cobertura extra,
+  // nao desvio.
+  categoriasDestino: {},
+  // jid de FONTE -> categoria fixa. Grupo que so publica bebida nao precisa
+  // depender de palavra-chave no titulo: o que vier dali ja nasce classificado.
+  // Ausente/vazio = classificacao normal pelo produto.
+  categoriaFonte: {},
   ativo: true,
   descontoMinimo: 5,      // % — abaixo disso descarta, salvo se for deal relampago
   dedupHoras: 24,
@@ -138,6 +148,8 @@ export function radarConfig() { return E().cfg; }
 export function salvarRadarConfig(novo = {}) {
   E().cfg = { ...E().cfg, ...novo };
   if (novo.papeis) E().cfg.papeis = novo.papeis;
+  if (novo.categoriasDestino) E().cfg.categoriasDestino = novo.categoriasDestino;
+  if (novo.categoriaFonte)    E().cfg.categoriaFonte    = novo.categoriaFonte;
   try {
     writeFileSync(cT('radar_config.json'), JSON.stringify(E().cfg, null, 2), 'utf-8');
     agendarPush(pT('radar_config.json'));
@@ -155,6 +167,39 @@ export function radarDestinos() {
 }
 export function ehFonteRadar(jid) {
   return E().cfg.ativo !== false && E().cfg.papeis?.[jid] === 'fonte';
+}
+
+// ── ROTEAMENTO POR CATEGORIA (grupos de nicho) ────────────────────────────
+// Um destino sem categoria configurada e GERAL. Isso preserva o comportamento
+// historico de quem nunca abrir esta configuracao: destino recebe tudo.
+
+/** Categorias de um destino. Array vazio = geral. */
+export function categoriasDoDestino(jid) {
+  const v = (E().cfg.categoriasDestino || {})[jid];
+  return Array.isArray(v) ? v.filter(Boolean) : (v ? [String(v)] : []);
+}
+
+/** Destinos GERAIS: recebem tudo, inclusive o que tambem foi para um nicho. */
+export function destinosGerais() {
+  return radarDestinos().filter(j => !categoriasDoDestino(j).length);
+}
+
+/**
+ * Para onde vai uma oferta desta categoria: todos os gerais + os grupos de
+ * nicho daquela categoria. Categoria vazia/indefinida = so os gerais, nunca
+ * um nicho — grupo de bebidas nao pode receber "produto que talvez seja bebida".
+ */
+export function destinosDaCategoria(categoria) {
+  const cat = String(categoria || '').trim();
+  const gerais = destinosGerais();
+  if (!cat) return gerais;
+  const nicho = radarDestinos().filter(j => categoriasDoDestino(j).includes(cat));
+  return [...new Set([...gerais, ...nicho])];
+}
+
+/** Categoria fixa de um grupo-fonte, ou '' quando a classificacao decide. */
+export function categoriaDaFonte(jid) {
+  return String((E().cfg.categoriaFonte || {})[jid] || '').trim();
 }
 
 // ── MONITORAMENTO POR GRUPO ───────────────────────────────────────────────
