@@ -20,7 +20,7 @@ import QRCode from 'qrcode';
 import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
-  categoriasDoDestino, destinosGerais, destinosDaCategoria, categoriaDaFonte,
+  trilhas, salvarTrilhas, destinosGerais, destinosDaOferta, explicarRoteamento,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
@@ -2397,22 +2397,25 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
   // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
   // uma mensagem que diz o que fazer — antes isso caia num grupo fixo que o
   // operador nao tinha escolhido.
-  // Roteamento por nicho: os destinos GERAIS recebem tudo, e os grupos de
-  // categoria recebem so o que a classificacao confirmou ser deles. Categoria
-  // indefinida ou com confianca abaixo do limiar nao entra em nicho nenhum —
-  // grupo de bebidas nao recebe "produto que talvez seja bebida".
-  const _cat = oferta?.dadosExtraidos?.categoria || null;
-  const _catOk = categoriaConfiavel({ categoria: _cat, confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0 });
-  const alvos = _catOk ? destinosDaCategoria(_cat) : destinosGerais();
+  // Roteamento por TRILHA: a oferta vai para os destinos das trilhas que tem a
+  // fonte dela. Trilha geral entrega tudo o que capturou; trilha de nicho so
+  // entrega quando o classificador confirmou a categoria — sem isso, o grupo de
+  // bebidas receberia "produto que talvez seja bebida".
+  const _rota = {
+    fonte: oferta?.grupoOrigem || null,
+    categoria: oferta?.dadosExtraidos?.categoria || null,
+    categoriaConfiavel: categoriaConfiavel({
+      categoria: oferta?.dadosExtraidos?.categoria || null,
+      confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0,
+    }),
+  };
+  const alvos = destinosDaOferta(_rota);
+  console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' roteamento: ' + explicarRoteamento(_rota)
+    + ' -> ' + alvos.length + ' grupo(s).');
   if (!alvos.length) {
-    throw new Error(radarDestinos().length
-      ? 'Nenhum grupo GERAL marcado como destino na aba Grupos — todos os destinos tem categoria.'
-      : 'Nenhum grupo marcado como destino na aba Grupos.');
-  }
-  if (_catOk) {
-    const nicho = alvos.filter(j => categoriasDoDestino(j).length);
-    if (nicho.length) console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' categoria "' + _cat
-      + '" -> ' + nicho.length + ' grupo(s) de nicho + ' + (alvos.length - nicho.length) + ' geral(is).');
+    throw new Error(trilhas().length
+      ? 'Nenhuma trilha entrega esta oferta — confira as fontes e destinos na aba Grupos.'
+      : 'Nenhuma trilha configurada na aba Grupos.');
   }
   // Grupo so-cupons nao recebe oferta de produto, mesmo que esteja marcado
   // como destino por engano.
@@ -4463,15 +4466,7 @@ async function processarRadarMarketplace(jid, texto) {
     // A classificacao entra na oferta ANTES de qualquer decisao de destino:
     // roteamento por nicho, vitrine publica e relatorio leem daqui. Nunca lanca
     // e nunca faz rede — categoria indefinida e um resultado valido e esperado.
-    let _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
-    // Fonte com categoria fixa manda: um grupo que so publica bebida ja diz
-    // qual e a prateleira, e isso vale mais que palavra-chave no titulo (que
-    // erra em "taca de vinho"). Confianca 1: decide roteamento sozinha.
-    const _catFonte = categoriaDaFonte(jid);
-    if (_catFonte) {
-      _cls = { categoria: _catFonte, confianca: 1, sinal: 'fonte-fixa',
-               nome: (categoriasConfig().categorias?.[_catFonte]?.nome || _catFonte) };
-    }
+    const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
     oferta.dadosExtraidos.categoria          = _cls.categoria;
     oferta.dadosExtraidos.categoriaNome      = _cls.nome;
     oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
@@ -7165,10 +7160,9 @@ app.get('/mkt/config', (req, res) => {
     gatilhoPadrao: cfg.gatilhoPadrao || '',
     fontes: radarFontes(),
     destinos: radarDestinos(),
-    // Grupos de nicho: quem recebe so uma categoria e qual fonte ja nasce
-    // classificada. Ausente = geral, que e o padrao de todo destino antigo.
-    categoriasDestino: cfg.categoriasDestino || {},
-    categoriaFonte: cfg.categoriaFonte || {},
+    // Trilhas: cada uma com as proprias fontes e destinos. A aba Grupos edita
+    // isto; `papeis` acima e so o retrato derivado, para quem ja lia de la.
+    trilhas: trilhas(),
     destinosGerais: destinosGerais(),
     credenciaisOk: !!(process.env.AMZ_CLIENT_ID && process.env.AMZ_CLIENT_SECRET),
     credenciaisShopeeOk: credenciaisShopeeOk(),
@@ -7185,32 +7179,19 @@ app.get('/mkt/config', (req, res) => {
 app.post('/mkt/config', (req, res) => {
   try {
     const permitido = {};
-    for (const k of ['papeis','ativo','descontoMinimo','dedupHoras','partnerTag','gatilhoPadrao',
-                     'categoriasDestino','categoriaFonte']) {
+    // `papeis` nao entra mais: e derivado das trilhas. Mandar os dois deixaria
+    // a marcacao da tela e a do disco discordando.
+    for (const k of ['ativo','descontoMinimo','dedupHoras','partnerTag','gatilhoPadrao']) {
       if (req.body[k] !== undefined) permitido[k] = req.body[k];
     }
-    // Higiene dos mapas de nicho: categoria so vale em grupo de DESTINO e
-    // categoria fixa so vale em grupo FONTE. Sem isso, um grupo que trocou de
-    // papel deixaria para tras uma regra invisivel que ninguem consegue achar
-    // na tela — e que continuaria valendo no dia que ele voltasse ao papel.
-    const _papeis = permitido.papeis || radarConfig().papeis || {};
-    if (permitido.categoriasDestino) {
-      const limpo = {};
-      for (const [jid, cats] of Object.entries(permitido.categoriasDestino)) {
-        if (_papeis[jid] !== 'destino') continue;
-        const lista = (Array.isArray(cats) ? cats : [cats]).map(x => String(x || '').trim()).filter(Boolean);
-        if (lista.length) limpo[jid] = [...new Set(lista)];
-      }
-      permitido.categoriasDestino = limpo;
-    }
-    if (permitido.categoriaFonte) {
-      const limpo = {};
-      for (const [jid, cat] of Object.entries(permitido.categoriaFonte)) {
-        if (_papeis[jid] !== 'fonte') continue;
-        const v = String(cat || '').trim();
-        if (v) limpo[jid] = v;
-      }
-      permitido.categoriaFonte = limpo;
+    // Trilhas tem gravacao propria: valida nome, JID, categoria existente e o
+    // conflito fonte/destino ANTES de gravar, porque trilha torta aqui vira
+    // oferta no grupo errado.
+    if (req.body.trilhas !== undefined) {
+      const taxo = categoriasConfig().categorias || {};
+      salvarTrilhas(req.body.trilhas || [], (cat) => Object.prototype.hasOwnProperty.call(taxo, cat));
+      console.log('[MKT] Trilhas atualizadas — ' + trilhas().map(t => t.nome
+        + ' (' + t.fontes.length + 'f/' + t.destinos.length + 'd)').join(', '));
     }
     const cfg = salvarRadarConfig(permitido);
     // Janela de cupons tem gravacao propria (valida os horarios antes de salvar).
@@ -7234,9 +7215,8 @@ app.post('/mkt/config', (req, res) => {
         + '. Agora: ' + contaDoTurno() + '.');
     }
     console.log('[MKT] Config atualizada — ' + radarFontes().length + ' fonte(s), ' + radarDestinos().length + ' destino(s).');
-    res.json({ ok:true, papeis: cfg.papeis, fontes: radarFontes(), destinos: radarDestinos(),
-               categoriasDestino: cfg.categoriasDestino || {}, categoriaFonte: cfg.categoriaFonte || {},
-               destinosGerais: destinosGerais(),
+    res.json({ ok:true, papeis: radarConfig().papeis, fontes: radarFontes(), destinos: radarDestinos(),
+               trilhas: trilhas(), destinosGerais: destinosGerais(),
                janelaCupom: janela, espacamentoGrupos: espac,
                turnosTsp: turnos, contaAgora: contaDoTurno() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
