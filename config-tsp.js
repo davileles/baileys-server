@@ -91,6 +91,18 @@ const CFG_TSP_PADRAO = {
     // captura. Complementa (nao substitui) a env TG_CANAIS_IGNORADOS.
     canaisIgnorados: ['bugmundodasmilhas'],
   },
+  // Modo de disparo automatico. Decisao de OPERACAO, nao de infraestrutura:
+  // mora aqui para o operador mudar em tela, sem mexer no Railway e sem
+  // redeploy. String vazia = herda a env de mesmo nome (AUTO_ENVIO_CUPOM /
+  // AUTO_ENVIO_OFERTA), que continua valendo como fallback — assim ninguem
+  // perde a configuracao atual ao subir esta versao.
+  autoEnvio: {
+    // 'off' (tudo vai para a fila) | 'sombra' (avalia e loga, mas nao envia)
+    // | 'on' (envia direto quando passa em todos os gates).
+    cupom:  '',
+    // Ofertas de marketplace nao tem modo 'sombra': 'off' | 'on'.
+    oferta: '',
+  },
 };
 
 // Config de partida por operador: a raiz herda os valores historicos da
@@ -201,8 +213,21 @@ export function salvarConfigTsp(parcial = {}, tenantId) {
     rodapes:  { ...atual.rodapes,   ...(parcial.rodapes   || {}) },
     grupos:   { ...atual.grupos,    ...(parcial.grupos    || {}) },
     telegram: { ...atual.telegram,  ...(parcial.telegram  || {}) },
+    autoEnvio:{ ...atual.autoEnvio, ...(parcial.autoEnvio || {}) },
     credenciais: { ...atual.credenciais, ...(parcial.credenciais || {}) },
   }, tenantId);
+
+  // Modo invalido aqui viraria disparo em massa por engano: recusa explicita.
+  const MODOS_CUPOM  = ['', 'off', 'sombra', 'on'];
+  const MODOS_OFERTA = ['', 'off', 'on'];
+  novo.autoEnvio.cupom  = String(novo.autoEnvio.cupom  || '').trim().toLowerCase();
+  novo.autoEnvio.oferta = String(novo.autoEnvio.oferta || '').trim().toLowerCase();
+  if (!MODOS_CUPOM.includes(novo.autoEnvio.cupom)) {
+    throw new Error('Auto-envio de cupom invalido: use off, sombra ou on.');
+  }
+  if (!MODOS_OFERTA.includes(novo.autoEnvio.oferta)) {
+    throw new Error('Auto-envio de oferta invalido: use off ou on.');
+  }
   // Um JID invalido quebra avisos do operador em silencio — melhor recusar.
   // Tenant novo pode ficar sem grupo do operador ate conectar o WhatsApp.
   const opd = String(novo.grupos.operador || '').trim();
@@ -305,6 +330,33 @@ export function estadoCredenciais(tenantId) {
 }
 
 export function tgIgnoradosConfig(tenantId) { return obter(tenantId).telegram.canaisIgnorados.slice(); }
+
+// ── MODO DE AUTO-ENVIO ───────────────────────────────────────────────────────
+// Ordem de resolucao: config do painel -> env do Railway -> padrao seguro.
+// Lidos a CADA decisao de envio (nunca cacheados numa const de modulo), para
+// que salvar no painel passe a valer na hora, sem restart.
+export function modoAutoEnvioCupom(tenantId) {
+  const cfg = String(obter(tenantId).autoEnvio?.cupom || '').trim().toLowerCase();
+  if (cfg) return cfg;
+  return String(process.env.AUTO_ENVIO_CUPOM || 'sombra').toLowerCase();
+}
+
+export function modoAutoEnvioOferta(tenantId) {
+  const cfg = String(obter(tenantId).autoEnvio?.oferta || '').trim().toLowerCase();
+  if (cfg) return cfg;
+  return String(process.env.AUTO_ENVIO_OFERTA || 'off').toLowerCase();
+}
+
+// De onde veio cada modo — o painel precisa dizer se o valor esta vindo da
+// tela ou ainda da env, senao o operador nao entende por que mudar no Railway
+// deixou de ter efeito (ou por que ainda tem).
+export function origemAutoEnvio(tenantId) {
+  const a = obter(tenantId).autoEnvio || {};
+  return {
+    cupom:  String(a.cupom  || '').trim() ? 'painel' : 'env',
+    oferta: String(a.oferta || '').trim() ? 'painel' : 'env',
+  };
+}
 
 // ── Credencial por contexto (fase 2.3) ───────────────────────────────────────
 // Resolucao para os radares: o que o operador do contexto salvou no painel; na
