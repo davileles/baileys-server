@@ -39,6 +39,7 @@ import {
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
   recarregarRadarTenants, refDeterministico,
+  jaDivulgado, registrarVisto, horasDedup, descontoMinimoRadar, chaveDedupProduto,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -4313,6 +4314,41 @@ async function processarRadarMarketplace(jid, texto) {
       continue;
     }
     const p = r.produto;
+
+    // ── GATES COMUNS A TODAS AS LOJAS ────────────────────────────────────────
+    // Ate aqui cada radar aplicava as proprias regras e so a Amazon tinha
+    // deduplicacao e piso de desconto: o mesmo produto chegando por tres
+    // grupos-fonte saia tres vezes em ML, Shopee, Magalu e Awin.
+    // Os gates ficam AQUI e nao dentro dos pipelines porque /mkt/montar e
+    // /mkt/testar reusam os mesmos pipelines — ali quem escolheu o produto foi
+    // o operador e nada pode ser barrado.
+
+    // Estoque: ML ja checava, Awin trazia o campo e ninguem olhava.
+    if (p.disponivel === false) {
+      console.log('[MKT] ' + (p.asin || p.itemId || '?') + ' descartado — esgotado ou pausado ('
+        + (p.loja || '?') + ')');
+      continue;
+    }
+
+    // Piso de desconto: so vale quando existe preco de lista confiavel. Magalu
+    // e parte da Awin nao expoem 'De' — ali desconto 0 significa "nao sei", nao
+    // "sem promocao", e barrar por isso mataria a captura inteira dessas lojas.
+    const _minDesc = descontoMinimoRadar();
+    if (p.precoDe && (p.desconto || 0) < _minDesc && !p.ehDeal) {
+      console.log('[MKT] ' + (p.asin || p.itemId || '?') + ' descartado — desconto de '
+        + (p.desconto || 0) + '% abaixo do minimo de ' + _minDesc + '% (' + (p.loja || '?') + ')');
+      continue;
+    }
+
+    // Deduplicacao por produto (nao por grupo): tres grupos-fonte postando o
+    // mesmo item resultam em UMA publicacao dentro da janela configurada.
+    // Excecao ja existente: queda de mais de 5% no preco libera o repost.
+    if (jaDivulgado(p)) {
+      console.log('[MKT] ' + (p.asin || p.itemId || '?') + ' descartado — ja divulgado nas ultimas '
+        + horasDedup() + 'h (' + (p.loja || '?') + ', chave ' + chaveDedupProduto(p) + ')');
+      continue;
+    }
+    registrarVisto(p);
 
     // Cupom citado no post original que nao existe na base: sem a regra
     // (percentual, minimo, teto) o radar nao calcula o desconto e a oferta sai
