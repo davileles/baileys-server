@@ -1837,7 +1837,8 @@ carregarVitrine();
 // Sem ele o relatorio da Amazon e ilegivel, porque 'tsp007-20' sozinho nao
 // diz nada. Por isso ele e sincronizado com o repo de dados.
 
-const RASTREIO_PADRAO = { pool: [], cursor: 0, atribuicoes: [], atualizadoEm: null };
+const RASTREIO_PADRAO = { pool: [], cursor: 0, atribuicoes: [], atualizadoEm: null,
+                          poolMl: [], mapaMl: {} };
 
 // Quantos dias de atribuicao ficam no arquivo. O relatorio da Amazon so e
 // consultavel retroativamente por alguns meses e o coletor varre uma janela
@@ -1902,6 +1903,76 @@ function hojeSP() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
 }
 
+// ── TAGS DO MERCADO LIVRE ───────────────────────────────────────────────────
+//
+// O ML nao aceita tag arbitraria: createLink devolve error_code 109 ("Tag is
+// not associated with this affiliate") para qualquer valor que nao exista na
+// conta. O modelo, entao, e o mesmo da Amazon — um pool de tags criadas a mao
+// no painel de afiliados — com uma diferenca importante: aqui a tag NAO gira
+// por dia. Ela e grudada no produto e fica: o relatorio do ML nao separa por
+// data de disparo, entao reciclar tag entre produtos misturaria resultados que
+// nunca mais poderiam ser separados.
+//
+// Pool vazio = comportamento anterior, byte por byte: link sai com a tag padrao
+// da conta e o ledger guarda o ref deterministico. Nada muda ate alguem POSTar
+// tags reais em /rastreio/pool-ml.
+
+const RE_TAG_ML = /^[a-z0-9][a-z0-9_-]{1,49}$/;
+
+export function listarPoolMl() {
+  const r = rastreio();
+  const mapa = r.mapaMl || {};
+  const usadas = new Set(Object.values(mapa));
+  return {
+    pool: [...(r.poolMl || [])],
+    mapa: { ...mapa },
+    usadas: usadas.size,
+    livres: (r.poolMl || []).filter((t) => !usadas.has(t)).length,
+  };
+}
+
+export function salvarPoolMl(tags) {
+  const limpos = [], recusados = [];
+  for (const t of (Array.isArray(tags) ? tags : [])) {
+    const v = String(t || '').trim().toLowerCase();
+    if (!v) continue;
+    if (!RE_TAG_ML.test(v)) { recusados.push(v); continue; }
+    if (!limpos.includes(v)) limpos.push(v);
+  }
+  const r = rastreio();
+  r.poolMl = limpos;
+  // Produto amarrado a uma tag que saiu do pool volta para a tag da conta na
+  // proxima geracao de link — melhor perder a segmentacao do que mandar link
+  // com tag inexistente, que e comissao perdida.
+  const validas = new Set(limpos);
+  for (const [asin, tag] of Object.entries(r.mapaMl || {})) {
+    if (!validas.has(tag)) delete r.mapaMl[asin];
+  }
+  salvarRastreio();
+  return { pool: limpos, recusados, mapa: { ...(r.mapaMl || {}) } };
+}
+
+/**
+ * Tag do ML para este produto. Assinatura estavel: mesmo produto, mesma tag
+ * sempre. Devolve null quando nao ha pool ou quando ele acabou — e o chamador
+ * cai na tag da conta, que e o comportamento de hoje.
+ */
+export function tagMlDoProduto(asin) {
+  const id = String(asin || '').toUpperCase();
+  if (!id) return null;
+  const r = rastreio();
+  const pool = r.poolMl || [];
+  if (!pool.length) return null;
+  r.mapaMl = r.mapaMl || {};
+  if (r.mapaMl[id] && pool.includes(r.mapaMl[id])) return r.mapaMl[id];
+  const usadas = new Set(Object.values(r.mapaMl));
+  const livre = pool.find((t) => !usadas.has(t));
+  if (!livre) return null;   // pool esgotado: nao rouba tag de outro produto
+  r.mapaMl[id] = livre;
+  salvarRastreio();
+  return livre;
+}
+
 function atribuicaoDoDia(asin, data) {
   return (rastreio().atribuicoes || []).find(a => a.asin === asin && a.data === data) || null;
 }
@@ -1949,7 +2020,11 @@ export function refDoDisparo(p) {
   let ref = null;
   if (loja.includes('amazon')) ref = proximaTagAmazon(data);
   else if (loja.includes('shopee')) ref = refDeterministico(p.asin);
-  else ref = refDeterministico(p.asin); // ML e demais: so registra, nao altera a URL
+  // ML: com pool configurado, o ref E a tag que foi para o createLink — e o que
+  // vai permitir o coletor casar o relatorio de volta no produto. Sem pool,
+  // continua o ref deterministico interno, que so serve de chave local.
+  else if (loja.includes('mercado')) ref = tagMlDoProduto(p.asin) || refDeterministico(p.asin);
+  else ref = refDeterministico(p.asin); // demais lojas: so registra, nao altera a URL
 
   rastreio().atribuicoes.push({
     ref, data, asin: p.asin, loja: p.loja || '',
