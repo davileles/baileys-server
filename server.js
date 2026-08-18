@@ -2293,9 +2293,77 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
 // Monta o preview de link nativo. O Baileys aceita um linkPreview pronto
 // (Utils/messages.js), entao nao precisamos de link-preview-js nem de raspar a
 // pagina da Amazon — que bloqueia bots. A thumbnail vem da propria API.
-// Acima de ~100KB o WhatsApp descarta o jpegThumbnail e a mensagem sai sem
-// imagem; melhor mandar preview sem foto do que a mensagem falhar.
-const THUMB_MAX_BYTES = 100 * 1024;
+// LIMITE DA MINIATURA. O jpegThumbnail viaja INLINE no protobuf da mensagem, e
+// o WhatsApp descarta o campo quando ele passa de ~64KB — junto com o card
+// inteiro, nao so a foto. O teto estava em 100KB, o que deixava passar imagem
+// grande demais: a oferta saia sem preview nenhum e sem erro nenhum no log.
+// 60KB fica com folga abaixo do ponto de corte observado.
+const THUMB_MAX_BYTES = 60 * 1024;
+
+function ehJpegBuffer(buf) {
+  return !!buf && buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
+}
+
+/**
+ * Versoes menores da MESMA imagem no CDN da loja. Em vez de simplesmente
+ * desistir da foto quando a original estoura o limite, pedimos ao proprio CDN
+ * uma variante reduzida — sem redimensionar nada aqui dentro e sem dependencia
+ * nova. Se nenhuma couber, o preview vai sem foto (card simples), que ainda e
+ * melhor que mensagem sem card.
+ */
+function variantesMiniatura(url) {
+  const u = String(url || '');
+  if (!u) return [];
+  const lista = [];
+  if (/mlstatic\.com/i.test(u)) {
+    // Mercado Livre: o sufixo antes da extensao e o tamanho (-O grande, -V/-I/-S menores).
+    const base = u.replace(/\.webp(\?|$)/i, '.jpg$1').replace(/D_NQ_NP_2X_/i, 'D_NQ_NP_');
+    for (const s of ['-V', '-I', '-S', '-N']) {
+      lista.push(base.replace(/-[A-Z]\.jpg/i, s + '.jpg'));
+    }
+  } else if (/media-amazon\.com|images-amazon\.com/i.test(u)) {
+    // Amazon: os modificadores entre pontos controlam o lado maior da imagem.
+    const limpo = u.replace(/\._[^.]+_\./, '.');
+    for (const s of ['_SL400_', '_SL300_', '_SL200_']) {
+      lista.push(limpo.replace(/\.(jpg|jpeg|png)(\?|$)/i, '.' + s + '.$1$2'));
+    }
+  } else if (/shopee|susercontent\.com/i.test(u)) {
+    lista.push(u.replace(/(\?.*)?$/, '_tn'));
+  }
+  return [...new Set(lista.filter(x => x && x !== u))];
+}
+
+/**
+ * Miniatura pronta para o preview, ja dentro do limite. Ordem: o que veio na
+ * captura (sem rede) -> variantes menores do CDN -> nenhuma.
+ */
+async function miniaturaDoPreview(imagemBase64, imagemUrl, rotulo) {
+  if (imagemBase64) {
+    const buf = Buffer.from(imagemBase64, 'base64');
+    // Precisa ser JPEG de verdade: um buffer webp (padrao do Mercado Livre)
+    // rotulado como jpegThumbnail faz o cliente descartar o card inteiro.
+    if (!ehJpegBuffer(buf)) {
+      console.log('[PREVIEW] ' + rotulo + ': miniatura nao e JPEG — tentando variante do CDN.');
+    } else if (buf.length <= THUMB_MAX_BYTES) {
+      return buf;
+    } else {
+      console.log('[PREVIEW] ' + rotulo + ': miniatura de ' + Math.round(buf.length / 1024)
+        + 'KB acima do limite de ' + Math.round(THUMB_MAX_BYTES / 1024) + 'KB — buscando variante menor.');
+    }
+  }
+  for (const alvo of variantesMiniatura(imagemUrl)) {
+    try {
+      const res = await fetch(alvo, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (!ehJpegBuffer(buf) || buf.length > THUMB_MAX_BYTES) continue;
+      console.log('[PREVIEW] ' + rotulo + ': usando variante de ' + Math.round(buf.length / 1024) + 'KB.');
+      return buf;
+    } catch (e) { /* variante indisponivel: tenta a proxima */ }
+  }
+  console.log('[PREVIEW] ' + rotulo + ': nenhuma miniatura coube — card vai sem foto.');
+  return null;
+}
 
 // O rastreio troca a marcacao de afiliado na hora de montar a mensagem (pool
 // rotativo da Amazon, sub_id da Shopee), entao a URL no texto pode diferir da
@@ -2314,7 +2382,7 @@ function urlNaMensagem(url, mensagem) {
   } catch { return url; }
 }
 
-function montarLinkPreview(oferta, mensagem) {
+async function montarLinkPreview(oferta, mensagem) {
   const d = oferta.dadosExtraidos || {};
   const url = d.link ? urlNaMensagem(d.link, mensagem) : null;
   if (!url) return null;
@@ -2328,15 +2396,9 @@ function montarLinkPreview(oferta, mensagem) {
   };
 
   const img = (oferta.imagens || [])[0];
-  if (img?.imagemBase64) {
-    const buf = Buffer.from(img.imagemBase64, 'base64');
-    // Precisa ser JPEG de verdade: um buffer webp (padrao do Mercado Livre)
-    // rotulado como jpegThumbnail faz o cliente descartar o card inteiro.
-    const ehJpeg = buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
-    if (!ehJpeg) console.log('[MKT] Thumbnail nao e JPEG (' + (img.mime || 'mime desconhecido') + ') — preview sem imagem.');
-    else if (buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
-    else console.log('[MKT] Thumbnail de ' + buf.length + ' bytes acima do limite — preview sem imagem.');
-  }
+  const thumb = await miniaturaDoPreview(img?.imagemBase64 || null, d.imagemUrl || null,
+    'oferta #' + (oferta.id || '?'));
+  if (thumb) preview.jpegThumbnail = thumb;
   return preview;
 }
 
@@ -2356,11 +2418,8 @@ async function montarLinkPreviewManual(dados, mensagem) {
   };
   if (dados.imagemUrl) {
     const img = await baixarImagemProduto(dados.imagemUrl);
-    if (img?.imagemBase64) {
-      const buf = Buffer.from(img.imagemBase64, 'base64');
-      const ehJpeg = buf.length > 3 && buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF;
-      if (ehJpeg && buf.length <= THUMB_MAX_BYTES) preview.jpegThumbnail = buf;
-    }
+    const thumb = await miniaturaDoPreview(img?.imagemBase64 || null, dados.imagemUrl, 'envio manual');
+    if (thumb) preview.jpegThumbnail = thumb;
   }
   return preview;
 }
@@ -2383,7 +2442,7 @@ async function espelharCategoriaNoOperador(oferta, cls) {
       + '`' + (categoriaConfiavel(cls)
                 ? 'acima do limiar \u2014 iria para o grupo de nicho'
                 : 'abaixo do limiar \u2014 ficaria so no grupo geral') + '`\n\n';
-    const preview = montarLinkPreview(oferta, oferta.mensagemFormatada);
+    const preview = await montarLinkPreview(oferta, oferta.mensagemFormatada);
     const corpo = cabecalho + oferta.mensagemFormatada;
     await enviarMensagem(jid, preview ? { text: corpo, linkPreview: preview } : { text: corpo });
     console.log('[CAT] Espelho "' + cls.categoria + '" enviado ao operador \u2014 oferta #' + oferta.id);
@@ -2421,7 +2480,7 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
   // como destino por engano.
   const soCupons = new Set(GRUPOS['tsp_cupons']);
   const enviados = [], falhas = [];
-  const preview = oferta ? montarLinkPreview(oferta, mensagem) : null;
+  const preview = oferta ? await montarLinkPreview(oferta, mensagem) : null;
   const op = { conta: contaDoTurno() };
 
   for (const jid of alvos) {
