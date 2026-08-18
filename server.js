@@ -1114,6 +1114,9 @@ async function workerFila() {
           datas_ida:   de.datasIda || '',
           datas_volta: de.datasVolta || '',
           fonte:       'alerta',
+          // Distingue disparo automatico (AUTO_ENVIO_ALERTA=on + veredito
+          // positivo) de envio liberado na aprovacao manual do gerador.
+          auto:        !!ofertaEnviada?.autoEnviado,
         }).catch(() => {});
       }
 
@@ -6563,6 +6566,7 @@ app.post('/backfill-passagens', async (req, res) => {
         datas_ida:   de.datasIda || '',
         datas_volta: de.datasVolta || '',
         fonte:       'alerta',
+        auto:        !!oferta.autoEnviado,
       });
       ok++;
     } catch(e) {
