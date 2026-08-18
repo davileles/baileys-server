@@ -95,16 +95,24 @@ const LINK_CONVITE_OFERTAS = 'https://chat.whatsapp.com/Ia5ZTqeTJdXHG5OT9LUwz8';
 const CFG_PADRAO = {
   // jid -> 'fonte' | 'destino'. Gravado pela aba Grupos do painel.
   papeis: {},
-  // Grupos de nicho. jid de DESTINO -> ['bebidas', 'infantil', ...]. Lista
-  // vazia (ou jid ausente) = destino GERAL: recebe tudo, como sempre recebeu.
-  // Destino com categoria so recebe oferta daquelas categorias — e o geral
-  // continua recebendo essa mesma oferta, porque nicho aqui e cobertura extra,
-  // nao desvio.
-  categoriasDestino: {},
-  // jid de FONTE -> categoria fixa. Grupo que so publica bebida nao precisa
-  // depender de palavra-chave no titulo: o que vier dali ja nasce classificado.
-  // Ausente/vazio = classificacao normal pelo produto.
-  categoriaFonte: {},
+  // TRILHAS: a unidade de configuracao do radar. Cada trilha tem as PROPRIAS
+  // fontes e os PROPRIOS destinos, e a regra e uma so — o que a fonte da trilha
+  // captura vai para os destinos da mesma trilha.
+  //
+  //   { id, nome, categoria, fontes: [jid], destinos: [jid] }
+  //
+  // categoria vazia = trilha geral, entrega tudo o que capturou. Categoria
+  // preenchida = trilha de nicho, entrega so o que o classificador confirmou
+  // ser daquela categoria (confianca acima do limiar).
+  //
+  // O mesmo grupo pode ser fonte de VARIAS trilhas: um grupo generico marcado
+  // em Geral e em Bebidas alimenta os dois, cada um pela sua regra. Destinos
+  // repetidos entre trilhas recebem uma vez so.
+  //
+  // `papeis` continua existindo e e DERIVADO daqui (ver sincronizarPapeis):
+  // todo o resto do servidor — captura, monitoramento por grupo, censo — le de
+  // papeis, e nao precisou mudar.
+  trilhas: [],
   ativo: true,
   descontoMinimo: 5,      // % — abaixo disso descarta, salvo se for deal relampago
   dedupHoras: 24,
@@ -132,8 +140,10 @@ export function carregarRadarConfig() {
   try {
     if (existsSync(cT('radar_config.json'))) {
       E().cfg = { ...CFG_PADRAO, ...JSON.parse(readFileSync(cT('radar_config.json'), 'utf-8')) };
+      migrarParaTrilhas();
       const f = radarFontes().length, d = radarDestinos().length;
-      console.log(`[MKT] Config carregada — ${f} grupo(s) fonte, ${d} destino.`);
+      console.log(`[MKT] Config carregada — ${f} grupo(s) fonte, ${d} destino, `
+        + `${(E().cfg.trilhas || []).length} trilha(s).`);
     } else {
       console.log('[MKT] Sem config em disco, usando padrao.');
     }
@@ -146,10 +156,11 @@ export function carregarRadarConfig() {
 export function radarConfig() { return E().cfg; }
 
 export function salvarRadarConfig(novo = {}) {
-  E().cfg = { ...E().cfg, ...novo };
-  if (novo.papeis) E().cfg.papeis = novo.papeis;
-  if (novo.categoriasDestino) E().cfg.categoriasDestino = novo.categoriasDestino;
-  if (novo.categoriaFonte)    E().cfg.categoriaFonte    = novo.categoriaFonte;
+  // `papeis` e `trilhas` NAO entram por aqui: papeis e derivado das trilhas e
+  // trilhas tem gravacao propria, que valida antes. Aceitar os dois caminhos
+  // deixaria a tela e o disco discordando sem ninguem perceber.
+  const { papeis: _p, trilhas: _t, ...resto } = novo;
+  E().cfg = { ...E().cfg, ...resto };
   try {
     writeFileSync(cT('radar_config.json'), JSON.stringify(E().cfg, null, 2), 'utf-8');
     agendarPush(pT('radar_config.json'));
@@ -169,37 +180,167 @@ export function ehFonteRadar(jid) {
   return E().cfg.ativo !== false && E().cfg.papeis?.[jid] === 'fonte';
 }
 
-// ── ROTEAMENTO POR CATEGORIA (grupos de nicho) ────────────────────────────
-// Um destino sem categoria configurada e GERAL. Isso preserva o comportamento
-// historico de quem nunca abrir esta configuracao: destino recebe tudo.
+// ── TRILHAS ───────────────────────────────────────────────────────────────
 
-/** Categorias de um destino. Array vazio = geral. */
-export function categoriasDoDestino(jid) {
-  const v = (E().cfg.categoriasDestino || {})[jid];
-  return Array.isArray(v) ? v.filter(Boolean) : (v ? [String(v)] : []);
+const RE_JID_GRUPO_MKT = /^[\d-]{5,}@g\.us$/;
+
+export function trilhas() {
+  return (E().cfg.trilhas || []).map(t => ({
+    id: String(t.id || ''),
+    nome: String(t.nome || ''),
+    categoria: String(t.categoria || '').trim(),
+    fontes:   Array.isArray(t.fontes)   ? t.fontes.slice()   : [],
+    destinos: Array.isArray(t.destinos) ? t.destinos.slice() : [],
+  }));
 }
 
-/** Destinos GERAIS: recebem tudo, inclusive o que tambem foi para um nicho. */
-export function destinosGerais() {
-  return radarDestinos().filter(j => !categoriasDoDestino(j).length);
+/** Trilhas gerais (sem categoria): entregam tudo o que capturam. */
+export function trilhasGerais() { return trilhas().filter(t => !t.categoria); }
+
+/**
+ * `papeis` deixa de ser editado a mao e passa a ser o retrato das trilhas.
+ * Manter os dois em sincronia aqui — e nao em cada chamador — e o que permite
+ * que captura, monitoramento e censo sigam lendo papeis sem alteracao nenhuma.
+ * Grupo em nenhuma trilha perde o papel: era isso ou deixar orfao capturando.
+ */
+function sincronizarPapeis() {
+  const p = {};
+  for (const t of trilhas()) {
+    for (const j of t.fontes)   p[j] = 'fonte';
+    for (const j of t.destinos) p[j] = 'destino';
+  }
+  E().cfg.papeis = p;
+  return p;
 }
 
 /**
- * Para onde vai uma oferta desta categoria: todos os gerais + os grupos de
- * nicho daquela categoria. Categoria vazia/indefinida = so os gerais, nunca
- * um nicho — grupo de bebidas nao pode receber "produto que talvez seja bebida".
+ * Config antiga (papeis soltos + categoriasDestino/categoriaFonte) vira trilha.
+ * Roda uma vez, no carregamento: sem isso, subir esta versao apagaria a
+ * marcacao de todo mundo — o pior tipo de "migracao" que existe.
  */
-export function destinosDaCategoria(categoria) {
-  const cat = String(categoria || '').trim();
-  const gerais = destinosGerais();
-  if (!cat) return gerais;
-  const nicho = radarDestinos().filter(j => categoriasDoDestino(j).includes(cat));
-  return [...new Set([...gerais, ...nicho])];
+function migrarParaTrilhas() {
+  const cfg = E().cfg;
+  if (Array.isArray(cfg.trilhas) && cfg.trilhas.length) { sincronizarPapeis(); return; }
+
+  const papeis = cfg.papeis || {};
+  const catDest = cfg.categoriasDestino || {};
+  const catFonte = cfg.categoriaFonte || {};
+  const fontes   = Object.keys(papeis).filter(j => papeis[j] === 'fonte');
+  const destinos = Object.keys(papeis).filter(j => papeis[j] === 'destino');
+  const catsDe = (j) => {
+    const v = catDest[j];
+    return Array.isArray(v) ? v.filter(Boolean) : (v ? [String(v)] : []);
+  };
+
+  const lista = [{
+    id: 'geral', nome: 'Ofertas gerais', categoria: '',
+    // Fonte com categoria fixa no modelo antigo nao alimentava o geral.
+    fontes: fontes.filter(j => !catFonte[j]),
+    destinos: destinos.filter(j => !catsDe(j).length),
+  }];
+  const nichos = [...new Set([...destinos.flatMap(catsDe), ...Object.values(catFonte)])].filter(Boolean);
+  for (const cat of nichos) {
+    lista.push({
+      id: cat, nome: cat, categoria: cat,
+      // Sem fonte especifica, a trilha herda as fontes gerais: o comportamento
+      // anterior era justamente "qualquer fonte alimenta o nicho pela categoria".
+      fontes: fontes.filter(j => catFonte[j] === cat).length
+        ? fontes.filter(j => catFonte[j] === cat)
+        : fontes.slice(),
+      destinos: destinos.filter(j => catsDe(j).includes(cat)),
+    });
+  }
+  cfg.trilhas = lista;
+  delete cfg.categoriasDestino;
+  delete cfg.categoriaFonte;
+  sincronizarPapeis();
+  console.log('[MKT] Config migrada para trilhas — ' + lista.length + ' trilha(s).');
 }
 
-/** Categoria fixa de um grupo-fonte, ou '' quando a classificacao decide. */
-export function categoriaDaFonte(jid) {
-  return String((E().cfg.categoriaFonte || {})[jid] || '').trim();
+/**
+ * Grava as trilhas. Valida antes: uma trilha malformada aqui vira oferta
+ * caindo no grupo errado, que e o erro mais caro desta operacao.
+ * @param {Array} lista
+ * @param {(cat:string)=>boolean} categoriaExiste — validador da taxonomia,
+ *        injetado pelo chamador (este modulo nao conhece o categorizador).
+ */
+export function salvarTrilhas(lista, categoriaExiste) {
+  if (!Array.isArray(lista)) throw new Error('Trilhas invalidas: esperado uma lista.');
+  const vistos = new Set();
+  const papelDe = new Map();   // jid -> 'fonte' | 'destino', para pegar conflito
+  const limpas = [];
+
+  for (const bruta of lista) {
+    const t = bruta && typeof bruta === 'object' ? bruta : {};
+    const nome = String(t.nome || '').trim();
+    if (!nome) throw new Error('Toda trilha precisa de um nome.');
+    const id = String(t.id || '').trim() || nome.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    if (vistos.has(id)) throw new Error('Trilha duplicada: "' + nome + '".');
+    vistos.add(id);
+
+    const categoria = String(t.categoria || '').trim();
+    if (categoria && typeof categoriaExiste === 'function' && !categoriaExiste(categoria)) {
+      throw new Error('Trilha "' + nome + '": categoria "' + categoria + '" nao existe na taxonomia.');
+    }
+
+    const norm = (arr, papel) => [...new Set((Array.isArray(arr) ? arr : []).map(x => String(x || '').trim()).filter(Boolean))]
+      .map(j => {
+        if (!RE_JID_GRUPO_MKT.test(j)) throw new Error('Trilha "' + nome + '": "' + j + '" nao e um JID de grupo.');
+        const outro = papelDe.get(j);
+        // Um grupo que le E publica realimenta o proprio radar: a oferta que ele
+        // recebe volta como captura na rodada seguinte.
+        if (outro && outro !== papel) {
+          throw new Error('O grupo ' + j + ' esta como fonte e como destino ao mesmo tempo.');
+        }
+        papelDe.set(j, papel);
+        return j;
+      });
+
+    limpas.push({ id, nome, categoria, fontes: norm(t.fontes, 'fonte'), destinos: norm(t.destinos, 'destino') });
+  }
+
+  E().cfg.trilhas = limpas;
+  sincronizarPapeis();
+  try {
+    writeFileSync(cT('radar_config.json'), JSON.stringify(E().cfg, null, 2), 'utf-8');
+    agendarPush(pT('radar_config.json'));
+  } catch (e) {
+    console.log('[MKT] Erro ao salvar trilhas:', e.message);
+  }
+  return limpas;
+}
+
+/** Destinos das trilhas GERAIS. Usado por cupom e mensagem manual, que nao tem categoria. */
+export function destinosGerais() {
+  return [...new Set(trilhasGerais().flatMap(t => t.destinos))];
+}
+
+/**
+ * Para onde vai esta oferta. Uma trilha entrega quando:
+ *   - a fonte da oferta esta nas fontes dela, E
+ *   - ela e geral, OU a categoria confirmada da oferta e a categoria dela.
+ * Oferta sem fonte conhecida (feed Awin, disparo do painel) cai nas gerais.
+ */
+export function destinosDaOferta({ fonte, categoria, categoriaConfiavel } = {}) {
+  const cat = String(categoria || '').trim();
+  const f = String(fonte || '').trim();
+  const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
+  const alvos = candidatas
+    .filter(t => !t.categoria || (categoriaConfiavel && t.categoria === cat))
+    .flatMap(t => t.destinos);
+  return [...new Set(alvos)];
+}
+
+/** Diagnostico para o log: quais trilhas entregaram e quais recusaram. */
+export function explicarRoteamento({ fonte, categoria, categoriaConfiavel } = {}) {
+  const cat = String(categoria || '').trim();
+  const f = String(fonte || '').trim();
+  const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
+  if (!candidatas.length) return 'nenhuma trilha tem esta fonte';
+  return candidatas.map(t => {
+    const entrega = !t.categoria || (categoriaConfiavel && t.categoria === cat);
+    return t.nome + (entrega ? ' ✓' : ' ✗');
+  }).join(', ');
 }
 
 // ── MONITORAMENTO POR GRUPO ───────────────────────────────────────────────
