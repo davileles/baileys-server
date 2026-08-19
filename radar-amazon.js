@@ -316,6 +316,17 @@ export function destinosGerais() {
 }
 
 /**
+ * Destinos das trilhas escolhidas a mao no painel (gerador manual). Ids que nao
+ * existem mais sao ignorados: trilha apagada nao pode derrubar o envio.
+ * Lista vazia devolve vazio — quem decide o fallback para as gerais e o chamador.
+ */
+export function destinosDasTrilhas(ids) {
+  const alvo = new Set((Array.isArray(ids) ? ids : []).map(x => String(x || '').trim()).filter(Boolean));
+  if (!alvo.size) return [];
+  return [...new Set(trilhas().filter(t => alvo.has(t.id)).flatMap(t => t.destinos))];
+}
+
+/**
  * Para onde vai esta oferta. Uma trilha entrega quando:
  *   - a fonte da oferta esta nas fontes dela, E
  *   - ela e geral, OU a categoria confirmada da oferta e a categoria dela.
