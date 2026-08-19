@@ -332,12 +332,43 @@ export function destinosDasTrilhas(ids) {
  *   - ela e geral, OU a categoria confirmada da oferta e a categoria dela.
  * Oferta sem fonte conhecida (feed Awin, disparo do painel) cai nas gerais.
  */
+/**
+ * A fonte alimenta EXCLUSIVAMENTE trilhas desta categoria? Um grupo que so
+ * publica bebe ja e, ele proprio, uma declaracao de categoria — exigir que o
+ * classificador redescubra isso pelo titulo joga fora o sinal mais confiavel
+ * que existe. Derivado das trilhas em vez de ser um flag gravado: assim o
+ * painel nao consegue perder a marcacao ao salvar, e mover a fonte para uma
+ * trilha geral desliga o comportamento sozinho.
+ */
+function fonteDedicadaA(fonte, categoria) {
+  if (!fonte || !categoria) return false;
+  const cats = new Set();
+  for (const t of trilhas()) {
+    if (!t.fontes.includes(fonte)) continue;
+    cats.add(t.categoria || '');     // '' = trilha geral
+  }
+  return cats.size === 1 && cats.has(categoria);
+}
+
+/** Esta trilha entrega esta oferta? Regra unica, usada tambem no diagnostico. */
+function trilhaEntrega(t, { fonte, categoria, categoriaConfiavel }) {
+  if (!t.categoria) return true;
+  if (categoriaConfiavel && t.categoria === categoria) return true;
+  // Fonte dedicada cobre o buraco do classificador: entrega quando ele nao tem
+  // opiniao, e SO quando nao tem — categoria confirmada e diferente continua
+  // barrando, senao o grupo de bebe receberia a cerveja postada por engano.
+  if (fonteDedicadaA(fonte, t.categoria)) {
+    return !(categoriaConfiavel && categoria && categoria !== t.categoria);
+  }
+  return false;
+}
+
 export function destinosDaOferta({ fonte, categoria, categoriaConfiavel } = {}) {
   const cat = String(categoria || '').trim();
   const f = String(fonte || '').trim();
   const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
   const alvos = candidatas
-    .filter(t => !t.categoria || (categoriaConfiavel && t.categoria === cat))
+    .filter(t => trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel }))
     .flatMap(t => t.destinos);
   return [...new Set(alvos)];
 }
@@ -349,8 +380,9 @@ export function explicarRoteamento({ fonte, categoria, categoriaConfiavel } = {}
   const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
   if (!candidatas.length) return 'nenhuma trilha tem esta fonte';
   return candidatas.map(t => {
-    const entrega = !t.categoria || (categoriaConfiavel && t.categoria === cat);
-    return t.nome + (entrega ? ' ✓' : ' ✗');
+    const entrega = trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel });
+    const porFonte = entrega && t.categoria && !(categoriaConfiavel && t.categoria === cat);
+    return t.nome + (entrega ? (porFonte ? ' ✓(fonte)' : ' ✓') : ' ✗');
   }).join(', ');
 }
 
