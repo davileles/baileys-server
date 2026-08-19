@@ -59,6 +59,7 @@ import {
   estadoMonitorPrecos, listarMonitorados, historicoDe, varrer as varrerPrecos,
   simular as simularPrecos, descartarCandidato, publicarAgora as publicarPrecoAgora,
   carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
+  semearVitrinePorDesempenho, rankingEpc, estadoEpc,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -9037,6 +9038,26 @@ app.post('/monitor-precos/varrer', async (req, res) => {
 app.post('/monitor-precos/simular', (req, res) => {
   try { res.json({ ok:true, ...simularPrecos(req.body?.regras || null) }); }
   catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+
+// ── DESEMPENHO REAL (ganho por clique) ──
+// O ledger epc-produtos.json e escrito pelo coletor no GitHub Actions; aqui ele
+// so e lido. Sem o arquivo, tudo isto responde vazio e o monitor segue igual.
+app.get('/monitor-precos/epc', (req, res) => {
+  res.json({ ok:true, estado: estadoEpc(),
+             ranking: rankingEpc({ limite: Math.min(Number(req.query.limite) || 100, 400) }) });
+});
+
+// Previa da semeadura: mostra exatamente o que entraria, sem cadastrar nada.
+app.post('/monitor-precos/semear/previa', (req, res) => {
+  try { res.json({ ok:true, ...semearVitrinePorDesempenho({ simular: true }) }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Semeadura sob demanda. Roda tambem sozinha a cada varredura, quando ligada.
+app.post('/monitor-precos/semear', (req, res) => {
+  try { res.json({ ok:true, ...semearVitrinePorDesempenho() }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 app.delete('/monitor-precos/fila/:asin', (req, res) => {
