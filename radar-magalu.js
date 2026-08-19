@@ -351,7 +351,13 @@ export async function montarOfertasMagaluVitrine(itens, codigoCupom = null) {
       precoDeReferencia: true,
     };
 
-    const codigo = codigoCupom || salvo.cupom || null;
+    // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
+    // produto vence o automatico. Cupom fixo do disparo vence tudo; 'nenhum' sai
+    // sem cupom mesmo quando o item tem vinculo.
+    const semCupom = codigoCupom === 'nenhum';
+    const codigo = semCupom ? null
+                 : (codigoCupom && codigoCupom !== 'auto') ? codigoCupom
+                 : (salvo.cupom || codigoCupom);
     let cupom = null, avisoCupom = null;
     if (codigo === 'auto') {
       const mc = melhorCupomAplicavel('Magazine Luiza', preco);
