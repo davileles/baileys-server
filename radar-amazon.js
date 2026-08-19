@@ -1835,6 +1835,10 @@ export function salvarItemVitrine(item) {
       ? (item.precoEm || new Date().toISOString())
       : (anterior?.precoEm || null),
     cupom: item.cupom !== undefined ? (item.cupom || null) : (anterior?.cupom || null),
+    // Quem colocou este item aqui. Vazio = cadastro manual (o caso historico).
+    // 'epc' = cadastrado sozinho pelo monitor a partir do desempenho real, e e
+    // o que permite o teto do automatico nao consumir a curadoria manual.
+    origemSemeadura: item.origemSemeadura || anterior?.origemSemeadura || null,
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
     ultimoDisparo: anterior?.ultimoDisparo || null,
