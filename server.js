@@ -20,7 +20,7 @@ import QRCode from 'qrcode';
 import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
-  trilhas, salvarTrilhas, destinosGerais, destinosDaOferta, explicarRoteamento,
+  trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento,
   comRodapeExtra, rodapeExtraParaGrupo,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
@@ -1272,10 +1272,12 @@ async function despacharAgendamentoMulti(ag) {
     };
   }
   return enviarManualParaGrupos({
-    mensagem: ag.mensagem,
-    tipo:     ag.tipo || null,
+    mensagem:   ag.mensagem,
+    tipo:       ag.tipo || null,
     imagem,
-    preview:  ag.preview || null,
+    preview:    ag.preview || null,
+    categoria:  ag.categoria || null,
+    trilhasIds: ag.trilhas || null,
   });
 }
 
@@ -2525,17 +2527,33 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
 // Existe separado de enviarCupomParaGrupos/enviarOfertaParaDestinos porque a
 // mensagem manual pode trazer imagem E card de link, combinacao que nao aparece
 // no fluxo da fila.
-async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categoria }) {
+// Multipart nao tem array: o painel manda as trilhas como JSON ou separadas por
+// virgula. Entrada torta vira lista vazia (= grupos gerais), nunca excecao.
+function parseTrilhasForm(v) {
+  if (Array.isArray(v)) return v;
+  const s = String(v || '').trim();
+  if (!s) return [];
+  if (s[0] === '[') { try { const a = JSON.parse(s); return Array.isArray(a) ? a : []; } catch { return []; } }
+  return s.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categoria, trilhasIds }) {
   const ehCupom  = String(tipo || '').toLowerCase() === 'cupom';
-  // Mensagem escrita a mao vai para os GERAIS. Nicho e alimentado pelo radar,
-  // que sabe a categoria do produto; aqui nao ha classificacao nenhuma e todo
-  // texto livre cairia em todos os grupos de nicho ao mesmo tempo.
-  const destinos = destinosGerais();
+  // Sem escolha explicita, mensagem escrita a mao vai para os GERAIS — nicho e
+  // territorio do radar, que sabe a categoria do produto, e texto livre sem
+  // classificacao cairia em todos os grupos de nicho ao mesmo tempo.
+  // Com trilhas marcadas no painel, quem manda e o operador: ele viu o produto.
+  const escolhidos = destinosDasTrilhas(trilhasIds);
+  const destinos = escolhidos.length ? escolhidos : destinosGerais();
   const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
   const alvos = ehCupom
     ? [...new Set([...destinos, ...soCupons])]
     : destinos.filter(j => !soCupons.has(j));
-  if (!alvos.length) throw new Error('Nenhum grupo marcado como destino na aba Grupos.');
+  if (!alvos.length) {
+    throw new Error(escolhidos.length
+      ? 'As trilhas escolhidas nao tem grupo de destino cadastrado.'
+      : 'Nenhum grupo marcado como destino na aba Grupos.');
+  }
 
   // Mesma conta em todos os grupos: alternar no meio deixaria a mesma mensagem
   // com dois remetentes no mesmo minuto.
@@ -7001,7 +7019,9 @@ app.post('/enviar', async (req, res) => {
   // do radar. So vale no envio imediato: agendamento guarda apenas o texto.
   // tipo: 'cupom' | 'oferta' — so importa quando o grupo e um apelido multi.
   // Decide se os grupos so-cupons entram na lista de alvos.
-  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo } = req.body;
+  // categoria + trilhas: escolha de nicho feita no gerador manual. 'trilhas' e a
+  // lista de ids da aba Grupos; 'categoria' vale para as regras de rodape.
+  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, trilhas: trilhasEnvio } = req.body;
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
@@ -7036,6 +7056,8 @@ app.post('/enviar', async (req, res) => {
     const id = gerarId();
     agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto,
                         tipo: tipo || null,
+                        categoria: categoria || null,
+                        trilhas: Array.isArray(trilhasEnvio) ? trilhasEnvio : null,
                         preview: preview?.link ? preview : null,
                         anexo: anexoGuardado,
                         criadoEm: new Date().toISOString() });
@@ -7046,7 +7068,7 @@ app.post('/enviar', async (req, res) => {
 
   if (multi) {
     try {
-      const r = await enviarManualParaGrupos({ mensagem, tipo, preview });
+      const r = await enviarManualParaGrupos({ mensagem, tipo, preview, categoria, trilhasIds: trilhasEnvio });
       return res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
     } catch(err) { return res.status(500).json({ ok:false, erro:err.message }); }
   }
@@ -7124,9 +7146,11 @@ async function enviarAnexoHandler(req, res, padraoImagem) {
         throw new Error('Envio para varios grupos aceita apenas imagem.');
       }
       const r = await enviarManualParaGrupos({
-        mensagem: legenda || '',
-        tipo:     tipoEnvio,
-        imagem:   { imagemBase64: buf.toString('base64'), mime: mtMulti || 'image/jpeg' },
+        mensagem:   legenda || '',
+        tipo:       tipoEnvio,
+        imagem:     { imagemBase64: buf.toString('base64'), mime: mtMulti || 'image/jpeg' },
+        categoria:  req.body?.categoria || null,
+        trilhasIds: parseTrilhasForm(req.body?.trilhas),
       });
       return res.json({ ok:true, tipo:'imagem', enviados:r.enviados.length, falhas:r.falhas });
     } catch(err) {
