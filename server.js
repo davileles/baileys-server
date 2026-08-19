@@ -7521,11 +7521,19 @@ app.post('/tsp/categorias', (req, res) => {
       .map(x => String(x || '').trim()).filter(Boolean))];
     const nome = String(def.nome || '').trim();
     if (!nome) return res.status(400).json({ ok:false, erro:'A categoria "' + id + '" precisa de um nome.' });
+    // Prioridade resolve sobreposicao legitima entre prateleiras (sandalia
+    // infantil e moda E infantil); marcas sao sinal mais forte que keyword.
+    // Ausentes no corpo, os dois preservam o valor atual em vez de zerar: o
+    // painel antigo nao manda estes campos e nao pode apagar a taxonomia.
+    const atual = categoriasConfig().categorias?.[id] || {};
     limpo[id] = {
       nome,
       emoji:             String(def.emoji || '').trim(),
+      prioridade:        Number.isFinite(Number(def.prioridade)) ? Number(def.prioridade)
+                                                                 : (Number(atual.prioridade) || 0),
       segmentosAmazon:   lista(def.segmentosAmazon),
       segmentosBloqueio: lista(def.segmentosBloqueio),
+      marcas:            def.marcas !== undefined ? lista(def.marcas) : lista(atual.marcas),
       keywords:          lista(def.keywords),
       bloqueio:          lista(def.bloqueio),
     };
