@@ -55,6 +55,12 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // editada a mao no repo (nao exige deploy); o cache e escrito pelo servidor.
   'categorias.json',
   'categorias_cache.json',
+  // Monitor de queda de preco: configuracao, serie diaria de precos e estado
+  // (fila de candidatos + cotas do dia). A serie e o ativo mais caro de
+  // reconstruir — sem ela o gatilho volta a zero e leva dias para amadurecer.
+  'monitor_precos_config.json',
+  'precos_hist.json',
+  'monitor_precos_estado.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
