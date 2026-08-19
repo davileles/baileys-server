@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush } from './sync-github.js';
-import { listarVitrine, itemVitrine, melhorCupomAplicavel, marcarDisparo,
+import { listarVitrine, itemVitrine, salvarItemVitrine, melhorCupomAplicavel, marcarDisparo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
@@ -40,6 +40,8 @@ const SESSAO_DIR = './sessao';
 const ARQ_CFG    = 'monitor_precos_config.json';
 const ARQ_HIST   = 'precos_hist.json';
 const ARQ_ESTADO = 'monitor_precos_estado.json';
+// Escrito pelo coletor (GitHub Actions), somente LIDO aqui.
+const ARQ_EPC    = 'epc-produtos.json';
 
 const TZ_SP = 'America/Sao_Paulo';
 
@@ -109,6 +111,33 @@ const CFG_PADRAO = {
     aplicarCupom: true,    // pede o melhor cupom aplicavel no disparo
   },
 
+  // ── DESEMPENHO REAL (ganho por clique) ──
+  // O ledger epc-produtos.json diz quanto cada ASIN pagou por clique gasto nos
+  // ultimos 90 dias. Duas funcoes aqui:
+  //   semear  cadastra na vitrine, sozinho, o que ja provou que converte
+  //   score   sobe na fila quem paga bem e VETA quem so consome clique
+  // Sem o arquivo (coletor nunca rodou) tudo isto fica inerte e o monitor se
+  // comporta exatamente como antes.
+  desempenho: {
+    semear: {
+      ativo: false,          // liga o cadastro automatico na vitrine
+      epcMin: 0.80,          // R$ por clique para o produto merecer ser vigiado
+      cliquesMin: 10,        // amostra minima — EPC de 3 cliques nao e sinal
+      maximo: 150,           // teto de produtos semeados no total
+      porRodada: 25,         // teto por rodada, para nao inundar a vitrine de uma vez
+    },
+    score: {
+      // Bonus no score = epc * pesoEpc. Com peso 8, um produto de R$ 0,90/clique
+      // ganha ~7 pontos, na mesma ordem de grandeza do bonus de recorde (10).
+      pesoEpc: 8,
+      // Veto: produto com amostra suficiente e EPC pifio nao dispara, por mais
+      // fundo que esteja o desconto. E o caso do iPad e da calca jeans: muito
+      // clique, quase nenhum ganho.
+      epcVeto: 0.30,
+      cliquesParaVeto: 60,
+    },
+  },
+
   // Regra padrao + sobrescrita por nicho. Nicho sem entrada em porNicho herda
   // integralmente o padrao.
   regras: {
@@ -130,6 +159,7 @@ const CFG_PADRAO = {
 // ── ESTADO EM MEMORIA ────────────────────────────────────────────────────────
 let _cfg    = clonar(CFG_PADRAO);
 let _hist   = {};    // asin -> { n, loja, dias: { 'YYYY-MM-DD': min }, ult: {preco, precoDe, em, disponivel} }
+let _epc    = { produtos: {} };   // ledger somente-leitura escrito pelo coletor
 let _estado = {      // fila de candidatos + contadores do dia
   fila: [],          // [{ asin, nome, loja, nicho, preco, mediana30, min90, quedaPct, quedaRs, score, recorde, em }]
   cotas: { dia: null, porLoja: {}, porNicho: {} },
@@ -184,6 +214,7 @@ function gravar(nome, dados, push = true) {
 export function carregarMonitorPrecos() {
   _cfg    = estruturarCfg(ler(ARQ_CFG, {}));
   _hist   = ler(ARQ_HIST, {});
+  _epc    = ler(ARQ_EPC, { produtos: {} });
   _estado = { ..._estado, ...ler(ARQ_ESTADO, {}) };
   if (!Array.isArray(_estado.fila)) _estado.fila = [];
   if (!Array.isArray(_estado.historicoDisparos)) _estado.historicoDisparos = [];
@@ -221,6 +252,17 @@ function estruturarCfg(bruto) {
   out.publicacao.aplicarCupom = p.aplicarCupom !== false;
   out.publicacao.cotaPorLoja  = mapaNumerico(p.cotaPorLoja,  CFG_PADRAO.publicacao.cotaPorLoja,  0, 500);
   out.publicacao.cotaPorNicho = mapaNumerico(p.cotaPorNicho, CFG_PADRAO.publicacao.cotaPorNicho, 0, 500);
+
+  const dz = b.desempenho || {};
+  const sem = dz.semear || {}, sc = dz.score || {};
+  out.desempenho.semear.ativo      = sem.ativo === true;
+  out.desempenho.semear.epcMin     = limitar(sem.epcMin, 0, 1000, CFG_PADRAO.desempenho.semear.epcMin);
+  out.desempenho.semear.cliquesMin = limitar(sem.cliquesMin, 1, 100000, CFG_PADRAO.desempenho.semear.cliquesMin);
+  out.desempenho.semear.maximo     = limitar(sem.maximo, 0, 5000, CFG_PADRAO.desempenho.semear.maximo);
+  out.desempenho.semear.porRodada  = limitar(sem.porRodada, 1, 500, CFG_PADRAO.desempenho.semear.porRodada);
+  out.desempenho.score.pesoEpc         = limitar(sc.pesoEpc, 0, 100, CFG_PADRAO.desempenho.score.pesoEpc);
+  out.desempenho.score.epcVeto         = limitar(sc.epcVeto, 0, 1000, CFG_PADRAO.desempenho.score.epcVeto);
+  out.desempenho.score.cliquesParaVeto = limitar(sc.cliquesParaVeto, 0, 100000, CFG_PADRAO.desempenho.score.cliquesParaVeto);
 
   const r = b.regras || {};
   out.regras.padrao = estruturarRegra(r.padrao, CFG_PADRAO.regras.padrao);
@@ -416,6 +458,30 @@ async function lerPrecosAmazon(itens) {
   return out;
 }
 
+// ── DESEMPENHO REAL ──────────────────────────────────────────────────────────
+// O ledger e por ASIN da Amazon: e a unica das tres lojas que entrega ganho por
+// clique por produto. Shopee e ML devolvem null e seguem sem bonus nem veto —
+// ausencia de dado nunca vira penalidade.
+export function epcDe(asin) {
+  const p = _epc?.produtos?.[asin];
+  if (!p || !p.cliques) return null;
+  return { epc: p.epc ?? 0, cliques: p.cliques, pedidos: p.pedidos ?? 0,
+           comissao: p.comissao ?? 0, conversao: p.conversao ?? null,
+           ticket: p.ticket ?? 0, nome: p.nome || '', categoria: p.categoria || '' };
+}
+
+/** Estado do ledger para o painel (e para saber se o coletor ja rodou). */
+export function estadoEpc() {
+  const prods = Object.values(_epc?.produtos || {}).filter(p => p.cliques > 0);
+  return {
+    disponivel: prods.length > 0,
+    atualizadoEm: _epc?.atualizadoEm || null,
+    janelaDias: _epc?.janelaDias || null,
+    produtos: prods.length,
+    totais: _epc?.totais || null,
+  };
+}
+
 // ── AVALIACAO ────────────────────────────────────────────────────────────────
 /**
  * Decide se o preco lido merece virar oferta. Devolve sempre um objeto com
@@ -461,9 +527,21 @@ export function avaliar(item, leitura, stats, nicho) {
   if (diasDesde < r.reenvioMinDias)
     return { ...detalhe, passou: false, motivo: 'enviado ha ' + Math.floor(diasDesde) + 'd (minimo ' + r.reenvioMinDias + 'd)' };
 
-  // Score: a queda e o corpo da nota; recorde e cupom aplicavel sao bonus. Nao
-  // ha ajuste fino aqui de proposito — o que ordena a fila e a profundidade real
-  // do desconto, e o resto so desempata.
+  // Veto por desempenho: produto com amostra suficiente que so consome clique
+  // nao sai, por mais fundo que esteja o desconto. Sem dado no ledger nao ha
+  // veto — ausencia de informacao nao pode virar condenacao.
+  const d = epcDe(item.asin);
+  const sc = _cfg.desempenho.score;
+  if (d && d.cliques >= sc.cliquesParaVeto && d.epc < sc.epcVeto) {
+    return { ...detalhe, passou: false, epc: d.epc, cliquesEpc: d.cliques,
+             motivo: 'EPC de R$ ' + d.epc.toFixed(2) + ' em ' + d.cliques + ' cliques (minimo R$ '
+               + sc.epcVeto.toFixed(2) + ')' };
+  }
+
+  // Score: a queda e o corpo da nota; recorde, cupom e desempenho sao bonus. O
+  // que ordena a fila continua sendo a profundidade real do desconto — o EPC
+  // desempata entre dois descontos parecidos, e e assim que produto que paga
+  // bem passa na frente de produto que so tem numero bonito.
   let score = quedaPct;
   if (recorde) score += 10;
   let cupom = null;
@@ -471,9 +549,84 @@ export function avaliar(item, leitura, stats, nicho) {
     try { cupom = melhorCupomAplicavel(item.loja, preco) || null; } catch (e) { cupom = null; }
     if (cupom) score += 5;
   }
+  if (d) score += d.epc * sc.pesoEpc;
 
   return { ...detalhe, passou: true, motivo: 'ok', score: Math.round(score * 10) / 10,
-           cupom: cupom?.codigo || null };
+           cupom: cupom?.codigo || null,
+           epc: d?.epc ?? null, cliquesEpc: d?.cliques ?? null };
+}
+
+// ── SEMEADURA DA VITRINE PELO DESEMPENHO ─────────────────────────────────────
+/**
+ * Cadastra na vitrine, sozinho, o ASIN que ja provou que converte.
+ *
+ * A curadoria manual tem um teto obvio: ninguem cola 150 links por semana. E o
+ * ledger sabe de coisa que a curadoria nao sabe — conversao acima de 100%
+ * significa que a pessoa entrou por um link nosso e comprou AQUILO sem que
+ * aquilo tivesse sido divulgado. Esse produto nunca apareceria numa lista feita
+ * a mao, porque ninguem sabia que ele existia na cabeca do publico.
+ *
+ * Só cadastra: o produto entra na vitrine e passa a ser vigiado como qualquer
+ * outro, sujeito a mesma regra de disparo. Semear nao e publicar.
+ */
+export function semearVitrinePorDesempenho({ simular: apenasSimular = false } = {}) {
+  const cfg = _cfg.desempenho.semear;
+  const prods = Object.values(_epc?.produtos || {});
+  const saida = { candidatos: 0, cadastrados: [], ignorados: {}, jaNaVitrine: 0, tetoAtingido: false };
+
+  if (!prods.length) { saida.erro = 'ledger de EPC vazio — o coletor ainda nao rodou'; return saida; }
+
+  const naVitrine = new Set(listarVitrine().map(i => String(i.asin)));
+  // Teto conta so o que ESTE mecanismo cadastrou: produto colado a mao nao
+  // pode consumir a cota do automatico, nem o contrario.
+  const jaSemeados = listarVitrine().filter(i => i.origemSemeadura === 'epc').length;
+  let vagas = Math.max(0, cfg.maximo - jaSemeados);
+
+  const elegiveis = prods
+    .filter(p => {
+      if (!/^B[A-Z0-9]{9}$/.test(String(p.asin || ''))) return false;
+      if (naVitrine.has(p.asin)) { saida.jaNaVitrine++; return false; }
+      saida.candidatos++;
+      if (p.cliques < cfg.cliquesMin) {
+        saida.ignorados['amostra pequena (< ' + cfg.cliquesMin + ' cliques)'] =
+          (saida.ignorados['amostra pequena (< ' + cfg.cliquesMin + ' cliques)'] || 0) + 1;
+        return false;
+      }
+      if ((p.epc || 0) < cfg.epcMin) {
+        saida.ignorados['EPC abaixo de R$ ' + cfg.epcMin.toFixed(2)] =
+          (saida.ignorados['EPC abaixo de R$ ' + cfg.epcMin.toFixed(2)] || 0) + 1;
+        return false;
+      }
+      if (!p.nome) {
+        saida.ignorados['sem titulo no ledger'] = (saida.ignorados['sem titulo no ledger'] || 0) + 1;
+        return false;
+      }
+      return true;
+    })
+    // Ordem por comissao total, nao por EPC: entre dois produtos que passam no
+    // corte, entra primeiro o que move mais dinheiro de verdade.
+    .sort((a, b) => (b.comissao || 0) - (a.comissao || 0));
+
+  for (const p of elegiveis) {
+    if (vagas <= 0) { saida.tetoAtingido = true; break; }
+    if (saida.cadastrados.length >= cfg.porRodada) break;
+    if (!apenasSimular) {
+      salvarItemVitrine({
+        asin: p.asin, loja: 'Amazon', nome: p.nome,
+        url: 'https://www.amazon.com.br/dp/' + p.asin,
+        origemSemeadura: 'epc',
+      });
+    }
+    saida.cadastrados.push({ asin: p.asin, nome: p.nome, epc: p.epc, cliques: p.cliques,
+                             comissao: p.comissao, conversao: p.conversao });
+    vagas--;
+  }
+
+  if (!apenasSimular && saida.cadastrados.length) {
+    console.log('[PRECOS] Semeadura por desempenho — ' + saida.cadastrados.length
+      + ' produto(s) cadastrado(s) na vitrine (EPC >= R$ ' + cfg.epcMin + ').');
+  }
+  return saida;
 }
 
 // ── VARREDURA ────────────────────────────────────────────────────────────────
@@ -547,6 +700,15 @@ export async function varrer({ manual = false } = {}) {
       if ((i + 1) % _cfg.varredura.lote === 0) {
         await new Promise(r => setTimeout(r, _cfg.varredura.pausaMs));
       }
+    }
+
+    // Semeadura antes de fechar a rodada: produto novo entra na vitrine agora e
+    // ja comeca a acumular serie na varredura seguinte.
+    if (_cfg.desempenho.semear.ativo) {
+      try {
+        const s = semearVitrinePorDesempenho();
+        resumo.semeados = s.cadastrados.length;
+      } catch (e) { console.warn('[PRECOS] Semeadura falhou:', e.message); }
     }
 
     podarFila();
@@ -818,6 +980,8 @@ export function estadoMonitorPrecos() {
     dentroDaJanela: dentroDaJanela(),
     historicoDisparos: _estado.historicoDisparos.slice(0, 50),
     lojasDisponiveis: LOJAS_MONITORAVEIS_PRECO,
+    epc: estadoEpc(),
+    semeados: listarVitrine().filter(i => i.origemSemeadura === 'epc').length,
   };
 }
 
@@ -843,6 +1007,30 @@ export function listarMonitorados() {
       };
     })
     .sort((a, b) => (b.quedaPct ?? -999) - (a.quedaPct ?? -999));
+}
+
+/**
+ * Ranking do ledger para o painel: o que paga por clique e o que so consome.
+ * `naVitrine` diz se o produto ja esta sendo vigiado — e a lista de compras da
+ * curadoria manual para o que ainda nao esta.
+ */
+export function rankingEpc({ limite = 100 } = {}) {
+  const naVitrine = new Set(listarVitrine().map(i => String(i.asin)));
+  const sc = _cfg.desempenho.score;
+  return Object.values(_epc?.produtos || {})
+    .filter(p => p.cliques > 0)
+    .sort((a, b) => (b.comissao || 0) - (a.comissao || 0))
+    .slice(0, limite)
+    .map(p => ({
+      asin: p.asin, nome: p.nome, categoria: p.categoria || '',
+      cliques: p.cliques, pedidos: p.pedidos, comissao: p.comissao,
+      epc: p.epc, conversao: p.conversao, ticket: p.ticket,
+      naVitrine: naVitrine.has(p.asin),
+      vetado: p.cliques >= sc.cliquesParaVeto && p.epc < sc.epcVeto,
+      // Conversao acima de 100% e venda indireta: comprado sem ter sido
+      // divulgado. E o sinal mais forte de demanda que este relatorio da.
+      indireta: (p.conversao ?? 0) > 100,
+    }));
 }
 
 /** Descarta um candidato manualmente (o operador viu e nao quer). */
