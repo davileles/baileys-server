@@ -1316,7 +1316,13 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     if (!p.disponivel) { descartados.push({ asin: salvo.asin, nome, motivo: 'produto pausado ou sem estoque' }); continue; }
 
     // Cupom do disparo vence o vinculado; sem nenhum dos dois, entra o do anuncio.
-    const codigo = codigoCupom || salvo.cupom || null;
+    // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
+    // produto vence o automatico. Cupom fixo do disparo vence tudo; 'nenhum' sai
+    // sem cupom mesmo quando o item tem vinculo.
+    const semCupom = codigoCupom === 'nenhum';
+    const codigo = semCupom ? null
+                 : (codigoCupom && codigoCupom !== 'auto') ? codigoCupom
+                 : (salvo.cupom || codigoCupom);
     let cupom = null, avisoCupom = null;
 
     // O cupom que o proprio anuncio declara. Vale para 'auto' e para o disparo
@@ -1324,7 +1330,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     // o anuncio e a fonte mais confiavel: o ML ja conferiu categoria, vendedor e
     // teto para ESTE item. Um codigo escolhido a mao pelo operador nao e
     // sobrescrito: ali a decisao e dele.
-    const daPagina = (!codigo || codigo === 'auto')
+    const daPagina = (!semCupom && (!codigo || codigo === 'auto'))
       ? resolverCupomPaginaMl(dados.cuponsPagina, p.preco)
       : { cupom: null, aviso: null };
 
