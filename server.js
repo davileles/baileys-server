@@ -8723,11 +8723,30 @@ app.get('/rastreio/pool-ml', (_req, res) => {
   res.json({ ok:true, ...listarPoolMl() });
 });
 
+// Recebe { porCategoria: { bebidas:'bebidas', '':'geral', ... } }. A chave vazia
+// e o balde de quem nao tem categoria confiavel — sem ela, produto nao
+// classificado sai com a tag da conta e some da medicao por nicho.
 app.post('/rastreio/pool-ml', (req, res) => {
-  const tags = Array.isArray(req.body?.tags) ? req.body.tags : null;
-  if (!tags) return res.status(400).json({ ok:false, erro:'informe { tags: [...] }' });
-  const r = salvarPoolMl(tags);
-  res.json({ ok:true, total:r.pool.length, pool:r.pool, recusados:r.recusados, mapa:r.mapa });
+  const entrada = req.body?.porCategoria ?? req.body?.tags;
+  if (!entrada) return res.status(400).json({ ok:false, erro:'informe { porCategoria: {...} }' });
+  const r = salvarPoolMl(entrada);
+  res.json({ ok:true, porCategoria:r.porCategoria, recusados:r.recusados,
+             categorias: Object.keys(r.porCategoria).length });
+});
+
+// Etiquetas sugeridas: cruza a taxonomia carregada com o mapa ja gravado, para
+// o painel montar a tela sem inventar categoria que o classificador nao conhece.
+app.get('/rastreio/pool-ml/sugestao', (_req, res) => {
+  const cfg = categoriasConfig();
+  const atual = listarPoolMl().porCategoria || {};
+  const linhas = Object.entries(cfg.categorias || {}).map(([id, c]) => ({
+    categoria: id, nome: c.nome || id, emoji: c.emoji || '', etiqueta: atual[id] || '',
+  }));
+  linhas.sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+  // O balde geral fica por ultimo: e o destino de quem nao casou em nenhuma.
+  linhas.push({ categoria: '', nome: 'Sem categoria confiável (geral)', emoji: '📦',
+                etiqueta: atual[''] || '' });
+  res.json({ ok:true, linhas });
 });
 
 // Ledger ref -> produto. O coletor de comissoes le este mesmo conteudo pelo
