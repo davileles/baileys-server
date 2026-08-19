@@ -49,10 +49,30 @@ function norm(s) {
     .trim();
 }
 
+// Plural do portugues, versao pobre de proposito: so o suficiente para que
+// "Fraldas" case com a keyword "fralda". Aplicada nos DOIS lados da comparacao,
+// entao um erro de reducao (tenis -> tenil) e inofensivo: os dois lados erram
+// igual e o casamento continua valendo.
+function desplural(p) {
+  if (p.length <= 3) return p;
+  if (p.endsWith('oes') || p.endsWith('aes')) return p.slice(0, -3) + 'ao';
+  if (p.endsWith('ns')) return p.slice(0, -2) + 'm';
+  if (p.endsWith('is') && p.length > 4) return p.slice(0, -2) + 'l';
+  if (p.endsWith('es') && p.length > 4) return p.slice(0, -2);
+  if (p.endsWith('s')) return p.slice(0, -1);
+  return p;
+}
+
+// Normalizacao + reducao de plural palavra a palavra.
+function normSing(s) {
+  return norm(s).split(' ').filter(Boolean).map(desplural).join(' ');
+}
+
 // Casamento por palavra inteira: sem isto "gin" acha "original" e "engine",
-// e o grupo de bebidas recebe cabo HDMI.
+// e o grupo de bebidas recebe cabo HDMI. O texto ja chega despluralizado por
+// normSing; o termo passa pela mesma reducao aqui.
 function contemTermo(textoNorm, termo) {
-  const t = norm(termo);
+  const t = normSing(termo);
   if (!t) return false;
   return (' ' + textoNorm + ' ').includes(' ' + t + ' ');
 }
@@ -135,13 +155,13 @@ export function semearCacheTrilhas(mapa = {}) {
 // para Bebidas" contem a palavra "Bebidas" e e uma caneca.
 function porTrilha(caminho) {
   if (!caminho) return null;
-  const segmentos = String(caminho).split('>').map(s => norm(s)).filter(Boolean);
+  const segmentos = String(caminho).split('>').map(s => normSing(s)).filter(Boolean);
   if (!segmentos.length) return null;
 
   for (const [id, def] of Object.entries(_taxo.categorias || {})) {
-    const bloqueios = (def.segmentosBloqueio || []).map(norm);
+    const bloqueios = (def.segmentosBloqueio || []).map(normSing);
     if (segmentos.some(s => bloqueios.includes(s))) continue;
-    const alvos = (def.segmentosAmazon || []).map(norm);
+    const alvos = (def.segmentosAmazon || []).map(normSing);
     if (!alvos.length) continue;
     const bateu = segmentos.find(s => alvos.includes(s));
     if (bateu) return { categoria: id, confianca: 0.95, sinal: 'trilha:' + bateu };
@@ -154,22 +174,37 @@ function porTrilha(caminho) {
 // Quando isso acontece a categoria fica indefinida de proposito — ir para a
 // fila de aprovacao e o comportamento certo, chutar nao e.
 function porTitulo(titulo) {
-  const t = norm(titulo);
+  const t = normSing(titulo);
   if (!t) return null;
 
   let melhor = null;
   for (const [id, def] of Object.entries(_taxo.categorias || {})) {
+    // Marca e um sinal mais forte que palavra solta: "Mustela" so aparece em
+    // produto infantil, enquanto "hidratante" aparece em qualquer prateleira.
+    const marcas    = (def.marcas || []).filter(k => contemTermo(t, k));
     const positivas = (def.keywords || []).filter(k => contemTermo(t, k));
-    if (!positivas.length) continue;
+    if (!positivas.length && !marcas.length) continue;
     const bloqueada = (def.bloqueio || []).find(b => contemTermo(t, b));
     if (bloqueada) {
-      if (!melhor) melhor = { categoria: null, confianca: 0.3, sinal: 'bloqueio:' + norm(bloqueada) + ' vs ' + norm(positivas[0]) };
+      if (!melhor) melhor = { categoria: null, confianca: 0.3, _p: -1, _n: -1,
+        sinal: 'bloqueio:' + normSing(bloqueada) + ' vs ' + normSing(marcas[0] || positivas[0]) };
       continue;
     }
-    const cand = { categoria: id, confianca: 0.85, sinal: 'titulo:' + norm(positivas[0]), _n: positivas.length };
-    if (!melhor || melhor.categoria === null || cand._n > (melhor._n || 0)) melhor = cand;
+    const cand = {
+      categoria: id,
+      confianca: marcas.length ? 0.9 : 0.85,
+      sinal: (marcas.length ? 'marca:' : 'titulo:') + normSing(marcas[0] || positivas[0]),
+      // Prioridade resolve a sobreposicao legitima entre prateleiras: uma
+      // sandalia infantil e as duas coisas, e quem decide qual grupo recebe e a
+      // taxonomia, nao a contagem de palavras. Marca conta em dobro no empate.
+      _p: Number(def.prioridade) || 0,
+      _n: positivas.length + marcas.length * 2,
+    };
+    if (!melhor || melhor.categoria === null
+        || cand._p > melhor._p
+        || (cand._p === melhor._p && cand._n > melhor._n)) melhor = cand;
   }
-  if (melhor) delete melhor._n;
+  if (melhor) { delete melhor._n; delete melhor._p; }
   return melhor;
 }
 
