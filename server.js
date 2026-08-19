@@ -51,6 +51,16 @@ import {
   explicarClassificacao, semearCacheTrilhas,
 } from './categorizador.js';
 
+// ── MONITOR DE QUEDA DE PRECO (Shopee / Mercado Livre) ────────────────────────
+// Vigia a vitrine, guarda a serie diaria de precos e dispara sozinho quando o
+// preco cai contra o proprio historico — nao contra o "de" que a loja anuncia.
+import {
+  iniciarMonitorPrecos, configMonitorPrecos, salvarConfigMonitorPrecos,
+  estadoMonitorPrecos, listarMonitorados, historicoDe, varrer as varrerPrecos,
+  simular as simularPrecos, descartarCandidato, publicarAgora as publicarPrecoAgora,
+  carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
+} from './monitor-precos.js';
+
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
@@ -293,7 +303,7 @@ const baileysLogger = pino({ level: 'silent' });
     if (r.baixados) {
       carregarTenants(); carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-      carregarCategorias();
+      carregarCategorias(); carregarMonitorPrecos();
       carregarCensoHist(); carregarMembrosLog();
       recarregarRadarTenants();
       semearMonitorDasFontes();
@@ -7488,7 +7498,7 @@ app.post('/sync/pull', async (req, res) => {
     const r = await baixarDoGitHub();
     carregarTenants(); carregarConfigTsp();
     carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-    carregarCategorias();
+    carregarCategorias(); carregarMonitorPrecos();
     recarregarRadarTenants();
     res.json({ ok:true, ...r });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
@@ -8983,6 +8993,63 @@ app.post('/vitrine/:asin', (req, res) => {
 app.delete('/vitrine/:asin', (req, res) => {
   if (!removerItemVitrine(req.params.asin)) return res.status(404).json({ ok:false, erro:'não encontrado' });
   res.json({ ok:true });
+});
+
+// ── MONITOR DE QUEDA DE PRECO ────────────────────────────────────────────────
+// Toda configuracao e feita por estes endpoints — nao ha decisao de operacao
+// escondida em constante de codigo nem em variavel de ambiente.
+
+// Painel completo: config, fila de candidatos, cotas do dia, ultima varredura.
+app.get('/monitor-precos', (req, res) => {
+  res.json({ ok:true, ...estadoMonitorPrecos() });
+});
+
+app.get('/monitor-precos/config', (req, res) => {
+  res.json({ ok:true, config: configMonitorPrecos(), lojas: LOJAS_MONITORAVEIS_PRECO });
+});
+
+app.post('/monitor-precos/config', (req, res) => {
+  try { res.json({ ok:true, config: salvarConfigMonitorPrecos(req.body || {}) }); }
+  catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+
+// Tabela de monitorados com a estatistica de cada um (serie, min90, mediana30).
+app.get('/monitor-precos/produtos', (req, res) => {
+  res.json({ ok:true, produtos: listarMonitorados() });
+});
+
+// Serie completa de um produto — alimenta o grafico de historico no painel.
+app.get('/monitor-precos/produto/:asin', (req, res) => {
+  const h = historicoDe(req.params.asin);
+  if (!h) return res.status(404).json({ ok:false, erro:'sem serie para este produto' });
+  res.json({ ok:true, ...h });
+});
+
+// Varredura sob demanda. Sincrona de proposito: o operador clicou para VER o
+// resultado, e a resposta traz o resumo por motivo de reprovacao.
+app.post('/monitor-precos/varrer', async (req, res) => {
+  try { res.json(await varrerPrecos({ manual: true })); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Simulacao sobre a serie ja gravada: mexe nas regras e ve quantos passariam,
+// sem tocar em rede e sem enviar nada. E como se calibra o limiar sem cobaia.
+app.post('/monitor-precos/simular', (req, res) => {
+  try { res.json({ ok:true, ...simularPrecos(req.body?.regras || null) }); }
+  catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+
+app.delete('/monitor-precos/fila/:asin', (req, res) => {
+  res.json({ ok: descartarCandidato(req.params.asin) });
+});
+
+// Publica um candidato agora, ignorando janela e espacamento (a cota continua
+// valendo — furar cota em tela seria furar a propria cadencia).
+app.post('/monitor-precos/fila/:asin/publicar', async (req, res) => {
+  try {
+    const r = await publicarPrecoAgora(req.params.asin);
+    res.json({ ok: !!r.ok, ...r });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // ── TEMPLATES DE MENSAGEM POR LOJA ───────────────────────────────────────────
@@ -10703,6 +10770,19 @@ bootBotTsp({
   radarDestinos,
   salvarFila,
 }).catch(e => console.warn('[BOT-TSP] Falha no boot:', e.message));
+
+// Monitor de queda de preco. As funcoes de montagem e envio sao injetadas em
+// vez de importadas: o modulo precisa do caminho REAL de envio (template, cupom,
+// rodape por nicho, roteamento por trilha) sem criar ciclo de import com este
+// arquivo. whatsappPronto evita consumir a fila com o socket caido.
+iniciarMonitorPrecos({
+  enviarOferta:   enviarOfertaParaDestinos,
+  montarShopee:   montarOfertasShopeeVitrine,
+  montarMl:       montarOfertasMlVitrine,
+  baixarImagem:   baixarImagemProduto,
+  gerarId,
+  whatsappPronto: () => !!(conectado && sock),
+});
 
 // Conecta ao WhatsApp imediatamente no startup.
 // Garante que mensagens dos grupos monitorados não sejam perdidas após deploy.
