@@ -2038,60 +2038,91 @@ function hojeSP() {
 // da conta e o ledger guarda o ref deterministico. Nada muda ate alguem POSTar
 // tags reais em /rastreio/pool-ml.
 
-const RE_TAG_ML = /^[a-z0-9][a-z0-9_-]{1,49}$/;
+
+// ── POOL DE ETIQUETAS DO MERCADO LIVRE ────────────────────────────────────
+//
+// Modelo por CATEGORIA, nao por produto — e a diferenca que faz o rastreio do
+// ML sobreviver ao proprio catalogo.
+//
+// A tentacao e copiar a Amazon: um identificador por produto. Na Amazon isso
+// funciona porque a tag GIRA por dia (o relatorio separa por data), entao 150
+// tags cobrem 150 produtos por dia, para sempre. No ML o relatorio nao separa
+// por data: a tag teria de ficar grudada no produto e nunca mais poderia ser
+// reusada. Medido em 180 dias de operacao real, o ML vendeu ~2.000 produtos
+// distintos e 87% deles venderam UMA unidade — um pool por produto queimaria
+// cada etiqueta num item que nunca mais se repete e esgotaria em semanas.
+//
+// Por categoria a etiqueta e infinitamente reutilizavel e a medicao MELHORA com
+// o tempo em vez de fragmentar. E responde a pergunta que importa: quanto cada
+// nicho rende por clique gasto.
+//
+// A etiqueta precisa existir na conta de afiliado (criada a mao em
+// /afiliados/adminlabel). Etiqueta inventada faz o createLink devolver
+// error_code 109; o link e refeito com a tag da conta — perde-se a
+// segmentacao daquele item, nunca a comissao.
 
 export function listarPoolMl() {
   const r = rastreio();
-  const mapa = r.mapaMl || {};
-  const usadas = new Set(Object.values(mapa));
+  const mapa = r.tagsMlPorCategoria || {};
   return {
-    pool: [...(r.poolMl || [])],
-    mapa: { ...mapa },
-    usadas: usadas.size,
-    livres: (r.poolMl || []).filter((t) => !usadas.has(t)).length,
+    // Compat: o painel antigo lia `pool` como lista simples.
+    pool: [...new Set(Object.values(mapa).filter(Boolean))],
+    porCategoria: { ...mapa },
+    categorias: Object.keys(mapa).length,
   };
 }
 
-export function salvarPoolMl(tags) {
-  const limpos = [], recusados = [];
-  for (const t of (Array.isArray(tags) ? tags : [])) {
-    const v = String(t || '').trim().toLowerCase();
-    if (!v) continue;
-    if (!RE_TAG_ML.test(v)) { recusados.push(v); continue; }
-    if (!limpos.includes(v)) limpos.push(v);
+/**
+ * Grava o mapa categoria -> etiqueta. Aceita tanto o objeto novo quanto a
+ * lista antiga (que vira apenas um conjunto de etiquetas sem vinculo, para
+ * nao quebrar chamada existente).
+ */
+export function salvarPoolMl(entrada) {
+  const recusados = [];
+  const mapa = {};
+
+  const limpar = (v) => {
+    const s = String(v || '').trim().toLowerCase();
+    if (!s) return null;
+    // O ML aceita SO letras e numeros na etiqueta — sem hifen, sem underscore.
+    // Validar aqui evita descobrir isso pelo error_code 109 em producao.
+    if (!/^[a-z0-9]{2,30}$/.test(s)) { recusados.push(s); return null; }
+    return s;
+  };
+
+  if (entrada && typeof entrada === 'object' && !Array.isArray(entrada)) {
+    for (const [cat, tag] of Object.entries(entrada)) {
+      const t = limpar(tag);
+      if (t) mapa[String(cat || '').trim()] = t;
+    }
+  } else if (Array.isArray(entrada)) {
+    for (const t of entrada) limpar(t);
   }
+
   const r = rastreio();
-  r.poolMl = limpos;
-  // Produto amarrado a uma tag que saiu do pool volta para a tag da conta na
-  // proxima geracao de link — melhor perder a segmentacao do que mandar link
-  // com tag inexistente, que e comissao perdida.
-  const validas = new Set(limpos);
-  for (const [asin, tag] of Object.entries(r.mapaMl || {})) {
-    if (!validas.has(tag)) delete r.mapaMl[asin];
-  }
+  r.tagsMlPorCategoria = mapa;
+  // Mapa por produto do modelo antigo nao vale mais nada: some para nao ficar
+  // um resto de dado que ninguem le e todo mundo tem medo de apagar.
+  delete r.mapaMl;
+  delete r.poolMl;
   salvarRastreio();
-  return { pool: limpos, recusados, mapa: { ...(r.mapaMl || {}) } };
+  return { porCategoria: mapa, recusados };
 }
 
 /**
- * Tag do ML para este produto. Assinatura estavel: mesmo produto, mesma tag
- * sempre. Devolve null quando nao ha pool ou quando ele acabou — e o chamador
- * cai na tag da conta, que e o comportamento de hoje.
+ * Etiqueta do ML para este produto, escolhida pela CATEGORIA classificada.
+ * Devolve null quando nao ha mapa ou a categoria nao tem etiqueta — e o
+ * chamador cai na tag da conta, que e o comportamento historico.
+ *
+ * Recebe a categoria pronta: quem dispara ja classificou o produto para
+ * decidir o roteamento por trilha, e classificar de novo aqui gastaria
+ * trabalho para chegar no mesmo lugar.
  */
-export function tagMlDoProduto(asin) {
-  const id = String(asin || '').toUpperCase();
-  if (!id) return null;
-  const r = rastreio();
-  const pool = r.poolMl || [];
-  if (!pool.length) return null;
-  r.mapaMl = r.mapaMl || {};
-  if (r.mapaMl[id] && pool.includes(r.mapaMl[id])) return r.mapaMl[id];
-  const usadas = new Set(Object.values(r.mapaMl));
-  const livre = pool.find((t) => !usadas.has(t));
-  if (!livre) return null;   // pool esgotado: nao rouba tag de outro produto
-  r.mapaMl[id] = livre;
-  salvarRastreio();
-  return livre;
+export function tagMlDoProduto(asin, categoria) {
+  const mapa = rastreio().tagsMlPorCategoria || {};
+  if (!Object.keys(mapa).length) return null;
+  const cat = String(categoria || '').trim();
+  return mapa[cat] || mapa[''] || null;
 }
 
 function atribuicaoDoDia(asin, data) {
@@ -2144,7 +2175,11 @@ export function refDoDisparo(p) {
   // ML: com pool configurado, o ref E a tag que foi para o createLink — e o que
   // vai permitir o coletor casar o relatorio de volta no produto. Sem pool,
   // continua o ref deterministico interno, que so serve de chave local.
-  else if (loja.includes('mercado')) ref = tagMlDoProduto(p.asin) || refDeterministico(p.asin);
+  // ML: o ref e a etiqueta do NICHO que foi para o createLink — e o que permite
+  // o coletor casar o relatorio de etiquetas de volta na categoria. `p.categoria`
+  // e preenchida por quem classificou o produto para o roteamento por trilha;
+  // sem ela cai no balde geral e, sem mapa nenhum, no ref deterministico interno.
+  else if (loja.includes('mercado')) ref = tagMlDoProduto(p.asin, p.categoria) || refDeterministico(p.asin);
   else ref = refDeterministico(p.asin); // demais lojas: so registra, nao altera a URL
 
   rastreio().atribuicoes.push({
