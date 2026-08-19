@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
-import { rodapeOferta, rodapeCupom, credencialTsp } from './config-tsp.js';
+import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -341,6 +341,74 @@ export function explicarRoteamento({ fonte, categoria, categoriaConfiavel } = {}
     const entrega = !t.categoria || (categoriaConfiavel && t.categoria === cat);
     return t.nome + (entrega ? ' ✓' : ' ✗');
   }).join(', ');
+}
+
+// ── RODAPE EXTRA POR NICHO (convite cruzado) ──────────────────────────────
+// Um bloco de texto anexado ao FINAL da mensagem, decidido por GRUPO de destino
+// no momento do envio. Existe separado do rodape do template porque a pergunta
+// que ele responde ("este grupo aqui deveria receber um convite para o grupo de
+// bebidas?") so tem resposta depois de saber para qual grupo a mensagem vai — e
+// o corpo do template e renderizado uma vez para todos os destinos.
+//
+// Nada aqui reescreve a mensagem: so acrescenta. Lista de regras vazia, ou
+// nenhuma regra casando, devolve string vazia e o envio segue identico ao que
+// era antes desta camada existir.
+
+/** O grupo `jid` e destino de uma trilha de nicho da categoria `cat`? */
+function ehGrupoDoNicho(jid, categorias) {
+  if (!jid) return false;
+  return trilhas().some(t =>
+    t.categoria
+    && t.destinos.includes(jid)
+    && (!categorias.length || categorias.includes(t.categoria)));
+}
+
+/**
+ * Texto do rodape extra para um destino. Primeira regra que casa vence —
+ * empilhar duas viraria uma mensagem com dois convites no rodape.
+ * @param {{jid?:string, tipo?:'oferta'|'cupom'|'manual', categoria?:string|null,
+ *          categoriaConfiavel?:boolean}} ctx
+ * @returns {string} texto a anexar, ou '' quando nenhuma regra se aplica.
+ */
+export function rodapeExtraParaGrupo(ctx = {}) {
+  let regras;
+  try { regras = rodapesRegras(tenantAtual()); }
+  catch (e) { console.log('[RODAPE] Nao deu para ler as regras:', e.message); return ''; }
+  if (!regras.length) return '';
+
+  const tipo = String(ctx.tipo || 'oferta').toLowerCase();
+  const cat  = String(ctx.categoria || '').trim();
+  const jid  = String(ctx.jid || '').trim();
+
+  for (const r of regras) {
+    if (!r.ativo) continue;
+    if (!r.tipos.includes(tipo)) continue;
+    // Regra por categoria so vale com classificacao CONFIRMADA: a mesma trava
+    // do roteamento de nicho. Convidar para o grupo de bebidas com base num
+    // palpite do classificador e pior do que nao convidar.
+    if (r.categorias.length) {
+      if (!cat || !ctx.categoriaConfiavel) continue;
+      if (!r.categorias.includes(cat)) continue;
+    }
+    if (r.escopo !== 'todos') {
+      const dentro = ehGrupoDoNicho(jid, r.categorias);
+      if (r.escopo === 'fora-da-trilha' && dentro) continue;
+      if (r.escopo === 'so-trilha' && !dentro) continue;
+    }
+    return r.texto;
+  }
+  return '';
+}
+
+/** Mensagem + rodape extra do destino. Sem regra aplicavel, devolve a original. */
+export function comRodapeExtra(mensagem, ctx = {}) {
+  const msg = String(mensagem ?? '');
+  let extra = '';
+  // Envio nunca pode cair por causa de rodape: qualquer falha aqui vira
+  // mensagem sem o bloco extra, nao mensagem nao enviada.
+  try { extra = rodapeExtraParaGrupo(ctx); }
+  catch (e) { console.log('[RODAPE] Falha ao resolver rodape extra:', e.message); }
+  return extra ? msg + '\n\n' + extra : msg;
 }
 
 // ── MONITORAMENTO POR GRUPO ───────────────────────────────────────────────
