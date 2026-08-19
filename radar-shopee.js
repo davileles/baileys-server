@@ -417,7 +417,13 @@ export async function montarOfertasShopeeVitrine(itens, codigoCupom = null) {
     if (!p.preco) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'sem preço disponível' }); continue; }
     if (p.link) await marcarRastreio(p, node);
 
-    const codigo = codigoCupom || salvo.cupom || null;
+    // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
+    // produto vence o automatico. Cupom fixo do disparo vence tudo; 'nenhum' sai
+    // sem cupom mesmo quando o item tem vinculo.
+    const semCupom = codigoCupom === 'nenhum';
+    const codigo = semCupom ? null
+                 : (codigoCupom && codigoCupom !== 'auto') ? codigoCupom
+                 : (salvo.cupom || codigoCupom);
     let cupom = null, avisoCupom = null;
     // 'auto': o melhor cupom Shopee vigente que atenda o preco deste produto.
     if (codigo === 'auto') {
