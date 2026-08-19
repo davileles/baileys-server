@@ -1144,7 +1144,7 @@ async function workerFila() {
       // só emissões efetivamente enviadas entram no histórico divulgado.
       // Fallback em item.dados cobre agendamentos cuja oferta já saiu da fila.
       const de = ofertaEnviada?.dadosExtraidos || item.dados || {};
-      if (de.origem && de.destino && de.programa && ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
+      if (item.registrar !== false && de.origem && de.destino && de.programa && ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
         registrarPassagemProxy({
           origem:      de.origem,
           destino:     de.destino,
@@ -1154,10 +1154,12 @@ async function workerFila() {
           cabine:      de.cabine || 'Economica',
           datas_ida:   de.datasIda || '',
           datas_volta: de.datasVolta || '',
-          fonte:       'alerta',
+          // 'emissao' = gerado a mao na aba Emissao do gerador (agendado);
+          // 'alerta'   = veio do radar de grupos monitorados.
+          fonte:       item.fonte || 'alerta',
           // Distingue disparo automatico (AUTO_ENVIO_ALERTA=on + veredito
           // positivo) de envio liberado na aprovacao manual do gerador.
-          auto:        !!ofertaEnviada?.autoEnviado,
+          auto:        item.fonte === 'emissao' ? false : !!ofertaEnviada?.autoEnviado,
         }).catch(() => {});
       }
 
@@ -1184,12 +1186,19 @@ async function workerFila() {
   console.log('[FILA] Worker encerrado (fila vazia).');
 }
 
-function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados) {
+function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados, opts) {
   const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
   const posicao = filaEnvio.length;
   // dados: snapshot de dadosExtraidos usado como fallback no registro de passagem
   // quando a oferta já saiu de filaPendentes (agendamentos de mais de 24h).
-  filaEnvio.push({ ofertaId, mensagem, destino, dados: dados || null });
+  // opts.fonte: 'alerta' (padrao) | 'emissao' — vai para passagens.json e define
+  //   como a aba "Enviadas hoje" classifica a coluna Envio.
+  // opts.registrar:false → o item ja foi registrado por quem chamou (emissao
+  //   manual imediata registra client-side no gerador); evita linha duplicada.
+  const o = opts || {};
+  filaEnvio.push({ ofertaId, mensagem, destino, dados: dados || null,
+                   fonte: o.fonte || null,
+                   registrar: o.registrar === false ? false : true });
   console.log('[FILA] Oferta #' + ofertaId + ' enfileirada na posição ' + (posicao + 1));
   workerFila().catch(e => {
     console.error('[FILA] Worker encerrou com erro:', e.message);
@@ -1301,7 +1310,8 @@ setInterval(() => {
     if (!grupoId) { ag.status = 'erro'; delete ag.anexo; salvarAgendamentos(); continue; }
     const isEmissao = ag.grupo === 'cdv_emissao' || grupoId === GRUPOS['cdv_emissao'];
     if (isEmissao && !ag.direto) {
-      enfileirarEnvio(ag.ofertaId ?? ('ag-'+ag.id), ag.mensagem, grupoId, ag.dados || null);
+      enfileirarEnvio(ag.ofertaId ?? ('ag-'+ag.id), ag.mensagem, grupoId, ag.dados || null,
+                      { fonte: ag.fonteRegistro || null });
     } else {
       // A thumbnail e baixada agora, na hora do disparo, e nao no agendamento:
       // guardar bytes no agendamentos.json inflaria o arquivo e ainda entregaria
@@ -6273,12 +6283,37 @@ app.get('/status', (req, res) => {
 });
 
 app.get('/fila-envio', (req, res) => {
-  const itens = filaEnvio.map((item, idx) => ({
-    posicao:  idx + 1,
-    ofertaId: item.ofertaId,
-    destino:  item.destino,
-    preview:  item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
-  }));
+  // Devolve dados estruturados + previsao de horario para a aba "Enviadas hoje"
+  // do gerador conseguir montar a lista de PROGRAMADAS (aprovadas mas ainda nao
+  // publicadas) com as mesmas colunas das ja enviadas.
+  const itens = filaEnvio.map((item, idx) => {
+    const oferta = filaPendentes.find(o => String(o.id) === String(item.ofertaId));
+    const de     = oferta?.dadosExtraidos || item.dados || null;
+    const prev   = calcularPosicaoFila(idx);
+    return {
+      posicao:  idx + 1,
+      ofertaId: item.ofertaId,
+      destino:  item.destino,
+      preview:  item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
+      // origem do envio: 'auto' (radar automatico) | 'aprovacao' | 'emissao'
+      origemEnvio: item.fonte === 'emissao' ? 'emissao'
+                 : (oferta?.autoEnviado ? 'auto' : 'aprovacao'),
+      auto:         !!oferta?.autoEnviado,
+      tipoConteudo: oferta?.tipoConteudo || null,
+      dados: de ? {
+        origem:     de.origem     || '',
+        destino:    de.destino    || '',
+        cia:        de.cia        || '',
+        programa:   de.programa   || '',
+        pontos:     Number(de.pontos) || 0,
+        cabine:     de.cabine     || '',
+        datasIda:   de.datasIda   || de.datas_ida   || '',
+        datasVolta: de.datasVolta || de.datas_volta || '',
+      } : null,
+      previsaoMin:     prev.tempoMin,
+      previsaoHorario: prev.horario,
+    };
+  });
   const espera = msAteJanela();
   const horaSP_ = horaSP();
   res.json({
@@ -7021,7 +7056,11 @@ app.post('/enviar', async (req, res) => {
   // Decide se os grupos so-cupons entram na lista de alvos.
   // categoria + trilhas: escolha de nicho feita no gerador manual. 'trilhas' e a
   // lista de ids da aba Grupos; 'categoria' vale para as regras de rodape.
-  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, trilhas: trilhasEnvio } = req.body;
+  // dados: snapshot estruturado da emissao (origem/destino/programa/pontos...).
+  // Enviado pela aba Emissao do gerador para (a) a fila de envio conseguir
+  // exibir a rota na programacao e (b) o agendamento registrar a passagem no
+  // disparo — antes, emissao agendada nunca entrava em passagens.json.
+  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio } = req.body;
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
@@ -7056,6 +7095,8 @@ app.post('/enviar', async (req, res) => {
     const id = gerarId();
     agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto,
                         tipo: tipo || null,
+                        dados: dados || null,
+                        fonteRegistro: dados ? 'emissao' : null,
                         categoria: categoria || null,
                         trilhas: Array.isArray(trilhasEnvio) ? trilhasEnvio : null,
                         preview: preview?.link ? preview : null,
@@ -7088,7 +7129,11 @@ app.post('/enviar', async (req, res) => {
       })
       .join('\n');
     const info = calcularPosicaoFila(filaEnvio.length);
-    enfileirarEnvio('manual', mensagemComprimida, grupoId);
+    // Id unico por item: com o literal 'manual' duas emissoes na fila colidiam e
+    // DELETE /fila-envio/manual removia sempre a primeira.
+    // registrar:false — o gerador ja grava passagens.json no retorno deste POST.
+    enfileirarEnvio('man-' + Date.now().toString(36), mensagemComprimida, grupoId,
+                    dados || null, { fonte:'emissao', registrar:false });
     res.json({ ok:true, posicao:info.posicao, tempoMin:info.tempoMin, horario:info.horario });
   } else {
     try {
