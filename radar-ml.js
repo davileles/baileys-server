@@ -287,6 +287,51 @@ function extrairLdProduto(html) {
   return null;
 }
 
+// ── TRILHA DE CATEGORIA (breadcrumb) ──────────────────────────────────────
+// O classificador ja usa breadcrumb da Amazon como fonte de maior confianca;
+// sem isto, tudo que vem do ML e decidido so por palavra no titulo — que e
+// exatamente onde o classificador erra. A pagina ja esta em maos aqui, entao
+// ler a trilha nao custa nem uma requisicao a mais.
+const LIXO_TRILHA_ML = /^(voltar|inicio|in\u00edcio|home|mercado livre|todas as categorias|categorias)$/i;
+
+function decodificarEntidades(s) {
+  return String(s)
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
+}
+
+function limparTrilhaMl(nomes) {
+  const limpos = [...new Set((nomes || [])
+    .map(n => decodificarEntidades(n).replace(/\s+/g, ' ').trim())
+    .filter(n => n && n.length > 1 && !LIXO_TRILHA_ML.test(n)))];
+  if (!limpos.length) return null;
+  return { categoria: limpos[0], caminho: limpos.slice(0, 5).join(' > ') };
+}
+
+/** Trilha de categoria do anuncio. JSON-LD primeiro; nav.andes-breadcrumb depois. */
+export function extrairTrilhaMl(html) {
+  for (const m of String(html || '').matchAll(REGEX_LD_JSON)) {
+    try {
+      const dado = JSON.parse(m[1].trim());
+      for (const d of (Array.isArray(dado) ? dado : [dado])) {
+        if (d?.['@type'] !== 'BreadcrumbList') continue;
+        const t = limparTrilhaMl((d.itemListElement || [])
+          .map(e => e?.name || e?.item?.name || ''));
+        if (t) return t;
+      }
+    } catch (e) { /* bloco malformado: segue */ }
+  }
+  // O ultimo item do breadcrumb do ML costuma ser o proprio anuncio, sem <a>:
+  // ler so os links ja descarta esse ruido de graca.
+  const bloco = String(html || '').match(/andes-breadcrumb[\s\S]{0,4000}?<\/(?:nav|ol|ul)>/);
+  if (bloco) {
+    const nomes = [...bloco[0].matchAll(/<a[^>]*>\s*([^<>]{2,60}?)\s*<\/a>/g)].map(x => x[1]);
+    const t = limparTrilhaMl(nomes);
+    if (t) return t;
+  }
+  return null;
+}
+
 function metaConteudo(html, prop) {
   const m = html.match(new RegExp('<meta[^>]+(?:property|name)=["\']' + prop + '["\'][^>]*content=["\']([^"\']+)', 'i'));
   return m ? m[1] : null;
@@ -392,6 +437,9 @@ export async function buscarDadosProdutoMl(url) {
     avaliacoes: Number(ld?.aggregateRating?.reviewCount) || null,
     vendedor: oferta?.seller?.name || null,
     achouLd: !!ld,
+    // Trilha de categoria: alimenta o cache do classificador (categorizador.js),
+    // elevando o ML ao mesmo nivel de confianca que a Amazon ja tinha.
+    trilha: extrairTrilhaMl(html),
     // Cupons que o proprio anuncio declara. O ML ja resolveu categoria,
     // vendedor, minimo e teto para ESTE item — coisa que a base nao modela.
     cuponsPagina: extrairCupomMl(html),
@@ -808,6 +856,7 @@ export async function processarTextoMl(texto) {
       vendedor: dados.vendedor,
       nota: dados.nota, avaliacoes: dados.avaliacoes,
       dealTermina: null, ehDeal: false,
+      trilha: dados.trilha || null,
       loja: 'Mercado Livre',
     };
 
@@ -1256,6 +1305,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
       vendedor: dados.vendedor,
       nota: dados.nota, avaliacoes: dados.avaliacoes,
       vendas: null, dealTermina: null, ehDeal: false,
+      trilha: dados.trilha || null,
       loja: 'Mercado Livre',
     };
 
