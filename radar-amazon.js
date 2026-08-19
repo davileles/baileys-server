@@ -1882,7 +1882,13 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
     if (!p.disponivel) { descartados.push({ asin:p.asin, nome, motivo:'produto esgotado' }); continue; }
 
     // Cupom do disparo vence o vinculado; sem nenhum dos dois, vai sem cupom.
-    const codigo = codigoCupom || salvo?.cupom || null;
+    // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
+    // produto vence o automatico. Cupom fixo do disparo vence tudo; 'nenhum' sai
+    // sem cupom mesmo quando o item tem vinculo.
+    const semCupom = codigoCupom === 'nenhum';
+    const codigo = semCupom ? null
+                 : (codigoCupom && codigoCupom !== 'auto') ? codigoCupom
+                 : (salvo?.cupom || codigoCupom);
     let cupom = null, avisoCupom = null;
     // 'auto': escolhe sozinho o melhor cupom da loja que atenda o preco deste
     // produto — um cupom de R$10 acima de R$40 entra num produto de R$50 e nao
@@ -2293,7 +2299,10 @@ export function atualizarExecucaoLista(id, execucao) {
 
 /** Codigo de cupom a passar para o montador, conforme o modo da lista. */
 export function cupomDaLista(lista) {
-  if (!lista || lista.cupomModo === 'nenhum') return null;
+  if (!lista) return null;
+  // 'nenhum' precisa ser um sinal, nao ausencia de sinal: ausencia deixava o
+  // montador cair no cupom vinculado ao item — o oposto do pedido.
+  if (lista.cupomModo === 'nenhum') return 'nenhum';
   if (lista.cupomModo === 'fixo') return lista.cupomCodigo || null;
   return 'auto';
 }
