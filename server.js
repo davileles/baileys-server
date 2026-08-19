@@ -21,6 +21,7 @@ import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
   trilhas, salvarTrilhas, destinosGerais, destinosDaOferta, explicarRoteamento,
+  comRodapeExtra, rodapeExtraParaGrupo,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
@@ -2247,7 +2248,9 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
 
   for (const jid of alvos) {
     if (jaRecebeu.has(jid)) { pulados.push(jid); continue; }
-    const texto = mensagem;
+    // Rodape extra por grupo: cupom nao tem categoria, entao so casam regras
+    // sem filtro de categoria. Sem regra aplicavel, `texto` e a mensagem original.
+    const texto = comRodapeExtra(mensagem, { jid, tipo: 'cupom' });
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -2487,8 +2490,16 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
 
   for (const jid of alvos) {
     if (soCupons.has(jid)) continue;
+    // Rodape extra decidido AQUI, ja sabendo o destino: e o que permite a mesma
+    // oferta de bebida sair no grupo geral com o convite para o grupo de bebidas
+    // e sair sem ele dentro do proprio grupo de bebidas.
+    const texto = comRodapeExtra(mensagem, {
+      jid, tipo: 'oferta',
+      categoria: _rota.categoria,
+      categoriaConfiavel: _rota.categoriaConfiavel,
+    });
     try {
-      await enviarMensagem(jid, preview ? { text: mensagem, linkPreview: preview } : { text: mensagem }, 0, op);
+      await enviarMensagem(jid, preview ? { text: texto, linkPreview: preview } : { text: texto }, 0, op);
       enviados.push(jid);
       if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
     } catch (e) {
@@ -2514,7 +2525,7 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
 // Existe separado de enviarCupomParaGrupos/enviarOfertaParaDestinos porque a
 // mensagem manual pode trazer imagem E card de link, combinacao que nao aparece
 // no fluxo da fila.
-async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
+async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categoria }) {
   const ehCupom  = String(tipo || '').toLowerCase() === 'cupom';
   // Mensagem escrita a mao vai para os GERAIS. Nicho e alimentado pelo radar,
   // que sabe a categoria do produto; aqui nao ha classificacao nenhuma e todo
@@ -2538,16 +2549,26 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview }) {
   }
 
   const enviados = [], falhas = [];
+  // Mensagem escrita a mao nao passa pelo classificador: a categoria so existe
+  // se o painel mandar explicitamente. Sem ela, casam apenas as regras de
+  // rodape que nao filtram por categoria.
+  const catManual = String(categoria || '').trim();
   for (const jid of alvos) {
+    const texto = comRodapeExtra(mensagem, {
+      jid,
+      tipo: ehCupom ? 'cupom' : 'manual',
+      categoria: catManual || null,
+      categoriaConfiavel: !!catManual,
+    });
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
           image:    Buffer.from(imagem.imagemBase64, 'base64'),
-          caption:  mensagem || '',
+          caption:  texto || '',
           mimetype: imagem.mime || 'image/jpeg',
         }, 0, op);
       } else {
-        await enviarMensagem(jid, lp ? { text: mensagem, linkPreview: lp } : { text: mensagem }, 0, op);
+        await enviarMensagem(jid, lp ? { text: texto, linkPreview: lp } : { text: texto }, 0, op);
       }
       enviados.push(jid);
       // Espacamento entre grupos: mesmo padrao do radar. Disparo simultaneo em
@@ -7333,6 +7354,29 @@ app.post('/config-tsp', (req, res) => {
                credenciais: estadoCredenciais() });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
+  }
+});
+
+// Simulacao do rodape extra: para um tipo de mensagem e uma categoria, diz o
+// que CADA grupo de destino receberia no fim da mensagem. Somente leitura — nao
+// envia nada e nao grava nada. Existe para o operador conferir a regra antes de
+// ela valer num disparo real, que e onde o erro custaria caro.
+app.get('/config-tsp/rodape-preview', (req, res) => {
+  try {
+    const tipo      = String(req.query.tipo || 'oferta').toLowerCase();
+    const categoria = String(req.query.categoria || '').trim();
+    const destinos = radarDestinos().map(jid => ({
+      jid,
+      nome: NOMES_GRUPOS.get(jid) || jid,
+      rodape: rodapeExtraParaGrupo({
+        jid, tipo,
+        categoria: categoria || null,
+        categoriaConfiavel: !!categoria,
+      }),
+    }));
+    res.json({ ok: true, tipo, categoria, destinos });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
   }
 });
 
