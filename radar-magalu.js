@@ -234,9 +234,12 @@ export function ttlPrecoMagalu() {
   return isFinite(h) && h > 0 ? h : 24;
 }
 
-/** Le "R$ 1.234,56", "1234,56" ou "1234.56" de um pedaco de texto. */
+// Le "R$ 1.234,56", "1234,56" ou "1234.56" de um pedaco de texto. Os centavos
+// sao OBRIGATORIOS: sem eles, qualquer numero do nome do produto ("Smart TV 50
+// polegadas", "Kit 2 Unidades") virava candidato a preco e vencia por ser o
+// menor, cadastrando o item a R$ 50,00. Mesma regra que radar-awin.js ja usa.
 function precosDaLinha(resto) {
-  const achados = [...String(resto).matchAll(/R?\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:[.,]\d{2})?)/gi)]
+  const achados = [...String(resto).matchAll(/R?\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2}|\d+[.,]\d{2})/gi)]
     .map(m => {
       const bruto = m[1];
       // 1.234,56 -> 1234.56 | 1234,56 -> 1234.56 | 1234.56 fica como esta
