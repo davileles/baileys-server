@@ -29,7 +29,9 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush } from './sync-github.js';
-import { listarVitrine, itemVitrine, melhorCupomAplicavel, marcarDisparo } from './radar-amazon.js';
+import { listarVitrine, itemVitrine, melhorCupomAplicavel, marcarDisparo,
+         buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
+import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
 import { buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk } from './radar-shopee.js';
 import { buscarDadosProdutoMl, tokenAffOk } from './radar-ml.js';
@@ -45,10 +47,36 @@ const TZ_SP = 'America/Sao_Paulo';
 // isso comeca a comparar com precos de outra realidade de mercado.
 const DIAS_RETENCAO = 120;
 
-// Lojas com leitura de preco por API oficial. Amazon fica de fora nesta fase
-// (PA-API tem cota propria e a operacao ja a usa no radar); Magalu e Awin nao
-// tem leitura confiavel fora do disparo.
-export const LOJAS_MONITORAVEIS_PRECO = ['Shopee', 'Mercado Livre'];
+// Lojas com leitura de preco por API oficial. Magalu e Awin ficam de fora: nao
+// ha leitura confiavel de preco fora do momento do disparo, e monitorar preco
+// que so se conhece na hora de enviar nao e monitorar coisa nenhuma.
+//
+// A Amazon le em LOTE de 10 ASINs por chamada (getItems da Creators API), o que
+// a torna a loja mais barata de vigiar das tres — 250 produtos custam 25
+// chamadas, contra 250 na Shopee e no ML, que so aceitam um item por vez.
+export const LOJAS_MONITORAVEIS_PRECO = ['Amazon', 'Shopee', 'Mercado Livre'];
+
+// ASIN sintetico de outra rede que mora na mesma vitrine. Nao e produto Amazon
+// e nao pode ir para o getItems.
+const RE_ASIN_AMAZON = /^B[A-Z0-9]{9}$/;
+
+function ehItemAmazon(item) {
+  return item?.loja === 'Amazon' && RE_ASIN_AMAZON.test(String(item.asin || ''));
+}
+
+function credenciaisAmazonOk() {
+  return !!(credencialTsp('AMZ_CLIENT_ID') && credencialTsp('AMZ_CLIENT_SECRET'));
+}
+
+// Itens da vitrine efetivamente sob monitoramento. Ponto unico de verdade:
+// varredura, tabela do painel e simulacao precisam enxergar exatamente o mesmo
+// conjunto, senao o painel promete vigiar produto que a varredura ignora.
+// O filtro por ASIN valido barra o que mora na mesma vitrine mas nao e produto
+// Amazon (itens AWIN- herdam a loja padrao no cadastro).
+function itensMonitorados() {
+  return listarVitrine().filter(i =>
+    _cfg.varredura.lojas.includes(i.loja) && (i.loja !== 'Amazon' || ehItemAmazon(i)));
+}
 
 // ── CONFIG PADRAO ────────────────────────────────────────────────────────────
 // Comeca DESLIGADA e em modo sombra: subir esta versao nao muda nada no grupo.
@@ -65,7 +93,7 @@ const CFG_PADRAO = {
     intervaloMin: 60,      // de quanto em quanto tempo relê a vitrine inteira
     lote: 20,              // produtos por rodada antes da pausa
     pausaMs: 1500,         // respiro entre lotes (rate limit das APIs)
-    lojas: ['Shopee', 'Mercado Livre'],
+    lojas: ['Amazon', 'Shopee', 'Mercado Livre'],
   },
 
   publicacao: {
@@ -73,10 +101,10 @@ const CFG_PADRAO = {
     intervaloMin: 45,      // espacamento minimo entre duas ofertas do monitor
     // Cota DIARIA por loja. O pedido inicial e 10 por loja; sobe em tela sem
     // deploy quando o volume convencional der espaco.
-    cotaPorLoja: { 'Shopee': 10, 'Mercado Livre': 10 },
+    cotaPorLoja: { 'Amazon': 10, 'Shopee': 10, 'Mercado Livre': 10 },
     // Cota DIARIA por nicho (soma das lojas). Sem isto o dia inteiro vira o
     // nicho que tiver mais produto cadastrado.
-    cotaPorNicho: { geral: 12, bebidas: 4, infantil: 4 },
+    cotaPorNicho: { geral: 18, bebidas: 6, infantil: 6 },
     // Nicho e a categoria do classificador; 'geral' = sem categoria confiavel.
     aplicarCupom: true,    // pede o melhor cupom aplicavel no disparo
   },
@@ -357,7 +385,35 @@ async function lerPreco(item) {
     const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin));
     return { preco: d.preco, precoDe: d.precoDe, disponivel: d.disponivel !== false, titulo: d.titulo };
   }
+  if (ehItemAmazon(item)) {
+    // Caminho de UM item: usado so pela releitura avulsa. A varredura passa por
+    // lerPrecosAmazon, que agrupa de 10 em 10.
+    const p = (await lerPrecosAmazon([item])).get(item.asin);
+    if (!p) throw new Error('ASIN nao retornado pela API da Amazon');
+    return p;
+  }
   throw new Error('loja sem leitura de preco: ' + item.loja);
+}
+
+/**
+ * Leitura em LOTE da Amazon: getItems aceita 10 ASINs por chamada, entao ler um
+ * a um seria gastar 10x a cota para o mesmo resultado. Devolve um Map
+ * asin -> leitura; ASIN ausente do Map e ASIN que a API nao devolveu (fora do
+ * catalogo, retirado do ar ou sem oferta ativa) — quem chama trata como falha
+ * daquele item, nunca do lote inteiro.
+ */
+async function lerPrecosAmazon(itens) {
+  const out = new Map();
+  if (!itens.length) return out;
+  if (!credenciaisAmazonOk()) throw new Error('Amazon nao configurada (AMZ_CLIENT_ID / AMZ_CLIENT_SECRET)');
+
+  const brutos = await buscarProdutosAmazon(itens.map(i => i.asin));
+  for (const bruto of brutos) {
+    const p = normalizarAmazon(bruto);
+    if (!p?.asin) continue;
+    out.set(p.asin, { preco: p.preco, precoDe: p.precoDe, disponivel: p.disponivel, titulo: p.titulo });
+  }
+  return out;
 }
 
 // ── AVALIACAO ────────────────────────────────────────────────────────────────
@@ -429,30 +485,64 @@ export async function varrer({ manual = false } = {}) {
   const t0 = Date.now();
   const resumo = { lidos: 0, falhas: 0, candidatos: 0, porMotivo: {}, erros: [] };
 
+  // Grava a leitura na serie e decide se vira candidato. Compartilhado pelos
+  // dois caminhos de leitura (lote da Amazon e item a item das outras lojas)
+  // para que a REGRA seja uma so — duplicar isso seria criar duas verdades.
+  const processar = (item, leitura) => {
+    registrarPreco(item.asin, {
+      nome: leitura.titulo || item.nome, loja: item.loja,
+      preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
+    });
+    resumo.lidos++;
+
+    const stats = estatisticas(item.asin);
+    const { nicho } = nichoDoProduto(item, leitura.titulo);
+    const av = avaliar(item, leitura, stats, nicho);
+    resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
+    if (av.passou) { enfileirar(av); resumo.candidatos++; }
+  };
+
+  const falhar = (item, msg) => {
+    resumo.falhas++;
+    if (resumo.erros.length < 15) resumo.erros.push({ asin: item.asin, nome: item.nome, erro: msg });
+  };
+
   try {
-    const itens = listarVitrine().filter(i => _cfg.varredura.lojas.includes(i.loja));
-    console.log('[PRECOS] Varredura iniciada — ' + itens.length + ' produto(s).');
+    const itens = itensMonitorados();
+    // A Amazon le de 10 em 10; as outras, uma por vez. Separar aqui e o que
+    // permite cada API ser usada do jeito mais barato que ela oferece.
+    const amazon = itens.filter(ehItemAmazon);
+    const outros = itens.filter(i => !ehItemAmazon(i));
+    console.log('[PRECOS] Varredura iniciada — ' + itens.length + ' produto(s) ('
+      + amazon.length + ' Amazon em lote, ' + outros.length + ' individuais).');
 
-    for (let i = 0; i < itens.length; i++) {
-      const item = itens[i];
+    // ── Amazon, em lotes de 10 ──
+    for (let i = 0; i < amazon.length; i += 10) {
+      const lote = amazon.slice(i, i + 10);
       try {
-        const leitura = await lerPreco(item);
-        registrarPreco(item.asin, {
-          nome: leitura.titulo || item.nome, loja: item.loja,
-          preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
-        });
-        resumo.lidos++;
-
-        const stats = estatisticas(item.asin);
-        const { nicho } = nichoDoProduto(item, leitura.titulo);
-        const av = avaliar(item, leitura, stats, nicho);
-        resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
-        if (av.passou) { enfileirar(av); resumo.candidatos++; }
+        const mapa = await lerPrecosAmazon(lote);
+        for (const item of lote) {
+          const leitura = mapa.get(item.asin);
+          // ASIN que a API nao devolveu e falha DAQUELE item: produto retirado,
+          // sem oferta ativa ou fora do catalogo. O lote segue.
+          if (!leitura) { falhar(item, 'ASIN nao retornado pela API da Amazon'); continue; }
+          try { processar(item, leitura); }
+          catch (e) { falhar(item, e.message); }
+        }
       } catch (e) {
-        resumo.falhas++;
-        if (resumo.erros.length < 15) resumo.erros.push({ asin: item.asin, nome: item.nome, erro: e.message });
+        // Falha de credencial ou da chamada inteira: o lote todo cai, mas a
+        // varredura continua nas demais lojas.
+        for (const item of lote) falhar(item, e.message);
       }
-      // Pausa a cada lote: as duas APIs limitam por janela curta e nao adianta
+      if (i + 10 < amazon.length) await new Promise(r => setTimeout(r, _cfg.varredura.pausaMs));
+    }
+
+    // ── Shopee e Mercado Livre, item a item ──
+    for (let i = 0; i < outros.length; i++) {
+      const item = outros[i];
+      try { processar(item, await lerPreco(item)); }
+      catch (e) { falhar(item, e.message); }
+      // Pausa a cada lote: as APIs limitam por janela curta e nao adianta
       // correr — a varredura tem uma hora inteira para terminar.
       if ((i + 1) % _cfg.varredura.lote === 0) {
         await new Promise(r => setTimeout(r, _cfg.varredura.pausaMs));
@@ -616,6 +706,11 @@ export async function dispararMonitorado(item, candidato = {}) {
   } else if (item.loja === 'Mercado Livre') {
     if (!tokenAffOk()) return { ok: false, motivo: 'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
     montado = await _deps.montarMl([item], codigoCupom);
+  } else if (ehItemAmazon(item)) {
+    if (!credenciaisAmazonOk()) return { ok: false, motivo: 'Amazon nao configurada' };
+    // A montagem da Amazon recebe ASINs, nao o objeto do item — e a unica das
+    // tres com essa assinatura.
+    montado = await _deps.montarAmazon([item.asin], codigoCupom);
   } else {
     return { ok: false, motivo: 'loja fora do monitor: ' + item.loja };
   }
@@ -639,7 +734,8 @@ export async function dispararMonitorado(item, candidato = {}) {
   const oferta = {
     id: _deps.gerarId(),
     origem: 'monitor-precos',
-    tipoConteudo: item.loja === 'Shopee' ? 'oferta_shopee' : 'oferta_ml',
+    tipoConteudo: item.loja === 'Shopee' ? 'oferta_shopee'
+                : item.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
     mensagemFormatada: o.mensagem,
     dadosExtraidos: {
       loja: o.produto.loja || item.loja, asin: o.asin, titulo: o.produto.titulo,
@@ -679,8 +775,7 @@ export function simular(regrasParciais = null) {
   if (regrasParciais) _cfg = estruturarCfg({ ..._cfg, regras: regrasParciais });
   try {
     const saida = { passaram: [], reprovados: {}, total: 0 };
-    for (const item of listarVitrine()) {
-      if (!_cfg.varredura.lojas.includes(item.loja)) continue;
+    for (const item of itensMonitorados()) {
       const h = _hist[item.asin];
       if (!h?.ult) continue;
       saida.total++;
@@ -701,7 +796,7 @@ export function simular(regrasParciais = null) {
 export function estadoMonitorPrecos() {
   garantirCotasDoDia();
   podarFila();
-  const itens = listarVitrine().filter(i => _cfg.varredura.lojas.includes(i.loja));
+  const itens = itensMonitorados();
   const comSerie = itens.filter(i => _hist[i.asin]?.ult).length;
   const maduros = itens.filter(i => {
     const s = estatisticas(i.asin);
@@ -728,8 +823,7 @@ export function estadoMonitorPrecos() {
 
 /** Lista de monitorados com estatistica — a tabela principal da aba. */
 export function listarMonitorados() {
-  return listarVitrine()
-    .filter(i => _cfg.varredura.lojas.includes(i.loja))
+  return itensMonitorados()
     .map(i => {
       const s = estatisticas(i.asin);
       const h = _hist[i.asin];
@@ -793,7 +887,8 @@ function reprogramarVarredura() {
 }
 
 /**
- * deps: { enviarOferta, montarShopee, montarMl, baixarImagem, gerarId, whatsappPronto }
+ * deps: { enviarOferta, montarShopee, montarMl, montarAmazon, baixarImagem,
+ *         gerarId, whatsappPronto }
  * Injecao em vez de import para nao criar ciclo com server.js.
  */
 export function iniciarMonitorPrecos(deps) {
