@@ -61,6 +61,11 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   'monitor_precos_config.json',
   'precos_hist.json',
   'monitor_precos_estado.json',
+  // Ledger de ganho por clique por ASIN, escrito pelo coletor (GitHub Actions)
+  // e apenas LIDO aqui. Entra na lista para ser baixado no boot; o servidor
+  // nunca chama agendarPush para ele, entao as duas pontas nunca escrevem
+  // o mesmo arquivo.
+  'epc-produtos.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
