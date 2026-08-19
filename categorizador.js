@@ -158,15 +158,27 @@ function porTrilha(caminho) {
   const segmentos = String(caminho).split('>').map(s => normSing(s)).filter(Boolean);
   if (!segmentos.length) return null;
 
+  // Prioridade tambem vale aqui: "Alimentos e Bebidas > Bebes > Formulas" casa
+  // com duas prateleiras, e quem decide e a taxonomia — nao a ordem em que as
+  // categorias aparecem no JSON, que era o criterio anterior por acidente.
+  let melhor = null;
   for (const [id, def] of Object.entries(_taxo.categorias || {})) {
     const bloqueios = (def.segmentosBloqueio || []).map(normSing);
     if (segmentos.some(s => bloqueios.includes(s))) continue;
     const alvos = (def.segmentosAmazon || []).map(normSing);
     if (!alvos.length) continue;
     const bateu = segmentos.find(s => alvos.includes(s));
-    if (bateu) return { categoria: id, confianca: 0.95, sinal: 'trilha:' + bateu };
+    if (!bateu) continue;
+    const prio = Number(def.prioridade) || 0;
+    // Segmento mais profundo e mais especifico: "Cervejas" diz mais que
+    // "Alimentos e Bebidas", e vence quando as prioridades empatam.
+    const prof = segmentos.indexOf(bateu);
+    if (!melhor || prio > melhor._p || (prio === melhor._p && prof > melhor._d)) {
+      melhor = { categoria: id, confianca: 0.95, sinal: 'trilha:' + bateu, _p: prio, _d: prof };
+    }
   }
-  return null;
+  if (melhor) { delete melhor._p; delete melhor._d; }
+  return melhor;
 }
 
 // ── Classificacao por titulo ─────────────────────────────────────────────────
