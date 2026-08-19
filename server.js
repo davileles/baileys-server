@@ -292,6 +292,7 @@ const baileysLogger = pino({ level: 'silent' });
       carregarTenants(); carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
       carregarCategorias();
+      carregarCensoHist(); carregarMembrosLog();
       recarregarRadarTenants();
       semearMonitorDasFontes();
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
@@ -9735,16 +9736,33 @@ function salvarCenso() {
   catch(e) { console.error('[CENSO] Falha ao gravar censo:', e.message); }
 }
 
-(function carregarCensoHist() {
+// Declaracao (nao IIFE) porque o boot precisa chamar de novo DEPOIS do
+// baixarDoGitHub(): no import o volume do Railway pode estar vazio, e uma
+// memoria vazia gravando por cima apaga a serie inteira no repositorio.
+function carregarCensoHist() {
   try {
     if (existsSync(CENSO_HIST_FILE)) _censoHist = JSON.parse(readFileSync(CENSO_HIST_FILE, 'utf-8'));
     if (!_censoHist || typeof _censoHist !== 'object' || !_censoHist.dias) _censoHist = { dias: {} };
+    console.log('[CENSO] ' + Object.keys(_censoHist.dias).length + ' dia(s) na serie historica.');
   } catch(e) { console.warn('[CENSO] Falha ao ler historico:', e.message); _censoHist = { dias: {} }; }
-})();
+}
+carregarCensoHist();
 
 // Uma medicao por dia: rodar o censo duas vezes no mesmo dia sobrescreve o
 // ponto em vez de criar um segundo, senao o grafico ganharia degraus falsos.
 function registrarHistoricoCenso(grupos) {
+  // Defesa em profundidade: rele o disco e mescla antes de gravar. Se por
+  // qualquer motivo a memoria estiver mais pobre que o arquivo (volume que
+  // subiu depois do import, restauracao tardia do GitHub), a serie do disco
+  // prevalece nos dias que a memoria nao tem — gravar por cima nunca apaga.
+  try {
+    if (existsSync(CENSO_HIST_FILE)) {
+      const emDisco = JSON.parse(readFileSync(CENSO_HIST_FILE, 'utf-8'));
+      for (const [d, reg] of Object.entries(emDisco?.dias || {}))
+        if (!_censoHist.dias[d]) _censoHist.dias[d] = reg;
+    }
+  } catch(e) { console.warn('[CENSO] Falha ao mesclar historico do disco:', e.message); }
+
   const dia = _censoDiaRef();
   const porGrupo = {};
   for (const g of grupos) if (typeof g.membros === 'number') porGrupo[g.jid] = g.membros;
@@ -9859,13 +9877,15 @@ const MEMBROS_LOG_MAX  = 200000;
 let _membrosLog = { eventos: [] };
 let _membrosLogTimer = null;
 
-(function carregarMembrosLog() {
+// Mesma razao de carregarCensoHist(): o boot rechama apos o download.
+function carregarMembrosLog() {
   try {
     if (existsSync(MEMBROS_LOG_FILE)) _membrosLog = JSON.parse(readFileSync(MEMBROS_LOG_FILE, 'utf-8'));
     if (!_membrosLog?.eventos) _membrosLog = { eventos: [] };
     console.log('[MEMBROS] ' + _membrosLog.eventos.length + ' evento(s) no ledger.');
   } catch(e) { console.warn('[MEMBROS] Falha ao ler ledger:', e.message); _membrosLog = { eventos: [] }; }
-})();
+}
+carregarMembrosLog();
 
 // Debounce na gravacao: uma entrada em massa (link divulgado) gera dezenas de
 // eventos em segundos, e gravar a cada um seria desperdicio de I/O e de commit.
