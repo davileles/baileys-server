@@ -10779,6 +10779,7 @@ iniciarMonitorPrecos({
   enviarOferta:   enviarOfertaParaDestinos,
   montarShopee:   montarOfertasShopeeVitrine,
   montarMl:       montarOfertasMlVitrine,
+  montarAmazon:   montarOfertasVitrine,
   baixarImagem:   baixarImagemProduto,
   gerarId,
   whatsappPronto: () => !!(conectado && sock),
