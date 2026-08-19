@@ -127,6 +127,7 @@ import {
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
+  buscarDadosProdutoMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -4576,6 +4577,15 @@ async function processarRadarMarketplace(jid, texto) {
     // A classificacao entra na oferta ANTES de qualquer decisao de destino:
     // roteamento por nicho, vitrine publica e relatorio leem daqui. Nunca lanca
     // e nunca faz rede — categoria indefinida e um resultado valido e esperado.
+    // Trilha lida da pagina do produto (hoje: Mercado Livre) entra no cache
+    // ANTES da classificacao, para que este mesmo item ja decida por breadcrumb
+    // e nao por palavra no titulo. Amazon tem caminho proprio (enriquecimento
+    // em background); aqui a pagina ja foi aberta pelo radar, entao e de graca.
+    if (p.trilha?.caminho && p.asin) {
+      try { semearCacheTrilhas({ [p.asin]: { ...p.trilha, fonte: 'pagina-' + String(p.loja || '').toLowerCase() } }); }
+      catch (e) { /* cache e conveniencia: falha aqui nunca segura o pipeline */ }
+    }
+
     const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
     oferta.dadosExtraidos.categoria          = _cls.categoria;
     oferta.dadosExtraidos.categoriaNome      = _cls.nome;
@@ -7572,6 +7582,29 @@ app.post('/tsp/categorizar', (req, res) => {
 });
 
 // Liga/desliga o espelho no grupo do operador sem deploy.
+// Diagnostico da trilha do Mercado Livre: abre o anuncio com o cookie de
+// afiliado, mostra o breadcrumb lido e o que o classificador decide com ele.
+// Existe porque o seletor de breadcrumb e HTML de terceiro — a unica forma
+// honesta de saber se ainda funciona e perguntar a producao, nao supor.
+app.get('/tsp/trilha-ml', async (req, res) => {
+  const url = String(req.query.url || '').trim();
+  if (!url) return res.status(400).json({ ok:false, erro:'Informe ?url= do anuncio.' });
+  try {
+    const d = await buscarDadosProdutoMl(url);
+    const id = String(req.query.id || '').trim() || null;
+    if (d.trilha?.caminho && id) semearCacheTrilhas({ [id]: d.trilha });
+    const cls = classificarProduto({ titulo: d.titulo, asin: id, loja: 'Mercado Livre' });
+    res.json({
+      ok: true,
+      titulo: d.titulo,
+      trilha: d.trilha,
+      classificacao: { ...cls, confiavel: categoriaConfiavel(cls), explicacao: explicarClassificacao(cls) },
+    });
+  } catch (e) {
+    res.status(500).json({ ok:false, erro: e.message });
+  }
+});
+
 app.post('/tsp/categorias/espelho', (req, res) => {
   const { categorias } = req.body || {};
   if (!Array.isArray(categorias)) return res.status(400).json({ ok:false, erro:'"categorias" deve ser um array.' });
