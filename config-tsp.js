@@ -58,6 +58,19 @@ const CFG_TSP_PADRAO = {
     // Mensagens de OFERTA (gerador manual, mensagem livre e semente do
     // template padrao de produto).
     oferta:      '`Convide seus amigos para entrar aqui no grupo:  https://chat.whatsapp.com/Ia5ZTqeTJdXHG5OT9LUwz8`',
+    // RODAPES EXTRA POR NICHO (convite cruzado). Cada regra e um bloco de texto
+    // anexado ao FINAL da mensagem no momento do envio, grupo a grupo. Nada
+    // aqui altera template salvo: sem regra que case, a mensagem sai exatamente
+    // como saia antes desta camada existir.
+    //   { id, nome, ativo, tipos:['oferta'|'cupom'|'manual'],
+    //     categorias:[ids da taxonomia], escopo, texto }
+    // escopo: 'fora-da-trilha' (padrao) anexa so nos grupos que NAO sao destino
+    // de uma trilha da mesma categoria — e o que evita convidar para o grupo de
+    // bebidas quem ja esta nele; 'todos' anexa em todo destino; 'so-trilha'
+    // anexa apenas dentro do grupo de nicho.
+    // Primeira regra que casa vence: duas regras aplicaveis nao viram dois
+    // blocos empilhados no fim da mensagem.
+    regras: [],
   },
   // Grupos especiais da operacao (JIDs de WhatsApp).
   //
@@ -113,7 +126,10 @@ function padraoDe(tenantId) {
   if (tenantId === TENANT_RAIZ) return CFG_TSP_PADRAO;
   const vazio = JSON.parse(JSON.stringify(CFG_TSP_PADRAO));
   for (const k of Object.keys(vazio.afiliados))   vazio.afiliados[k] = '';
-  for (const k of Object.keys(vazio.rodapes))     vazio.rodapes[k] = '';
+  for (const k of Object.keys(vazio.rodapes)) {
+    if (Array.isArray(vazio.rodapes[k])) vazio.rodapes[k] = [];
+    else vazio.rodapes[k] = '';
+  }
   for (const k of Object.keys(vazio.credenciais)) vazio.credenciais[k] = '';
   vazio.grupos = { cupons: [], operador: '' };
   vazio.telegram.canaisIgnorados = [];
@@ -140,6 +156,11 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   // Rodape de convite cruzado do grupo so-cupons: regra removida. Some do JSON
   // gravado para nao ressuscitar se alguem reler a config antiga.
   delete out.rodapes.grupoCupons;
+  // Regras de rodape extra: normalizadas na leitura, nao na gravacao. Assim
+  // config antiga (sem o campo) e config editada a mao no repositorio chegam
+  // no mesmo formato para quem consome — regra torta vira regra descartada,
+  // nunca excecao no meio de um envio.
+  out.rodapes.regras = normalizarRegrasRodape(out.rodapes.regras);
   // Credencial nao preenchida fica string vazia, nunca undefined: o painel
   // precisa distinguir "nao configurado" de "campo inexistente".
   for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
@@ -149,6 +170,41 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   out.telegram.canaisIgnorados = Array.isArray(out.telegram.canaisIgnorados)
     ? out.telegram.canaisIgnorados.map(s => String(s).trim().toLowerCase()).filter(Boolean)
     : padraoDe(tenantId).telegram.canaisIgnorados.slice();
+  return out;
+}
+
+// Regra sem texto e regra que nao faz nada: sai da lista. Os demais campos tem
+// default seguro — o escopo mais conservador ('fora-da-trilha') e o tipo mais
+// comum ('oferta'), para que um cadastro incompleto nunca vire cupom com
+// convite cruzado que ninguem pediu.
+const ESCOPOS_RODAPE = ['fora-da-trilha', 'todos', 'so-trilha'];
+const TIPOS_RODAPE   = ['oferta', 'cupom', 'manual'];
+
+function normalizarRegrasRodape(bruto) {
+  const lista = Array.isArray(bruto) ? bruto : [];
+  const vistos = new Set();
+  const out = [];
+  lista.forEach((b, i) => {
+    const o = (b && typeof b === 'object') ? b : {};
+    const texto = String(o.texto ?? '').trim();
+    if (!texto) return;
+    let id = String(o.id || '').trim() || ('rod' + (i + 1));
+    while (vistos.has(id)) id += '-' + (i + 1);
+    vistos.add(id);
+    const tipos = [...new Set((Array.isArray(o.tipos) ? o.tipos : [])
+      .map(x => String(x || '').trim().toLowerCase())
+      .filter(t => TIPOS_RODAPE.includes(t)))];
+    out.push({
+      id,
+      nome: String(o.nome || '').trim() || ('Rodape ' + (i + 1)),
+      ativo: o.ativo !== false,
+      tipos: tipos.length ? tipos : ['oferta'],
+      categorias: [...new Set((Array.isArray(o.categorias) ? o.categorias : [])
+        .map(x => String(x || '').trim()).filter(Boolean))],
+      escopo: ESCOPOS_RODAPE.includes(String(o.escopo || '')) ? String(o.escopo) : 'fora-da-trilha',
+      texto,
+    });
+  });
   return out;
 }
 
@@ -283,6 +339,11 @@ export function linksTsp(tenantId) {
 
 export function rodapeCupom(tenantId)       { return (obter(tenantId).rodapes.cupom || '').trim(); }
 export function rodapeOferta(tenantId)      { return (obter(tenantId).rodapes.oferta || '').trim(); }
+/** Regras de rodape extra por nicho, ja normalizadas e na ordem de prioridade. */
+export function rodapesRegras(tenantId) {
+  const r = obter(tenantId).rodapes.regras;
+  return Array.isArray(r) ? r.map(x => ({ ...x, tipos: x.tipos.slice(), categorias: x.categorias.slice() })) : [];
+}
 
 export function gruposTspCupons(tenantId)   { return (obter(tenantId).grupos.cupons || []).slice(); }
 export function grupoOperadorTsp(tenantId)  { return obter(tenantId).grupos.operador; }
