@@ -53,6 +53,10 @@ export function tagMl() { return credencialTsp('ML_TAG') || null; }
 // Tag por produto (pool criado a mao no painel do ML). Sem pool devolve null e
 // tudo segue com a tag unica da conta.
 import { tagMlDoProduto } from './radar-amazon.js';
+// A etiqueta do ML e escolhida pela CATEGORIA do produto, entao a geracao de
+// link precisa saber classificar. categorizador.js so depende de fs e do sync,
+// entao nao ha ciclo de import aqui.
+import { classificarProduto, categoriaConfiavel } from './categorizador.js';
 
 function carregarToken() {
   try { if (existsSync(tokenPath())) tokDef(JSON.parse(readFileSync(tokenPath(), 'utf-8'))); }
@@ -463,16 +467,33 @@ async function chamarCreateLink(urls, tag) {
   return r.corpo.urls || [];
 }
 
-export async function gerarLinksAfiliadoMl(urls) {
+/**
+ * @param {string[]} urls
+ * @param {object}  [opcoes]
+ * @param {object}  [opcoes.titulos]  mapa url -> titulo do produto. E o que
+ *   permite classificar e escolher a etiqueta do nicho. Sem titulo o produto
+ *   cai na etiqueta do balde geral (ou na tag da conta, se nao houver mapa) —
+ *   nunca fica sem afiliado.
+ */
+export async function gerarLinksAfiliadoMl(urls, opcoes = {}) {
   const tagConta = tagMl();
   if (!tagConta) throw new Error('ML_TAG nao configurado');
 
+  const titulos = opcoes.titulos || {};
+
   // Uma chamada por tag: o createLink aceita varias URLs, mas uma unica tag por
-  // requisicao. Sem pool configurado todo mundo cai no mesmo balde e o numero
+  // requisicao. Sem mapa de etiquetas todo mundo cai no mesmo balde e o numero
   // de chamadas continua sendo um, como antes.
   const porTag = new Map();
   for (const u of urls) {
-    const t = tagMlDoProduto(idDeUrl(u)) || tagConta;
+    const titulo = titulos[u] || titulos[idDeUrl(u)] || '';
+    // Categoria so vale quando o classificador tem confianca: etiqueta errada
+    // e pior que etiqueta generica, porque contamina a medicao do nicho.
+    const cls = titulo
+      ? classificarProduto({ titulo, asin: idDeUrl(u), loja: 'Mercado Livre' })
+      : null;
+    const cat = (cls && categoriaConfiavel(cls)) ? cls.categoria : '';
+    const t = tagMlDoProduto(idDeUrl(u), cat) || tagConta;
     if (!porTag.has(t)) porTag.set(t, []);
     porTag.get(t).push(u);
   }
@@ -1271,7 +1292,10 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     const url = urlCanonicaMl(salvo.url || ('https://www.mercadolivre.com.br/p/' + salvo.asin));
 
     let links;
-    try { links = await gerarLinksAfiliadoMl([url]); }
+    // O nome salvo na vitrine e o que da a categoria — e por isso que o item
+    // cadastrado sai com a etiqueta do nicho e o link cru capturado num grupo
+    // (que chega sem titulo) cai no balde geral.
+    try { links = await gerarLinksAfiliadoMl([url], { titulos: { [url]: salvo.nome || '' } }); }
     catch (e) {
       descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'painel de afiliados: ' + e.message });
       continue;
