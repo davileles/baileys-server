@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
-import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp, tagAmazonDoGrupo } from './config-tsp.js';
+import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp, tagAmazonDoGrupo, trocasDeLinkDoGrupo } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -489,13 +489,33 @@ export function trocarTagAmazon(url, tag) {
 }
 
 /**
- * Mensagem com as URLs da Amazon reapontadas para a tag do grupo.
+ * Substitui os links de afiliado FIXOS (os de resgate de cupom) pelos do grupo.
+ * Troca literal, e nao reescrita de query string, porque esses links sao
+ * encurtados: a tag mora do outro lado do redirect e mexer na URL nao muda a
+ * conta que recebe.
+ */
+function comLinksDoGrupo(msg, jid) {
+  let pares = [];
+  try { pares = trocasDeLinkDoGrupo(jid, tenantAtual()); }
+  catch (e) { console.log('[TAG-GRUPO] Nao deu para ler os links do grupo:', e.message); return msg; }
+  if (!pares.length) return msg;
+  let out = msg;
+  for (const [de, para] of pares) out = out.split(de).join(para);
+  return out;
+}
+
+/**
+ * Mensagem preparada para o destino: links de afiliado fixos trocados pelos do
+ * grupo e URLs da Amazon reapontadas para a tag dele. Grupo sem nenhum override
+ * recebe a mensagem original, byte a byte.
  * @param {string} mensagem texto ja renderizado, com a tag do pool
  * @param {string} jid      grupo de destino
- * @returns {string} mensagem original quando o grupo nao tem tag propria
  */
 export function comTagDoGrupo(mensagem, jid) {
-  const msg = String(mensagem ?? '');
+  // Links fixos primeiro: o substituto e um link curto (link.amazon), que nao
+  // casa no host da Amazon e por isso escapa intocado da troca de tag abaixo —
+  // preservando a tag que ja vem embutida nele.
+  const msg = comLinksDoGrupo(String(mensagem ?? ''), jid);
   let tag = null;
   // Envio nunca pode cair por causa de rastreio: falha aqui deixa a mensagem
   // com a tag padrao (comissao na conta principal), nunca mensagem nao enviada.
@@ -524,12 +544,12 @@ export function comTagDoGrupo(mensagem, jid) {
  */
 export function previewComTagDoGrupo(preview, jid) {
   if (!preview) return preview;
-  let tag = null;
-  try { tag = tagAmazonDoGrupo(jid, tenantAtual()); } catch (e) { return preview; }
-  if (!tag) return preview;
   try {
-    const canonica = trocarTagAmazon(preview['canonical-url'], tag);
-    const casada   = trocarTagAmazon(preview['matched-text'], tag);
+    // Mesmas duas etapas do texto, na mesma ordem: link fixo e depois tag.
+    const canonica = trocarTagAmazon(comLinksDoGrupo(String(preview['canonical-url'] || ''), jid),
+                                     tagAmazonDoGrupo(jid, tenantAtual()));
+    const casada   = trocarTagAmazon(comLinksDoGrupo(String(preview['matched-text'] || ''), jid),
+                                     tagAmazonDoGrupo(jid, tenantAtual()));
     if (canonica === preview['canonical-url'] && casada === preview['matched-text']) return preview;
     return { ...preview, 'canonical-url': canonica, 'matched-text': casada };
   } catch (e) {

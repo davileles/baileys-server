@@ -70,6 +70,26 @@ const CFG_TSP_PADRAO = {
     // Promos do Davi #07 — comissao direcionada a outro associado.
     '120363429334971122@g.us': 'dl04f-20',
   },
+  // LINK DE AFILIADO POR GRUPO DE DESTINO.
+  //
+  // Irmao de tagsPorGrupo, para o caso que a troca de tag nao resolve: os links
+  // de resgate de cupom acima sao ENCURTADOS, e num link curto a tag mora do
+  // outro lado do redirect — reescrever a query string nao muda nada. Entao,
+  // para esses grupos, o link inteiro e substituido pelo do outro associado.
+  //
+  //   { '<jid>@g.us': { amazon: 'https://...' } }
+  //
+  // As chaves de loja sao as mesmas de `afiliados` (amazon, mercadolivre,
+  // shopee_sem, shopee_com, magalu, zedelivery). Loja ausente no override
+  // continua com o link global.
+  linksPorGrupo: {
+    // Promos do Davi #07 — link de afiliado da conta que recebe a comissao.
+    // Qualquer link da Amazon com a tag do associado abre a janela de cookie,
+    // entao o produto de destino e indiferente para a atribuicao.
+    '120363429334971122@g.us': {
+      amazon: 'https://link.amazon/B03wEQT0G',
+    },
+  },
   // Rodapes anexados as mensagens. Texto livre — o operador pode usar crase
   // para o estilo monoespacado do WhatsApp, ou deixar vazio para nao anexar.
   rodapes: {
@@ -185,6 +205,7 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   // torta (jid vazio, tag fora do formato da Amazon) e descartada em vez de
   // virar excecao no meio de um envio.
   out.afiliados.tagsPorGrupo = normalizarTagsPorGrupo(out.afiliados.tagsPorGrupo);
+  out.afiliados.linksPorGrupo = normalizarLinksPorGrupo(out.afiliados.linksPorGrupo);
   // Credencial nao preenchida fica string vazia, nunca undefined: o painel
   // precisa distinguir "nao configurado" de "campo inexistente".
   for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
@@ -218,6 +239,37 @@ function normalizarTagsPorGrupo(bruto) {
       continue;
     }
     out[j] = t;
+  }
+  return out;
+}
+
+// Chaves de loja aceitas no override por grupo: exatamente as de `afiliados`.
+// Uma chave desconhecida seria um override que nunca casa com nada, e um erro
+// de digitacao passaria despercebido ate alguem conferir o relatorio.
+const LOJAS_AFILIADO = ['amazon', 'mercadolivre', 'shopee_sem', 'shopee_com', 'magalu', 'zedelivery'];
+
+function normalizarLinksPorGrupo(bruto) {
+  const o = (bruto && typeof bruto === 'object' && !Array.isArray(bruto)) ? bruto : {};
+  const out = {};
+  for (const [jid, mapa] of Object.entries(o)) {
+    const j = String(jid || '').trim();
+    if (!j || !mapa || typeof mapa !== 'object') continue;
+    const limpo = {};
+    for (const [loja, url] of Object.entries(mapa)) {
+      const l = String(loja || '').trim().toLowerCase();
+      const u = String(url || '').trim();
+      if (!l || !u) continue;
+      if (!LOJAS_AFILIADO.includes(l)) {
+        console.log('[CFG-TSP] Override de link ignorado (loja desconhecida): ' + j + ' -> ' + l);
+        continue;
+      }
+      if (!/^https?:\/\//i.test(u)) {
+        console.log('[CFG-TSP] Override de link ignorado (nao e URL): ' + j + ' -> ' + l);
+        continue;
+      }
+      limpo[l] = u;
+    }
+    if (Object.keys(limpo).length) out[j] = limpo;
   }
   return out;
 }
@@ -397,6 +449,30 @@ export function tagAmazonDoGrupo(jid, tenantId) {
   try { return obter(tenantId).afiliados.tagsPorGrupo[j] || null; }
   catch (e) { return null; }
 }
+/**
+ * Pares [linkGlobal, linkDoGrupo] para substituir no texto ao enviar para `jid`.
+ * Cruza o override com os links globais aqui, e nao em quem chama, porque a
+ * substituicao so faz sentido contra o link que REALMENTE foi renderizado.
+ * Grupo sem override, ou override igual ao global, devolve lista vazia.
+ */
+export function trocasDeLinkDoGrupo(jid, tenantId) {
+  const j = String(jid || '').trim();
+  if (!j) return [];
+  try {
+    const cfg = obter(tenantId);
+    const over = cfg.afiliados.linksPorGrupo[j];
+    if (!over) return [];
+    const globais = cfg.afiliados;
+    const pares = [];
+    for (const [loja, url] of Object.entries(over)) {
+      const global = String(globais[loja] || '').trim();
+      if (!global || global === url) continue;
+      pares.push([global, url]);
+    }
+    return pares;
+  } catch (e) { return []; }
+}
+
 export function tagsAmazonPorGrupo(tenantId) {
   try { return { ...obter(tenantId).afiliados.tagsPorGrupo }; } catch (e) { return {}; }
 }
