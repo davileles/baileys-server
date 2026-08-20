@@ -1273,7 +1273,21 @@ export async function resolverLinhaVitrineMl(linha) {
   try { titulo = (await buscarDadosProdutoMl(canonica))?.titulo || ''; }
   catch (e) { console.warn('[ML] Vitrine — sem titulo da pagina:', e.message); }
 
-  const nome = nomeManual || titulo || nomeDoSlugMl(canonica) || nomeDoSlugMl(url) || ('Produto ' + id);
+  // Nome manual que e so o comeco do titulo real e recorte de captura, nao
+  // escolha do operador — a extensao corta em ~180 chars. Nesse caso o titulo
+  // da pagina vence, senao "...12V Displa" ficaria gravado na base e sairia
+  // assim na mensagem. Nome manual de verdade (diferente do inicio do titulo)
+  // continua vencendo.
+  const recorte = (a, b) => {
+    const n = s => String(s || '').toLowerCase().normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+    const x = n(a), y = n(b);
+    // Piso de 100 chars: nome curto e escolha do operador, nunca recorte. So
+    // titulo longo perto do teto da extensao (~180) entra nesta regra.
+    return x.length >= 100 && y.length > x.length && y.startsWith(x.slice(0, 60));
+  };
+  const nomeBase = recorte(nomeManual, titulo) ? titulo : nomeManual;
+  const nome = nomeBase || titulo || nomeDoSlugMl(canonica) || nomeDoSlugMl(url) || ('Produto ' + id);
   return { asin: id, nome, url: canonica, loja: 'Mercado Livre' };
 }
 
