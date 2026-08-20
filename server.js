@@ -1180,6 +1180,9 @@ async function workerFila() {
           // Distingue disparo automatico (AUTO_ENVIO_ALERTA=on + veredito
           // positivo) de envio liberado na aprovacao manual do gerador.
           auto:        item.fonte === 'emissao' ? false : !!ofertaEnviada?.autoEnviado,
+          // 'coleta' separa o auto-envio da varredura seats.aero do auto-envio
+          // de captura em grupo monitorado. null nao e gravado pelo proxy.
+          captura:     capturaDaOferta(ofertaEnviada) || item.captura || null,
         }).catch(() => {});
       }
 
@@ -1216,8 +1219,12 @@ function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados, opts) {
   // opts.registrar:false → o item ja foi registrado por quem chamou (emissao
   //   manual imediata registra client-side no gerador); evita linha duplicada.
   const o = opts || {};
+  // opts.captura: 'coleta' quando a oferta nasceu da varredura seats.aero
+  //   injetada em /injetar. Guardado aqui para o registro em passagens.json
+  //   funcionar mesmo quando a oferta ja saiu de filaPendentes.
   filaEnvio.push({ ofertaId, mensagem, destino, dados: dados || null,
                    fonte: o.fonte || null,
+                   captura: o.captura || null,
                    registrar: o.registrar === false ? false : true });
   console.log('[FILA] Oferta #' + ofertaId + ' enfileirada na posição ' + (posicao + 1));
   workerFila().catch(e => {
@@ -1767,6 +1774,19 @@ function precoForaDaCurva(pontos, hist180, tipoVoo) {
 // continua rodando ANTES: muito acima da média nem chega aqui.
 const AUTO_ENVIO_ALERTA_MODO = (process.env.AUTO_ENVIO_ALERTA || 'on').toLowerCase();
 
+// ── PROCEDENCIA DA CAPTURA ───────────────────────────────────────────────────
+// 'coleta' = achado da varredura seats.aero (Cowork) injetado em /injetar.
+// Ausencia do campo = captura em grupo/canal monitorado (comportamento antigo).
+// Existe porque as duas coisas saiam com o mesmo rotulo "Auto (grupo)" na aba
+// Enviadas hoje do gerador, e o auto-envio da varredura nao passou por grupo
+// nenhum — o tooltip afirmava algo falso sobre a origem da oferta.
+const PREFIXO_INJECAO_COLETA = 'coleta_seats_';
+
+function capturaDaOferta(oferta) {
+  const g = String(oferta?.grupoOrigem || '');
+  return g.startsWith(PREFIXO_INJECAO_COLETA) ? 'coleta' : null;
+}
+
 // Campo só conta como preenchido se tiver valor real: vazio, '?', '-', 'N/A',
 // 'desconhecido(a)', 'não identificado(a)', 'indefinido(a)' etc. reprovam.
 function campoAlertaValido(v) {
@@ -1822,7 +1842,8 @@ function entregarOfertaAlerta(oferta, hist180) {
         // apos um restart. Sem gravar aqui, o auto-envio ficava dependente de a
         // filaEnvio (em memoria) sobreviver ate o disparo.
         oferta.mensagemFinal = oferta.mensagemFormatada;
-        enfileirarEnvio(oferta.id, oferta.mensagemFormatada, null, oferta.dadosExtraidos || null);
+        enfileirarEnvio(oferta.id, oferta.mensagemFormatada, null, oferta.dadosExtraidos || null,
+                        { captura: capturaDaOferta(oferta) });
       } else if (AUTO_ENVIO_ALERTA_MODO === 'on') {
         console.log('[AUTO-ALERTA] Para aprovação: ' + rota + ' — ' + v.motivo);
         // Persiste o motivo para o painel exibir por que o alerta caiu na fila
@@ -6324,9 +6345,12 @@ app.get('/fila-envio', (req, res) => {
       ofertaId: item.ofertaId,
       destino:  item.destino,
       preview:  item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
-      // origem do envio: 'auto' (radar automatico) | 'aprovacao' | 'emissao'
+      // origem do envio: 'auto' (captura em grupo monitorado, automatico)
+      // | 'coleta' (varredura seats.aero, automatico) | 'aprovacao' | 'emissao'
       origemEnvio: item.fonte === 'emissao' ? 'emissao'
-                 : (oferta?.autoEnviado ? 'auto' : 'aprovacao'),
+                 : (oferta?.autoEnviado
+                     ? ((capturaDaOferta(oferta) || item.captura) === 'coleta' ? 'coleta' : 'auto')
+                     : 'aprovacao'),
       auto:         !!oferta?.autoEnviado,
       tipoConteudo: oferta?.tipoConteudo || null,
       dados: de ? {
@@ -7060,13 +7084,22 @@ app.post('/painel/limpar', (req, res) => {
 });
 
 app.post('/injetar', async (req, res) => {
-  const { texto } = req.body;
+  // origem: 'coleta' (padrao) | 'manual'. Marca DE ONDE veio o texto injetado.
+  // Hoje o unico chamador de /injetar e a varredura seats.aero do Cowork, por
+  // isso o padrao e 'coleta' — nenhuma mudanca e necessaria do lado da
+  // automacao. Injecao feita a mao deve mandar origem:'manual' para nao ser
+  // contabilizada como achado da varredura.
+  const { texto, origem } = req.body;
   if (!texto?.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
   // Cada injeção manual recebe seu PRÓPRIO grupo (id único) e é processada
   // isoladamente. Assim 1 injeção = 1 oferta: não há janela de 3 min
   // compartilhada (que quebrava as injeções em lotes conforme o tempo) nem
   // risco de o agrupamento por IA fundir rotas diferentes enviadas em sequência.
-  const grupoFake = 'injecao_manual_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  // O prefixo do id carrega a procedencia ate passagens.json sem precisar de um
+  // campo novo em cada ponto do pipeline: grupoOrigem ja e propagado.
+  const prefixo = String(origem || '').toLowerCase() === 'manual'
+    ? 'injecao_manual_' : PREFIXO_INJECAO_COLETA;
+  const grupoFake = prefixo + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
   const entrada = { itens: [], timer: null };
   bufferAgrupamento.set(grupoFake, entrada);
   entrada.itens.push({ texto: texto.trim(), imagemBase64: null, timestamp: Date.now() });
