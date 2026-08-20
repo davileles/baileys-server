@@ -50,6 +50,26 @@ const CFG_TSP_PADRAO = {
     magalu:       'https://magazineluiza.onelink.me/589508454/3jdc7bbv',
     zedelivery:   'https://ze.onelink.me/qZhP/p8z09c1x',
   },
+  // TAG DE AFILIADO AMAZON POR GRUPO DE DESTINO.
+  //
+  // Excecao ao rastreio padrao: o link sai da API com a tag da conta e o pool
+  // rotativo a substitui por um identificador de produto. Para os JIDs listados
+  // aqui, a tag e trocada mais uma vez no momento do envio — depois de saber
+  // para qual grupo a mensagem vai — para direcionar a comissao daquele grupo a
+  // outra conta de associado.
+  //
+  //   { '<jid>@g.us': 'tag-20' }
+  //
+  // Grupo fora do mapa nao muda em NADA: continua com a tag do pool e continua
+  // medido pelo desempenho. So vale para Amazon; Shopee, Mercado Livre, Magalu
+  // e Awin saem intactos.
+  //
+  // Consequencia deliberada: a venda cai na conta do associado dono da tag, e
+  // por isso NAO aparece no relatorio de comissoes nem no EPC desta operacao.
+  tagsPorGrupo: {
+    // Promos do Davi #07 — comissao direcionada a outro associado.
+    '120363429334971122@g.us': 'dl04f-20',
+  },
   // Rodapes anexados as mensagens. Texto livre — o operador pode usar crase
   // para o estilo monoespacado do WhatsApp, ou deixar vazio para nao anexar.
   rodapes: {
@@ -161,6 +181,10 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   // no mesmo formato para quem consome — regra torta vira regra descartada,
   // nunca excecao no meio de um envio.
   out.rodapes.regras = normalizarRegrasRodape(out.rodapes.regras);
+  // Mapa jid -> tag: normalizado na leitura, como as regras de rodape. Entrada
+  // torta (jid vazio, tag fora do formato da Amazon) e descartada em vez de
+  // virar excecao no meio de um envio.
+  out.afiliados.tagsPorGrupo = normalizarTagsPorGrupo(out.afiliados.tagsPorGrupo);
   // Credencial nao preenchida fica string vazia, nunca undefined: o painel
   // precisa distinguir "nao configurado" de "campo inexistente".
   for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
@@ -177,6 +201,27 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
 // default seguro — o escopo mais conservador ('fora-da-trilha') e o tipo mais
 // comum ('oferta'), para que um cadastro incompleto nunca vire cupom com
 // convite cruzado que ninguem pediu.
+// A Amazon so aceita tag no formato <nome>-<numero> (ex.: dl04f-20). Qualquer
+// outra coisa viraria um link com tag invalida — a venda ate acontece, mas sem
+// atribuicao para ninguem. Melhor descartar e deixar o grupo no fluxo normal.
+const RE_TAG_AFILIADO = /^[a-z0-9](?:[a-z0-9._-]{1,48})-[0-9]{2}$/i;
+
+function normalizarTagsPorGrupo(bruto) {
+  const o = (bruto && typeof bruto === 'object' && !Array.isArray(bruto)) ? bruto : {};
+  const out = {};
+  for (const [jid, tag] of Object.entries(o)) {
+    const j = String(jid || '').trim();
+    const t = String(tag || '').trim();
+    if (!j || !t) continue;
+    if (!RE_TAG_AFILIADO.test(t)) {
+      console.log('[CFG-TSP] Tag de afiliado ignorada (formato invalido): ' + j + ' -> ' + t);
+      continue;
+    }
+    out[j] = t;
+  }
+  return out;
+}
+
 const ESCOPOS_RODAPE = ['fora-da-trilha', 'todos', 'so-trilha'];
 const TIPOS_RODAPE   = ['oferta', 'cupom', 'manual'];
 
@@ -343,6 +388,17 @@ export function rodapeOferta(tenantId)      { return (obter(tenantId).rodapes.of
 export function rodapesRegras(tenantId) {
   const r = obter(tenantId).rodapes.regras;
   return Array.isArray(r) ? r.map(x => ({ ...x, tipos: x.tipos.slice(), categorias: x.categorias.slice() })) : [];
+}
+
+/** Tag de afiliado Amazon especifica do grupo, ou null quando ele nao tem. */
+export function tagAmazonDoGrupo(jid, tenantId) {
+  const j = String(jid || '').trim();
+  if (!j) return null;
+  try { return obter(tenantId).afiliados.tagsPorGrupo[j] || null; }
+  catch (e) { return null; }
+}
+export function tagsAmazonPorGrupo(tenantId) {
+  try { return { ...obter(tenantId).afiliados.tagsPorGrupo }; } catch (e) { return {}; }
 }
 
 export function gruposTspCupons(tenantId)   { return (obter(tenantId).grupos.cupons || []).slice(); }

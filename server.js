@@ -22,6 +22,7 @@ import {
   radarFontes, radarDestinos, ehFonteRadar,
   trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento,
   comRodapeExtra, rodapeExtraParaGrupo,
+  comTagDoGrupo, previewComTagDoGrupo,
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
@@ -1269,6 +1270,12 @@ carregarAgendamentos();
 // o link preview e assincrono (baixa a thumbnail) e o loop nao pode esperar.
 // Falha ao montar o card nao cancela o envio: a mensagem sai sem preview.
 async function despacharAgendamento(ag, grupoId) {
+  // Tag de afiliado do destino, pelo mesmo motivo do envio imediato: agendamento
+  // para um grupo com tag propria precisa sair com ela. Grupo fora do mapa
+  // recebe a mensagem original. O caminho multi-grupo nao passa por aqui — ele
+  // cai em enviarManualParaGrupos, que ja faz a troca destino a destino.
+  const msg = comTagDoGrupo(ag.mensagem || '', grupoId);
+
   // Anexo agendado: os bytes viajam dentro do proprio agendamento (o painel
   // manda em base64), entao o disparo nao depende de nenhum arquivo em disco
   // nem de baixar nada na hora. Imagem vai com legenda; qualquer outro mime
@@ -1278,21 +1285,21 @@ async function despacharAgendamento(ag, grupoId) {
     if (!buffer.length) throw new Error('Anexo do agendamento vazio ou base64 invalido.');
     const mt = String(ag.anexo.mimetype || '');
     if (!mt || mt.indexOf('image/') === 0) {
-      const conteudo = { image: buffer, caption: ag.mensagem || '' };
+      const conteudo = { image: buffer, caption: msg };
       if (mt) conteudo.mimetype = mt;
       return enviarMensagem(grupoId, conteudo);
     }
     const conteudo = { document: buffer, mimetype: mt, fileName: ag.anexo.nomeArquivo || 'arquivo' };
-    if (ag.mensagem && ag.mensagem.trim()) conteudo.caption = ag.mensagem;
+    if (msg && msg.trim()) conteudo.caption = msg;
     return enviarMensagem(grupoId, conteudo);
   }
 
   let lp = null;
   if (ag.preview?.link) {
-    try { lp = await montarLinkPreviewManual(ag.preview, ag.mensagem); }
+    try { lp = previewComTagDoGrupo(await montarLinkPreviewManual(ag.preview, msg), grupoId); }
     catch (e) { console.warn('[AGEND] Nao montou o preview de #' + ag.id + ':', e.message); }
   }
-  return enviarMensagem(grupoId, lp ? { text: ag.mensagem, linkPreview: lp } : { text: ag.mensagem });
+  return enviarMensagem(grupoId, lp ? { text: msg, linkPreview: lp } : { text: msg });
 }
 
 // Versao multi-grupo do despacho agendado. Anexo so vale se for imagem: enviar
@@ -2303,7 +2310,10 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
     if (jaRecebeu.has(jid)) { pulados.push(jid); continue; }
     // Rodape extra por grupo: cupom nao tem categoria, entao so casam regras
     // sem filtro de categoria. Sem regra aplicavel, `texto` e a mensagem original.
-    const texto = comRodapeExtra(mensagem, { jid, tipo: 'cupom' });
+    // Tag de afiliado do destino: grupo com tag propria recebe o link com ela,
+    // os demais seguem com a tag do pool. Sem grupo no mapa, `texto` e a
+    // mensagem original, byte a byte.
+    const texto = comTagDoGrupo(comRodapeExtra(mensagem, { jid, tipo: 'cupom' }), jid);
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -2546,13 +2556,16 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
     // Rodape extra decidido AQUI, ja sabendo o destino: e o que permite a mesma
     // oferta de bebida sair no grupo geral com o convite para o grupo de bebidas
     // e sair sem ele dentro do proprio grupo de bebidas.
-    const texto = comRodapeExtra(mensagem, {
+    const texto = comTagDoGrupo(comRodapeExtra(mensagem, {
       jid, tipo: 'oferta',
       categoria: _rota.categoria,
       categoriaConfiavel: _rota.categoriaConfiavel,
-    });
+    }), jid);
+    // O card e clicavel e carrega a propria URL: sem reescrever o preview, o
+    // texto sairia com a tag do grupo e o card levaria o clique para a antiga.
+    const lpDoGrupo = previewComTagDoGrupo(preview, jid);
     try {
-      await enviarMensagem(jid, preview ? { text: texto, linkPreview: preview } : { text: texto }, 0, op);
+      await enviarMensagem(jid, lpDoGrupo ? { text: texto, linkPreview: lpDoGrupo } : { text: texto }, 0, op);
       enviados.push(jid);
       if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
     } catch (e) {
@@ -2623,12 +2636,13 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
   // rodape que nao filtram por categoria.
   const catManual = String(categoria || '').trim();
   for (const jid of alvos) {
-    const texto = comRodapeExtra(mensagem, {
+    const texto = comTagDoGrupo(comRodapeExtra(mensagem, {
       jid,
       tipo: ehCupom ? 'cupom' : 'manual',
       categoria: catManual || null,
       categoriaConfiavel: !!catManual,
-    });
+    }), jid);
+    const lpGrupo = previewComTagDoGrupo(lp, jid);
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -2637,7 +2651,7 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
           mimetype: imagem.mime || 'image/jpeg',
         }, 0, op);
       } else {
-        await enviarMensagem(jid, lp ? { text: texto, linkPreview: lp } : { text: texto }, 0, op);
+        await enviarMensagem(jid, lpGrupo ? { text: texto, linkPreview: lpGrupo } : { text: texto }, 0, op);
       }
       enviados.push(jid);
       // Espacamento entre grupos: mesmo padrao do radar. Disparo simultaneo em

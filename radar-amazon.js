@@ -18,7 +18,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
-import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp } from './config-tsp.js';
+import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp, tagAmazonDoGrupo } from './config-tsp.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -452,6 +452,90 @@ export function comRodapeExtra(mensagem, ctx = {}) {
   try { extra = rodapeExtraParaGrupo(ctx); }
   catch (e) { console.log('[RODAPE] Falha ao resolver rodape extra:', e.message); }
   return extra ? msg + '\n\n' + extra : msg;
+}
+
+// ── TAG DE AFILIADO POR GRUPO DE DESTINO ──────────────────────────────────
+// Mesma logica do rodape extra, pelo mesmo motivo: a pergunta ("a comissao
+// deste grupo vai para qual conta?") so tem resposta depois de saber o destino,
+// e o corpo da mensagem e renderizado uma vez para todos.
+//
+// O link chega aqui com a tag do pool rotativo (posta por comRastreio). Para os
+// grupos do mapa em config_tsp.afiliados.tagsPorGrupo, essa tag e trocada pela
+// tag do associado dono do grupo. Grupo fora do mapa devolve a mensagem
+// EXATAMENTE como entrou — nem uma nova string e alocada.
+//
+// So Amazon: as outras lojas nao usam `tag` na URL e uma reescrita ali quebraria
+// a atribuicao da rede.
+
+// Sufixo fechado, nao `amazon.<qualquer coisa>`: um host como
+// `amazon.com.br.dominio-de-terceiro.net` casaria no padrao aberto e receberia
+// a tag de afiliado numa URL que nao e da Amazon.
+const RE_HOST_AMAZON = /(^|\.)amazon\.(com|com\.br|com\.mx|com\.au|com\.tr|co\.uk|co\.jp|de|fr|es|it|nl|se|pl|ca|in|ae|sa|sg|eg)$/i;
+// Mesmo formato que RE_TAG_AMAZON valida no pool, repetido aqui de proposito:
+// aquela constante e declarada mais abaixo no arquivo e depender da ordem de
+// avaliacao para uma funcao chamada em todo envio nao vale o risco.
+const RE_TAG_DESTINO = /^[a-z0-9][a-z0-9-]{1,40}-\d{2}$/i;
+
+/** URL da Amazon com a tag trocada. Qualquer outra URL volta intacta. */
+export function trocarTagAmazon(url, tag) {
+  if (!url || !tag) return url;
+  try {
+    const u = new URL(url);
+    if (!RE_HOST_AMAZON.test(u.hostname)) return url;
+    if (!RE_TAG_DESTINO.test(tag)) return url;
+    u.searchParams.set('tag', tag);
+    return u.toString();
+  } catch { return url; }
+}
+
+/**
+ * Mensagem com as URLs da Amazon reapontadas para a tag do grupo.
+ * @param {string} mensagem texto ja renderizado, com a tag do pool
+ * @param {string} jid      grupo de destino
+ * @returns {string} mensagem original quando o grupo nao tem tag propria
+ */
+export function comTagDoGrupo(mensagem, jid) {
+  const msg = String(mensagem ?? '');
+  let tag = null;
+  // Envio nunca pode cair por causa de rastreio: falha aqui deixa a mensagem
+  // com a tag padrao (comissao na conta principal), nunca mensagem nao enviada.
+  try { tag = tagAmazonDoGrupo(jid, tenantAtual()); }
+  catch (e) { console.log('[TAG-GRUPO] Nao deu para ler o mapa:', e.message); return msg; }
+  if (!tag) return msg;
+  try {
+    return msg.replace(/https?:\/\/[^\s`"'<>]+/g, (u) => {
+      // A URL no texto pode terminar em pontuacao da frase; devolver o sufixo
+      // evita comer o ponto final ao reescrever.
+      const m = u.match(/[).,;!?]+$/);
+      const sufixo = m ? m[0] : '';
+      const limpa = sufixo ? u.slice(0, -sufixo.length) : u;
+      return trocarTagAmazon(limpa, tag) + sufixo;
+    });
+  } catch (e) {
+    console.log('[TAG-GRUPO] Falha ao reescrever links:', e.message);
+    return msg;
+  }
+}
+
+/**
+ * Preview do card com a mesma troca de tag. O card e clicavel e carrega a
+ * propria URL: sem isso, o texto sairia com a tag do grupo e o card levaria o
+ * clique para a tag antiga.
+ */
+export function previewComTagDoGrupo(preview, jid) {
+  if (!preview) return preview;
+  let tag = null;
+  try { tag = tagAmazonDoGrupo(jid, tenantAtual()); } catch (e) { return preview; }
+  if (!tag) return preview;
+  try {
+    const canonica = trocarTagAmazon(preview['canonical-url'], tag);
+    const casada   = trocarTagAmazon(preview['matched-text'], tag);
+    if (canonica === preview['canonical-url'] && casada === preview['matched-text']) return preview;
+    return { ...preview, 'canonical-url': canonica, 'matched-text': casada };
+  } catch (e) {
+    console.log('[TAG-GRUPO] Falha ao reescrever o preview:', e.message);
+    return preview;
+  }
 }
 
 // ── MONITORAMENTO POR GRUPO ───────────────────────────────────────────────
