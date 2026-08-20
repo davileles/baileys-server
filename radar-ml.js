@@ -833,8 +833,26 @@ export async function processarTextoMl(texto) {
   }
   if (!canonicas.length) return [];
 
+  // Dados do produto ANTES do createLink. A ordem importa: a etiqueta de nicho
+  // e escolhida dentro de gerarLinksAfiliadoMl a partir do TITULO, e o link do
+  // grupo-fonte chega cru, sem titulo nenhum. Gerando o link primeiro, todo
+  // produto do radar caia na etiqueta 'geral' — cadeirinha de bebe e
+  // esmerilhadeira inclusive — e a medicao por nicho no ML nunca saia do papel.
+  // Nao ha requisicao extra: buscarDadosProdutoMl ja era chamada para cada URL,
+  // so que depois. De brinde, a trilha lida aqui alimenta o cache do
+  // classificador, entao a classificacao fica melhor do que so pelo titulo.
+  const dadosPorUrl = new Map();
+  const falhaDados = new Map();
+  for (const url of canonicas) {
+    try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url)); }
+    catch (e) { falhaDados.set(url, e.message); }
+  }
+
+  const titulos = {};
+  for (const [url, d] of dadosPorUrl) if (d?.titulo) titulos[url] = d.titulo;
+
   let links;
-  try { links = await gerarLinksAfiliadoMl(canonicas); }
+  try { links = await gerarLinksAfiliadoMl(canonicas, { titulos }); }
   catch (e) {
     console.error('[ML] createLink falhou:', e.message);
     return canonicas.map(u => ({ produto: { loja: 'Mercado Livre', link: u },
@@ -850,11 +868,10 @@ export async function processarTextoMl(texto) {
       continue;
     }
 
-    let dados;
-    try { dados = await buscarDadosProdutoMl(url); }
-    catch (e) {
+    const dados = dadosPorUrl.get(url);
+    if (!dados) {
       saida.push({ produto: { loja: 'Mercado Livre', link: r.link },
-                   descartadoPor: 'dados do produto: ' + e.message });
+                   descartadoPor: 'dados do produto: ' + (falhaDados.get(url) || 'nao lidos') });
       continue;
     }
 
