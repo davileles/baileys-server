@@ -109,6 +109,9 @@ const CFG_PADRAO = {
     cotaPorNicho: { geral: 18, bebidas: 6, infantil: 6, ferramentas: 6 },
     // Nicho e a categoria do classificador; 'geral' = sem categoria confiavel.
     aplicarCupom: true,    // pede o melhor cupom aplicavel no disparo
+    // Avalia a queda tambem sobre o preco COM cupom, contra o historico de
+    // preco com cupom. Desligado, o monitor volta a olhar so a etiqueta.
+    considerarCupom: true,
 
     // ── PRODUTO CURADO (nicho declarado no cadastro) ──
     // Grupo nichado tem contrato diferente do grupo geral: quem entra num grupo
@@ -272,6 +275,7 @@ function estruturarCfg(bruto) {
   out.publicacao.janelas = jan.length ? jan : clonar(CFG_PADRAO.publicacao.janelas);
   out.publicacao.intervaloMin = limitar(p.intervaloMin, 1, 1440, CFG_PADRAO.publicacao.intervaloMin);
   out.publicacao.aplicarCupom = p.aplicarCupom !== false;
+  out.publicacao.considerarCupom = p.considerarCupom !== false;
   out.publicacao.cotaPorLoja  = mapaNumerico(p.cotaPorLoja,  CFG_PADRAO.publicacao.cotaPorLoja,  0, 500);
   out.publicacao.cotaPorNicho = mapaNumerico(p.cotaPorNicho, CFG_PADRAO.publicacao.cotaPorNicho, 0, 500);
 
@@ -366,24 +370,41 @@ export function salvarConfigMonitorPrecos(parcial = {}) {
 // 8 leituras/dia e 200 produtos, guardar tudo daria ~2 MB de serie em 90 dias
 // e a Contents API para de devolver arquivo acima de ~1 MB — a restauracao
 // pos-deploy morreria em silencio. O minimo diario e o que o gatilho usa.
-function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel }) {
+function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfetivo }) {
   if (!Number.isFinite(preco) || preco <= 0) return null;
   const dia = diaSP();
-  const h = _hist[asin] || { n: '', loja: '', dias: {}, ult: null };
+  const h = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, ult: null };
+  if (!h.diasEf) h.diasEf = {};      // serie nova: historico antigo nao tem
   h.n = nome || h.n;
   h.loja = loja || h.loja;
   h.dias[dia] = (h.dias[dia] === undefined) ? preco : Math.min(h.dias[dia], preco);
-  h.ult = { preco, precoDe: precoDe ?? null, disponivel: disponivel !== false, em: new Date().toISOString() };
+
+  // SERIE EFETIVA: preco depois do melhor cupom vigente da loja naquele momento.
+  // Gravada SEMPRE, mesmo sem cupom (quando ef === preco) — se so registrasse os
+  // dias com cupom, a mediana sairia calculada apenas sobre dias descontados e
+  // toda comparacao ficaria enviesada para baixo.
+  const ef = Number.isFinite(precoEfetivo) && precoEfetivo > 0 ? Math.min(precoEfetivo, preco) : preco;
+  h.diasEf[dia] = (h.diasEf[dia] === undefined) ? ef : Math.min(h.diasEf[dia], ef);
+
+  h.ult = { preco, precoDe: precoDe ?? null, disponivel: disponivel !== false,
+            precoEfetivo: ef, em: new Date().toISOString() };
 
   // Poda: dias fora do horizonte saem do arquivo.
   const corte = diaSP(Date.now() - DIAS_RETENCAO * 86400000);
-  for (const d of Object.keys(h.dias)) if (d < corte) delete h.dias[d];
+  for (const d of Object.keys(h.dias))   if (d < corte) delete h.dias[d];
+  for (const d of Object.keys(h.diasEf)) if (d < corte) delete h.diasEf[d];
 
   _hist[asin] = h;
   return h;
 }
 
 /** Estatisticas da serie de um produto. Base de toda decisao de disparo. */
+function medianaDe(v) {
+  if (!v.length) return null;
+  const o = [...v].sort((a, b) => a - b);
+  return o.length % 2 ? o[(o.length - 1) / 2] : (o[o.length / 2 - 1] + o[o.length / 2]) / 2;
+}
+
 export function estatisticas(asin) {
   const h = _hist[asin];
   if (!h || !h.dias) return null;
@@ -396,20 +417,28 @@ export function estatisticas(asin) {
   const v90 = pares.filter(([d]) => d >= corte90).map(([, v]) => v);
   if (!v90.length) return null;
 
-  const ord = [...v30].sort((a, b) => a - b);
-  const mediana30 = ord.length
-    ? (ord.length % 2 ? ord[(ord.length - 1) / 2] : (ord[ord.length / 2 - 1] + ord[ord.length / 2]) / 2)
-    : null;
+  // Estatistica da serie EFETIVA (com cupom). Produto monitorado antes desta
+  // camada nao tem diasEf: devolve null e o gatilho por cupom simplesmente nao
+  // opina ate a serie encher — ausencia de dado nao pode virar sinal.
+  const paresEf = Object.entries(h.diasEf || {}).sort((a, b) => a[0] < b[0] ? -1 : 1);
+  const e30 = paresEf.filter(([d]) => d >= corte30).map(([, v]) => v);
+  const e90 = paresEf.filter(([d]) => d >= corte90).map(([, v]) => v);
 
   return {
     dias: pares.length,
     diasRecentes: v90.length,
     min90: Math.min(...v90),
     max90: Math.max(...v90),
-    mediana30,
+    mediana30: medianaDe(v30),
     ultimo: h.ult?.preco ?? null,
     ultimoEm: h.ult?.em ?? null,
     primeiroDia: pares[0]?.[0] || null,
+    efetivo: e90.length ? {
+      dias: paresEf.length,
+      min90: Math.min(...e90),
+      mediana30: medianaDe(e30),
+      ultimo: h.ult?.precoEfetivo ?? null,
+    } : null,
   };
 }
 
@@ -418,6 +447,7 @@ export function historicoDe(asin) {
   if (!h) return null;
   return { asin, nome: h.n, loja: h.loja, ult: h.ult,
            serie: Object.entries(h.dias).sort((a, b) => a[0] < b[0] ? -1 : 1).map(([d, v]) => ({ d, v })),
+           serieEfetiva: Object.entries(h.diasEf || {}).sort((a, b) => a[0] < b[0] ? -1 : 1).map(([d, v]) => ({ d, v })),
            stats: estatisticas(asin) };
 }
 
@@ -550,20 +580,75 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   const ref = stats.mediana30 ?? stats.min90;
   if (!Number.isFinite(ref) || ref <= 0)      return { ...base, passou: false, motivo: 'sem referencia' };
 
-  const quedaPct = Math.round((1 - preco / ref) * 1000) / 10;
-  const quedaRs  = Math.round((ref - preco) * 100) / 100;
-  const limiar   = stats.min90 * (1 + (r.toleranciaMinimoPct || 0) / 100);
-  const recorde  = preco <= limiar;
+  // ── DUAS LEITURAS DA MESMA QUEDA ──
+  // BRUTO    preco de etiqueta contra o historico de etiqueta.
+  // EFETIVO  preco depois do melhor cupom vigente, contra o historico de preco
+  //          efetivo. Existe porque cupom novo derruba o que o cliente paga sem
+  //          mexer na etiqueta: sem esta serie, 20% de cupom num produto de
+  //          preco parado e invisivel para o monitor. E o contrario tambem —
+  //          produto que TINHA cupom e nao tem mais ficou mais caro, e so a
+  //          serie efetiva registra isso.
+  const medir = (p, refer, minimo) => {
+    if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(refer) || refer <= 0) return null;
+    const lim = Number.isFinite(minimo) ? minimo * (1 + (r.toleranciaMinimoPct || 0) / 100) : null;
+    return {
+      quedaPct: Math.round((1 - p / refer) * 1000) / 10,
+      quedaRs:  Math.round((refer - p) * 100) / 100,
+      recorde:  lim === null ? false : p <= lim,
+    };
+  };
+  const aprova = (m) => m
+    && m.quedaPct >= r.quedaMinPct
+    && m.quedaRs  >= r.quedaMinReais
+    && (!r.exigirMinimo90d || m.recorde);
 
+  const mBruto = medir(preco, ref, stats.min90);
+
+  // A leitura efetiva so entra quando a serie efetiva ja existe E o cupom de
+  // agora e real: o desconto e recalculado aqui, nao herdado do que estava
+  // gravado ontem.
+  let cupomAtual = null;
+  if (_cfg.publicacao.aplicarCupom) {
+    try { cupomAtual = melhorCupomAplicavel(item.loja, preco) || null; } catch (e) { cupomAtual = null; }
+  }
+  const precoEfetivo = cupomAtual ? Math.round((preco - cupomAtual.desconto) * 100) / 100 : preco;
+  const ef = stats.efetivo;
+  const usarEfetivo = _cfg.publicacao.considerarCupom && ef && ef.dias >= r.maturidadeMinDias;
+  const mEfet = usarEfetivo
+    ? medir(precoEfetivo, ef.mediana30 ?? ef.min90, ef.min90)
+    : null;
+
+  // Vence a leitura que APROVA. Se as duas aprovam, vence a de queda maior — e
+  // ela que descreve melhor o tamanho real da oportunidade.
+  const okB = aprova(mBruto), okE = aprova(mEfet);
+  let venc = null, via = null;
+  if (okB && okE) { const b = mBruto.quedaPct >= mEfet.quedaPct; venc = b ? mBruto : mEfet; via = b ? 'preco' : 'cupom'; }
+  else if (okB)   { venc = mBruto; via = 'preco'; }
+  else if (okE)   { venc = mEfet;  via = 'cupom'; }
+
+  const melhorParaRelato = venc || mBruto || { quedaPct: 0, quedaRs: 0, recorde: false };
   const detalhe = { ...base, mediana30: stats.mediana30, min90: stats.min90,
-                    quedaPct, quedaRs, recorde, diasSerie: stats.dias };
+                    quedaPct: melhorParaRelato.quedaPct, quedaRs: melhorParaRelato.quedaRs,
+                    recorde: melhorParaRelato.recorde, diasSerie: stats.dias,
+                    via, precoEfetivo,
+                    quedaPctBruto: mBruto?.quedaPct ?? null,
+                    quedaPctEfetivo: mEfet?.quedaPct ?? null,
+                    medianaEfetiva30: ef?.mediana30 ?? null,
+                    minEfetivo90: ef?.min90 ?? null };
 
-  if (quedaPct < r.quedaMinPct)
-    return { ...detalhe, passou: false, motivo: 'queda de ' + quedaPct + '% < ' + r.quedaMinPct + '%' };
-  if (quedaRs < r.quedaMinReais)
-    return { ...detalhe, passou: false, motivo: 'queda de R$ ' + quedaRs.toFixed(2) + ' < R$ ' + r.quedaMinReais };
-  if (r.exigirMinimo90d && !recorde)
+  if (!venc) {
+    // O motivo relata a leitura BRUTA (a que sempre existe); quando a efetiva
+    // chegou perto, o operador ve os dois numeros no modo sombra.
+    const m = mBruto;
+    if (!m) return { ...detalhe, passou: false, motivo: 'sem referencia' };
+    if (m.quedaPct < r.quedaMinPct)
+      return { ...detalhe, passou: false, motivo: 'queda de ' + m.quedaPct + '% < ' + r.quedaMinPct + '%'
+        + (mEfet ? ' (com cupom: ' + mEfet.quedaPct + '%)' : '') };
+    if (m.quedaRs < r.quedaMinReais)
+      return { ...detalhe, passou: false, motivo: 'queda de R$ ' + m.quedaRs.toFixed(2) + ' < R$ ' + r.quedaMinReais };
     return { ...detalhe, passou: false, motivo: 'nao esta no menor patamar de 90 dias' };
+  }
+  const quedaPct = venc.quedaPct, quedaRs = venc.quedaRs, recorde = venc.recorde;
 
   // Cooldown por produto: vale tanto para disparo do monitor quanto para
   // disparo manual/lista, porque quem recebe e o mesmo grupo.
@@ -589,15 +674,17 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   // bem passa na frente de produto que so tem numero bonito.
   let score = quedaPct;
   if (recorde) score += 10;
-  let cupom = null;
-  if (_cfg.publicacao.aplicarCupom) {
-    try { cupom = melhorCupomAplicavel(item.loja, preco) || null; } catch (e) { cupom = null; }
-    if (cupom) score += 5;
-  }
+  // Reaproveita o cupom ja calculado na leitura efetiva — chamar de novo aqui
+  // era uma segunda varredura da base de cupons para o mesmo resultado.
+  if (cupomAtual) score += 5;
   if (d) score += d.epc * sc.pesoEpc;
 
   return { ...detalhe, passou: true, motivo: 'ok', score: Math.round(score * 10) / 10,
-           cupom: cupom?.codigo || null,
+           // melhorCupomAplicavel devolve { reg, desconto } — ler .codigo direto
+           // do retorno deixava este campo sempre nulo, e a fila do painel
+           // aparecia sem cupom mesmo quando havia um aplicavel.
+           cupom: cupomAtual?.reg?.codigo || null,
+           descontoCupom: cupomAtual?.desconto || null,
            epc: d?.epc ?? null, cliquesEpc: d?.cliques ?? null };
 }
 
@@ -687,9 +774,18 @@ export async function varrer({ manual = false } = {}) {
   // dois caminhos de leitura (lote da Amazon e item a item das outras lojas)
   // para que a REGRA seja uma so — duplicar isso seria criar duas verdades.
   const processar = (item, leitura) => {
+    // Cupom vigente AGORA, para a serie efetiva. Calculado na varredura porque
+    // e aqui que se sabe qual era o cupom naquele instante — reconstruir isso
+    // depois seria impossivel: cupom expira e some da base.
+    let descontoAgora = 0;
+    if (_cfg.publicacao.aplicarCupom && Number.isFinite(leitura.preco)) {
+      try { descontoAgora = melhorCupomAplicavel(item.loja, leitura.preco)?.desconto || 0; }
+      catch (e) { descontoAgora = 0; }
+    }
     registrarPreco(item.asin, {
       nome: leitura.titulo || item.nome, loja: item.loja,
       preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
+      precoEfetivo: Number.isFinite(leitura.preco) ? leitura.preco - descontoAgora : null,
     });
     resumo.lidos++;
 
@@ -910,7 +1006,8 @@ async function tentarPublicar() {
       registrarDisparo({ ...escolhido, precoEnviado: r.preco, grupos: r.grupos,
                          cupom: r.cupom, espelhouNoGeral: !!r.espelhouNoGeral, ok: true });
       console.log('[PRECOS] Enviado: ' + (r.nome || escolhido.nome) + ' — R$ ' + r.preco
-        + ' (' + escolhido.quedaPct + '% abaixo da mediana, nicho ' + escolhido.nicho
+        + ' (' + escolhido.quedaPct + '% abaixo da mediana'
+        + (escolhido.via === 'cupom' ? ' por CUPOM' : '') + ', nicho ' + escolhido.nicho
         + (escolhido.curado ? ', curado' : '')
         + (r.espelhouNoGeral ? ', nicho+geral' : (escolhido.curado ? ', so no nicho' : ''))
         + ', ' + r.grupos + ' grupo(s)).');
@@ -1015,7 +1112,10 @@ export async function dispararMonitorado(item, candidato = {}) {
       categoriaConfianca: cls.confianca || 0,
       // Rastro do porque esta oferta saiu — aparece no historico do painel.
       monitor: { quedaPct: candidato.quedaPct ?? null, mediana30: candidato.mediana30 ?? null,
-                 min90: candidato.min90 ?? null, recorde: !!candidato.recorde },
+                 min90: candidato.min90 ?? null, recorde: !!candidato.recorde,
+                 // 'cupom' = a etiqueta nao mudou, quem caiu foi o que se paga.
+                 via: candidato.via || 'preco',
+                 precoEfetivo: candidato.precoEfetivo ?? null },
     },
     imagens: [],
   };
