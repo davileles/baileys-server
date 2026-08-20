@@ -28,7 +28,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { agendarPush } from './sync-github.js';
+import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
 import { listarVitrine, itemVitrine, salvarItemVitrine, melhorCupomAplicavel, marcarDisparo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
@@ -229,16 +229,153 @@ function ler(nome, padrao) {
 function gravar(nome, dados, push = true) {
   try {
     if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
-    writeFileSync(caminho(nome), JSON.stringify(dados, null, nome === ARQ_HIST ? 0 : 2));
+    const compacto = nome === ARQ_HIST || /^precos_hist_\d{4}-\d{2}\.json$/.test(nome);
+    writeFileSync(caminho(nome), JSON.stringify(dados, null, compacto ? 0 : 2));
     if (push) agendarPush(nome);
   } catch (e) {
     console.error('[PRECOS] Falha ao gravar ' + nome + ':', e.message);
   }
 }
 
+// ── SHARD MENSAL DA SERIE DE PRECOS ─────────────────────────────────────────
+// Em MEMORIA a serie continua sendo um objeto so, com chave de dia completa
+// ('2026-08-20'). O que muda e a persistencia: em disco a serie vira um arquivo
+// por mes, e dentro dele a chave e so o DIA ('20') — o mes ja esta no nome do
+// arquivo, repeti-lo em cada ponto custava ~10 bytes por leitura por produto.
+//
+// Duas razoes para shardar por TEMPO e nao por loja ou nicho:
+//   1. o que faz o arquivo crescer e o horizonte de 120 dias, nao a categoria;
+//      dividir por loja daria 3 arquivos que crescem para sempre do mesmo jeito
+//   2. shard de mes fechado e IMUTAVEL — a varredura so escreve o mes corrente,
+//      entao as 24 gravacoes diarias param de reenviar a serie inteira
+const ARQ_HIST_LEGADO = ARQ_HIST;
+const RE_SHARD = /^precos_hist_(\d{4}-\d{2})\.json$/;
+
+function nomeShard(mes) { return 'precos_hist_' + mes + '.json'; }
+function mesDoDia(dia)  { return String(dia).slice(0, 7); }
+function mesSP(ts = Date.now()) { return mesDoDia(diaSP(ts)); }
+
+/** Meses que a janela de retencao alcanca, do mais novo para o mais antigo. */
+function mesesNaJanela(qtd = null) {
+  const n = qtd ?? Math.ceil(DIAS_RETENCAO / 30) + 1;
+  const out = [];
+  const hoje = new Date();
+  for (let i = 0; i < n; i++) {
+    out.push(mesSP(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth() - i, 15)));
+  }
+  return out;
+}
+
+/** Recorta de _hist so os pontos de um mes, com a chave curta do dia. */
+function serializarShard(mes) {
+  const out = {};
+  for (const [asin, h] of Object.entries(_hist)) {
+    const dias = {}, diasEf = {};
+    for (const [d, v] of Object.entries(h.dias || {}))   if (mesDoDia(d) === mes) dias[d.slice(8)] = v;
+    for (const [d, v] of Object.entries(h.diasEf || {})) if (mesDoDia(d) === mes) diasEf[d.slice(8)] = v;
+    if (!Object.keys(dias).length && !Object.keys(diasEf).length) continue;
+    const reg = { n: h.n, loja: h.loja, dias, diasEf };
+    // A ultima leitura e estado corrente, nao historico: mora so no shard do
+    // mes atual, senao um shard antigo restaurado sobrescreveria o preco de hoje.
+    if (mes === mesSP() && h.ult) reg.ult = h.ult;
+    out[asin] = reg;
+  }
+  return out;
+}
+
+/** Funde um shard lido do disco dentro de _hist, expandindo a chave do dia. */
+function fundirShard(mes, dados) {
+  for (const [asin, r] of Object.entries(dados || {})) {
+    const h = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, ult: null };
+    h.n = h.n || r.n || '';
+    h.loja = h.loja || r.loja || '';
+    if (!h.dias) h.dias = {};
+    if (!h.diasEf) h.diasEf = {};
+    for (const [d, v] of Object.entries(r.dias   || {})) h.dias[mes + '-' + d]   = v;
+    for (const [d, v] of Object.entries(r.diasEf || {})) h.diasEf[mes + '-' + d] = v;
+    // Vence a leitura mais recente: shards sao fundidos do mais antigo para o
+    // mais novo, mas o volume pode ter um shard velho de um deploy anterior.
+    if (r.ult && (!h.ult || String(r.ult.em || '') > String(h.ult.em || ''))) h.ult = r.ult;
+    _hist[asin] = h;
+  }
+}
+
+/** Grava o shard do mes corrente. Meses fechados nao sao reescritos. */
+function gravarShardCorrente() {
+  const mes = mesSP();
+  gravar(nomeShard(mes), serializarShard(mes));
+}
+
+/**
+ * Migracao do arquivo unico. Roda uma vez: se precos_hist.json ainda existir,
+ * ele e lido, quebrado em shards e os shards sao gravados. O arquivo antigo NAO
+ * e apagado do repo — se este deploy for revertido, a versao anterior precisa
+ * encontrar a serie onde sempre esteve.
+ */
+function migrarHistoricoUnico() {
+  const legado = ler(ARQ_HIST_LEGADO, null);
+  if (!legado || !Object.keys(legado).length) return 0;
+  for (const [asin, h] of Object.entries(legado)) {
+    const atual = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, ult: null };
+    atual.n = atual.n || h.n || '';
+    atual.loja = atual.loja || h.loja || '';
+    atual.dias = { ...(h.dias || {}), ...(atual.dias || {}) };
+    atual.diasEf = { ...(h.diasEf || {}), ...(atual.diasEf || {}) };
+    if (h.ult && !atual.ult) atual.ult = h.ult;
+    _hist[asin] = atual;
+  }
+  const meses = new Set();
+  for (const h of Object.values(_hist)) {
+    for (const d of Object.keys(h.dias || {}))   meses.add(mesDoDia(d));
+    for (const d of Object.keys(h.diasEf || {})) meses.add(mesDoDia(d));
+  }
+  for (const m of meses) gravar(nomeShard(m), serializarShard(m));
+  console.log('[PRECOS] Migracao — serie unica quebrada em ' + meses.size + ' shard(s) mensal(is): '
+    + [...meses].sort().join(', ') + '.');
+  return meses.size;
+}
+
+/** Remove de _hist o que caiu fora do horizonte de retencao. */
+function podarHistorico() {
+  const corte = diaSP(Date.now() - DIAS_RETENCAO * 86400000);
+  for (const h of Object.values(_hist)) {
+    for (const d of Object.keys(h.dias || {}))   if (d < corte) delete h.dias[d];
+    for (const d of Object.keys(h.diasEf || {})) if (d < corte) delete h.diasEf[d];
+  }
+}
+
+/**
+ * Restaura do repo os shards da janela. Necessario porque nome dinamico nao
+ * entra na varredura do boot do sync — num volume novo do Railway, a primeira
+ * gravacao do mes sobrescreveria a serie que ja esta no GitHub.
+ */
+export async function restaurarShardsDePrecos(meses = null) {
+  const alvos = mesesNaJanela(meses);
+  let ok = 0;
+  for (const m of alvos) {
+    if (await baixarArquivoDoGitHub(nomeShard(m))) ok++;
+  }
+  for (const m of [...alvos].reverse()) {
+    const d = ler(nomeShard(m), null);
+    if (d) fundirShard(m, d);
+  }
+  podarHistorico();
+  console.log('[PRECOS] Shards restaurados — ' + ok + ' de ' + alvos.length + ' mes(es) ('
+    + alvos.join(', ') + '), ' + Object.keys(_hist).length + ' produto(s) com serie.');
+  return { meses: alvos, baixados: ok, produtos: Object.keys(_hist).length };
+}
+
 export function carregarMonitorPrecos() {
   _cfg    = estruturarCfg(ler(ARQ_CFG, {}));
-  _hist   = ler(ARQ_HIST, {});
+  _hist   = {};
+  // Shards do disco primeiro (do mais antigo para o mais novo), depois a
+  // migracao do arquivo unico para quem ainda nao rodou esta versao.
+  for (const m of [...mesesNaJanela()].reverse()) {
+    const d = ler(nomeShard(m), null);
+    if (d) fundirShard(m, d);
+  }
+  if (!Object.keys(_hist).length) migrarHistoricoUnico();
+  podarHistorico();
   _epc    = ler(ARQ_EPC, { produtos: {} });
   _estado = { ..._estado, ...ler(ARQ_ESTADO, {}) };
   if (!Array.isArray(_estado.fila)) _estado.fila = [];
@@ -857,7 +994,9 @@ export async function varrer({ manual = false } = {}) {
       em: new Date().toISOString(), duracaoSeg: Math.round((Date.now() - t0) / 1000),
       ...resumo,
     };
-    gravar(ARQ_HIST, _hist);
+    // So o shard do mes corrente: a varredura nunca acrescenta ponto em mes
+    // fechado, entao reescrever os antigos seria reenviar dado identico.
+    gravarShardCorrente();
     gravar(ARQ_ESTADO, _estado);
     console.log('[PRECOS] Varredura concluida em ' + Math.round((Date.now() - t0) / 1000) + 's — '
       + resumo.lidos + ' lido(s), ' + resumo.candidatos + ' candidato(s), ' + resumo.falhas + ' falha(s).');
@@ -1310,6 +1449,12 @@ function reprogramarVarredura() {
 export function iniciarMonitorPrecos(deps) {
   _deps = deps;
   carregarMonitorPrecos();
+  // Shard tem nome dinamico e nao entra na varredura do boot do sync: num
+  // volume novo do Railway o disco esta vazio e a serie inteira mora so no
+  // repo. Sem esta restauracao, a primeira gravacao do mes subiria um shard
+  // com um dia de serie por cima do que ja estava la.
+  restaurarShardsDePrecos()
+    .catch(e => console.error('[PRECOS] Restauracao de shards falhou:', e.message));
   reprogramarVarredura();
   // Publicador roda sempre: e ele que respeita o modo, entao ligar/desligar em
   // tela tem efeito imediato sem reprogramar timer.
