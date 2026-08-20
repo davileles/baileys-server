@@ -101,12 +101,29 @@ const CFG_TSP_PADRAO = {
   //
   // A troca e literal, comparando a string inteira: link que nao aparecer na
   // mensagem simplesmente nao casa e nada acontece.
-  linksLiteraisPorGrupo: {
-    // Promos do Davi #07 — convite do Prime na conta do associado (dl04f-20).
-    '120363429334971122@g.us': {
-      'https://link.amazon/B0dULFSvu': 'https://link.amazon/B08eCYlQ3',
+  linksLiteraisPorGrupo: {},
+  // REGRAS POR PREFIXO DO NOME DO GRUPO.
+  //
+  // Os mapas acima sao por JID, e JID novo so passa a valer depois que alguem
+  // lembra de cadastra-lo. Uma familia de grupos que cresce ("Promos do Davi
+  // #01", "#02", ...) precisa da regra escrita uma vez: grupo criado amanha ja
+  // nasce com a atribuicao certa, sem editar config.
+  //
+  // O prefixo e comparado no inicio do nome, sem acento e sem diferenciar
+  // maiusculas. Primeira regra que casa vence. Um mapa por JID tem prioridade
+  // sobre a regra de nome — a excecao pontual continua podendo existir.
+  regrasPorNome: [
+    {
+      nome: 'Promos do Davi',
+      prefixo: 'promos do davi',
+      // Tag das ofertas de produto.
+      tag: 'dl04f-20',
+      // Links de afiliado que substituem os de `afiliados` (chaves iguais).
+      links: { amazon: 'https://link.amazon/B03wEQT0G' },
+      // Trocas literais de URL: links escritos no corpo do template.
+      literais: { 'https://link.amazon/B0dULFSvu': 'https://link.amazon/B08eCYlQ3' },
     },
-  },
+  ],
   // Rodapes anexados as mensagens. Texto livre — o operador pode usar crase
   // para o estilo monoespacado do WhatsApp, ou deixar vazio para nao anexar.
   rodapes: {
@@ -224,6 +241,7 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   out.afiliados.tagsPorGrupo = normalizarTagsPorGrupo(out.afiliados.tagsPorGrupo);
   out.afiliados.linksPorGrupo = normalizarLinksPorGrupo(out.afiliados.linksPorGrupo);
   out.afiliados.linksLiteraisPorGrupo = normalizarLiteraisPorGrupo(out.afiliados.linksLiteraisPorGrupo);
+  out.afiliados.regrasPorNome = normalizarRegrasPorNome(out.afiliados.regrasPorNome);
   // Credencial nao preenchida fica string vazia, nunca undefined: o painel
   // precisa distinguir "nao configurado" de "campo inexistente".
   for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
@@ -289,6 +307,44 @@ function normalizarLinksPorGrupo(bruto) {
     }
     if (Object.keys(limpo).length) out[j] = limpo;
   }
+  return out;
+}
+
+/** Sem acento, sem espaco duplo, minusculo — para o prefixo casar como o olho ve. */
+function chaveNome(s) {
+  return String(s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function normalizarRegrasPorNome(bruto) {
+  const lista = Array.isArray(bruto) ? bruto : [];
+  const out = [];
+  lista.forEach((b, i) => {
+    const o = (b && typeof b === 'object') ? b : {};
+    const prefixo = chaveNome(o.prefixo || o.nome);
+    if (!prefixo) return;
+    const tag = String(o.tag || '').trim();
+    if (tag && !RE_TAG_AFILIADO.test(tag)) {
+      console.log('[CFG-TSP] Regra por nome ignorada (tag invalida): ' + prefixo);
+      return;
+    }
+    const links = {};
+    for (const [loja, url] of Object.entries(o.links || {})) {
+      const l = String(loja || '').trim().toLowerCase();
+      const u = String(url || '').trim();
+      if (l && u && LOJAS_AFILIADO.includes(l) && /^https?:\/\//i.test(u)) links[l] = u;
+    }
+    const literais = {};
+    for (const [de, para] of Object.entries(o.literais || {})) {
+      const d = String(de || '').trim(), a = String(para || '').trim();
+      if (d && a && d !== a && /^https?:\/\//i.test(d) && /^https?:\/\//i.test(a)) literais[d] = a;
+    }
+    if (!tag && !Object.keys(links).length && !Object.keys(literais).length) return;
+    out.push({ nome: String(o.nome || prefixo), prefixo, tag: tag || null, links, literais });
+  });
   return out;
 }
 
@@ -482,12 +538,42 @@ export function rodapesRegras(tenantId) {
   return Array.isArray(r) ? r.map(x => ({ ...x, tipos: x.tipos.slice(), categorias: x.categorias.slice() })) : [];
 }
 
-/** Tag de afiliado Amazon especifica do grupo, ou null quando ele nao tem. */
+// O nome do grupo vive no cache do WhatsApp, dentro do server. Em vez de mudar a
+// assinatura de tudo que consome estas funcoes, o server registra o resolvedor
+// uma vez no boot. Sem resolvedor, as regras por nome simplesmente nao casam e o
+// comportamento e o dos mapas por JID — nunca um erro no meio de um envio.
+let _nomeDoGrupo = null;
+export function registrarResolvedorDeNome(fn) {
+  _nomeDoGrupo = (typeof fn === 'function') ? fn : null;
+}
+function nomeDe(jid) {
+  if (!_nomeDoGrupo) return '';
+  try { return String(_nomeDoGrupo(jid) || ''); } catch (e) { return ''; }
+}
+
+/** Primeira regra por nome que casa com o prefixo do grupo, ou null. */
+function regraDoNome(jid, tenantId) {
+  const nome = chaveNome(nomeDe(jid));
+  if (!nome) return null;
+  try {
+    const regras = obter(tenantId).afiliados.regrasPorNome || [];
+    return regras.find(r => nome.startsWith(r.prefixo)) || null;
+  } catch (e) { return null; }
+}
+
+/**
+ * Tag de afiliado Amazon do grupo, ou null.
+ * Ordem: mapa por JID (excecao pontual) > regra por prefixo de nome.
+ */
 export function tagAmazonDoGrupo(jid, tenantId) {
   const j = String(jid || '').trim();
   if (!j) return null;
-  try { return obter(tenantId).afiliados.tagsPorGrupo[j] || null; }
-  catch (e) { return null; }
+  try {
+    const porJid = obter(tenantId).afiliados.tagsPorGrupo[j];
+    if (porJid) return porJid;
+    const regra = regraDoNome(j, tenantId);
+    return regra?.tag || null;
+  } catch (e) { return null; }
 }
 /**
  * Pares [linkGlobal, linkDoGrupo] para substituir no texto ao enviar para `jid`.
@@ -500,19 +586,21 @@ export function trocasDeLinkDoGrupo(jid, tenantId) {
   if (!j) return [];
   try {
     const cfg = obter(tenantId);
-    const over = cfg.afiliados.linksPorGrupo[j];
-    const temLiteral = !!cfg.afiliados.linksLiteraisPorGrupo[j];
-    if (!over && !temLiteral) return [];
+    const regra = regraDoNome(j, tenantId);
+    // Mapa por JID sobrescreve a regra por nome, chave a chave: a excecao
+    // pontual continua valendo mesmo para um grupo que casa no prefixo.
+    const over = { ...(regra?.links || {}), ...(cfg.afiliados.linksPorGrupo[j] || {}) };
+    const literais = { ...(regra?.literais || {}), ...(cfg.afiliados.linksLiteraisPorGrupo[j] || {}) };
+    if (!Object.keys(over).length && !Object.keys(literais).length) return [];
     const globais = cfg.afiliados;
     const pares = [];
-    for (const [loja, url] of Object.entries(over || {})) {
+    for (const [loja, url] of Object.entries(over)) {
       const global = String(globais[loja] || '').trim();
       if (!global || global === url) continue;
       pares.push([global, url]);
     }
     // Trocas literais entram na mesma lista: para quem consome, e tudo
     // "substitua esta URL por aquela antes de enviar".
-    const literais = cfg.afiliados.linksLiteraisPorGrupo[j] || {};
     for (const [de, para] of Object.entries(literais)) pares.push([de, para]);
     return pares;
   } catch (e) { return []; }

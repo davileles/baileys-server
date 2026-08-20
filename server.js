@@ -78,6 +78,7 @@ import {
 import {
   carregarConfigTsp, configTsp, salvarConfigTsp,
   linksTsp,
+  registrarResolvedorDeNome,
   gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
   estadoCredenciais, aplicarCredenciais,
   modoAutoEnvioCupom, modoAutoEnvioOferta, origemAutoEnvio,
@@ -4245,6 +4246,11 @@ const _debugUpserts = [];
 // jid -> nome do grupo. Preenchido sob demanda para o painel mostrar de onde
 // veio cada oferta sem depender de uma chamada extra ao WhatsApp.
 const NOMES_GRUPOS = new Map();
+// As regras de afiliado por prefixo de nome (config_tsp.afiliados.regrasPorNome)
+// precisam do nome do grupo, que so existe aqui. Registrado uma vez: o mapa e
+// mutavel, entao a config sempre le o cache mais recente.
+registrarResolvedorDeNome((jid) => NOMES_GRUPOS.get(jid) || '');
+
 async function atualizarNomesGrupos() {
   if (!sock || !conectado) return;
   try {
