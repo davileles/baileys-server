@@ -21,6 +21,7 @@ import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
   trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento,
+  ehDestinoDeNicho,
   comRodapeExtra, rodapeExtraParaGrupo,
   comTagDoGrupo, previewComTagDoGrupo,
   processarTextoAmazon,
@@ -2520,7 +2521,7 @@ async function espelharCategoriaNoOperador(oferta, cls) {
   }
 }
 
-async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
+async function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   // Sem fallback: oferta vai para os grupos marcados como DESTINO na aba
   // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
   // uma mensagem que diz o que fazer — antes isso caia num grupo fixo que o
@@ -2537,9 +2538,26 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta) {
       confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0,
     }),
   };
-  const alvos = destinosDaOferta(_rota);
+  let alvos = destinosDaOferta(_rota);
   console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' roteamento: ' + explicarRoteamento(_rota)
     + ' -> ' + alvos.length + ' grupo(s).');
+
+  // ── RECORTE POR TIPO DE DESTINO ──
+  // Usado pelo monitor de precos quando o produto e curado e o desconto nao foi
+  // fundo o bastante para interromper o grupo geral: a MESMA oferta sai, so que
+  // num subconjunto dos destinos. Sem opcoes, nada muda — todos os outros
+  // caminhos de envio continuam recebendo a lista inteira.
+  if (opcoes.somenteNicho) {
+    const antes = alvos.length;
+    alvos = alvos.filter(jid => ehDestinoDeNicho(jid, opcoes.categoriaNicho || null));
+    console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' restrita ao nicho '
+      + (opcoes.categoriaNicho || '(qualquer)') + ' — ' + alvos.length + ' de ' + antes + ' grupo(s).');
+    if (!alvos.length) {
+      throw new Error('Nenhum grupo de nicho' + (opcoes.categoriaNicho ? ' "' + opcoes.categoriaNicho + '"' : '')
+        + ' entre os destinos desta oferta — confira as trilhas na aba Grupos.');
+    }
+  }
+
   if (!alvos.length) {
     throw new Error(trilhas().length
       ? 'Nenhuma trilha entrega esta oferta — confira as fontes e destinos na aba Grupos.'
@@ -8707,6 +8725,51 @@ app.post('/listas/:id/cancelar', (req, res) => {
   res.json({ ok:true, enviados: parcial.enviados.length, restantes: lista.produtos.length - parcial.indice });
 });
 
+// ── NICHO CURADO ─────────────────────────────────────────────────────────────
+// A lista de nichos validos e a propria taxonomia do classificador, nao uma
+// segunda lista mantida a mao: duas listas divergem no primeiro nicho novo, e o
+// produto curado para um nicho que o roteamento nao conhece nao chega a grupo
+// nenhum. 'geral' entra porque e um destino legitimo de curadoria ("este
+// produto e bom, mas nao e de nicho").
+function nichosDisponiveis() {
+  return ['geral', ...Object.keys(categoriasConfig().categorias || {})];
+}
+
+function nichoValido(id) {
+  return nichosDisponiveis().includes(String(id || '').trim());
+}
+
+app.get('/vitrine/nichos', (_req, res) => {
+  const taxo = categoriasConfig().categorias || {};
+  res.json({ ok:true, nichos: nichosDisponiveis().map(id => ({
+    id,
+    nome: id === 'geral' ? 'Geral (sem nicho)' : (taxo[id]?.nome || id),
+    emoji: id === 'geral' ? '📦' : (taxo[id]?.emoji || ''),
+  })) });
+});
+
+// Marcacao em MASSA de itens ja cadastrados. Existe porque a vitrine ja tem 221
+// produtos de antes desta camada — sem isto, so produto novo poderia ser
+// curado, e os que ja estao la ficariam para sempre a merce do classificador.
+// { asins:[...], nicho:'ferramentas' } — nicho '' limpa a curadoria.
+app.post('/vitrine/nicho', (req, res) => {
+  const asins = Array.isArray(req.body?.asins) ? req.body.asins.map(a => String(a || '').trim()).filter(Boolean) : [];
+  if (!asins.length) return res.status(400).json({ ok:false, erro:'informe { asins:[...] }' });
+  const nicho = String(req.body?.nicho || '').trim();
+  if (nicho && !nichoValido(nicho)) {
+    return res.status(400).json({ ok:false,
+      erro:'nicho "' + nicho + '" nao existe na taxonomia — use um dos: ' + nichosDisponiveis().join(', ') });
+  }
+  const atualizados = [], faltando = [];
+  for (const asin of asins) {
+    if (!itemVitrine(asin)) { faltando.push(asin); continue; }
+    // String vazia LIMPA (salvarItemVitrine trata '' como null); undefined preservaria.
+    atualizados.push(salvarItemVitrine({ asin, nicho }));
+  }
+  console.log('[VITRINE] Nicho "' + (nicho || '(limpo)') + '" aplicado a ' + atualizados.length + ' item(ns).');
+  res.json({ ok:true, nicho: nicho || null, atualizados: atualizados.length, faltando });
+});
+
 // ── VITRINE ──────────────────────────────────────────────────────────────────
 // Link encurtado (amzn.to) e link /dp/ASIN puro nao trazem o slug com o nome do
 // produto, entao o item entrava na base como "Produto B0XXXXXXXX". O disparo ja
@@ -8874,6 +8937,14 @@ app.post('/vitrine', async (req, res) => {
   if (linhas.length > 60) return res.status(400).json({ ok:false, erro:'máximo de 60 linhas por vez' });
 
   const cupom = req.body?.cupom || null;
+  // NICHO CURADO da leva inteira. Quem cola 40 links de furadeira ja sabe que
+  // sao 40 ferramentas — pedir para o classificador redescobrir isso titulo a
+  // titulo e trocar certeza por palpite. Vazio = comportamento historico.
+  const nicho = String(req.body?.nicho || '').trim() || null;
+  if (nicho && !nichoValido(nicho)) {
+    return res.status(400).json({ ok:false,
+      erro:'nicho "' + nicho + '" nao existe na taxonomia — use um dos: ' + nichosDisponiveis().join(', ') });
+  }
   const salvos = [], erros = [];
 
   for (const linha of linhas) {
@@ -8908,7 +8979,7 @@ app.post('/vitrine', async (req, res) => {
           shopId: String(ids[0].shopId), itemId: String(ids[0].itemId),
           nome: (nomeManual || '').trim() || node?.productName || ('Produto ' + ids[0].itemId),
           url: node?.offerLink || node?.productLink || linha.trim(),
-          cupom,
+          cupom, nicho,
         }), jaExistia: jaTinha });
         continue;
       }
@@ -8918,7 +8989,7 @@ app.post('/vitrine', async (req, res) => {
         const rmg = await resolverLinhaVitrineMagalu(linha);
         if (!rmg || rmg.erro) { erros.push({ linha, erro: rmg?.erro || 'falhou' }); continue; }
         const jaTinhaMg = !!itemVitrine(rmg.asin);
-        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom }), jaExistia: jaTinhaMg });
+        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom, nicho }), jaExistia: jaTinhaMg });
         continue;
       }
       // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
@@ -8928,7 +8999,7 @@ app.post('/vitrine', async (req, res) => {
         const rml = await resolverLinhaVitrineMl(linha);
         if (!rml || rml.erro) { erros.push({ linha, erro: rml?.erro || 'falhou' }); continue; }
         const jaTinhaMl = !!itemVitrine(rml.asin);
-        salvos.push({ ...salvarItemVitrine({ ...rml, cupom }), jaExistia: jaTinhaMl });
+        salvos.push({ ...salvarItemVitrine({ ...rml, cupom, nicho }), jaExistia: jaTinhaMl });
         continue;
       }
       // Rede Awin: qualquer anunciante afiliado. Vem antes do fallback da
@@ -8937,14 +9008,14 @@ app.post('/vitrine', async (req, res) => {
         const raw = await resolverLinhaVitrineAwin(linha);
         if (!raw || raw.erro) { erros.push({ linha, erro: raw?.erro || 'falhou' }); continue; }
         const jaTinhaAw = !!itemVitrine(raw.asin);
-        salvos.push({ ...salvarItemVitrine({ ...raw, cupom }), jaExistia: jaTinhaAw,
+        salvos.push({ ...salvarItemVitrine({ ...raw, cupom, nicho }), jaExistia: jaTinhaAw,
           aviso: raw.precoManual ? 'preco informado a mao — a loja bloqueou a leitura automatica' : null });
         continue;
       }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
-      salvos.push({ ...salvarItemVitrine({ ...r, cupom }), jaExistia: jaTinha });
+      salvos.push({ ...salvarItemVitrine({ ...r, cupom, nicho }), jaExistia: jaTinha });
     } catch (e) { erros.push({ linha, erro: e.message }); }
   }
   // Titulo real antes de o produto aparecer na base — ver resolverNomesProvisorios.
@@ -8956,8 +9027,9 @@ app.post('/vitrine', async (req, res) => {
     }
   }
 
-  console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s).');
-  res.json({ ok: salvos.length > 0, salvos, erros });
+  console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s)'
+    + (nicho ? ', nicho curado: ' + nicho : '') + '.');
+  res.json({ ok: salvos.length > 0, salvos, erros, nicho });
 });
 
 // LEGADO — o painel nao usa mais este caminho. Todo disparo da vitrine passa
