@@ -397,6 +397,17 @@ export function explicarRoteamento({ fonte, categoria, categoriaConfiavel } = {}
 // nenhuma regra casando, devolve string vazia e o envio segue identico ao que
 // era antes desta camada existir.
 
+/**
+ * O grupo `jid` e destino de alguma trilha de NICHO? Com `categoria`, so conta
+ * a trilha daquele nicho. Exportado para o monitor de precos poder separar,
+ * dentro do mesmo conjunto de alvos, quem e grupo nichado e quem e grupo geral
+ * — sem isso o envio e indivisivel e nao ha como publicar no nicho segurando o
+ * geral.
+ */
+export function ehDestinoDeNicho(jid, categoria = null) {
+  return ehGrupoDoNicho(jid, categoria ? [categoria] : []);
+}
+
 /** O grupo `jid` e destino de uma trilha de nicho da categoria `cat`? */
 function ehGrupoDoNicho(jid, categorias) {
   if (!jid) return false;
@@ -1943,6 +1954,15 @@ export function salvarItemVitrine(item) {
     // 'epc' = cadastrado sozinho pelo monitor a partir do desempenho real, e e
     // o que permite o teto do automatico nao consumir a curadoria manual.
     origemSemeadura: item.origemSemeadura || anterior?.origemSemeadura || null,
+    // NICHO CURADO. Declarado por quem cadastrou, nao adivinhado pelo titulo.
+    // Preenchido = o operador garante que este produto E deste nicho, e o
+    // classificador deixa de ter voto: e o sinal mais forte que existe, porque
+    // veio de um humano que escolheu o produto para um grupo especifico.
+    // Vazio = comportamento historico (classificador decide pelo titulo).
+    // Passar '' (string vazia) LIMPA a curadoria; undefined preserva.
+    nicho: item.nicho !== undefined
+      ? (String(item.nicho || '').trim() || null)
+      : (anterior?.nicho || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
     ultimoDisparo: anterior?.ultimoDisparo || null,
