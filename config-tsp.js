@@ -90,6 +90,23 @@ const CFG_TSP_PADRAO = {
       amazon: 'https://link.amazon/B03wEQT0G',
     },
   },
+  // TROCAS LITERAIS DE LINK POR GRUPO — de -> para.
+  //
+  // Existe para os links de afiliado que NAO moram em `afiliados`: o convite do
+  // Prime, por exemplo, e escrito direto no corpo do template da Amazon
+  // (dados/tsp/templates.json), que e um so para todos os grupos. Trocar la
+  // mudaria a conta em toda a operacao; aqui a troca vale so no destino.
+  //
+  //   { '<jid>@g.us': { 'https://link-antigo': 'https://link-novo' } }
+  //
+  // A troca e literal, comparando a string inteira: link que nao aparecer na
+  // mensagem simplesmente nao casa e nada acontece.
+  linksLiteraisPorGrupo: {
+    // Promos do Davi #07 — convite do Prime na conta do associado (dl04f-20).
+    '120363429334971122@g.us': {
+      'https://link.amazon/B0dULFSvu': 'https://link.amazon/B08eCYlQ3',
+    },
+  },
   // Rodapes anexados as mensagens. Texto livre — o operador pode usar crase
   // para o estilo monoespacado do WhatsApp, ou deixar vazio para nao anexar.
   rodapes: {
@@ -206,6 +223,7 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
   // virar excecao no meio de um envio.
   out.afiliados.tagsPorGrupo = normalizarTagsPorGrupo(out.afiliados.tagsPorGrupo);
   out.afiliados.linksPorGrupo = normalizarLinksPorGrupo(out.afiliados.linksPorGrupo);
+  out.afiliados.linksLiteraisPorGrupo = normalizarLiteraisPorGrupo(out.afiliados.linksLiteraisPorGrupo);
   // Credencial nao preenchida fica string vazia, nunca undefined: o painel
   // precisa distinguir "nao configurado" de "campo inexistente".
   for (const k of Object.keys(CFG_TSP_PADRAO.credenciais)) {
@@ -268,6 +286,28 @@ function normalizarLinksPorGrupo(bruto) {
         continue;
       }
       limpo[l] = u;
+    }
+    if (Object.keys(limpo).length) out[j] = limpo;
+  }
+  return out;
+}
+
+function normalizarLiteraisPorGrupo(bruto) {
+  const o = (bruto && typeof bruto === 'object' && !Array.isArray(bruto)) ? bruto : {};
+  const out = {};
+  for (const [jid, mapa] of Object.entries(o)) {
+    const j = String(jid || '').trim();
+    if (!j || !mapa || typeof mapa !== 'object') continue;
+    const limpo = {};
+    for (const [de, para] of Object.entries(mapa)) {
+      const d = String(de || '').trim();
+      const a = String(para || '').trim();
+      if (!d || !a || d === a) continue;
+      if (!/^https?:\/\//i.test(d) || !/^https?:\/\//i.test(a)) {
+        console.log('[CFG-TSP] Troca literal ignorada (nao e URL): ' + j + ' -> ' + d);
+        continue;
+      }
+      limpo[d] = a;
     }
     if (Object.keys(limpo).length) out[j] = limpo;
   }
@@ -461,14 +501,19 @@ export function trocasDeLinkDoGrupo(jid, tenantId) {
   try {
     const cfg = obter(tenantId);
     const over = cfg.afiliados.linksPorGrupo[j];
-    if (!over) return [];
+    const temLiteral = !!cfg.afiliados.linksLiteraisPorGrupo[j];
+    if (!over && !temLiteral) return [];
     const globais = cfg.afiliados;
     const pares = [];
-    for (const [loja, url] of Object.entries(over)) {
+    for (const [loja, url] of Object.entries(over || {})) {
       const global = String(globais[loja] || '').trim();
       if (!global || global === url) continue;
       pares.push([global, url]);
     }
+    // Trocas literais entram na mesma lista: para quem consome, e tudo
+    // "substitua esta URL por aquela antes de enviar".
+    const literais = cfg.afiliados.linksLiteraisPorGrupo[j] || {};
+    for (const [de, para] of Object.entries(literais)) pares.push([de, para]);
     return pares;
   } catch (e) { return []; }
 }
