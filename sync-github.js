@@ -78,8 +78,14 @@ export const ARQUIVOS_SINCRONIZADOS = Object.fromEntries(
 // arquivo de historico cresceria alem disso em poucos meses e a restauracao
 // pos-deploy pararia de funcionar.
 const RE_NOME_HISTORICO = /^historico_envios_\d{4}-\d{2}\.json$/;
+// Shards mensais da serie de precos (precos_hist_2026-08.json). Mesmo motivo do
+// historico de envios: a serie diaria de cada produto cresce ate 120 dias e,
+// com a serie efetiva em paralelo, um arquivo unico passaria de 1 MB em poucos
+// meses — e acima disso a Contents API para de devolver o conteudo na leitura,
+// matando a restauracao pos-deploy em silencio.
+const RE_NOME_PRECOS = /^precos_hist_\d{4}-\d{2}\.json$/;
 function nomeSincronizavel(nome) {
-  return NOMES_SINCRONIZAVEIS.has(nome) || RE_NOME_HISTORICO.test(nome);
+  return NOMES_SINCRONIZAVEIS.has(nome) || RE_NOME_HISTORICO.test(nome) || RE_NOME_PRECOS.test(nome);
 }
 
 // Caminho relativo valido: nome permitido na raiz, ou tenants/<id>/<nome>.
