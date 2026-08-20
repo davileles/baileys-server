@@ -150,6 +150,20 @@ const CFG_PADRAO = {
       maximo: 150,           // teto de produtos semeados no total
       porRodada: 25,         // teto por rodada, para nao inundar a vitrine de uma vez
     },
+    // ── PRODUTOS ISCA ──
+    // Os links que vao nas mensagens de CUPOM. O cupom nao tem produto: para
+    // existir link rastreado, aponta-se para um produto qualquer, e o que
+    // importa e o clique e a compra que a pessoa fizer nas 24h seguintes —
+    // quase sempre de OUTRA coisa.
+    //
+    // Consequencia: no relatorio de produtos vinculados a isca acumula todo o
+    // clique e quase nenhuma comissao, porque a comissao vai para o produto
+    // efetivamente comprado. O EPC dela tende a zero POR DESENHO.
+    //
+    // Sem esta lista, o veto por desempenho barraria justamente o motor de
+    // trafego: 60 cliques com EPC baixo e exatamente o retrato de uma isca
+    // funcionando bem.
+    iscas: [],
     score: {
       // Bonus no score = epc * pesoEpc. Com peso 8, um produto de R$ 0,90/clique
       // ganha ~7 pontos, na mesma ordem de grandeza do bonus de recorde (10).
@@ -428,6 +442,9 @@ function estruturarCfg(bruto) {
   out.desempenho.semear.cliquesMin = limitar(sem.cliquesMin, 1, 100000, CFG_PADRAO.desempenho.semear.cliquesMin);
   out.desempenho.semear.maximo     = limitar(sem.maximo, 0, 5000, CFG_PADRAO.desempenho.semear.maximo);
   out.desempenho.semear.porRodada  = limitar(sem.porRodada, 1, 500, CFG_PADRAO.desempenho.semear.porRodada);
+  out.desempenho.iscas = Array.isArray(dz.iscas)
+    ? [...new Set(dz.iscas.map(x => String(x || '').trim()).filter(Boolean))]
+    : CFG_PADRAO.desempenho.iscas.slice();
   out.desempenho.score.pesoEpc         = limitar(sc.pesoEpc, 0, 100, CFG_PADRAO.desempenho.score.pesoEpc);
   out.desempenho.score.epcVeto         = limitar(sc.epcVeto, 0, 1000, CFG_PADRAO.desempenho.score.epcVeto);
   out.desempenho.score.cliquesParaVeto = limitar(sc.cliquesParaVeto, 0, 100000, CFG_PADRAO.desempenho.score.cliquesParaVeto);
@@ -671,6 +688,11 @@ async function lerPrecosAmazon(itens) {
 // O ledger e por ASIN da Amazon: e a unica das tres lojas que entrega ganho por
 // clique por produto. Shopee e ML devolvem null e seguem sem bonus nem veto —
 // ausencia de dado nunca vira penalidade.
+/** Este id e um link de cupom (isca)? Ver CFG_PADRAO.desempenho.iscas. */
+export function ehIsca(asin) {
+  return _cfg.desempenho.iscas.includes(String(asin || '').trim());
+}
+
 export function epcDe(asin) {
   const p = _epc?.produtos?.[asin];
   if (!p || !p.cliques) return null;
@@ -797,9 +819,12 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   // Veto por desempenho: produto com amostra suficiente que so consome clique
   // nao sai, por mais fundo que esteja o desconto. Sem dado no ledger nao ha
   // veto — ausencia de informacao nao pode virar condenacao.
+  //
+  // Isca nunca e vetada: o EPC dela e zero porque a comissao que ela gera esta
+  // registrada em OUTRO produto, nao porque ela nao rende.
   const d = epcDe(item.asin);
   const sc = _cfg.desempenho.score;
-  if (d && d.cliques >= sc.cliquesParaVeto && d.epc < sc.epcVeto) {
+  if (!ehIsca(item.asin) && d && d.cliques >= sc.cliquesParaVeto && d.epc < sc.epcVeto) {
     return { ...detalhe, passou: false, epc: d.epc, cliquesEpc: d.cliques,
              motivo: 'EPC de R$ ' + d.epc.toFixed(2) + ' em ' + d.cliques + ' cliques (minimo R$ '
                + sc.epcVeto.toFixed(2) + ')' };
@@ -855,6 +880,12 @@ export function semearVitrinePorDesempenho({ simular: apenasSimular = false } = 
     .filter(p => {
       if (!/^B[A-Z0-9]{9}$/.test(String(p.asin || ''))) return false;
       if (naVitrine.has(p.asin)) { saida.jaNaVitrine++; return false; }
+      // Isca fica de fora nos dois sentidos: o EPC alto ou baixo dela nao diz
+      // nada sobre o produto em si, e ela nao existe para ser divulgada.
+      if (ehIsca(p.asin)) {
+        saida.ignorados['isca de cupom'] = (saida.ignorados['isca de cupom'] || 0) + 1;
+        return false;
+      }
       saida.candidatos++;
       if (p.cliques < cfg.cliquesMin) {
         saida.ignorados['amostra pequena (< ' + cfg.cliquesMin + ' cliques)'] =
@@ -1381,6 +1412,9 @@ export function listarMonitorados() {
  * `naVitrine` diz se o produto ja esta sendo vigiado — e a lista de compras da
  * curadoria manual para o que ainda nao esta.
  */
+/** Ids marcados como isca, para o painel poder sinalizar na tabela. */
+export function listarIscas() { return _cfg.desempenho.iscas.slice(); }
+
 export function rankingEpc({ limite = 100 } = {}) {
   const naVitrine = new Set(listarVitrine().map(i => String(i.asin)));
   const sc = _cfg.desempenho.score;
