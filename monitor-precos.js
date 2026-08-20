@@ -106,9 +106,30 @@ const CFG_PADRAO = {
     cotaPorLoja: { 'Amazon': 10, 'Shopee': 10, 'Mercado Livre': 10 },
     // Cota DIARIA por nicho (soma das lojas). Sem isto o dia inteiro vira o
     // nicho que tiver mais produto cadastrado.
-    cotaPorNicho: { geral: 18, bebidas: 6, infantil: 6 },
+    cotaPorNicho: { geral: 18, bebidas: 6, infantil: 6, ferramentas: 6 },
     // Nicho e a categoria do classificador; 'geral' = sem categoria confiavel.
     aplicarCupom: true,    // pede o melhor cupom aplicavel no disparo
+
+    // ── PRODUTO CURADO (nicho declarado no cadastro) ──
+    // Grupo nichado tem contrato diferente do grupo geral: quem entra num grupo
+    // que so posta ferramenta ESPERA receber toda queda de ferramenta. Segurar
+    // oferta por cota ali nao protege ninguem, so esvazia a promessa do grupo.
+    // Por isso o item curado escapa da cota e do espacamento do geral — mas so
+    // no destino nichado.
+    curado: {
+      // Espacamento minimo entre duas ofertas DENTRO do grupo nichado. Existe
+      // para nao empilhar quatro mensagens no mesmo minuto quando a varredura
+      // encontra varias quedas de uma vez, nao para racionar volume.
+      intervaloMin: 5,
+      // Desconto a partir do qual a oferta curada TAMBEM sai no grupo geral.
+      // Abaixo disto ela fica so no nicho: ferramenta com 15% off interessa a
+      // quem entrou no grupo de ferramentas, nao ao grupo geral, que ja tem o
+      // radar inteiro alimentando ele.
+      espelharGeralPct: 25,
+      // O espelho no geral respeita a cota do geral? Ligado por padrao: e a
+      // cota que impede o monitor de tomar conta do grupo geral.
+      espelhoRespeitaCota: true,
+    },
   },
 
   // ── DESEMPENHO REAL (ganho por clique) ──
@@ -163,7 +184,8 @@ let _epc    = { produtos: {} };   // ledger somente-leitura escrito pelo coletor
 let _estado = {      // fila de candidatos + contadores do dia
   fila: [],          // [{ asin, nome, loja, nicho, preco, mediana30, min90, quedaPct, quedaRs, score, recorde, em }]
   cotas: { dia: null, porLoja: {}, porNicho: {} },
-  ultimoEnvioEm: 0,
+  ultimoEnvioEm: 0,        // relogio do GERAL (espacamento longo, com cota)
+  ultimoEnvioCuradoEm: 0,  // relogio do NICHO curado (espacamento curto, sem cota)
   ultimaVarredura: null,
   historicoDisparos: [],   // ultimos 200 disparos do monitor (auditoria em tela)
 };
@@ -252,6 +274,11 @@ function estruturarCfg(bruto) {
   out.publicacao.aplicarCupom = p.aplicarCupom !== false;
   out.publicacao.cotaPorLoja  = mapaNumerico(p.cotaPorLoja,  CFG_PADRAO.publicacao.cotaPorLoja,  0, 500);
   out.publicacao.cotaPorNicho = mapaNumerico(p.cotaPorNicho, CFG_PADRAO.publicacao.cotaPorNicho, 0, 500);
+
+  const cu = p.curado || {};
+  out.publicacao.curado.intervaloMin = limitar(cu.intervaloMin, 0, 1440, CFG_PADRAO.publicacao.curado.intervaloMin);
+  out.publicacao.curado.espelharGeralPct = limitar(cu.espelharGeralPct, 0, 100, CFG_PADRAO.publicacao.curado.espelharGeralPct);
+  out.publicacao.curado.espelhoRespeitaCota = cu.espelhoRespeitaCota !== false;
 
   const dz = b.desempenho || {};
   const sem = dz.semear || {}, sc = dz.score || {};
@@ -398,11 +425,26 @@ export function historicoDe(asin) {
 // 'geral' e a ausencia de categoria confiavel, nao uma categoria de verdade —
 // e o mesmo criterio que o roteamento por trilha ja usa.
 function nichoDoProduto(item, titulo) {
+  // Nicho CURADO vence o classificador, sem discussao. Quem cadastrou o produto
+  // escolheu ele para um grupo especifico — exigir que o classificador
+  // redescubra isso pelo titulo joga fora o unico sinal que nao erra. E o que
+  // faz uma "GSB 450 Bosch 13mm", que nao bate keyword nenhuma de ferramentas,
+  // chegar no grupo de ferramentas.
+  const curado = String(item?.nicho || '').trim();
+  if (curado) {
+    return {
+      nicho: curado,
+      classificacao: { categoria: curado, confianca: 1, sinal: 'curadoria', nome: curado },
+      confiavel: true,
+      curado: true,
+    };
+  }
   const cls = classificarProduto({ titulo: titulo || item.nome, asin: item.asin, loja: item.loja });
   return {
     nicho: categoriaConfiavel(cls) ? cls.categoria : 'geral',
     classificacao: cls,
     confiavel: categoriaConfiavel(cls),
+    curado: false,
   };
 }
 
@@ -488,10 +530,13 @@ export function estadoEpc() {
  * `passou` e `motivo` — o motivo alimenta o modo sombra, que e onde o operador
  * calibra as regras antes de ligar o envio.
  */
-export function avaliar(item, leitura, stats, nicho) {
+export function avaliar(item, leitura, stats, nicho, curado = false) {
   const r = regraDoNicho(nicho);
   const preco = leitura.preco;
-  const base = { asin: item.asin, nome: item.nome, loja: item.loja, nicho, preco };
+  // 'curado' viaja com o candidato ate o publicador: e ele que decide se a
+  // oferta escapa da cota e do espacamento longo.
+  const base = { asin: item.asin, nome: item.nome, loja: item.loja, nicho, preco,
+                 curado: !!curado };
 
   if (!Number.isFinite(preco) || preco <= 0)  return { ...base, passou: false, motivo: 'sem preco' };
   if (r.exigirDisponivel && leitura.disponivel === false)
@@ -649,8 +694,8 @@ export async function varrer({ manual = false } = {}) {
     resumo.lidos++;
 
     const stats = estatisticas(item.asin);
-    const { nicho } = nichoDoProduto(item, leitura.titulo);
-    const av = avaliar(item, leitura, stats, nicho);
+    const { nicho, curado } = nichoDoProduto(item, leitura.titulo);
+    const av = avaliar(item, leitura, stats, nicho, curado);
     resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
     if (av.passou) { enfileirar(av); resumo.candidatos++; }
   };
@@ -792,12 +837,48 @@ function dentroDaJanela(ts = Date.now()) {
  * erro que este pipeline existe para evitar. Quem revalida e o proprio
  * montarOfertas*Vitrine, que consulta a API de novo no momento do envio.
  */
+/**
+ * Escolhe o proximo item a publicar. Duas filas na pratica, uma lista so:
+ *
+ *   CURADO  produto com nicho declarado. Vai para o grupo nichado sempre que ha
+ *           queda — sem cota, no relogio curto. E o contrato do grupo: quem
+ *           entrou no grupo de ferramentas espera receber TODA queda de
+ *           ferramenta, e cota ali nao protege ninguem, so esvazia a promessa.
+ *
+ *   GERAL   todo o resto. Cota diaria por loja e por nicho, relogio longo.
+ *
+ * Os dois relogios sao independentes de proposito: uma rajada de bebidas no
+ * grupo de bebidas nao pode consumir o slot que o grupo geral esperava, e uma
+ * oferta no geral nao pode fazer o grupo de ferramentas esperar 45 minutos.
+ */
+function escolherDaFila() {
+  const agora = Date.now();
+  const cfgC = _cfg.publicacao.curado;
+  const curadoLiberado = (agora - (_estado.ultimoEnvioCuradoEm || 0)) >= cfgC.intervaloMin * 60000;
+  const geralLiberado  = (agora - (_estado.ultimoEnvioEm || 0)) >= _cfg.publicacao.intervaloMin * 60000;
+
+  const bloqueios = [];
+  // Curados primeiro: sao os que tem hora marcada com um grupo que os espera.
+  if (curadoLiberado) {
+    const c = _estado.fila.find(f => f.curado);
+    if (c) return { escolhido: c, viaCurado: true, bloqueios };
+  }
+  if (geralLiberado) {
+    for (const f of _estado.fila) {
+      if (f.curado) continue;   // curado nunca ocupa o slot do geral
+      const c = cotaDisponivel(f.loja, f.nicho);
+      if (c.ok) return { escolhido: f, viaCurado: false, bloqueios };
+      bloqueios.push(c.motivo);
+    }
+  }
+  return { escolhido: null, viaCurado: false, bloqueios };
+}
+
 async function tentarPublicar() {
   if (_publicando) return;
   if (!_cfg.ativo || _cfg.modo !== 'on') return;
   if (!_deps) return;
   if (!dentroDaJanela()) return;
-  if (Date.now() - (_estado.ultimoEnvioEm || 0) < _cfg.publicacao.intervaloMin * 60000) return;
   if (!_deps.whatsappPronto()) return;
 
   podarFila();
@@ -805,15 +886,9 @@ async function tentarPublicar() {
 
   _publicando = true;
   try {
-    // Primeiro item da fila (ja ordenada por score) que ainda tem cota.
-    let escolhido = null, bloqueios = [];
-    for (const f of _estado.fila) {
-      const c = cotaDisponivel(f.loja, f.nicho);
-      if (c.ok) { escolhido = f; break; }
-      bloqueios.push(c.motivo);
-    }
+    const { escolhido, viaCurado, bloqueios } = escolherDaFila();
     if (!escolhido) {
-      if (bloqueios.length) console.log('[PRECOS] Fila travada por cota — ' + [...new Set(bloqueios)].join('; '));
+      if (bloqueios.length) console.log('[PRECOS] Fila do geral travada por cota — ' + [...new Set(bloqueios)].join('; '));
       return;
     }
 
@@ -824,12 +899,21 @@ async function tentarPublicar() {
     removerDaFila(escolhido.asin);
 
     if (r.ok) {
-      consumirCota(escolhido.loja, escolhido.nicho);
-      _estado.ultimoEnvioEm = Date.now();
-      registrarDisparo({ ...escolhido, precoEnviado: r.preco, grupos: r.grupos, cupom: r.cupom, ok: true });
+      // Cota so e consumida por quem saiu no GERAL. Disparo que ficou dentro do
+      // grupo nichado nao gasta a cota do grupo geral — se gastasse, um dia
+      // movimentado de ferramentas mataria as ofertas do geral sem que uma
+      // unica mensagem tivesse chegado la.
+      if (r.espelhouNoGeral) consumirCota(escolhido.loja, escolhido.nicho);
+      if (viaCurado) _estado.ultimoEnvioCuradoEm = Date.now();
+      if (!viaCurado || r.espelhouNoGeral) _estado.ultimoEnvioEm = Date.now();
+
+      registrarDisparo({ ...escolhido, precoEnviado: r.preco, grupos: r.grupos,
+                         cupom: r.cupom, espelhouNoGeral: !!r.espelhouNoGeral, ok: true });
       console.log('[PRECOS] Enviado: ' + (r.nome || escolhido.nome) + ' — R$ ' + r.preco
-        + ' (' + escolhido.quedaPct + '% abaixo da mediana, nicho ' + escolhido.nicho + ', '
-        + r.grupos + ' grupo(s)).');
+        + ' (' + escolhido.quedaPct + '% abaixo da mediana, nicho ' + escolhido.nicho
+        + (escolhido.curado ? ', curado' : '')
+        + (r.espelhouNoGeral ? ', nicho+geral' : (escolhido.curado ? ', so no nicho' : ''))
+        + ', ' + r.grupos + ' grupo(s)).');
     } else {
       registrarDisparo({ ...escolhido, ok: false, motivo: r.motivo });
       console.log('[PRECOS] Descartado no disparo: ' + escolhido.nome + ' — ' + r.motivo);
@@ -891,7 +975,28 @@ export async function dispararMonitorado(item, candidato = {}) {
     }
   }
 
-  const cls = classificarProduto({ titulo: o.produto?.titulo || item.nome, asin: item.asin, loja: item.loja });
+  // Curadoria vence o classificador tambem aqui: e 'categoria' + 'confianca'
+  // que o roteamento por trilha le, entao e aqui que o produto curado ganha o
+  // passaporte para o grupo nichado.
+  const cls = String(item?.nicho || '').trim()
+    ? { categoria: String(item.nicho).trim(), confianca: 1, sinal: 'curadoria' }
+    : classificarProduto({ titulo: o.produto?.titulo || item.nome, asin: item.asin, loja: item.loja });
+
+  // ── ESPELHO NO GERAL ──
+  // Produto curado sai sempre no grupo do nicho. No grupo GERAL ele so entra se
+  // o desconto for fundo o bastante para valer a interrupcao de quem nao pediu
+  // por aquele nicho — o geral ja tem o radar inteiro alimentando ele, nao
+  // precisa da queda de 15% numa parafusadeira.
+  const ehCurado = !!String(item?.nicho || '').trim();
+  const cfgCur = _cfg.publicacao.curado;
+  const quedaPct = Number(candidato.quedaPct);
+  let espelhouNoGeral = true;   // nao-curado sempre segue o roteamento normal
+  if (ehCurado) {
+    const fundo = Number.isFinite(quedaPct) && quedaPct >= cfgCur.espelharGeralPct;
+    const temCota = !cfgCur.espelhoRespeitaCota
+      || cotaDisponivel(item.loja, String(item.nicho).trim()).ok;
+    espelhouNoGeral = fundo && temCota;
+  }
 
   const oferta = {
     id: _deps.gerarId(),
@@ -920,10 +1025,14 @@ export async function dispararMonitorado(item, candidato = {}) {
     if (img) oferta.imagens = [img];
   } catch (e) {}
 
-  const env = await _deps.enviarOferta(o.mensagem, null, oferta);
+  // somenteNicho corta os grupos gerais DENTRO do laco de envio: a mesma oferta,
+  // um subconjunto de destinos. Sem esta opcao o envio e indivisivel e nao ha
+  // como publicar no nicho segurando o geral.
+  const env = await _deps.enviarOferta(o.mensagem, null, oferta,
+    espelhouNoGeral ? {} : { somenteNicho: true, categoriaNicho: String(item.nicho).trim() });
   marcarDisparo(item.asin);
   return { ok: true, nome: o.nome, preco: o.produto.preco, grupos: env.enviados.length,
-           cupom: o.cupom?.codigo || null };
+           cupom: o.cupom?.codigo || null, espelhouNoGeral };
 }
 
 // ── SIMULACAO (modo sombra em tela) ──────────────────────────────────────────
@@ -955,6 +1064,19 @@ export function simular(regrasParciais = null) {
 }
 
 // ── ESTADO PARA O PAINEL ─────────────────────────────────────────────────────
+/** Quantos itens monitorados tem nicho declarado, por nicho. Diagnostico de
+ *  curadoria: nicho com zero produto curado e grupo nichado que nunca vai
+ *  receber nada do monitor. */
+export function curadoriaPorNicho() {
+  const out = {};
+  for (const i of itensMonitorados()) {
+    const n = String(i.nicho || '').trim();
+    if (!n) continue;
+    out[n] = (out[n] || 0) + 1;
+  }
+  return out;
+}
+
 export function estadoMonitorPrecos() {
   garantirCotasDoDia();
   podarFila();
@@ -977,6 +1099,12 @@ export function estadoMonitorPrecos() {
     limites: { porLoja: _cfg.publicacao.cotaPorLoja, porNicho: _cfg.publicacao.cotaPorNicho },
     ultimoEnvioEm: _estado.ultimoEnvioEm || null,
     proximoEnvioLiberadoEm: (_estado.ultimoEnvioEm || 0) + _cfg.publicacao.intervaloMin * 60000,
+    // Relogio do curado, separado: o painel precisa mostrar que o grupo nichado
+    // pode disparar em 3 minutos mesmo com o geral travado por mais 40.
+    ultimoEnvioCuradoEm: _estado.ultimoEnvioCuradoEm || null,
+    proximoEnvioCuradoLiberadoEm: (_estado.ultimoEnvioCuradoEm || 0) + _cfg.publicacao.curado.intervaloMin * 60000,
+    curadoria: curadoriaPorNicho(),
+    curadosNaFila: _estado.fila.filter(f => f.curado).length,
     dentroDaJanela: dentroDaJanela(),
     historicoDisparos: _estado.historicoDisparos.slice(0, 50),
     lojasDisponiveis: LOJAS_MONITORAVEIS_PRECO,
@@ -991,9 +1119,9 @@ export function listarMonitorados() {
     .map(i => {
       const s = estatisticas(i.asin);
       const h = _hist[i.asin];
-      const { nicho } = nichoDoProduto(i, h?.n);
+      const { nicho, curado } = nichoDoProduto(i, h?.n);
       return {
-        asin: i.asin, nome: h?.n || i.nome, loja: i.loja, nicho,
+        asin: i.asin, nome: h?.n || i.nome, loja: i.loja, nicho, curado,
         precoAtual: h?.ult?.preco ?? null,
         lidoEm: h?.ult?.em ?? null,
         disponivel: h?.ult?.disponivel ?? null,
