@@ -1954,6 +1954,17 @@ export function salvarItemVitrine(item) {
     // 'epc' = cadastrado sozinho pelo monitor a partir do desempenho real, e e
     // o que permite o teto do automatico nao consumir a curadoria manual.
     origemSemeadura: item.origemSemeadura || anterior?.origemSemeadura || null,
+    // GRUPO DE PRODUTO. Itens com o mesmo grupo sao O MESMO produto fisico em
+    // lojas diferentes. Existe porque a melhor oferta migra de loja: monitorar
+    // so a Amazon e nao ver a semana em que o ML esta 20% abaixo.
+    //
+    // O agrupamento e MANUAL (quem cadastra passa os links juntos), e isso e uma
+    // vantagem: o erro classico do comparador e casar automaticamente produtos
+    // que nao sao o mesmo — voltagem diferente, kit com 2 em vez de 1 — e
+    // anunciar preco de outro item.
+    grupo: item.grupo !== undefined
+      ? (String(item.grupo || '').trim() || null)
+      : (anterior?.grupo || null),
     // NICHO CURADO. Declarado por quem cadastrou, nao adivinhado pelo titulo.
     // Preenchido = o operador garante que este produto E deste nicho, e o
     // classificador deixa de ter voto: e o sinal mais forte que existe, porque
@@ -1983,6 +1994,13 @@ export function marcarDisparo(asin) {
 }
 
 export function itemVitrine(asin) { return E().vitrine[asin] || null; }
+
+/** Itens que compartilham o mesmo grupo (o mesmo produto em varias lojas). */
+export function itensDoGrupo(grupo) {
+  const g = String(grupo || '').trim();
+  if (!g) return [];
+  return Object.values(E().vitrine).filter(i => String(i.grupo || '').trim() === g);
+}
 
 /**
  * Monta as mensagens de uma lista de ASINs no momento do disparo: consulta a
