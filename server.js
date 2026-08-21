@@ -32,7 +32,7 @@ import {
   espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
-  templateCupom, templateAwin, templateProprioDaLoja,
+  templateCupom, templateCupomLote, templateCupomLoteItem, templateAwin, templateProprioDaLoja,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE, VARIAVEIS_CUPOM,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   buscarProdutos, normalizar,
@@ -1984,6 +1984,36 @@ function formatarCupomTSP(dados) {
   return renderTemplate(corpo, varsDoCupomTSP(dados));
 }
 
+// Teto de cupons por mensagem. Acima disso a lista vira duas mensagens: um
+// bloco muito longo no WhatsApp e lido pela metade e as ultimas linhas somem
+// atras do "Ler mais".
+const CUPOM_LOTE_MAX = 8;
+
+// Monta a mensagem UNICA de um lote de cupons da MESMA loja. Cada cupom e
+// renderizado pelo template de item (que ja aplica toda a regra de validade e
+// teto) e o resultado entra no envelope. O link e um so, da loja — repetir o
+// link de afiliado linha a linha nao muda o destino e polui a mensagem.
+// Campos do cupom individual (codigo, valor_str, validade) sao zerados de
+// proposito no envelope: se sobrassem, um template editado poderia anunciar no
+// cabecalho o dado de UM cupom como se valesse para todos.
+function formatarCupomLoteTSP(lista) {
+  const corpoItem = (templateCupomLoteItem()?.corpo || '').trim();
+  const itens = lista
+    .map(c => renderTemplate(corpoItem, varsDoCupomTSP(c)))
+    .filter(t => t && t.trim())
+    .join('\n\n');
+  const base = varsDoCupomTSP(lista[0]);
+  const corpo = (templateCupomLote()?.corpo || '').trim();
+  return renderTemplate(corpo, {
+    ...base,
+    codigo: '', valor_str: '', valor: '', validade: '', importante: '', aviso: '',
+    minimo: '', maximo: '', limite: '',
+    itens,
+    qtd: String(lista.length),
+    codigos: lista.map(c => String(c.codigo || '').toUpperCase()).filter(Boolean).join(', '),
+  });
+}
+
 // Boot: reaplica links de afiliado nos cupons TSP que já estavam na fila.
 // Precisa rodar aqui (e não junto de carregarFila) porque depende de LINKS_TSP.
 reformatarCupomsTSPPendentes();
@@ -2163,7 +2193,21 @@ function escopoDoCupom(texto, codigo, todosCodigos) {
 }
 
 // Gate deterministico. Retorna { auto:boolean, motivo:string }.
-function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = []) {
+// Gate TEMPORAL isolado: janela de publicacao e intervalo minimo entre envios.
+// Vive separado porque numa mensagem com varios cupons ele e do LOTE, nao do
+// item — avaliado por cupom, so o primeiro passaria e o agrupamento nasceria
+// com uma unica linha, que e exatamente o que ele existe para evitar.
+function avaliarTemporalAutoEnvio() {
+  const janela = dentroDaJanelaCupom();
+  if (!janela.ok) return { auto:false, motivo: janela.motivo };
+  const intervalo = intervaloAutoEnvioMs();
+  const desde = Date.now() - _ultimoAutoEnvio;
+  if (desde < intervalo)
+    return { auto:false, motivo:`intervalo minimo (faltam ${Math.ceil((intervalo-desde)/1000)}s)` };
+  return { auto:true, motivo:'aprovado' };
+}
+
+function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = [], opcoes = {}) {
   let t = textoOriginal || '';
 
   if (autoEnvioModo() === 'off')          return { auto:false, motivo:'modo off' };
@@ -2215,15 +2259,12 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
   if (!t.toLowerCase().includes(String(cupom.codigo).toLowerCase()))
     return { auto:false, motivo:'codigo nao aparece '+ondeStr };
 
-  // Janela de publicacao configurada na aba Cupons — nada de cupom as 3h da manha
-  const janela = dentroDaJanelaCupom();
-  if (!janela.ok) return { auto:false, motivo: janela.motivo };
-
-  // Anti-flood: canal despejando varios cupons de uma vez
-  const intervalo = intervaloAutoEnvioMs();
-  const desde = Date.now() - _ultimoAutoEnvio;
-  if (desde < intervalo)
-    return { auto:false, motivo:`intervalo minimo (faltam ${Math.ceil((intervalo-desde)/1000)}s)` };
+  // Janela de publicacao (nada de cupom as 3h) e anti-flood. Quem monta lote
+  // pede para pular esta parte e avalia uma vez so para a mensagem inteira.
+  if (!opcoes.ignorarTemporal) {
+    const temporal = avaliarTemporalAutoEnvio();
+    if (!temporal.auto) return temporal;
+  }
 
   return { auto:true, motivo:'aprovado' };
 }
@@ -2783,6 +2824,49 @@ async function registrarEnvioHistorico(oferta) {
     const regs = await _registrosDoShard(local);
     // Idempotente por id: aprovação manual e worker podem disputar o mesmo item.
     if (regs.some(r => String(r.id) === String(oferta.id))) return;
+
+    // LOTE: um registro POR CUPOM, todos com o mesmo loteId. Gravar so um
+    // registro pela mensagem faria a contagem de cupons por loja despencar sem
+    // que nada tivesse deixado de ser publicado. O campo 'mensagens' (1 apenas
+    // no primeiro item) e o que permite medir o volume real de disparos —
+    // somar registros passa a contar cupons, somar 'mensagens' conta mensagens.
+    if (Array.isArray(oferta.loteCupons) && oferta.loteCupons.length) {
+      const loteId = String(oferta.id);
+      if (regs.some(r => String(r.loteId) === loteId)) return;
+      const quando = oferta.enviadoEm || new Date().toISOString();
+      oferta.loteCupons.forEach((c, i) => {
+        regs.push({
+          id:            loteId + '-' + i,
+          loteId,
+          loteTamanho:   oferta.loteCupons.length,
+          mensagens:     i === 0 ? 1 : 0,
+          enviadoEm:     quando,
+          tipoConteudo:  'cupom_tsp',
+          subtipo:       c.subtipo || null,
+          loja:          c.loja || null,
+          titulo:        null,
+          codigo:        c.codigo || null,
+          valor:         c.valor ?? null,
+          tipo:          c.tipo ?? null,
+          preco:         null,
+          precoFinal:    null,
+          desconto:      null,
+          asin:          null,
+          link:          null,
+          origem:        oferta.grupoOrigem || oferta.origem || null,
+          gruposDestino: Array.isArray(oferta.gruposEnviados) ? oferta.gruposEnviados.length : null,
+          autoEnviado:   !!oferta.autoEnviado,
+          temImagem:     Array.isArray(oferta.imagens) && oferta.imagens.length > 0,
+        });
+      });
+      const caminhoLote = SESSAO_DIR + '/' + local;
+      const dirLote = caminhoLote.slice(0, caminhoLote.lastIndexOf('/'));
+      if (!existsSync(dirLote)) mkdirSync(dirLote, { recursive: true });
+      writeFileSync(caminhoLote, JSON.stringify({ registros: regs }), 'utf-8');
+      agendarPush(local);
+      return;
+    }
+
     regs.push({
       id:            oferta.id,
       enviadoEm:     oferta.enviadoEm || new Date().toISOString(),
@@ -2803,6 +2887,7 @@ async function registrarEnvioHistorico(oferta) {
                    : Array.isArray(oferta.destinos)       ? oferta.destinos.length : null,
       autoEnviado:   !!oferta.autoEnviado,
       temImagem:     Array.isArray(oferta.imagens) && oferta.imagens.length > 0,
+      mensagens:     1,
     });
     const caminho = SESSAO_DIR + '/' + local;
     const dir = caminho.slice(0, caminho.lastIndexOf('/'));
@@ -2858,7 +2943,9 @@ setInterval(async () => {
     if (!oferta) return;
 
     const d = oferta.dadosExtraidos || {};
-    const rotulo = `${nomeLojaExibicao(d.loja)} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
+    const rotulo = Array.isArray(oferta.loteCupons) && oferta.loteCupons.length > 1
+      ? `${nomeLojaExibicao(d.loja)} · lote de ${oferta.loteCupons.length} cupons`
+      : `${nomeLojaExibicao(d.loja)} ${d.valor}${d.tipo === 'pct' ? '%' : ' R$'}${d.codigo ? ' · '+d.codigo : ''}`;
 
     // Marca como 'enviando' antes do await para o card sumir do painel e
     // reduzir a janela de corrida com uma aprovacao manual simultanea.
@@ -2959,6 +3046,7 @@ async function enfileirarCupomTSP(c, ctx = {}) {
     tinhaMultiplos = false,
     codigosLista = [],
     somenteFila = false,
+    jaRegistrado = false,
   } = ctx;
 
   const mensagemFormatada = formatarCupomTSP(c);
@@ -2975,24 +3063,29 @@ async function enfileirarCupomTSP(c, ctx = {}) {
     tenant: tenantContexto() || TENANT_PADRAO,
   };
 
-  // Verificar deduplicação: ignorar se o mesmo cupom já foi visto recentemente
-  if (cupomJaVisto(c)) {
-    console.log(`[DEDUP] Cupom ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
-    return { ignorado: true, motivo: 'duplicata' };
-  }
+  // jaRegistrado: veio do montador de lote, que ja passou pelo dedup e ja
+  // gravou na base. Repetir aqui faria cupomJaVisto() acusar duplicata do
+  // proprio cupom e descartar em silencio o item que so precisava cair na fila.
+  if (!jaRegistrado) {
+    // Verificar deduplicação: ignorar se o mesmo cupom já foi visto recentemente
+    if (cupomJaVisto(c)) {
+      console.log(`[DEDUP] Cupom ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
+      return { ignorado: true, motivo: 'duplicata' };
+    }
 
-  // Registra ANTES de qualquer envio: se o envio falhar preferimos perder um
-  // cupom a arriscar mandar duplicado quando o outro canal repostar.
-  registrarCupomVisto(c);
-  // Mesmo ponto, mesma garantia: o cupom entra na base antes de qualquer
-  // envio, para ja estar disponivel quando uma oferta do radar chegar.
-  let regBase = null;
-  try { regBase = registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
-  // Cupom capturado de grupo so vale nas SUAS compras depois de ativado na
-  // conta. O sync horario ja faz isso, mas ate ele rodar o cupom fica anunciado
-  // sem estar aplicavel. Aqui a janela fecha na hora — sem await, porque o
-  // disparo nos grupos nao pode esperar pelo ML nem falhar por causa dele.
-  ativarCupomCapturadoMl(c, regBase);
+    // Registra ANTES de qualquer envio: se o envio falhar preferimos perder um
+    // cupom a arriscar mandar duplicado quando o outro canal repostar.
+    registrarCupomVisto(c);
+    // Mesmo ponto, mesma garantia: o cupom entra na base antes de qualquer
+    // envio, para ja estar disponivel quando uma oferta do radar chegar.
+    let regBase = null;
+    try { regBase = registrarCupomBase(c); } catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
+    // Cupom capturado de grupo so vale nas SUAS compras depois de ativado na
+    // conta. O sync horario ja faz isso, mas ate ele rodar o cupom fica anunciado
+    // sem estar aplicavel. Aqui a janela fecha na hora — sem await, porque o
+    // disparo nos grupos nao pode esperar pelo ML nem falhar por causa dele.
+    ativarCupomCapturadoMl(c, regBase);
+  }
 
   const veredito = avaliarAutoEnvio(c, textoOriginal, tinhaMultiplos, codigosLista);
   const rotulo   = `${nomeLojaExibicao(c.loja)} ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}${c.codigo ? ' · '+c.codigo : ''}`;
@@ -3070,6 +3163,150 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   return { oferta, veredito, enviado: false };
 }
 
+// ── LOTE DE CUPONS: UMA MENSAGEM POR MENSAGEM DE ORIGEM ──────────────────────
+// Canal de cupom manda a lista inteira de UMA loja numa mensagem so. Antes cada
+// item virava um disparo proprio, espacado pelo intervalo de anti-flood: uma
+// lista de 13 cupons ocupava meia hora do grupo do cliente e mandava 13
+// mensagens para dizer o que cabia em uma.
+//
+// O que NAO muda: dedup, gravacao em cupons_base.json, ativacao no ML e o gate
+// de conteudo continuam por cupom. Agrupar e uma decisao de APRESENTACAO — a
+// base de cupons segue com um registro por codigo, que e o que o casamento com
+// as ofertas do radar consulta.
+async function despacharBlocoCupons(bloco, ctx = {}) {
+  const { origem = 'desconhecida', textoOriginal = '', imagens = [] } = ctx;
+
+  const oferta = {
+    id: gerarId(),
+    timestamp: new Date().toISOString(),
+    grupoOrigem: origem,
+    tipoConteudo: 'cupom_tsp',
+    conteudoOriginal: textoOriginal,
+    imagens,
+    mensagemFormatada: formatarCupomLoteTSP(bloco),
+    // dadosExtraidos fica com o primeiro cupom para o painel e o histórico
+    // continuarem achando loja/valor/tipo onde sempre estiveram; a lista
+    // completa vive em loteCupons.
+    dadosExtraidos: { ...bloco[0], codigosLote: bloco.map(c => c.codigo || null) },
+    loteCupons: bloco,
+    status: 'pendente',
+    tenant: tenantContexto() || TENANT_PADRAO,
+  };
+
+  const rotulo = `${nomeLojaExibicao(bloco[0].loja)} · lote de ${bloco.length} cupons`;
+  const temporal = avaliarTemporalAutoEnvio();
+  oferta.autoAvaliacao = {
+    auto: temporal.auto,
+    motivo: temporal.auto ? `aprovado (lote de ${bloco.length})` : temporal.motivo,
+    modo: autoEnvioModo(),
+    avaliadoEm: new Date().toISOString(),
+  };
+
+  // Bloqueio temporal: o lote inteiro fica agendado e o worker de espacamento
+  // manda quando liberar. Nada de quebrar o lote so porque o relogio nao ajudou.
+  if (!temporal.auto) {
+    oferta.autoAgendado = true;
+    filaPendentes.unshift(oferta);
+    salvarFila();
+    console.log(`[AUTO-FILA] Lote #${oferta.id} agendado — ${rotulo} (${temporal.motivo})`);
+    return { oferta, agendado: true };
+  }
+
+  oferta.status        = 'enviando';
+  oferta.enviandoDesde = new Date().toISOString();
+  filaPendentes.unshift(oferta);
+  salvarFila();
+  try {
+    await despacharCupomAuto(oferta);
+    salvarFila();
+    console.log(`[AUTO] Lote #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
+    try {
+      await enviarMensagem(GRUPOS.operador, {
+        text: `*Lote de cupons enviado automaticamente* 🤖\n\n${rotulo}\n`
+          + bloco.map(c => `· ${c.codigo || 'sem código'} — ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}`).join('\n')
+          + `\n\nOrigem: ${origem}`
+      });
+    } catch(e) { console.warn('[AUTO] Falha ao avisar operador:', e.message); }
+    return { oferta, enviado: true };
+  } catch(err) {
+    // Falha no envio: vira aprovacao manual em vez de perder a lista.
+    oferta.status = 'pendente';
+    delete oferta.enviandoDesde;
+    salvarFila();
+    console.error(`[AUTO] Falha no envio do lote #${oferta.id}: ${err.message} — caindo para fila`);
+    try {
+      await enviarMensagem(GRUPOS.operador, {
+        text: '*Novo lote de cupons capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+      });
+    } catch(e) { console.warn('[FILA] Falha ao enviar alerta de lote:', e.message); }
+    return { oferta, enviado: false };
+  }
+}
+
+async function enfileirarLoteCupomTSP(lista, ctx = {}) {
+  const { origem = 'desconhecida', textoOriginal = '', codigosLista = [] } = ctx;
+
+  // 1. Dedup, base e ativacao no ML — POR CUPOM, antes de qualquer envio.
+  const novos = [];
+  for (const c of lista) {
+    if (cupomJaVisto(c)) {
+      console.log(`[DEDUP] Cupom do lote ignorado (duplicata): ${c.loja} | ${c.codigo || 'sem código'}`);
+      continue;
+    }
+    registrarCupomVisto(c);
+    let regBase = null;
+    try { regBase = registrarCupomBase(c); }
+    catch(e) { console.warn('[CUPONS] Falha ao gravar na base:', e.message); }
+    ativarCupomCapturadoMl(c, regBase);
+    novos.push(c);
+  }
+  if (!novos.length) return { ignorado: true, motivo: 'todos duplicatas' };
+
+  // 2. Gate de CONTEUDO por cupom (teto, minimo, codigo confere no bloco dele).
+  //    Um cupom sem regra de aplicacao completa nao entra na mensagem: ele iria
+  //    junto com os validos e sairia sem revisao nenhuma, que e justamente o que
+  //    o gate existe para impedir.
+  const modo = autoEnvioModo();
+  const aprovados = [], reprovados = [];
+  for (const c of novos) {
+    const v = avaliarAutoEnvio(c, textoOriginal, true, codigosLista, { ignorarTemporal: true });
+    if (v.auto && modo === 'on') aprovados.push(c);
+    else reprovados.push({ c, v });
+  }
+
+  const resultados = [];
+
+  // 3. Reprovados seguem o caminho individual de sempre: fila para aprovacao
+  //    manual, com o motivo visivel no card.
+  for (const { c } of reprovados) {
+    try {
+      resultados.push(await enfileirarCupomTSP(c, { ...ctx, tinhaMultiplos: true, jaRegistrado: true }));
+    } catch(e) {
+      console.error(`[LOTE] Falha ao enfileirar cupom ${c.codigo || 'sem código'}: ${e.message}`);
+    }
+  }
+
+  // 4. Aprovados em blocos de ate CUPOM_LOTE_MAX. Bloco de um unico cupom sai
+  //    no formato de cupom normal — envelope de lote para um item so anuncia
+  //    "1 cupons" e desperdica o cabecalho.
+  for (let i = 0; i < aprovados.length; i += CUPOM_LOTE_MAX) {
+    const bloco = aprovados.slice(i, i + CUPOM_LOTE_MAX);
+    try {
+      if (bloco.length === 1) {
+        resultados.push(await enfileirarCupomTSP(bloco[0], { ...ctx, tinhaMultiplos: true, jaRegistrado: true }));
+      } else {
+        resultados.push(await despacharBlocoCupons(bloco, ctx));
+      }
+    } catch(e) {
+      console.error(`[LOTE] Falha no bloco de ${bloco.length} cupons: ${e.message}`);
+    }
+  }
+
+  console.log(`[LOTE] ${lista.length} cupom(ns) da mensagem de ${origem}: `
+    + `${novos.length} novo(s), ${aprovados.length} agrupado(s), ${reprovados.length} para fila manual.`);
+  return { lote: true, resultados };
+}
+
 // ── PROCESSAR MENSAGEM DO TELEGRAM ────────────────────────────────────────────
 // Serializacao: o gate de dedup so roda DEPOIS da chamada a Anthropic (1-3s).
 // Sem mutex, o mesmo cupom chegando pelos dois canais com poucos segundos de
@@ -3113,17 +3350,41 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       : [campos];
     const codigosLista = lista.map(x => x.codigo).filter(Boolean);
 
+    const ctxCupom = {
+      origem: `telegram:@${canalUsername}`,
+      textoOriginal: texto,
+      imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
+      tinhaMultiplos, codigosLista,
+    };
+
+    // Mensagem com varios cupons vira UMA mensagem no grupo, nao N. O canal
+    // nao mistura lojas na mesma mensagem — a lista e sempre de uma loja so —,
+    // entao o agrupamento sai por mensagem de origem. Se algum dia vier
+    // misturada, cada loja vira seu proprio lote.
+    if (lista.length > 1) {
+      const porLoja = new Map();
+      for (const c of lista) {
+        const k = String(c.loja || 'sem-loja');
+        if (!porLoja.has(k)) porLoja.set(k, []);
+        porLoja.get(k).push(c);
+      }
+      for (const [loja, doLoja] of porLoja) {
+        try {
+          if (doLoja.length > 1) await enfileirarLoteCupomTSP(doLoja, ctxCupom);
+          else await enfileirarCupomTSP(doLoja[0], ctxCupom);
+        } catch (e) {
+          console.error(`[TG] Falha no lote de ${loja}: ${e.message} — seguindo.`);
+        }
+      }
+      return;
+    }
+
     // try/catch POR ITEM: antes um cupom que estourasse derrubava o catch geral
     // e os seguintes da mesma mensagem nunca eram processados — perda silenciosa
     // proporcional ao tamanho da lista.
     for (const c of lista) {
       try {
-        await enfileirarCupomTSP(c, {
-          origem: `telegram:@${canalUsername}`,
-          textoOriginal: texto,
-          imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
-          tinhaMultiplos, codigosLista,
-        });
+        await enfileirarCupomTSP(c, ctxCupom);
       } catch (e) {
         console.error(`[TG] Falha no cupom ${c.codigo || 'sem código'} (${c.loja}): ${e.message} — seguindo para o próximo.`);
       }
