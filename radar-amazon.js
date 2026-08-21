@@ -12,7 +12,7 @@
 // Requisitos no Railway:
 //   AMZ_CLIENT_ID      credencial da Creators API
 //   AMZ_CLIENT_SECRET  segredo da Creators API
-//   AMZ_PARTNER_TAG    ex: ticapromos-20
+//   AMZ_PARTNER_TAG    ex: tudosobrepromos-20
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
@@ -2606,8 +2606,21 @@ export function casarCupomDaPagina(loja, cupomPagina) {
   for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
-    if (cupomPagina.idCampanhaLoja && reg.idCampanhaLoja &&
-        String(reg.idCampanhaLoja) === String(cupomPagina.idCampanhaLoja)) porCampanha.push(reg);
+
+    const mesmaCampanha = !!(cupomPagina.idCampanhaLoja && reg.idCampanhaLoja &&
+      String(reg.idCampanhaLoja) === String(cupomPagina.idCampanhaLoja));
+    if (mesmaCampanha) porCampanha.push(reg);
+
+    // Campanha divergente e PROVA de que nao e o mesmo cupom: o registro ja
+    // sabe de qual campanha veio e o anuncio cita outra. Antes o casamento por
+    // (tipo, valor) ignorava isso e um cupom de LOJA do vendedor (campanha
+    // 13504679, sem codigo digitavel) virou "CUPOM BRINCADEIRAS" na mensagem
+    // so porque os dois eram de 15% — o desconto estava certo, o codigo nao
+    // existia para aquele produto. Registro ainda sem idCampanhaLoja continua
+    // elegivel: e exatamente assim que a via 2 aprende o vinculo.
+    const campanhaDivergente = !!(cupomPagina.idCampanhaLoja && reg.idCampanhaLoja) && !mesmaCampanha;
+    if (campanhaDivergente) continue;
+
     if (reg.tipo === cupomPagina.tipo && Number(reg.valor) === Number(cupomPagina.valor)) porValor.push(reg);
   }
 
