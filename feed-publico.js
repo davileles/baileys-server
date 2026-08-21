@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // feed-publico.js — vitrine publica das ofertas e cupons que sairam no grupo.
 //
-// O site publico (tudosobrepromos.com) e estatico: nao consulta o Railway, le
+// O site publico (ticapromos.com.br) e estatico: nao consulta o Railway, le
 // dois JSON servidos pelo GitHub Pages. Este modulo e quem mantem esses dois
 // arquivos atualizados no repositorio publico.
 //
@@ -18,6 +18,7 @@
 //   GITHUB_TOKEN          mesmo PAT do sync-github.js
 //   GITHUB_REPO_PUBLICO   padrao davileles/tudo-sobre-promos
 //   TSP_LINK_GRUPO        padrao https://grupo.tudosobrepromos.com/groups
+//                         (trocar para grupo.ticapromos.com.br quando o DNS virar)
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
