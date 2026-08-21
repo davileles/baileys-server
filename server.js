@@ -9647,7 +9647,7 @@ app.post('/templates/preview', (req, res) => {
       titulo:'Samsung Smart TV 58" Crystal UHD 4K U8000H 2026, Vision AI Companion, Modo Jogo',
       preco:3032.10, precoDe:3639.00, desconto:17, disponivel:true,
       nota:4.6, avaliacoes:812, vendedor:'Amazon.com.br', dealTermina:null,
-      link:'https://www.amazon.com.br/dp/B0H6N6K239?tag=tdsobrepromos-20',
+      link:'https://www.amazon.com.br/dp/B0H6N6K239?tag=davileles-20',
     };
     const cupom = req.body.comCupom === false ? null
       : { reg:{ codigo:'CURTEAPROMO' }, desconto:100, citado:true };
