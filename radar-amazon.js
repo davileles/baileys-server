@@ -1556,9 +1556,15 @@ function templateCupomPadrao() {
 // acrescentar informacao nenhuma. Sao DOIS templates: o item (repetido por
 // cupom) e o envelope (cabecalho + {{itens}} + link unico da loja).
 function templateCupomLoteItemPadrao() {
+  return '\uD83C\uDFF7\uFE0F *{{codigo}}* \u2014 {{valor_str}}';
+}
+
+// Cupom que NAO segue a condicao comum da mensagem: carrega a propria regra
+// logo abaixo, marcado com a seta que o cabecalho referencia.
+function templateCupomLoteItemExcecaoPadrao() {
   return [
     '\uD83C\uDFF7\uFE0F *{{codigo}}* \u2014 {{valor_str}}',
-    '{{validade}}',
+    '\u21B3 {{validade}}',
   ].join('\n');
 }
 
@@ -1567,6 +1573,8 @@ function templateCupomLotePadrao() {
     '`\uD83D\uDEA8 {{gatilho}}`',
     '',
     '*\uD83D\uDEA8 {{qtd}} cupons \u2014 {{loja}}*',
+    '',
+    '{{condicao_comum}}',
     '',
     '{{itens}}',
     '',
@@ -1598,7 +1606,8 @@ const TEMPLATE_PADRAO_LEGADO = [
 //   _cupom   mensagem de cupom (auto-envio + aba Cupom)
 //   _awin    ofertas vindas da rede Awin, quando a loja nao tem template proprio
 const TPL_RESERVADOS = { padrao: '_padrao', cupom: '_cupom', awin: '_awin',
-                          cupomlote: '_cupom_lote', cupomloteitem: '_cupom_lote_item' };
+                          cupomlote: '_cupom_lote', cupomloteitem: '_cupom_lote_item',
+                          cupomloteitemexcecao: '_cupom_lote_item_excecao' };
 
 function chaveLoja(loja) {
   const k = (loja || '')
@@ -1644,16 +1653,23 @@ export function carregarTemplates() {
   }
   // Lote de cupons: nasce com o layout equivalente ao do cupom unico, para o
   // agrupamento entrar sem o operador precisar escrever template nenhum.
-  if (!E().templates._cupom_lote) {
-    E().templates._cupom_lote = { nome: 'Cupom (lote)', corpo: templateCupomLotePadrao(),
-                                  usarLinkPreview: false, atualizadoEm: new Date().toISOString() };
+  // versao 2: condicao comum sobe para o cabecalho e o item vira uma linha so.
+  // A migracao existe porque a v1 chegou a ser semeada em producao — sem ela,
+  // o template salvo continuaria repetindo a mesma frase de validade em cada
+  // linha e a mudanca nao apareceria em mensagem nenhuma.
+  const LOTE_VERSAO = 2;
+  const semearLote = (chave, nome, corpo) => {
+    const atual = E().templates[chave];
+    if (atual && Number(atual.versaoLote || 1) >= LOTE_VERSAO) return;
+    if (atual) console.log('[TPL] ' + chave + ' migrado para a versao ' + LOTE_VERSAO + ' do lote.');
+    E().templates[chave] = { nome, corpo, usarLinkPreview: false,
+                             versaoLote: LOTE_VERSAO, atualizadoEm: new Date().toISOString() };
     salvarTemplates();
-  }
-  if (!E().templates._cupom_lote_item) {
-    E().templates._cupom_lote_item = { nome: 'Cupom (lote) — item', corpo: templateCupomLoteItemPadrao(),
-                                       usarLinkPreview: false, atualizadoEm: new Date().toISOString() };
-    salvarTemplates();
-  }
+  };
+  semearLote('_cupom_lote', 'Cupom (lote)', templateCupomLotePadrao());
+  semearLote('_cupom_lote_item', 'Cupom (lote) — item', templateCupomLoteItemPadrao());
+  semearLote('_cupom_lote_item_excecao', 'Cupom (lote) — item com condição própria',
+             templateCupomLoteItemExcecaoPadrao());
   if (!E().templates._awin) {
     E().templates._awin = { nome: 'Awin', corpo: (E().templates._padrao.corpo || templatePadrao()),
                             usarLinkPreview: true, atualizadoEm: new Date().toISOString() };
@@ -1691,9 +1707,15 @@ export function templateCupomLote() {
   return E().templates._cupom_lote || { nome: 'Cupom (lote)', corpo: templateCupomLotePadrao() };
 }
 
-/** Bloco repetido por cupom dentro do lote. */
+/** Bloco repetido por cupom dentro do lote (segue a condicao comum). */
 export function templateCupomLoteItem() {
   return E().templates._cupom_lote_item || { nome: 'Cupom (lote) — item', corpo: templateCupomLoteItemPadrao() };
+}
+
+/** Bloco do cupom que foge da condicao comum e declara a propria. */
+export function templateCupomLoteItemExcecao() {
+  return E().templates._cupom_lote_item_excecao
+      || { nome: 'Cupom (lote) — item com condição própria', corpo: templateCupomLoteItemExcecaoPadrao() };
 }
 
 /** Corpo das ofertas da rede Awin. Cai no padrao das ofertas se nao existir. */
@@ -1848,6 +1870,7 @@ export const VARIAVEIS_CUPOM = [
 // porque cada linha e um cupom normal renderizado.
 export const VARIAVEIS_CUPOM_LOTE = [
   { chave:'itens',      desc:'Bloco com todos os cupons ja renderizados (um por cupom)' },
+  { chave:'condicao_comum', desc:'Frase da condicao que vale para a maioria dos cupons da mensagem' },
   { chave:'qtd',        desc:'Quantidade de cupons na mensagem' },
   { chave:'codigos',    desc:'Codigos separados por virgula' },
   { chave:'loja',       desc:'Nome da loja' },
