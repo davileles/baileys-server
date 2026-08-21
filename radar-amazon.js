@@ -1550,6 +1550,35 @@ function templateCupomPadrao() {
   return linhas.join('\n');
 }
 
+// ── LOTE DE CUPONS (uma mensagem, varios codigos) ────────────────────────────
+// Canal de cupom quase sempre manda a lista inteira de uma loja numa mensagem
+// so. Explodir isso em N disparos multiplicava o volume no grupo do cliente sem
+// acrescentar informacao nenhuma. Sao DOIS templates: o item (repetido por
+// cupom) e o envelope (cabecalho + {{itens}} + link unico da loja).
+function templateCupomLoteItemPadrao() {
+  return [
+    '\uD83C\uDFF7\uFE0F *{{codigo}}* \u2014 {{valor_str}}',
+    '{{validade}}',
+  ].join('\n');
+}
+
+function templateCupomLotePadrao() {
+  const linhas = [
+    '`\uD83D\uDEA8 {{gatilho}}`',
+    '',
+    '*\uD83D\uDEA8 {{qtd}} cupons \u2014 {{loja}}*',
+    '',
+    '{{itens}}',
+    '',
+    '\uD83D\uDED2 *LOJA* {{loja_upper}}',
+    '',
+    '\uD83D\uDD17 *RESGATE OS CUPONS AQUI* {{link}}',
+  ];
+  const r = rodapeCupom(tenantAtual());
+  if (r) linhas.push('', r);
+  return linhas.join('\n');
+}
+
 // Corpo da versao anterior, que exigia {{#var}}...{{/var}}. Serve so para
 // reconhecer o padrao nao editado e migra-lo para a sintaxe simples — template
 // que o operador ja customizou nao e tocado.
@@ -1568,7 +1597,8 @@ const TEMPLATE_PADRAO_LEGADO = [
 //   _padrao  fallback das ofertas de marketplace
 //   _cupom   mensagem de cupom (auto-envio + aba Cupom)
 //   _awin    ofertas vindas da rede Awin, quando a loja nao tem template proprio
-const TPL_RESERVADOS = { padrao: '_padrao', cupom: '_cupom', awin: '_awin' };
+const TPL_RESERVADOS = { padrao: '_padrao', cupom: '_cupom', awin: '_awin',
+                          cupomlote: '_cupom_lote', cupomloteitem: '_cupom_lote_item' };
 
 function chaveLoja(loja) {
   const k = (loja || '')
@@ -1612,6 +1642,18 @@ export function carregarTemplates() {
                              atualizadoEm: new Date().toISOString() };
     salvarTemplates();
   }
+  // Lote de cupons: nasce com o layout equivalente ao do cupom unico, para o
+  // agrupamento entrar sem o operador precisar escrever template nenhum.
+  if (!E().templates._cupom_lote) {
+    E().templates._cupom_lote = { nome: 'Cupom (lote)', corpo: templateCupomLotePadrao(),
+                                  usarLinkPreview: false, atualizadoEm: new Date().toISOString() };
+    salvarTemplates();
+  }
+  if (!E().templates._cupom_lote_item) {
+    E().templates._cupom_lote_item = { nome: 'Cupom (lote) — item', corpo: templateCupomLoteItemPadrao(),
+                                       usarLinkPreview: false, atualizadoEm: new Date().toISOString() };
+    salvarTemplates();
+  }
   if (!E().templates._awin) {
     E().templates._awin = { nome: 'Awin', corpo: (E().templates._padrao.corpo || templatePadrao()),
                             usarLinkPreview: true, atualizadoEm: new Date().toISOString() };
@@ -1642,6 +1684,16 @@ export function templateProprioDaLoja(loja) {
 /** Corpo das mensagens de cupom. Sempre devolve algo renderizavel. */
 export function templateCupom() {
   return E().templates._cupom || { nome: 'Cupom', corpo: templateCupomPadrao() };
+}
+
+/** Envelope da mensagem de lote: cabecalho, {{itens}} e link unico da loja. */
+export function templateCupomLote() {
+  return E().templates._cupom_lote || { nome: 'Cupom (lote)', corpo: templateCupomLotePadrao() };
+}
+
+/** Bloco repetido por cupom dentro do lote. */
+export function templateCupomLoteItem() {
+  return E().templates._cupom_lote_item || { nome: 'Cupom (lote) — item', corpo: templateCupomLoteItemPadrao() };
 }
 
 /** Corpo das ofertas da rede Awin. Cai no padrao das ofertas se nao existir. */
@@ -1790,6 +1842,18 @@ export const VARIAVEIS_CUPOM = [
   { chave:'minimo',     desc:'Valor mínimo de compra, só o número' },
   { chave:'maximo',     desc:'Teto de preço do produto elegível, só o número' },
   { chave:'limite',     desc:'Teto de desconto em R$, só o número' },
+];
+
+// Variaveis exclusivas do envelope do lote. O bloco de item usa VARIAVEIS_CUPOM,
+// porque cada linha e um cupom normal renderizado.
+export const VARIAVEIS_CUPOM_LOTE = [
+  { chave:'itens',      desc:'Bloco com todos os cupons ja renderizados (um por cupom)' },
+  { chave:'qtd',        desc:'Quantidade de cupons na mensagem' },
+  { chave:'codigos',    desc:'Codigos separados por virgula' },
+  { chave:'loja',       desc:'Nome da loja' },
+  { chave:'loja_upper', desc:'Nome da loja em maiusculas' },
+  { chave:'link',       desc:'Link unico de afiliado da loja' },
+  { chave:'gatilho',    desc:'Chamada opcional no topo da mensagem' },
 ];
 
 // ── PIPELINE ──────────────────────────────────────────────────────────────
