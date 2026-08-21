@@ -43,7 +43,7 @@ const CFG_TSP_PADRAO = {
   // gerador manual do painel. Chave vazia = loja sem link: o cupom sai sem o
   // bloco "RESGATE O CUPOM AQUI" e a loja fica inelegivel para auto-envio.
   afiliados: {
-    amazon:       'https://amzn.to/4dFRSzy',
+    amazon:       'https://link.amazon/B0aA3uVrC',
     mercadolivre: 'https://meli.la/2xystLt',
     shopee_sem:   'https://s.shopee.com.br/9fHPmP3QZF',   // pagina de cupons (sem codigo)
     shopee_com:   'https://s.shopee.com.br/30kdYeLY0W',   // oferta com codigo
@@ -66,10 +66,10 @@ const CFG_TSP_PADRAO = {
   //
   // Consequencia deliberada: a venda cai na conta do associado dono da tag, e
   // por isso NAO aparece no relatorio de comissoes nem no EPC desta operacao.
-  tagsPorGrupo: {
-    // Promos do Davi #07 — comissao direcionada a outro associado.
-    '120363429334971122@g.us': 'dl04f-20',
-  },
+  // Vazio: destino unico. Toda a operacao aponta para a tag da conta propria
+  // (davileles-20). A camada continua existindo para excecao futura, mas hoje
+  // nenhum grupo desvia comissao.
+  tagsPorGrupo: {},
   // LINK DE AFILIADO POR GRUPO DE DESTINO.
   //
   // Irmao de tagsPorGrupo, para o caso que a troca de tag nao resolve: os links
@@ -82,14 +82,8 @@ const CFG_TSP_PADRAO = {
   // As chaves de loja sao as mesmas de `afiliados` (amazon, mercadolivre,
   // shopee_sem, shopee_com, magalu, zedelivery). Loja ausente no override
   // continua com o link global.
-  linksPorGrupo: {
-    // Promos do Davi #07 — link de afiliado da conta que recebe a comissao.
-    // Qualquer link da Amazon com a tag do associado abre a janela de cookie,
-    // entao o produto de destino e indiferente para a atribuicao.
-    '120363429334971122@g.us': {
-      amazon: 'https://link.amazon/B03wEQT0G',
-    },
-  },
+  // Vazio: destino unico (ver tagsPorGrupo).
+  linksPorGrupo: {},
   // TROCAS LITERAIS DE LINK POR GRUPO — de -> para.
   //
   // Existe para os links de afiliado que NAO moram em `afiliados`: o convite do
@@ -105,25 +99,15 @@ const CFG_TSP_PADRAO = {
   // REGRAS POR PREFIXO DO NOME DO GRUPO.
   //
   // Os mapas acima sao por JID, e JID novo so passa a valer depois que alguem
-  // lembra de cadastra-lo. Uma familia de grupos que cresce ("Promos do Davi
-  // #01", "#02", ...) precisa da regra escrita uma vez: grupo criado amanha ja
+  // lembra de cadastra-lo. Uma familia de grupos que cresce ("Promos #01",
+  // "#02", ...) precisaria da regra escrita uma vez: grupo criado amanha ja
   // nasce com a atribuicao certa, sem editar config.
   //
   // O prefixo e comparado no inicio do nome, sem acento e sem diferenciar
   // maiusculas. Primeira regra que casa vence. Um mapa por JID tem prioridade
   // sobre a regra de nome — a excecao pontual continua podendo existir.
-  regrasPorNome: [
-    {
-      nome: 'Promos do Davi',
-      prefixo: 'promos do davi',
-      // Tag das ofertas de produto.
-      tag: 'dl04f-20',
-      // Links de afiliado que substituem os de `afiliados` (chaves iguais).
-      links: { amazon: 'https://link.amazon/B03wEQT0G' },
-      // Trocas literais de URL: links escritos no corpo do template.
-      literais: { 'https://link.amazon/B0dULFSvu': 'https://link.amazon/B08eCYlQ3' },
-    },
-  ],
+  // Vazio: destino unico (ver tagsPorGrupo).
+  regrasPorNome: [],
   // Rodapes anexados as mensagens. Texto livre — o operador pode usar crase
   // para o estilo monoespacado do WhatsApp, ou deixar vazio para nao anexar.
   rodapes: {
@@ -258,7 +242,7 @@ function estruturar(bruto, tenantId = TENANT_RAIZ) {
 // default seguro — o escopo mais conservador ('fora-da-trilha') e o tipo mais
 // comum ('oferta'), para que um cadastro incompleto nunca vire cupom com
 // convite cruzado que ninguem pediu.
-// A Amazon so aceita tag no formato <nome>-<numero> (ex.: dl04f-20). Qualquer
+// A Amazon so aceita tag no formato <nome>-<numero> (ex.: davileles-20). Qualquer
 // outra coisa viraria um link com tag invalida — a venda ate acontece, mas sem
 // atribuicao para ninguem. Melhor descartar e deixar o grupo no fluxo normal.
 const RE_TAG_AFILIADO = /^[a-z0-9](?:[a-z0-9._-]{1,48})-[0-9]{2}$/i;
