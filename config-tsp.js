@@ -32,12 +32,12 @@ function caminhoPushDe(tenantId) {
   return tenantId === TENANT_RAIZ ? 'config_tsp.json' : 'tenants/' + tenantId + '/config_tsp.json';
 }
 
-// Valores padrao = operacao original (Tudo Sobre Promos / Davi), que e o
+// Valores padrao = operacao original (Tica Promos / Davi), que e o
 // "primeiro usuario" do modelo hospedado. Um deploy novo sem config gravada se
 // comporta exatamente como o sistema se comportava antes desta camada existir.
 const CFG_TSP_PADRAO = {
   branding: {
-    nome: 'Tudo Sobre Promos',
+    nome: 'Tica Promos',
   },
   // Links de afiliado usados no formatador de cupons (auto-envio e fila) e no
   // gerador manual do painel. Chave vazia = loja sem link: o cupom sai sem o
