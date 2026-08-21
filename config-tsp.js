@@ -435,6 +435,13 @@ export function carregarConfigTsp() {
 
 export function configTsp(tenantId) { return obter(tenantId); }
 
+// Chaves de `afiliados` que NAO sao link de loja: mapas de atribuicao por
+// grupo, com normalizacao propria em estruturar(). Ficam fora da validacao de
+// URL da gravacao.
+const CHAVES_ESTRUTURADAS_AFILIADOS = new Set([
+  'tagsPorGrupo', 'linksPorGrupo', 'linksLiteraisPorGrupo', 'regrasPorNome',
+]);
+
 const RE_JID_GRUPO = /^\d{5,}@g\.us$/;
 
 export function salvarConfigTsp(parcial = {}, tenantId) {
@@ -477,7 +484,14 @@ export function salvarConfigTsp(parcial = {}, tenantId) {
     }
   }
   // Links: se preenchidos, precisam ser http(s). Vazio e permitido (loja sem link).
+  //
+  // `afiliados` guarda DOIS tipos de coisa: os links por loja (strings) e os
+  // mapas de atribuicao por grupo (objetos e array, normalizados em estruturar).
+  // Validar tudo como URL transformava `tagsPorGrupo` em "[object Object]" e
+  // derrubava qualquer gravacao vinda do painel — as chaves estruturadas ficam
+  // de fora, que quem as valida sao os normalizadores.
   for (const [k, v] of Object.entries(novo.afiliados)) {
+    if (CHAVES_ESTRUTURADAS_AFILIADOS.has(k)) continue;
     const s = String(v || '').trim();
     novo.afiliados[k] = s;
     if (s && !/^https?:\/\//i.test(s)) {
