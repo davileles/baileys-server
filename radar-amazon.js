@@ -12,7 +12,7 @@
 // Requisitos no Railway:
 //   AMZ_CLIENT_ID      credencial da Creators API
 //   AMZ_CLIENT_SECRET  segredo da Creators API
-//   AMZ_PARTNER_TAG    ex: tudosobrepromos-20
+//   AMZ_PARTNER_TAG    ex: ticapromos-20
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
