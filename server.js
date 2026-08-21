@@ -71,7 +71,7 @@ import {
   flushPushesPendentes, pushesPendentes, baixarArquivoDoGitHub,
 } from './sync-github.js';
 
-// ── VITRINE PUBLICA (ticapromos.com.br) ─────────────────────────────────────
+// ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
 import {
   iniciarFeedPublico, registrarPublicacao, publicarAgora, estadoFeedPublico,
 } from './feed-publico.js';
@@ -7002,6 +7002,16 @@ app.get('/operacao/historico-envios', async (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
 });
 
+// conteudoOriginal chega como string (captura unica) ou array (itens que o
+// agrupador juntou). A aba Fila precisa do texto cru da fonte para comparar
+// com a mensagem formatada — e a unica forma de flagrar no painel um cupom
+// que saiu com codigo diferente do que o post/anuncio dizia.
+function originalDaFila(o) {
+  const c = o && o.conteudoOriginal;
+  const t = Array.isArray(c) ? c.filter(Boolean).join('\n\n') : String(c || '');
+  return t.slice(0, 4000);
+}
+
 app.get('/operacao/fila', async (req, res) => {
   try {
     const agora        = Date.now();
@@ -7045,6 +7055,7 @@ app.get('/operacao/fila', async (req, res) => {
         // Mensagem completa (limite de seguranca 4096): a previa da aba Fila
         // precisa mostrar exatamente o que vai sair no grupo, sem corte.
         mensagem:     String(o.mensagemFormatada || '').slice(0, 4096),
+        original:     originalDaFila(o),
         temImagem:    Array.isArray(o.imagens) && o.imagens.length > 0,
         previsaoEm:   previsao ? new Date(previsao).toISOString() : null,
         expiraEm:     ts && !isNaN(ts) ? new Date(ts + AUTO_ENVIO_MAX_ESPERA).toISOString() : null,
@@ -7111,6 +7122,7 @@ app.get('/operacao/fila', async (req, res) => {
           // Previa da aba Fila tambem vale para o que ja saiu: mesma mensagem
           // e mesma flag de imagem dos itens aguardando.
           mensagem:      String(o.mensagemFormatada || '').slice(0, 4096),
+          original:      originalDaFila(o),
           temImagem:     Array.isArray(o.imagens) && o.imagens.length > 0,
         };
       });
