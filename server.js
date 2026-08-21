@@ -10452,6 +10452,11 @@ const GG_CHECK_MS = 6 * 60 * 60 * 1000;   // 4x ao dia; cada rodada e uma chamad
 // futuro volta a alertar.
 const _ggConvitesQuebrados = new Map();
 
+// Ultimo resultado, para o painel mostrar o estado sem re-disparar a varredura.
+// A badge abre junto com a aba: se ela chamasse a verificacao, cada abertura
+// viraria 40+ chamadas de grupo ao WhatsApp e alguns segundos de espera.
+let _ggUltimaVerificacao = null;
+
 function _ggConviteGone(msg) {
   return /\bgone\b|not-authorized|forbidden|404|item-not-found/i.test(String(msg || ''));
 }
@@ -10520,11 +10525,34 @@ async function verificarConvitesDistribuidor(opcoes = {}) {
   console.log('[GG-CHECK] ' + checados + '/' + lista.length + ' grupos checados — '
     + quebrados.length + ' novo(s) quebrado(s), ' + recuperados.length + ' recuperado(s), '
     + _ggConvitesQuebrados.size + ' em estado quebrado.');
+
+  // Nomes junto do jid: a badge precisa DIZER qual grupo quebrou. Um jid cru
+  // nao ajuda ninguem a achar o grupo no WhatsApp.
+  const quebradosAgora = lista
+    .filter(g => _ggConvitesQuebrados.has(g.jid))
+    .map(g => ({ jid:g.jid, nome:g.nome || g.jid, slug:g.slug }));
+
+  _ggUltimaVerificacao = {
+    verificadoEm: new Date().toISOString(),
+    total: lista.length, checados,
+    quebrados: quebradosAgora,
+  };
+
   return { ok:true, total:lista.length, checados,
            quebrados: quebrados.map(g => ({ jid:g.jid, nome:g.nome, slug:g.slug, erro:g.erro })),
            recuperados: recuperados.map(g => ({ jid:g.jid, nome:g.nome })),
-           emEstadoQuebrado: [..._ggConvitesQuebrados.keys()] };
+           emEstadoQuebrado: quebradosAgora };
 }
+
+// Leitura barata do ultimo resultado, para a badge do painel. Nunca dispara a
+// varredura: quem quer forcar usa o POST abaixo.
+app.get('/gg/convites-status', (req, res) => {
+  if (!_ggUltimaVerificacao) {
+    return res.json({ ok:true, verificado:false,
+      motivo: conectado ? 'primeira verificacao ainda nao rodou' : 'WhatsApp nao conectado' });
+  }
+  res.json({ ok:true, verificado:true, ..._ggUltimaVerificacao });
+});
 
 // Verificacao manual pelo painel/curl, alem do ciclo automatico.
 app.post('/gg/checar-convites', async (req, res) => {
