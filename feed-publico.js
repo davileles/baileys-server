@@ -16,9 +16,13 @@
 //
 // Variaveis no Railway (todas opcionais — os padroes ja valem):
 //   GITHUB_TOKEN          mesmo PAT do sync-github.js
-//   GITHUB_REPO_PUBLICO   padrao davileles/tudo-sobre-promos
-//   TSP_LINK_GRUPO        padrao https://grupo.tudosobrepromos.com/groups
-//                         (trocar para grupo.ticapromos.com.br quando o DNS virar)
+//   GITHUB_REPO_PUBLICO   padrao davileles/tsp-site,davileles/tica-site
+//                         Aceita LISTA separada por virgula: durante a migracao
+//                         de dominio os dois sites publicos ficam no ar em
+//                         paralelo e precisam do MESMO feed. Espelhar o
+//                         repositorio nao resolveria — a copia nasceria com as
+//                         ofertas congeladas no momento em que foi feita.
+//   TSP_LINK_GRUPO        padrao https://ir.ticapromos.com.br/geral
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
@@ -41,8 +45,11 @@ const DEBOUNCE_MS  = 10 * 60 * 1000;
 // Sem isso a aba Cupons mostraria codigo vencido ate o proximo envio.
 const INTERVALO_MS = 30 * 60 * 1000;
 
-function repoPublico() { return process.env.GITHUB_REPO_PUBLICO || 'davileles/tudo-sobre-promos'; }
-function linkGrupo()   { return process.env.TSP_LINK_GRUPO || 'https://grupo.tudosobrepromos.com/groups'; }
+function reposPublicos() {
+  return String(process.env.GITHUB_REPO_PUBLICO || 'davileles/tsp-site,davileles/tica-site')
+    .split(',').map(s => s.trim()).filter(Boolean);
+}
+function linkGrupo()   { return process.env.TSP_LINK_GRUPO || 'https://ir.ticapromos.com.br/geral'; }
 function ativo()       { return !!process.env.GITHUB_TOKEN; }
 
 let _publicadas = [];
@@ -194,8 +201,8 @@ function montarCupons() {
 
 // ── PUBLICACAO NO REPOSITORIO ────────────────────────────────────────────────
 
-async function api(caminho, opcoes = {}) {
-  return fetch('https://api.github.com/repos/' + repoPublico() + '/contents/' + caminho, {
+async function api(repo, caminho, opcoes = {}) {
+  return fetch('https://api.github.com/repos/' + repo + '/contents/' + caminho, {
     ...opcoes,
     headers: {
       'Authorization': 'Bearer ' + process.env.GITHUB_TOKEN,
@@ -217,22 +224,22 @@ function mesmoConteudo(remotoTexto, novo) {
   } catch { return false; }
 }
 
-async function enviarArquivo(caminho, objeto) {
+async function enviarArquivoNoRepo(repo, caminho, objeto) {
   const conteudo = JSON.stringify(objeto, null, 2);
 
   // SHA sempre fresco imediatamente antes do PUT: o repositorio recebe commits
   // de outros processos e um SHA reaproveitado falha com 409.
   let sha = null;
-  const atual = await api(caminho);
+  const atual = await api(repo, caminho);
   if (atual.ok) {
     const d = await atual.json();
     sha = d.sha;
     if (mesmoConteudo(Buffer.from(d.content, 'base64').toString('utf-8'), objeto)) return false;
   } else if (atual.status !== 404) {
-    throw new Error('leitura de ' + caminho + ': HTTP ' + atual.status);
+    throw new Error('leitura de ' + repo + '/' + caminho + ': HTTP ' + atual.status);
   }
 
-  const res = await api(caminho, {
+  const res = await api(repo, caminho, {
     method: 'PUT',
     body: JSON.stringify({
       message: 'chore(site): atualiza ' + caminho,
@@ -240,8 +247,27 @@ async function enviarArquivo(caminho, objeto) {
       ...(sha ? { sha } : {}),
     }),
   });
-  if (!res.ok) throw new Error('PUT ' + caminho + ': HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
+  if (!res.ok) throw new Error('PUT ' + repo + '/' + caminho + ': HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
   return true;
+}
+
+// Publica o MESMO arquivo em todos os repositorios da lista. Falha em um nao
+// impede os outros: com dois sites no ar, um repositorio fora do ar nao pode
+// deixar o outro com o feed velho — e o erro precisa aparecer no log em vez de
+// abortar o ciclo inteiro em silencio.
+async function enviarArquivo(caminho, objeto) {
+  let mudou = false;
+  const erros = [];
+  for (const repo of reposPublicos()) {
+    try {
+      if (await enviarArquivoNoRepo(repo, caminho, objeto)) mudou = true;
+    } catch (e) {
+      erros.push(repo + ': ' + e.message);
+      console.error('[FEED] Falha em ' + repo + '/' + caminho + ': ' + e.message);
+    }
+  }
+  if (erros.length === reposPublicos().length) throw new Error(erros.join(' | '));
+  return mudou;
 }
 
 /** Publica os dois arquivos agora, sem esperar o debounce. */
@@ -286,13 +312,13 @@ export function iniciarFeedPublico(deps = {}) {
   }, INTERVALO_MS);
   // Primeira publicacao 1min apos o boot, ja com a base de cupons carregada.
   setTimeout(() => publicarAgora().catch(() => {}), 60e3);
-  console.log('[FEED] Vitrine publica ativa — ' + repoPublico() + '/dados/');
+  console.log('[FEED] Vitrine publica ativa — ' + reposPublicos().join(', ') + ' (dados/)');
 }
 
 export function estadoFeedPublico() {
   return {
     ativo: ativo(),
-    repo: repoPublico(),
+    repos: reposPublicos(),
     ofertas: _publicadas.length,
     cupons: montarCupons().cupons.length,
     ultimaPublicacao: _ultimaPublicacao,
