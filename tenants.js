@@ -30,7 +30,7 @@ export const TENANT_PADRAO = 'tsp';
 const SEED = {
   tenants: [{
     id: 'tsp',
-    nome: 'Tudo Sobre Promos',
+    nome: 'Tica Promos',
     emails: ['davileles@gmail.com'],
     ativo: true,
     criadoEm: '2026-08-09T00:00:00.000Z',
