@@ -71,7 +71,7 @@ import {
   flushPushesPendentes, pushesPendentes, baixarArquivoDoGitHub,
 } from './sync-github.js';
 
-// ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
+// ── VITRINE PUBLICA (ticapromos.com.br) ─────────────────────────────────────
 import {
   iniciarFeedPublico, registrarPublicacao, publicarAgora, estadoFeedPublico,
 } from './feed-publico.js';
