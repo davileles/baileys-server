@@ -10434,6 +10434,109 @@ app.get('/grupos/convite', async (req, res) => {
   }
 });
 
+// ── SAUDE DOS CONVITES DO DISTRIBUIDOR ───────────────────────────────────────
+// Um convite revogado no WhatsApp nao quebra nada do lado do servidor: o link
+// segue gravado, o distribuidor entrega normalmente e quem clica cai num "o
+// link foi redefinido". O /gg/saude nao ve isso — ele checa se o ESTADO
+// carregou, nao se os convites estao vivos. Resultado: a fatia da campanha
+// roteada para aquele grupo se perde em silencio ate alguem reclamar.
+//
+// Aqui a verificacao e ativa: percorre os grupos ativos e pede o codigo de
+// convite a cada um. O WhatsApp responde 'gone' quando o codigo foi
+// invalidado, que e exatamente o sintoma que o usuario final enxerga.
+const GG_CHECK_MS = 6 * 60 * 60 * 1000;   // 4x ao dia; cada rodada e uma chamada por grupo
+
+// Estado dos alertas ja emitidos, para nao repetir o mesmo aviso a cada rodada
+// (4x ao dia viraria ruido e o operador pararia de ler). Guarda so o jid ->
+// quando alertou; quando o convite volta, o jid sai daqui e um novo problema
+// futuro volta a alertar.
+const _ggConvitesQuebrados = new Map();
+
+function _ggConviteGone(msg) {
+  return /\bgone\b|not-authorized|forbidden|404|item-not-found/i.test(String(msg || ''));
+}
+
+async function verificarConvitesDistribuidor(opcoes = {}) {
+  const chave = process.env.CAMPANHAS_KEY || '';
+  if (!chave) return { ok:false, erro:'CAMPANHAS_KEY nao configurada' };
+  if (!sock || !conectado) return { ok:false, erro:'WhatsApp nao conectado' };
+
+  let lista = [];
+  try {
+    const r = await fetch(CDV_PROXY_URL + '/gg/grupos-ativos', {
+      headers: { 'X-CDV-Op': chave },
+      signal: AbortSignal.timeout(20000),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) throw new Error(d.erro || ('status ' + r.status));
+    lista = d.grupos || [];
+  } catch (e) {
+    console.error('[GG-CHECK] Falha ao listar grupos ativos:', e.message);
+    return { ok:false, erro:e.message };
+  }
+
+  const quebrados = [], recuperados = [];
+  let checados = 0;
+  for (const g of lista) {
+    try {
+      // Sem cache de proposito: o objetivo e justamente detectar a revogacao,
+      // e um convite em cache responderia com o codigo velho, que e o proprio
+      // link morto que estamos tentando encontrar.
+      await sock.groupInviteCode(g.jid);
+      checados++;
+      if (_ggConvitesQuebrados.has(g.jid)) {
+        _ggConvitesQuebrados.delete(g.jid);
+        recuperados.push(g);
+      }
+    } catch (e) {
+      checados++;
+      const msg = e?.message || String(e);
+      if (!_ggConviteGone(msg)) {
+        // Erro transitorio (timeout, socket instavel) nao e convite morto:
+        // alertar aqui geraria falso positivo toda vez que a conexao oscilasse.
+        console.warn('[GG-CHECK] ' + (g.nome || g.jid) + ': erro transitorio — ' + msg);
+        continue;
+      }
+      if (!_ggConvitesQuebrados.has(g.jid)) {
+        _ggConvitesQuebrados.set(g.jid, Date.now());
+        quebrados.push({ ...g, erro: msg });
+      }
+    }
+    await new Promise(r => setTimeout(r, 700));   // respiro entre chamadas
+  }
+
+  if (quebrados.length) {
+    const txt = '*Convite quebrado no distribuidor* \u26A0\uFE0F\n\n'
+      + quebrados.map(g => '\u00b7 ' + (g.nome || g.jid) + '  (link: ' + g.slug + ')').join('\n')
+      + '\n\nQuem clicar e roteado para esse grupo recebe "o link foi redefinido".'
+      + '\nAbra o grupo no WhatsApp, gere o convite de novo e rode a sincronizacao do distribuidor.';
+    await _avisarOperador(txt).catch(() => {});
+  }
+  if (recuperados.length) {
+    await _avisarOperador('OK — convite normalizado: '
+      + recuperados.map(g => g.nome || g.jid).join(', ')).catch(() => {});
+  }
+
+  console.log('[GG-CHECK] ' + checados + '/' + lista.length + ' grupos checados — '
+    + quebrados.length + ' novo(s) quebrado(s), ' + recuperados.length + ' recuperado(s), '
+    + _ggConvitesQuebrados.size + ' em estado quebrado.');
+  return { ok:true, total:lista.length, checados,
+           quebrados: quebrados.map(g => ({ jid:g.jid, nome:g.nome, slug:g.slug, erro:g.erro })),
+           recuperados: recuperados.map(g => ({ jid:g.jid, nome:g.nome })),
+           emEstadoQuebrado: [..._ggConvitesQuebrados.keys()] };
+}
+
+// Verificacao manual pelo painel/curl, alem do ciclo automatico.
+app.post('/gg/checar-convites', async (req, res) => {
+  try { res.json(await verificarConvitesDistribuidor()); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Primeira rodada 5 min depois do boot: da tempo do WhatsApp conectar e evita
+// disparar 12+ chamadas de grupo durante o restabelecimento da sessao.
+setTimeout(() => { verificarConvitesDistribuidor().catch(() => {}); }, 5 * 60 * 1000).unref?.();
+setInterval(() => { verificarConvitesDistribuidor().catch(() => {}); }, GG_CHECK_MS).unref?.();
+
 // ── CENSO DE MEMBROS DOS GRUPOS DE DESTINO ───────────────────────────────────
 // Fotografia diaria de quantas pessoas ha em cada grupo marcado como destino.
 // Roda as 00:10 (SP) e fica gravada em disco: a leitura do painel e instantanea
