@@ -32,7 +32,8 @@ import {
   espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
-  templateCupom, templateCupomLote, templateCupomLoteItem, templateAwin, templateProprioDaLoja,
+  templateCupom, templateCupomLote, templateCupomLoteItem, templateCupomLoteItemExcecao,
+  templateAwin, templateProprioDaLoja,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE, VARIAVEIS_CUPOM,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
   buscarProdutos, normalizar,
@@ -1996,19 +1997,73 @@ const CUPOM_LOTE_MAX = 8;
 // Campos do cupom individual (codigo, valor_str, validade) sao zerados de
 // proposito no envelope: se sobrassem, um template editado poderia anunciar no
 // cabecalho o dado de UM cupom como se valesse para todos.
+// Assinatura das CONDICOES de um cupom (nao do desconto): dois cupons com a
+// mesma assinatura sao aplicaveis exatamente nas mesmas compras, ainda que um
+// desconte 25% e o outro 18%.
+function assinaturaCondicaoCupom(c) {
+  return [c.minimo ?? '', c.maximo ?? '', c.limite ?? ''].join('|');
+}
+
+// Assinatura que vale para a maior parte da mensagem. Exige pelo menos dois
+// cupons: uma condicao que so um cupom tem nao e regra geral de nada, e subir
+// ela para o cabecalho faria os outros parecerem seguir uma condicao alheia.
+function condicaoComumDoLote(lista) {
+  const cont = new Map();
+  for (const c of lista) {
+    const k = assinaturaCondicaoCupom(c);
+    cont.set(k, (cont.get(k) || 0) + 1);
+  }
+  let melhor = null, n = 0;
+  for (const [k, v] of cont) if (v > n) { melhor = k; n = v; }
+  return n >= 2 ? melhor : null;
+}
+
+// Monta a mensagem UNICA de um lote de cupons da MESMA loja.
+//
+// A condicao que a maioria compartilha sobe para uma frase no cabecalho e cada
+// cupom vira uma linha de codigo e desconto; quem foge dela declara a propria
+// regra logo abaixo, com a seta que o cabecalho referencia. Repetir "acima de
+// R$ 29, limite R$ 500" em oito linhas seguidas mais que dobrava a mensagem
+// para nao dizer nada de novo.
+//
+// A frase do cabecalho muda conforme o caso: "Todos válidos ..." so pode ser
+// dito quando NAO ha excecao na lista. Com excecao, vira ressalva — anunciar
+// uma condicao que nao vale para parte dos cupons e o erro mais caro possivel
+// numa mensagem de cupom.
+//
+// O link e um so, da loja: repetir o link de afiliado linha a linha nao muda o
+// destino e polui a mensagem.
+//
+// Campos do cupom individual (codigo, valor_str, validade) sao zerados de
+// proposito no envelope: se sobrassem, um template editado poderia anunciar no
+// cabecalho o dado de UM cupom como se valesse para todos.
 function formatarCupomLoteTSP(lista) {
-  const corpoItem = (templateCupomLoteItem()?.corpo || '').trim();
+  const comum = condicaoComumDoLote(lista);
+  const corpoItem    = (templateCupomLoteItem()?.corpo || '').trim();
+  const corpoExcecao = (templateCupomLoteItemExcecao()?.corpo || '').trim();
+
   const itens = lista
-    .map(c => renderTemplate(corpoItem, varsDoCupomTSP(c)))
+    .map(c => renderTemplate(
+      (comum && assinaturaCondicaoCupom(c) === comum) ? corpoItem : corpoExcecao,
+      varsDoCupomTSP(c)))
     .filter(t => t && t.trim())
-    .join('\n\n');
+    .join('\n');
+
+  const refComum = comum ? lista.find(c => assinaturaCondicaoCupom(c) === comum) : null;
+  const temExcecao = !!comum && lista.some(c => assinaturaCondicaoCupom(c) !== comum);
+  const condicao_comum = refComum
+    ? varsDoCupomTSP(refComum).validade
+        .replace(/^Válido /, temExcecao ? 'Válidos ' : 'Todos válidos ')
+        .replace(/\.$/, temExcecao ? ' — exceto onde indicado (↳).' : '.')
+    : '';
+
   const base = varsDoCupomTSP(lista[0]);
   const corpo = (templateCupomLote()?.corpo || '').trim();
   return renderTemplate(corpo, {
     ...base,
     codigo: '', valor_str: '', valor: '', validade: '', importante: '', aviso: '',
     minimo: '', maximo: '', limite: '',
-    itens,
+    itens, condicao_comum,
     qtd: String(lista.length),
     codigos: lista.map(c => String(c.codigo || '').toUpperCase()).filter(Boolean).join(', '),
   });
