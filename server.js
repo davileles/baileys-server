@@ -6641,6 +6641,52 @@ app.get('/contas/:id/grupos', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// Confere se a conta secundaria e ADMIN em cada grupo de destino. Estar no
+// grupo (endpoint acima) nao basta: sem admin ela nao gera link de convite nem
+// administra o grupo no turno dela. Somente leitura; consulta em serie com
+// pausa porque groupMetadata em lote derruba a conta em rate-overlimit.
+app.get('/contas/:id/admin', async (req, res) => {
+  const id = contaIdReq(req);
+  const c = contasExtras.get(id);
+  if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
+
+  const meus = new Set();
+  for (const v of [c.sock?.user?.id, c.sock?.user?.lid]) {
+    const n = String(v || '').split(':')[0].split('@')[0].trim();
+    if (n) meus.add(n);
+  }
+
+  const alvos = [...new Set([...radarDestinos(), ...GRUPOS['tsp_cupons']])];
+  const pausaMs = Math.min(Math.max(parseInt(req.query.pausa || '900', 10) || 900, 0), 5000);
+  const grupos = [];
+  for (const jid of alvos) {
+    try {
+      const md = await c.sock.groupMetadata(jid);
+      const meu = (md.participants || []).find(p => _ggIdsDoParticipante(p).some(n => meus.has(n)));
+      grupos.push({
+        jid,
+        nome: md.subject || NOMES_GRUPOS.get(jid) || null,
+        membro: !!meu,
+        admin: !!(meu && meu.admin),
+        nivel: meu?.admin || null,
+      });
+    } catch (e) {
+      grupos.push({ jid, nome: NOMES_GRUPOS.get(jid) || null, membro:null, admin:null, erro:e.message });
+    }
+    if (pausaMs) await new Promise(r => setTimeout(r, pausaMs));
+  }
+
+  res.json({
+    ok: true,
+    conta: apelidoDaConta(id),
+    conferidos: alvos.length,
+    admin: grupos.filter(g => g.admin === true).length,
+    semAdmin: grupos.filter(g => g.admin === false).map(g => ({ jid:g.jid, nome:g.nome })),
+    erros: grupos.filter(g => g.erro).map(g => ({ jid:g.jid, nome:g.nome, erro:g.erro })),
+    grupos,
+  });
+});
+
 // Nucleo da reconexao soft: usado pelo endpoint manual e pela autocura do
 // watchdog de surdez. Declarada como function para valer por hoisting no
 // watchdog, que fica acima neste arquivo.
