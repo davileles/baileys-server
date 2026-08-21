@@ -8947,7 +8947,29 @@ app.post('/vitrine', async (req, res) => {
   }
   const salvos = [], erros = [];
 
+  // ── AGRUPAMENTO POR LINHA ──
+  // Linha com DUAS OU MAIS URLs = o mesmo produto em lojas diferentes. Os itens
+  // entram na base separados (cada loja tem seu preco e seu identificador), mas
+  // compartilham um `grupo` — e e o grupo que o monitor usa para o historico, o
+  // cooldown e a escolha da loja mais barata no disparo.
+  //
+  // Uma URL por linha continua funcionando exatamente como antes, inclusive o
+  // formato do Magalu (`Nome | link | preco | precoDe`), que usa '|' para outra
+  // coisa. A deteccao e pela CONTAGEM de URLs, nao pela presenca do separador.
+  const RE_URL_LINHA = /https?:\/\/[^\s|]+/g;
+  const expandidas = [];
   for (const linha of linhas) {
+    const urls = linha.match(RE_URL_LINHA) || [];
+    if (urls.length < 2) { expandidas.push({ linha, grupo: null }); continue; }
+    const nomeGrupo = linha.slice(0, linha.indexOf(urls[0])).replace(/[|;]\s*$/, '').trim();
+    const grupo = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    for (const u of urls) {
+      expandidas.push({ linha: nomeGrupo ? nomeGrupo + ' | ' + u : u, grupo });
+    }
+  }
+  const grupos = new Set(expandidas.filter(e => e.grupo).map(e => e.grupo));
+
+  for (const { linha, grupo } of expandidas) {
     try {
       // Shopee tem seu proprio formato de link e de identificador.
       if (ehLinkShopee(linha)) {
@@ -8979,7 +9001,7 @@ app.post('/vitrine', async (req, res) => {
           shopId: String(ids[0].shopId), itemId: String(ids[0].itemId),
           nome: (nomeManual || '').trim() || node?.productName || ('Produto ' + ids[0].itemId),
           url: node?.offerLink || node?.productLink || linha.trim(),
-          cupom, nicho,
+          cupom, nicho, grupo,
         }), jaExistia: jaTinha });
         continue;
       }
@@ -8989,7 +9011,7 @@ app.post('/vitrine', async (req, res) => {
         const rmg = await resolverLinhaVitrineMagalu(linha);
         if (!rmg || rmg.erro) { erros.push({ linha, erro: rmg?.erro || 'falhou' }); continue; }
         const jaTinhaMg = !!itemVitrine(rmg.asin);
-        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom, nicho }), jaExistia: jaTinhaMg });
+        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom, nicho, grupo }), jaExistia: jaTinhaMg });
         continue;
       }
       // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
@@ -8999,7 +9021,7 @@ app.post('/vitrine', async (req, res) => {
         const rml = await resolverLinhaVitrineMl(linha);
         if (!rml || rml.erro) { erros.push({ linha, erro: rml?.erro || 'falhou' }); continue; }
         const jaTinhaMl = !!itemVitrine(rml.asin);
-        salvos.push({ ...salvarItemVitrine({ ...rml, cupom, nicho }), jaExistia: jaTinhaMl });
+        salvos.push({ ...salvarItemVitrine({ ...rml, cupom, nicho, grupo }), jaExistia: jaTinhaMl });
         continue;
       }
       // Rede Awin: qualquer anunciante afiliado. Vem antes do fallback da
@@ -9008,14 +9030,14 @@ app.post('/vitrine', async (req, res) => {
         const raw = await resolverLinhaVitrineAwin(linha);
         if (!raw || raw.erro) { erros.push({ linha, erro: raw?.erro || 'falhou' }); continue; }
         const jaTinhaAw = !!itemVitrine(raw.asin);
-        salvos.push({ ...salvarItemVitrine({ ...raw, cupom, nicho }), jaExistia: jaTinhaAw,
+        salvos.push({ ...salvarItemVitrine({ ...raw, cupom, nicho, grupo }), jaExistia: jaTinhaAw,
           aviso: raw.precoManual ? 'preco informado a mao — a loja bloqueou a leitura automatica' : null });
         continue;
       }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
-      salvos.push({ ...salvarItemVitrine({ ...r, cupom, nicho }), jaExistia: jaTinha });
+      salvos.push({ ...salvarItemVitrine({ ...r, cupom, nicho, grupo }), jaExistia: jaTinha });
     } catch (e) { erros.push({ linha, erro: e.message }); }
   }
   // Titulo real antes de o produto aparecer na base — ver resolverNomesProvisorios.
@@ -9029,7 +9051,7 @@ app.post('/vitrine', async (req, res) => {
 
   console.log('[VITRINE] Cadastro — ' + salvos.length + ' ok, ' + erros.length + ' erro(s)'
     + (nicho ? ', nicho curado: ' + nicho : '') + '.');
-  res.json({ ok: salvos.length > 0, salvos, erros, nicho });
+  res.json({ ok: salvos.length > 0, salvos, erros, nicho, grupos: grupos.size });
 });
 
 // LEGADO — o painel nao usa mais este caminho. Todo disparo da vitrine passa
