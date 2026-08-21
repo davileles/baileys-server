@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
-import { listarVitrine, itemVitrine, salvarItemVitrine, melhorCupomAplicavel, marcarDisparo,
+import { listarVitrine, itemVitrine, salvarItemVitrine, melhorCupomAplicavel, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
@@ -560,7 +560,15 @@ function medianaDe(v) {
 }
 
 export function estatisticas(asin) {
-  const h = _hist[asin];
+  return estatisticasDeSerie(_hist[asin], _hist[asin]?.ult || null);
+}
+
+/**
+ * Mesma conta, qualquer serie: a do item ou a fundida do grupo. A ultima leitura
+ * entra separada porque no grupo ela e a da LOJA que estamos julgando — o
+ * historico e do produto, mas o preco de agora e de uma loja especifica.
+ */
+function estatisticasDeSerie(h, ult) {
   if (!h || !h.dias) return null;
   const hoje = Date.now();
   const corte30 = diaSP(hoje - 30 * 86400000);
@@ -584,16 +592,72 @@ export function estatisticas(asin) {
     min90: Math.min(...v90),
     max90: Math.max(...v90),
     mediana30: medianaDe(v30),
-    ultimo: h.ult?.preco ?? null,
-    ultimoEm: h.ult?.em ?? null,
+    ultimo: ult?.preco ?? null,
+    ultimoEm: ult?.em ?? null,
     primeiroDia: pares[0]?.[0] || null,
     efetivo: e90.length ? {
       dias: paresEf.length,
       min90: Math.min(...e90),
       mediana30: medianaDe(e30),
-      ultimo: h.ult?.precoEfetivo ?? null,
+      ultimo: ult?.precoEfetivo ?? null,
     } : null,
   };
+}
+
+// ── SERIE DO PRODUTO (GRUPO DE LOJAS) ───────────────────────────────────────
+/**
+ * Funde as series dos itens de um grupo pegando, para cada dia, o MENOR preco
+ * visto em qualquer loja. E a serie que um comparador usa: o historico do que o
+ * cliente conseguiria pagar naquele dia, nao do que uma loja especifica cobrava.
+ *
+ * Isto muda o gatilho de forma essencial. Se a Amazon esta hoje a R$ 200 e o ML
+ * estava ontem a R$ 190, o item da Amazon isolado parece estar no menor preco da
+ * sua propria historia — mas o produto nao caiu, so trocou de loja. Comparando
+ * contra a serie do grupo, esse falso positivo desaparece.
+ */
+function historicoDoGrupo(grupo) {
+  const itens = itensDoGrupo(grupo);
+  if (itens.length < 2) return null;
+  const dias = {}, diasEf = {};
+  for (const it of itens) {
+    const h = _hist[it.asin];
+    if (!h) continue;
+    for (const [d, v] of Object.entries(h.dias || {})) {
+      if (dias[d] === undefined || v < dias[d]) dias[d] = v;
+    }
+    for (const [d, v] of Object.entries(h.diasEf || {})) {
+      if (diasEf[d] === undefined || v < diasEf[d]) diasEf[d] = v;
+    }
+  }
+  return Object.keys(dias).length ? { dias, diasEf } : null;
+}
+
+/** Estatisticas contra as quais o item deve ser julgado: do grupo, se houver. */
+function estatisticasParaGatilho(item) {
+  const g = String(item?.grupo || '').trim();
+  if (!g) return estatisticas(item.asin);
+  const h = historicoDoGrupo(g);
+  if (!h) return estatisticas(item.asin);
+  return estatisticasDeSerie(h, _hist[item.asin]?.ult || null);
+}
+
+/** O item tem o melhor preco do seu grupo agora? So ele pode virar candidato —
+ *  anunciar a loja mais cara de um produto que temos mais barato e indefensavel. */
+function ehMelhorDoGrupo(item, precoAtual) {
+  const g = String(item?.grupo || '').trim();
+  if (!g) return true;
+  const itens = itensDoGrupo(g);
+  if (itens.length < 2) return true;
+  for (const outro of itens) {
+    if (outro.asin === item.asin) continue;
+    const u = _hist[outro.asin]?.ult;
+    if (!u || u.disponivel === false) continue;
+    // Leitura velha nao derruba ninguem: loja que a varredura nao alcancou hoje
+    // nao pode vetar a que foi lida agora.
+    if (Date.now() - Date.parse(u.em || 0) > 6 * 3600000) continue;
+    if (Number.isFinite(u.preco) && u.preco < precoAtual) return false;
+  }
+  return true;
 }
 
 export function historicoDe(asin) {
@@ -725,7 +789,7 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   // 'curado' viaja com o candidato ate o publicador: e ele que decide se a
   // oferta escapa da cota e do espacamento longo.
   const base = { asin: item.asin, nome: item.nome, loja: item.loja, nicho, preco,
-                 curado: !!curado };
+                 curado: !!curado, grupo: String(item.grupo || '').trim() || null };
 
   if (!Number.isFinite(preco) || preco <= 0)  return { ...base, passou: false, motivo: 'sem preco' };
   if (r.exigirDisponivel && leitura.disponivel === false)
@@ -735,6 +799,11 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
     return { ...base, passou: false, motivo: 'serie imatura (' + stats.dias + '/' + r.maturidadeMinDias + ' dias)' };
   if (preco < r.precoMin)                     return { ...base, passou: false, motivo: 'abaixo do preco minimo' };
   if (preco > r.precoMax)                     return { ...base, passou: false, motivo: 'acima do preco maximo' };
+
+  // Num grupo, so a loja mais barata AGORA pode disparar. Anunciar a Amazon a
+  // R$ 240 tendo o ML a R$ 210 na mesma base seria indefensavel.
+  if (!ehMelhorDoGrupo(item, preco))
+    return { ...base, passou: false, motivo: 'outra loja do mesmo produto esta mais barata' };
 
   const ref = stats.mediana30 ?? stats.min90;
   if (!Number.isFinite(ref) || ref <= 0)      return { ...base, passou: false, motivo: 'sem referencia' };
@@ -809,9 +878,15 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   }
   const quedaPct = venc.quedaPct, quedaRs = venc.quedaRs, recorde = venc.recorde;
 
-  // Cooldown por produto: vale tanto para disparo do monitor quanto para
-  // disparo manual/lista, porque quem recebe e o mesmo grupo.
-  const ultimo = item.ultimoDisparo ? Date.parse(item.ultimoDisparo) : 0;
+  // Cooldown por PRODUTO, nao por item: se a mesma furadeira esta cadastrada em
+  // tres lojas, ela nao pode sair segunda pela Amazon, quarta pela Shopee e
+  // sexta pelo ML. Quem recebe e o mesmo grupo de WhatsApp, e para ele e a
+  // mesma oferta repetida.
+  const grupoItem = String(item.grupo || '').trim();
+  const ultimo = grupoItem
+    ? itensDoGrupo(grupoItem).reduce((max, i) =>
+        Math.max(max, i.ultimoDisparo ? Date.parse(i.ultimoDisparo) : 0), 0)
+    : (item.ultimoDisparo ? Date.parse(item.ultimoDisparo) : 0);
   const diasDesde = ultimo ? (Date.now() - ultimo) / 86400000 : 999;
   if (diasDesde < r.reenvioMinDias)
     return { ...detalhe, passou: false, motivo: 'enviado ha ' + Math.floor(diasDesde) + 'd (minimo ' + r.reenvioMinDias + 'd)' };
@@ -957,7 +1032,9 @@ export async function varrer({ manual = false } = {}) {
     });
     resumo.lidos++;
 
-    const stats = estatisticas(item.asin);
+    // Estatistica do PRODUTO quando ha grupo: o gatilho compara contra o menor
+    // preco historico entre as lojas, nao contra a historia daquela loja so.
+    const stats = estatisticasParaGatilho(item);
     const { nicho, curado } = nichoDoProduto(item, leitura.titulo);
     const av = avaliar(item, leitura, stats, nicho, curado);
     resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
@@ -1040,10 +1117,21 @@ export async function varrer({ manual = false } = {}) {
 // Candidato repetido substitui o anterior: o preco de agora vale mais do que o
 // preco de tres horas atras, e a fila nao pode crescer com o mesmo produto.
 function enfileirar(av) {
-  const idx = _estado.fila.findIndex(f => f.asin === av.asin);
   const reg = { ...av, em: new Date().toISOString() };
-  if (idx >= 0) _estado.fila[idx] = reg;
-  else _estado.fila.push(reg);
+  const idx = _estado.fila.findIndex(f => f.asin === av.asin);
+  if (idx >= 0) { _estado.fila[idx] = reg; return; }
+
+  // Um candidato por PRODUTO. Sem isto, a mesma furadeira em tres lojas entra
+  // tres vezes na fila e o publicador manda as tres — cada uma respeitando o
+  // proprio espacamento, todas para o mesmo grupo de WhatsApp.
+  if (reg.grupo) {
+    const j = _estado.fila.findIndex(f => f.grupo === reg.grupo);
+    if (j >= 0) {
+      if ((reg.score || 0) > (_estado.fila[j].score || 0)) _estado.fila[j] = reg;
+      return;
+    }
+  }
+  _estado.fila.push(reg);
 }
 
 // Candidato velho e candidato mentiroso: o preco pode ter voltado. Vale ate a
@@ -1300,7 +1388,11 @@ export async function dispararMonitorado(item, candidato = {}) {
   // como publicar no nicho segurando o geral.
   const env = await _deps.enviarOferta(o.mensagem, null, oferta,
     espelhouNoGeral ? {} : { somenteNicho: true, categoriaNicho: String(item.nicho).trim() });
-  marcarDisparo(item.asin);
+  // Marca o produto inteiro, nao so a loja que saiu: as outras lojas do mesmo
+  // produto entram no cooldown junto.
+  const gDisp = String(item.grupo || '').trim();
+  if (gDisp) for (const i of itensDoGrupo(gDisp)) marcarDisparo(i.asin);
+  else marcarDisparo(item.asin);
   return { ok: true, nome: o.nome, preco: o.produto.preco, grupos: env.enviados.length,
            cupom: o.cupom?.codigo || null, espelhouNoGeral };
 }
@@ -1392,6 +1484,8 @@ export function listarMonitorados() {
       const { nicho, curado } = nichoDoProduto(i, h?.n);
       return {
         asin: i.asin, nome: h?.n || i.nome, loja: i.loja, nicho, curado,
+        grupo: String(i.grupo || '').trim() || null,
+        melhorDoGrupo: h?.ult?.preco ? ehMelhorDoGrupo(i, h.ult.preco) : null,
         precoAtual: h?.ult?.preco ?? null,
         lidoEm: h?.ult?.em ?? null,
         disponivel: h?.ult?.disponivel ?? null,
