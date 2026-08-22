@@ -5631,9 +5631,17 @@ function _agendarSalvarEnviadas() {
     let n = 0;
     for (const id in obj) {
       const r = obj[id];
-      if (r?.m && agora - (r.em || 0) <= ENVIADAS_TTL_MS) { mensagensEnviadas.set(id, r); n++; }
+      // Enxuga na restauracao tambem: o arquivo gravado por versoes antigas tem
+      // as thumbnails dentro e e ele que precisa encolher — sem isso o store so
+      // seria podado no proximo envio, e o disco cheio nao espera.
+      if (r?.m && agora - (r.em || 0) <= ENVIADAS_TTL_MS) {
+        mensagensEnviadas.set(id, { em: r.em, m: _semThumb(r.m) });
+        n++;
+      }
     }
     if (n) console.log('[ENTREGA] ' + n + ' mensagens enviadas restauradas do disco (getMessage sobrevive a restart).');
+    // Reescreve ja no arranque aplicando teto de bytes e a poda de thumbnail.
+    _agendarSalvarEnviadas();
   } catch {}
 })();
 
