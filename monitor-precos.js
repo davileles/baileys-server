@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
-import { listarVitrine, itemVitrine, salvarItemVitrine, melhorCupomAplicavel, marcarDisparo, itensDoGrupo,
+import { listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, melhorCupomAplicavel, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
@@ -96,6 +96,30 @@ const CFG_PADRAO = {
     lote: 20,              // produtos por rodada antes da pausa
     pausaMs: 1500,         // respiro entre lotes (rate limit das APIs)
     lojas: ['Amazon', 'Shopee', 'Mercado Livre'],
+
+    // ── CAMADAS ──
+    // Sem camada, a lista cresce ate a varredura completa demorar mais que o
+    // proprio intervalo e comecar a atropelar a si mesma. Como registrarPreco
+    // guarda o MENOR preco do dia, um ponto a cada N dias mantem a mediana
+    // honesta para a cauda — o que precisa de leitura diaria e so o que foi
+    // divulgado ha pouco e ainda pode voltar a ser.
+    quenteDias: 14,        // divulgado nos ultimos N dias = camada quente
+    friaCadaDias: 3,       // a cauda e relida 1x a cada N dias
+    // Teto duro da lista inteira. Estourou, corta pelo fim da fila fria.
+    maximoVigiados: 1500,
+  },
+
+  // ── VIGILANCIA AUTOMATICA ──
+  // Todo produto DIVULGADO entra na varredura para ganhar linha de preco. O
+  // criterio e divulgacao, nao captura: capturar e ~100 produtos/dia e a lista
+  // estouraria em semanas, enquanto divulgado sao ~20 distintos/dia — e e
+  // exatamente o conjunto que interessa, porque a pergunta que a serie responde
+  // ("este preco e bom?") so e feita sobre produto que a gente divulga.
+  vigilancia: {
+    ativo: true,
+    // Dias sem divulgacao apos os quais o produto sai da varredura. Item
+    // cadastrado a mao ou semeado por EPC nunca e expurgado por aqui.
+    expurgoDias: 60,
   },
 
   publicacao: {
@@ -284,11 +308,12 @@ function mesesNaJanela(qtd = null) {
 function serializarShard(mes) {
   const out = {};
   for (const [asin, h] of Object.entries(_hist)) {
-    const dias = {}, diasEf = {};
+    const dias = {}, diasEf = {}, diasDe = {};
     for (const [d, v] of Object.entries(h.dias || {}))   if (mesDoDia(d) === mes) dias[d.slice(8)] = v;
     for (const [d, v] of Object.entries(h.diasEf || {})) if (mesDoDia(d) === mes) diasEf[d.slice(8)] = v;
+    for (const [d, v] of Object.entries(h.diasDe || {})) if (mesDoDia(d) === mes) diasDe[d.slice(8)] = v;
     if (!Object.keys(dias).length && !Object.keys(diasEf).length) continue;
-    const reg = { n: h.n, loja: h.loja, dias, diasEf };
+    const reg = { n: h.n, loja: h.loja, dias, diasEf, diasDe };
     // A ultima leitura e estado corrente, nao historico: mora so no shard do
     // mes atual, senao um shard antigo restaurado sobrescreveria o preco de hoje.
     if (mes === mesSP() && h.ult) reg.ult = h.ult;
@@ -305,8 +330,10 @@ function fundirShard(mes, dados) {
     h.loja = h.loja || r.loja || '';
     if (!h.dias) h.dias = {};
     if (!h.diasEf) h.diasEf = {};
+    if (!h.diasDe) h.diasDe = {};
     for (const [d, v] of Object.entries(r.dias   || {})) h.dias[mes + '-' + d]   = v;
     for (const [d, v] of Object.entries(r.diasEf || {})) h.diasEf[mes + '-' + d] = v;
+    for (const [d, v] of Object.entries(r.diasDe || {})) h.diasDe[mes + '-' + d] = v;
     // Vence a leitura mais recente: shards sao fundidos do mais antigo para o
     // mais novo, mas o volume pode ter um shard velho de um deploy anterior.
     if (r.ult && (!h.ult || String(r.ult.em || '') > String(h.ult.em || ''))) h.ult = r.ult;
@@ -355,6 +382,7 @@ function podarHistorico() {
   for (const h of Object.values(_hist)) {
     for (const d of Object.keys(h.dias || {}))   if (d < corte) delete h.dias[d];
     for (const d of Object.keys(h.diasEf || {})) if (d < corte) delete h.diasEf[d];
+    for (const d of Object.keys(h.diasDe || {})) if (d < corte) delete h.diasDe[d];
   }
 }
 
@@ -417,6 +445,13 @@ function estruturarCfg(bruto) {
   out.varredura.lojas = Array.isArray(v.lojas)
     ? v.lojas.filter(l => LOJAS_MONITORAVEIS_PRECO.includes(l))
     : CFG_PADRAO.varredura.lojas.slice();
+  out.varredura.quenteDias     = limitar(v.quenteDias, 1, 365, CFG_PADRAO.varredura.quenteDias);
+  out.varredura.friaCadaDias   = limitar(v.friaCadaDias, 1, 30, CFG_PADRAO.varredura.friaCadaDias);
+  out.varredura.maximoVigiados = limitar(v.maximoVigiados, 50, 20000, CFG_PADRAO.varredura.maximoVigiados);
+
+  const vg = b.vigilancia || {};
+  out.vigilancia.ativo       = vg.ativo !== false;
+  out.vigilancia.expurgoDias = limitar(vg.expurgoDias, 1, 730, CFG_PADRAO.vigilancia.expurgoDias);
 
   const p = b.publicacao || {};
   const jan = Array.isArray(p.janelas)
@@ -525,13 +560,24 @@ export function salvarConfigMonitorPrecos(parcial = {}) {
 // e a Contents API para de devolver arquivo acima de ~1 MB — a restauracao
 // pos-deploy morreria em silencio. O minimo diario e o que o gatilho usa.
 function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfetivo }) {
+  if (!asin) return null;
   if (!Number.isFinite(preco) || preco <= 0) return null;
   const dia = diaSP();
-  const h = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, ult: null };
+  const h = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, diasDe: {}, ult: null };
   if (!h.diasEf) h.diasEf = {};      // serie nova: historico antigo nao tem
+  if (!h.diasDe) h.diasDe = {};
   h.n = nome || h.n;
   h.loja = loja || h.loja;
   h.dias[dia] = (h.dias[dia] === undefined) ? preco : Math.min(h.dias[dia], preco);
+
+  // SERIE DO 'DE': o preco de tabela que a loja anuncia. Guardado para medir,
+  // ao longo do tempo, o quanto o de->por das nossas ofertas e real — que e a
+  // conta que decide o piso de desconto. Aqui vale o MAIOR do dia, ao contrario
+  // das outras series: o 'de' e o teto anunciado, e pegar o minimo esconderia
+  // justamente a inflacao que se quer enxergar.
+  if (Number.isFinite(precoDe) && precoDe > 0) {
+    h.diasDe[dia] = (h.diasDe[dia] === undefined) ? precoDe : Math.max(h.diasDe[dia], precoDe);
+  }
 
   // SERIE EFETIVA: preco depois do melhor cupom vigente da loja naquele momento.
   // Gravada SEMPRE, mesmo sem cupom (quando ef === preco) — se so registrasse os
@@ -547,8 +593,28 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
   const corte = diaSP(Date.now() - DIAS_RETENCAO * 86400000);
   for (const d of Object.keys(h.dias))   if (d < corte) delete h.dias[d];
   for (const d of Object.keys(h.diasEf)) if (d < corte) delete h.diasEf[d];
+  for (const d of Object.keys(h.diasDe)) if (d < corte) delete h.diasDe[d];
 
   _hist[asin] = h;
+  return h;
+}
+
+/**
+ * Porta de entrada para leituras vindas de FORA da varredura — hoje, a captura
+ * de link em grupo monitorado, que ja buscou o preco na API da loja e pode
+ * doar esse dado de graca.
+ *
+ * Vale para grupo dentro OU fora da janela de disparo: a janela protege o
+ * DISPARO, nao a leitura. Ler 24h enche a serie com pontos intradiarios que a
+ * varredura horaria sozinha nao pega.
+ *
+ * NAO enfileira candidato e NAO avalia gatilho: leitura e so leitura. Quem
+ * decide disparo e a varredura, que roda com a regra completa.
+ */
+export function registrarLeituraPreco(asin, dados = {}) {
+  if (!asin) return null;
+  const h = registrarPreco(String(asin), dados);
+  if (h) gravarShardCorrente();
   return h;
 }
 
@@ -601,6 +667,25 @@ function estatisticasDeSerie(h, ult) {
       mediana30: medianaDe(e30),
       ultimo: ult?.precoEfetivo ?? null,
     } : null,
+    // DE->POR MEDIDO. Percentual do 'de' anunciado contra o preco realmente
+    // praticado, dia a dia. E o numero que responde "o de-por das nossas
+    // ofertas e real?" — a mediana de 30 dias aqui perto de zero significa que
+    // aquele 'de' e etiqueta de vitrine, nao desconto.
+    dePor: (() => {
+      const paresDe = Object.entries(h.diasDe || {}).sort((a, b) => a[0] < b[0] ? -1 : 1);
+      const pcts = paresDe
+        .filter(([d]) => d >= corte90 && h.dias[d] > 0 && d in h.dias)
+        .map(([d, de]) => 100 * (de - h.dias[d]) / de)
+        .filter(x => Number.isFinite(x) && x >= 0);
+      if (!pcts.length) return null;
+      const p30 = paresDe
+        .filter(([d]) => d >= corte30 && h.dias[d] > 0 && d in h.dias)
+        .map(([d, de]) => 100 * (de - h.dias[d]) / de)
+        .filter(x => Number.isFinite(x) && x >= 0);
+      return { dias: pcts.length, mediana90: medianaDe(pcts),
+               mediana30: p30.length ? medianaDe(p30) : null,
+               max90: Math.max(...pcts) };
+    })(),
   };
 }
 
@@ -1004,6 +1089,94 @@ export function semearVitrinePorDesempenho({ simular: apenasSimular = false } = 
   return saida;
 }
 
+// ── VIGILANCIA AUTOMATICA (entrada, expurgo, camadas) ───────────────────────
+/**
+ * Coloca sob vigilancia de preco um produto que acabou de ser DIVULGADO.
+ *
+ * Chamado pelo server no momento do disparo. O criterio e divulgacao e nao
+ * captura de propósito: captura sao ~100 produtos/dia e a lista estouraria em
+ * semanas; divulgado sao ~20 distintos/dia, e e sobre esses que a pergunta
+ * "este preco esta bom?" vai ser feita de novo no futuro.
+ *
+ * Idempotente: produto ja cadastrado (a mao, por EPC ou por divulgacao) so tem
+ * a data de ultima divulgacao renovada — o cadastro manual nunca e sobrescrito
+ * nem tem a origem trocada.
+ */
+export function vigiarProdutoDivulgado({ asin, loja, nome, url, preco, precoDe }) {
+  if (!_cfg.vigilancia?.ativo) return { ok: false, motivo: 'vigilancia desligada' };
+  if (!asin) return { ok: false, motivo: 'sem id de produto' };
+  if (!_cfg.varredura.lojas.includes(loja)) {
+    return { ok: false, motivo: loja + ' fora das lojas varridas' };
+  }
+
+  const existente = itemVitrine(asin);
+  if (existente) {
+    // So renova o carimbo de divulgacao; nada mais e tocado.
+    salvarItemVitrine({ asin, divulgadoEm: new Date().toISOString() });
+    return { ok: true, novo: false, motivo: 'ja vigiado' };
+  }
+
+  const vagas = _cfg.varredura.maximoVigiados - listarVitrine().length;
+  if (vagas <= 0) {
+    const liberadas = expurgarVigilancia({ forcar: 1 });
+    if (!liberadas) return { ok: false, motivo: 'teto de vigiados atingido e nada expurgavel' };
+  }
+
+  salvarItemVitrine({
+    asin, loja, nome: nome || '', url: url || '',
+    preco: Number.isFinite(preco) ? preco : null,
+    precoDe: Number.isFinite(precoDe) ? precoDe : null,
+    origemSemeadura: 'divulgacao',
+    divulgadoEm: new Date().toISOString(),
+  });
+  // Semeia o primeiro ponto da serie com o preco que motivou a divulgacao: sem
+  // isto o produto entraria com serie vazia e levaria dias para poder opinar.
+  registrarPreco(asin, { nome, loja, preco, precoDe, disponivel: true });
+  gravarShardCorrente();
+  console.log('[PRECOS] Vigilancia — ' + asin + ' (' + loja + ') entrou pela divulgacao.');
+  return { ok: true, novo: true };
+}
+
+/**
+ * Tira da varredura o que entrou por divulgacao e nao foi mais divulgado.
+ * Item manual (sem origemSemeadura) e item semeado por EPC NAO sao expurgados:
+ * eles estao ali por decisao explicita, nao por passagem.
+ */
+export function expurgarVigilancia({ forcar = 0, simular = false } = {}) {
+  const limite = Date.now() - (_cfg.vigilancia?.expurgoDias ?? 60) * 86400000;
+  const candidatos = listarVitrine()
+    .filter(i => i.origemSemeadura === 'divulgacao')
+    .map(i => ({ i, quando: Date.parse(i.divulgadoEm || i.criadoEm || 0) || 0 }))
+    .filter(x => forcar ? true : x.quando < limite)
+    .sort((a, b) => a.quando - b.quando);
+
+  const alvos = forcar ? candidatos.slice(0, forcar) : candidatos;
+  if (!simular) for (const { i } of alvos) removerItemVitrine(i.asin);
+  if (alvos.length && !simular) {
+    console.log('[PRECOS] Vigilancia — ' + alvos.length + ' produto(s) expurgado(s) por inatividade.');
+  }
+  return alvos.length;
+}
+
+/**
+ * A camada de um item decide com que frequencia ele e relido. Quente = divulgado
+ * ha pouco, le todo dia. Fria = a cauda, le 1x a cada friaCadaDias.
+ * Item manual ou semeado por EPC e sempre quente: alguem o escolheu de proposito.
+ */
+function ehCamadaQuente(item) {
+  if (item.origemSemeadura !== 'divulgacao') return true;
+  const q = Date.parse(item.divulgadoEm || item.criadoEm || 0) || 0;
+  return q >= Date.now() - _cfg.varredura.quenteDias * 86400000;
+}
+
+/** Item frio ja lido dentro do intervalo da camada fria pode ser pulado. */
+function friaJaLidaHoje(item) {
+  const h = _hist[item.asin];
+  const ultimo = h?.ult?.em ? Date.parse(h.ult.em) : 0;
+  if (!ultimo) return false;
+  return (Date.now() - ultimo) < _cfg.varredura.friaCadaDias * 86400000;
+}
+
 // ── VARREDURA ────────────────────────────────────────────────────────────────
 export async function varrer({ manual = false } = {}) {
   if (_varrendo) return { ok: false, erro: 'varredura ja em andamento' };
@@ -1011,7 +1184,7 @@ export async function varrer({ manual = false } = {}) {
 
   _varrendo = true;
   const t0 = Date.now();
-  const resumo = { lidos: 0, falhas: 0, candidatos: 0, porMotivo: {}, erros: [] };
+  const resumo = { lidos: 0, falhas: 0, candidatos: 0, pulados: 0, porMotivo: {}, erros: [] };
 
   // Grava a leitura na serie e decide se vira candidato. Compartilhado pelos
   // dois caminhos de leitura (lote da Amazon e item a item das outras lojas)
@@ -1047,13 +1220,21 @@ export async function varrer({ manual = false } = {}) {
   };
 
   try {
-    const itens = itensMonitorados();
+    // CAMADAS: a lista completa nao cabe numa rodada horaria depois que a
+    // vigilancia automatica enche a vitrine. Quente (divulgado ha pouco, mais
+    // manual e EPC) le sempre; a cauda fria le 1x a cada friaCadaDias. Rodada
+    // manual ignora a camada — quem clicou quer a leitura inteira.
+    const todos = itensMonitorados();
+    const itens = manual ? todos
+      : todos.filter(i => ehCamadaQuente(i) || !friaJaLidaHoje(i));
+    resumo.pulados = todos.length - itens.length;
     // A Amazon le de 10 em 10; as outras, uma por vez. Separar aqui e o que
     // permite cada API ser usada do jeito mais barato que ela oferece.
     const amazon = itens.filter(ehItemAmazon);
     const outros = itens.filter(i => !ehItemAmazon(i));
-    console.log('[PRECOS] Varredura iniciada — ' + itens.length + ' produto(s) ('
-      + amazon.length + ' Amazon em lote, ' + outros.length + ' individuais).');
+    console.log('[PRECOS] Varredura iniciada — ' + itens.length + ' de ' + todos.length
+      + ' produto(s) (' + amazon.length + ' Amazon em lote, ' + outros.length
+      + ' individuais' + (resumo.pulados ? ', ' + resumo.pulados + ' na camada fria' : '') + ').');
 
     // ── Amazon, em lotes de 10 ──
     for (let i = 0; i < amazon.length; i += 10) {
@@ -1106,6 +1287,10 @@ export async function varrer({ manual = false } = {}) {
     // fechado, entao reescrever os antigos seria reenviar dado identico.
     gravarShardCorrente();
     gravar(ARQ_ESTADO, _estado);
+    // Expurgo roda no fim da varredura, nao num timer proprio: e o unico momento
+    // em que a lista ja esta carregada e ninguem mais esta escrevendo nela.
+    try { expurgarVigilancia(); } catch (e) { console.warn('[PRECOS] Expurgo falhou:', e.message); }
+
     console.log('[PRECOS] Varredura concluida em ' + Math.round((Date.now() - t0) / 1000) + 's — '
       + resumo.lidos + ' lido(s), ' + resumo.candidatos + ' candidato(s), ' + resumo.falhas + ' falha(s).');
     return { ok: true, ..._estado.ultimaVarredura, fila: _estado.fila.length };
