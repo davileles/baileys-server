@@ -1562,8 +1562,15 @@ function templateCupomPadrao() {
 // so. Explodir isso em N disparos multiplicava o volume no grupo do cliente sem
 // acrescentar informacao nenhuma. Sao DOIS templates: o item (repetido por
 // cupom) e o envelope (cabecalho + {{itens}} + link unico da loja).
+// Item que segue a condicao comum do cabecalho. Mesmo assim leva o teto util na
+// linha de baixo: o teto depende do PERCENTUAL de cada cupom, entao dois cupons
+// com o mesmo minimo e o mesmo limite tem tetos diferentes — subir isso para o
+// cabecalho anunciaria o teto de um como se valesse para todos.
 function templateCupomLoteItemPadrao() {
-  return '\uD83C\uDFF7\uFE0F *{{codigo}}* \u2014 {{valor_str}}';
+  return [
+    '\uD83C\uDFF7\uFE0F *{{codigo}}* \u2014 {{valor_str}}',
+    '{{teto_str}}',
+  ].join('\n');
 }
 
 // Cupom que NAO segue a condicao comum da mensagem: carrega a propria regra na
@@ -1664,7 +1671,7 @@ export function carregarTemplates() {
   // A migracao existe porque a v1 chegou a ser semeada em producao — sem ela,
   // o template salvo continuaria repetindo a mesma frase de validade em cada
   // linha e a mudanca nao apareceria em mensagem nenhuma.
-  const LOTE_VERSAO = 3;
+  const LOTE_VERSAO = 4;
   const semearLote = (chave, nome, corpo) => {
     const atual = E().templates[chave];
     if (atual && Number(atual.versaoLote || 1) >= LOTE_VERSAO) return;
@@ -1863,7 +1870,8 @@ export const VARIAVEIS_CUPOM = [
   { chave:'loja',       desc:'Nome da loja' },
   { chave:'loja_upper', desc:'Nome da loja em maiúsculas' },
   { chave:'validade',   desc:'Frase das condições (mínimo, teto de produto, teto de desconto)' },
-  { chave:'condicao_curta', desc:'Mesmas condições em versão enxuta — ex: "Acima de R$ 19 · limite de R$ 100"' },
+  { chave:'condicao_curta', desc:'Mesmas condições em versão enxuta — ex: "Acima de R$ 19 · bom para compras de até R$ 400"' },
+  { chave:'teto_str',   desc:'Só o teto útil da compra — ex: "Bom para compras de até R$ 400" (vazio quando não há limite de desconto)' },
   { chave:'codigo',     desc:'Código do cupom (vazio quando é cupom sem código)' },
   { chave:'importante', desc:'Aviso calculado do teto — ex: "Ideal para compras de até R$ 400."' },
   { chave:'aviso',      desc:'Observação livre digitada na aba Cupom' },
