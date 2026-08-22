@@ -5106,6 +5106,13 @@ async function processarRadarMarketplace(jid, texto) {
     }
   }
 
+  // Magalu e Awin NAO tem modo leitura, e nao e omissao. O preco delas nao vem
+  // de API: o da Magalu e extraido do TEXTO do grupo (por isso a flag
+  // precoDeReferencia) e o da Awin so se conhece no momento do disparo. Alimentar
+  // a serie com numero digitado por terceiro em mensagem de WhatsApp envenenaria
+  // a mediana justamente na estatistica que existe para NAO depender do 'de'
+  // declarado. E a mesma razao pela qual LOJAS_MONITORAVEIS_PRECO ja exclui as
+  // duas do monitor de precos — ler sem poder confiar na leitura nao e ler.
   if (ehLinkMagalu(texto)) {
     const podeMagalu = podeCapturar(jid, 'Magazine Luiza');
     if (!podeMagalu.ok) {
@@ -5118,7 +5125,12 @@ async function processarRadarMarketplace(jid, texto) {
 
   if (ehLinkShopee(texto)) {
     const podeShopee = podeCapturar(jid, 'Shopee');
-    if (!podeShopee.ok) {
+    if (!podeShopee.ok && podeShopee.modo === 'leitura' && leituraForaJanelaAtiva() && credenciaisShopeeOk()) {
+      try {
+        const lidos = await processarTextoShopee(texto, { leitura: true });
+        await lerPrecosParaSerie(lidos.map(r => r.produto), jid, podeShopee.motivo);
+      } catch (e) { console.warn('[LEITURA] Shopee:', e.message); }
+    } else if (!podeShopee.ok) {
       console.log('[MONITOR] Shopee ignorada em ' + jid.split('@')[0] + ' — ' + podeShopee.motivo);
     } else if (!credenciaisShopeeOk()) {
       console.warn('[SHOPEE] Link detectado mas SHOPEE_APP_ID/SHOPEE_SECRET nao estao configurados.');
