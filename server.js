@@ -849,6 +849,7 @@ function outboxEnfileirar({ id, jid, texto, conta, origem, erro }) {
       ultimoErro: erro || null,
     });
     salvarOutbox();
+    _outboxContar('enfileiradas');
     console.warn('[OUTBOX] Entrega guardada para retry: ' + (origem || 'envio') + ' #' + chaveId + ' -> ' + jid + ' (' + outboxFalhas.length + ' pendente(s)).');
     return true;
   } catch (e) { console.error('[OUTBOX] Erro ao enfileirar:', e.message); return false; }
@@ -880,6 +881,7 @@ async function outboxWorker() {
         const idx = outboxFalhas.indexOf(item);
         if (idx >= 0) outboxFalhas.splice(idx, 1);
         salvarOutbox();
+        _outboxContar('recuperadas');
         console.log('[OUTBOX] ✓ Entrega recuperada: ' + item.origem + ' #' + item.id + ' -> ' + item.jid
           + ' (tentativa ' + (item.tentativas + 1) + '; ' + outboxFalhas.length + ' restante(s)).');
         if (outboxFalhas.length) await new Promise(r => setTimeout(r, msEntreGrupos()));
@@ -889,6 +891,7 @@ async function outboxWorker() {
         if (item.tentativas >= OUTBOX_MAX_TENTATIVAS) {
           const idx = outboxFalhas.indexOf(item);
           if (idx >= 0) outboxFalhas.splice(idx, 1);
+          _outboxContar('desistidas');
           console.error('[OUTBOX] ✗ Desistindo apos ' + item.tentativas + ' tentativas: ' + item.origem + ' #' + item.id + ' -> ' + item.jid + ': ' + e.message);
           _avisarOperador('Outbox: desisti de entregar ' + item.origem + ' #' + item.id + ' no grupo '
             + (NOMES_GRUPOS.get(item.jid) || item.jid) + ' apos ' + item.tentativas + ' tentativas.\nUltimo erro: ' + e.message
@@ -6558,6 +6561,69 @@ function publicacoesHoje() {
   const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
   return (_health.publicacoesDia && _health.publicacoesDia.data === hoje) ? _health.publicacoesDia.n : 0;
 }
+
+// ── CONTADORES DIARIOS DA OUTBOX (persistidos em health.json) ─────────────────
+// Mesmo padrao de publicacoesDia: viram na data de SP, sobrevivem a restart.
+// Alimentam o resumo diario; sem eles o operador so veria "pendentes agora" e
+// nao saberia quantas entregas o retry salvou (ou perdeu) ao longo do dia.
+function _outboxContar(campo) {
+  try {
+    const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+    if (!_health.outboxDia || _health.outboxDia.data !== hoje) {
+      _health.outboxDia = { data: hoje, enfileiradas: 0, recuperadas: 0, desistidas: 0 };
+    }
+    _health.outboxDia[campo] = (_health.outboxDia[campo] || 0) + 1;
+    _salvarHealth();
+  } catch (e) { /* contador nunca derruba o fluxo de envio */ }
+}
+function outboxHoje() {
+  const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+  const d = (_health.outboxDia && _health.outboxDia.data === hoje) ? _health.outboxDia : {};
+  return { enfileiradas: d.enfileiradas || 0, recuperadas: d.recuperadas || 0, desistidas: d.desistidas || 0 };
+}
+
+// ── RESUMO DIARIO AO OPERADOR ────────────────────────────────────────────────
+// Uma mensagem por dia, depois das RESUMO_DIARIO_HORA (padrao 21h SP, fim da
+// janela de envio do CDV), com o que importa: publicacoes, o que a outbox
+// guardou/recuperou/perdeu, fila de aprovacao e saude da conexao.
+// Disparo por "ja passou da hora E ainda nao mandei hoje" (marca persistida em
+// health.json), nao por minuto exato: um restart no minuto certo nao perde o
+// resumo, e um restart depois nao manda duas vezes.
+// Comeca com "Watchdog —" de proposito: e o prefixo que _EH_AVISO_DO_SISTEMA
+// reconhece, entao o proprio resumo, ao voltar como upsert do grupo operador,
+// nao entra no pipeline de IA como se fosse mensagem capturada.
+const RESUMO_HORA_SP = Math.min(23, Math.max(0, parseInt(process.env.RESUMO_DIARIO_HORA || '21', 10)));
+setInterval(async () => {
+  try {
+    if (Date.now() - _bootEm < 2 * 60 * 1000) return;          // carencia pos-boot
+    if (horaSP() < RESUMO_HORA_SP) return;
+    const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+    if (_health.resumoDiarioData === hoje) return;
+    // Marca ANTES de enviar: se todos os canais falharem perde-se um resumo,
+    // o que e melhor do que repetir a cada 10 min ate alguem acordar.
+    _health.resumoDiarioData = hoje;
+    _healthGravadoEm = 0; _salvarHealth();
+
+    const ob = outboxHoje();
+    const minInbound = _health.ultimoUpsertEm ? Math.round((Date.now() - _health.ultimoUpsertEm) / 60000) : null;
+    const pendAprov = filaPendentes.filter(o => o.status === 'pendente' && !o.autoAgendado).length;
+    const conexao = conectado ? 'conectado' : (_logoutEm ? 'LOGOUT (precisa parear)' : 'DESCONECTADO');
+    const [d, m] = hoje.split('-').slice(1).reverse();
+    const uptimeH = ((Date.now() - _bootEm) / 3600000).toFixed(1);
+
+    const texto = 'Watchdog — resumo do dia ' + d + '/' + m + '\n\n'
+      + '📤 Publicacoes: ' + publicacoesHoje() + ' oferta(s) nos grupos\n'
+      + '🔁 Outbox: ' + ob.enfileiradas + ' guardada(s), ' + ob.recuperadas + ' recuperada(s), '
+        + ob.desistidas + ' perdida(s) — ' + outboxFalhas.length + ' pendente(s) agora\n'
+      + '📥 Fila de aprovacao: ' + pendAprov + ' pendente(s)\n'
+      + '📡 Conexao: ' + conexao + ' · surdez ' + _surdezEstado
+        + (minInbound != null ? ' · ultima msg ha ' + minInbound + ' min' : '') + '\n'
+      + '⏱ Uptime: ' + uptimeH + ' h'
+      + (ob.desistidas ? '\n\n⚠️ Houve entrega(s) perdida(s) hoje: confira se o bot ainda esta nos grupos de destino.' : '');
+    await _avisarOperador(texto);
+    console.log('[RESUMO] Resumo diario enviado.');
+  } catch (e) { console.error('[RESUMO] Erro:', e.message); }
+}, 10 * 60 * 1000).unref?.();
 
 setInterval(async () => {
   try {
