@@ -7509,6 +7509,48 @@ app.get('/status', (req, res) => {
   res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
+// ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
+// Endpoint simples para um monitor externo (UptimeRobot, BetterStack, etc)
+// pingar a cada poucos minutos e AVISAR UM HUMANO quando o WhatsApp cai — o
+// terceiro sinal, fora dos watchdogs internos. Diferente do /status (que sempre
+// responde 200 com o retrato detalhado), aqui o CODIGO HTTP carrega o veredito:
+//   200  saudavel  — socket conectado, recebendo, sem logout pendente
+//   503  degradado — desconectado, surdo (escada != ok) ou logout ativo
+// PROPOSITO: alerta a humano. NAO e para o Railway usar como healthcheck de
+// deploy: reiniciar nao cura logout (so novo pareamento) e um healthcheck que
+// derruba o container a cada queda do WhatsApp viraria loop. Por isso o
+// railway.json NAO aponta healthcheckPath para ca — o restart fica com o
+// crash-only + a escada de surdez.
+app.get('/health', (req, res) => {
+  const agora = Date.now();
+  const minSemUpsert = _health.ultimoUpsertEm
+    ? Math.round((agora - _health.ultimoUpsertEm) / 60000) : null;
+  const logoutMin = _logoutEm ? Math.round((agora - _logoutEm) / 60000) : null;
+
+  const saudavel = conectado && !!sock && _surdezEstado === 'ok' && !_logoutEm;
+
+  // Motivo legivel para o painel do monitor (aparece no corpo da resposta).
+  let motivo = 'ok';
+  if (!conectado || !sock)          motivo = 'whatsapp desconectado';
+  else if (_logoutEm)               motivo = 'logout — precisa parear (/pair ou /qr)';
+  else if (_surdezEstado !== 'ok')  motivo = 'socket surdo (escada: ' + _surdezEstado + ')';
+
+  res.status(saudavel ? 200 : 503).json({
+    ok: saudavel,
+    motivo,
+    conectado,
+    sockAtivo: !!sock,
+    surdezEstado: _surdezEstado,
+    logout: !!_logoutEm,
+    logoutMin,
+    minSemUpsert,
+    telegramConectado: tgConectado,
+    publicacoesHoje: publicacoesHoje(),
+    filaTotal: filaPendentes.length,
+    uptimeSeg: Math.round((agora - _bootEm) / 1000),
+  });
+});
+
 app.get('/fila-envio', (req, res) => {
   // Devolve dados estruturados + previsao de horario para a aba "Enviadas hoje"
   // do gerador conseguir montar a lista de PROGRAMADAS (aprovadas mas ainda nao
