@@ -544,6 +544,16 @@ let sock         = null;
 let conectado    = false;
 let qrAtual      = null;
 
+// ── PAREAMENTO POR CODIGO (sem QR) ──────────────────────────────────────────
+// Alternativa ao QR para quando so ha o celular em maos: o WhatsApp aceita
+// vincular um dispositivo digitando um codigo de 8 caracteres em
+// Dispositivos conectados > Conectar dispositivo > Conectar com numero de
+// telefone. Exige sessao NAO registrada — por isso /pair reseta antes.
+let pairNumero   = null;   // numero alvo, so digitos, com DDI (ex 5511999999999)
+let pairCodigo   = null;   // codigo de 8 caracteres devolvido pelo WhatsApp
+let pairErro     = null;   // ultima falha ao solicitar o codigo
+let pairPedidoEm = 0;      // timestamp do pedido (expira em 10 min)
+
 // ── GERENCIADOR DE CONEXÃO ────────────────────────────────────────────────────
 // Flag que indica se já existe um processo de conexão ativo.
 // Evita instâncias duplas de sock sem complexidade de Promises aninhadas.
@@ -6078,7 +6088,8 @@ setInterval(async () => {
       + 'Correcao (exige celular em maos):\n'
       + '1) No WhatsApp do celular, desconecte o dispositivo antigo em Dispositivos conectados\n'
       + '2) POST /reset-sessao-completo\n'
-      + '3) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n\n'
+      + '3) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n'
+      + '   OU, so com o celular: https://baileys-server-production-ebfe.up.railway.app/pair (codigo de 8 digitos)\n\n'
       + '(Este aviso se repete a cada 60 min enquanto persistir.)',
       { critico: true }
     );
@@ -6235,6 +6246,31 @@ async function conectar() {
     });
     sock = novaSock;
     sock.ev.on('creds.update', saveCreds);
+    // Pareamento por codigo: so faz sentido enquanto a sessao nao esta
+    // registrada. O socket precisa de alguns segundos de websocket aberto
+    // antes de aceitar o pedido, por isso o retry espacado.
+    if (pairNumero && !novaSock.authState?.creds?.registered) {
+      const numeroAlvo = pairNumero;
+      (async () => {
+        for (let tentativa = 1; tentativa <= 4; tentativa++) {
+          await new Promise(r => setTimeout(r, tentativa === 1 ? 4000 : 4000));
+          if (novaSock !== sock) return;
+          if (novaSock.authState?.creds?.registered) return;
+          if (pairNumero !== numeroAlvo) return;
+          if (pairCodigo) return;
+          try {
+            const codigo = await novaSock.requestPairingCode(numeroAlvo);
+            pairCodigo = String(codigo || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+            pairErro   = null;
+            console.log('[WA] Codigo de pareamento gerado: ' + pairCodigo);
+            return;
+          } catch (e) {
+            pairErro = e?.message || String(e);
+            console.warn('[WA] Falha ao gerar codigo de pareamento (tentativa ' + tentativa + '): ' + pairErro);
+          }
+        }
+      })();
+    }
     // Escuta o no bruto de retry: e o aviso de que alguem nao decifrou o que
     // mandamos. Sem isso, uma campanha inteira pode nao chegar sem deixar
     // rastro nenhum no log — todo sendMessage tera retornado sucesso.
@@ -6249,6 +6285,7 @@ async function conectar() {
       if (connection === 'open') {
         conectado = true;
         qrAtual = null;
+        pairNumero = null; pairCodigo = null; pairErro = null; pairPedidoEm = 0;
         errosDescripto = 0;
         isConnecting = false;
         _reconectarTentativas = 0;
@@ -6860,7 +6897,7 @@ app.get('/', (req, res) => {
   const emBuffer  = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
   const statusWA  = conectado ? 'WhatsApp conectado' : qrAtual ? 'Aguardando QR' : 'Desconectado';
   const statusTG  = tgConectado ? 'Telegram conectado' : 'Telegram desconectado';
-  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>CDV Server</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h1{color:#ffa500}p{color:#aaa;font-size:14px}.links{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:8px}a{color:#ffa500;text-decoration:none;border:1px solid #333;padding:9px 20px;border-radius:8px;font-size:14px}a:hover{border-color:#ffa500}</style></head><body><h1>CDV Baileys Server</h1><p>${statusWA}</p><p>${statusTG}</p>${emBuffer>0?'<p>'+emBuffer+' item(ns) na janela</p>':''}<div class="links">${!conectado?'<a href="/qr">Escanear QR WhatsApp</a>':''}${!tgConectado?'<a href="/tg-auth">Conectar Telegram</a>':''}<a href="/painel">Painel${pendentes>0?' ('+pendentes+')':''}</a><a href="/status">Status</a><a href="/grupos">Grupos</a></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>CDV Server</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h1{color:#ffa500}p{color:#aaa;font-size:14px}.links{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:8px}a{color:#ffa500;text-decoration:none;border:1px solid #333;padding:9px 20px;border-radius:8px;font-size:14px}a:hover{border-color:#ffa500}</style></head><body><h1>CDV Baileys Server</h1><p>${statusWA}</p><p>${statusTG}</p>${emBuffer>0?'<p>'+emBuffer+' item(ns) na janela</p>':''}<div class="links">${!conectado?'<a href="/qr">Escanear QR WhatsApp</a>':''}${!conectado?'<a href="/pair">Conectar por codigo</a>':''}${!tgConectado?'<a href="/tg-auth">Conectar Telegram</a>':''}<a href="/painel">Painel${pendentes>0?' ('+pendentes+')':''}</a><a href="/status">Status</a><a href="/grupos">Grupos</a></div></body></html>`);
 });
 
 app.get('/qr', (req, res) => {
@@ -11548,6 +11585,134 @@ app.post('/reset-sessao-completo', async (req, res) => {
   isResetting = false;
 
   _agendarReconexao(2000);
+});
+
+// ── CONECTAR SEM QR: PAREAMENTO POR CODIGO ──────────────────────────────────
+// Cenario alvo: operador com o celular na mao e sem computador. O QR exige uma
+// segunda tela; o codigo de 8 caracteres nao. Como o WhatsApp so aceita o
+// pedido de codigo com a sessao ainda NAO registrada, este fluxo apaga as
+// credenciais antes (mesmo filtro de preservacao do reset completo) e so
+// entao sobe o socket pedindo o codigo.
+
+async function limparCredenciaisSessao() {
+  try {
+    const arquivos = await readdir(SESSAO_DIR);
+    for (const arq of arquivos) {
+      if (PRESERVAR_NO_RESET.has(arq)) continue;
+      await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+    }
+    console.log('[PAIR] Credenciais apagadas. Sessao pronta para novo pareamento.');
+    return true;
+  } catch (e) {
+    console.error('[PAIR] Erro ao apagar sessao:', e.message);
+    return false;
+  }
+}
+
+app.post('/pair', async (req, res) => {
+  const bruto  = String(req.body?.numero || req.query?.numero || '');
+  const numero = bruto.replace(/\D/g, '');
+  if (numero.length < 10 || numero.length > 15) {
+    return res.status(400).json({ ok:false, erro:'numero invalido: use DDI + DDD + numero, so digitos (ex 5511999999999)' });
+  }
+  if (isResetting) return res.status(409).json({ ok:false, erro:'reset em andamento, tente em alguns segundos' });
+
+  console.log('[PAIR] Pareamento por codigo solicitado para ' + numero);
+  isResetting = true;
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  conectado = false;
+  qrAtual   = null;
+  const sockRef = sock;
+  sock = null;
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+  if (sockRef) { try { sockRef.end(new Error('pair-codigo')); } catch(e) {} }
+
+  await limparCredenciaisSessao();
+
+  pairNumero   = numero;
+  pairCodigo   = null;
+  pairErro     = null;
+  pairPedidoEm = Date.now();
+  errosDescripto = 0;
+  _reconectarTentativas = 0;
+  isResetting = false;
+
+  _agendarReconexao(1500);
+  res.json({ ok:true, mensagem:'Gerando codigo para ' + numero + '. Consulte /pair/status.' });
+});
+
+app.get('/pair/status', (req, res) => {
+  const expirado = pairPedidoEm > 0 && (Date.now() - pairPedidoEm) > 10 * 60 * 1000;
+  res.json({
+    ok: true,
+    conectado,
+    numero: pairNumero,
+    codigo: expirado ? null : pairCodigo,
+    erro: pairErro,
+    expirado,
+    aguardando: !!pairNumero && !pairCodigo && !pairErro && !expirado,
+  });
+});
+
+app.get('/pair', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conectar por codigo</title><style>
+*{box-sizing:border-box}body{background:#0d0d0d;color:#f0f0f0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;display:flex;flex-direction:column;align-items:center;gap:14px}
+h1{color:#ffa500;font-size:1.3rem;margin:8px 0 0}
+.card{width:100%;max-width:420px;background:#151515;border:1px solid #2a2a2a;border-radius:14px;padding:18px}
+label{display:block;font-size:.85rem;color:#aaa;margin-bottom:6px}
+input{width:100%;padding:14px;font-size:1.1rem;border-radius:10px;border:1px solid #333;background:#0d0d0d;color:#fff}
+button{width:100%;margin-top:12px;padding:14px;font-size:1rem;font-weight:600;border:0;border-radius:10px;background:#ffa500;color:#111}
+button:disabled{opacity:.5}
+#codigo{font-size:2.1rem;letter-spacing:.28em;color:#ffa500;text-align:center;font-weight:700;margin:10px 0}
+ol{color:#ccc;font-size:.9rem;line-height:1.6;padding-left:18px}
+.msg{font-size:.9rem;color:#aaa;text-align:center}
+.err{color:#ff6b6b}.ok{color:#4ade80}
+</style></head><body>
+<h1>Conectar WhatsApp por codigo</h1>
+<div class="card">
+  <label>Numero da conta (DDI + DDD + numero)</label>
+  <input id="num" type="tel" inputmode="numeric" placeholder="5511999999999">
+  <button id="btn">Gerar codigo</button>
+  <p class="msg" id="msg"></p>
+  <div id="codigo"></div>
+</div>
+<div class="card">
+  <ol>
+    <li>Antes de tudo: no WhatsApp do celular, va em <b>Dispositivos conectados</b> e desconecte o dispositivo antigo.</li>
+    <li>Digite o numero acima e toque em <b>Gerar codigo</b>.</li>
+    <li>No WhatsApp: <b>Dispositivos conectados > Conectar dispositivo > Conectar com numero de telefone</b>.</li>
+    <li>Digite o codigo de 8 caracteres que aparecer aqui. Ele vale poucos minutos.</li>
+  </ol>
+</div>
+<script>
+var t=null;
+function msg(txt,cls){var m=document.getElementById('msg');m.textContent=txt;m.className='msg '+(cls||'');}
+document.getElementById('btn').onclick=async function(){
+  var n=document.getElementById('num').value.replace(/\D/g,'');
+  if(n.length<10){msg('Numero invalido.','err');return;}
+  this.disabled=true;document.getElementById('codigo').textContent='';
+  msg('Reiniciando a sessao e pedindo o codigo...');
+  try{
+    var r=await fetch('/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:n})});
+    var j=await r.json();
+    if(!j.ok){msg(j.erro||'Falhou.','err');this.disabled=false;return;}
+    if(t)clearInterval(t);
+    t=setInterval(checar,2500);
+  }catch(e){msg('Erro: '+e.message,'err');this.disabled=false;}
+};
+async function checar(){
+  try{
+    var r=await fetch('/pair/status');var j=await r.json();
+    if(j.conectado){clearInterval(t);msg('WhatsApp conectado!','ok');document.getElementById('codigo').textContent='';return;}
+    if(j.codigo){document.getElementById('codigo').textContent=j.codigo.replace(/(.{4})(.{4})/,'$1-$2');msg('Digite este codigo no WhatsApp.');return;}
+    if(j.erro){msg('Erro: '+j.erro,'err');document.getElementById('btn').disabled=false;return;}
+    msg('Aguardando o codigo...');
+  }catch(e){}
+}
+checar();
+</script></body></html>`);
 });
 // ═══════════════════════════════════════════════════════════════════════════
 // HISTÓRICO SEATS.AERO — BLOCO ÚNICO
