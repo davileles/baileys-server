@@ -5235,6 +5235,47 @@ async function faxinaEmergencia(alvo = 500) {
 }
 
 // Endpoint manual: util quando o disco ja encheu e o painel e a unica via.
+// Raio-x do volume: agrega por FAMILIA de arquivo (o nome carrega o tipo) e
+// lista os maiores. Sem isso a unica pista de disco cheio e o ENOSPC no log,
+// que diz que acabou mas nao diz quem gastou.
+function _familiaDe(nome) {
+  if (nome.startsWith('session-'))          return 'session-*';
+  if (nome.startsWith('sender-key-memory')) return 'sender-key-memory-*';
+  if (nome.startsWith('sender-key'))        return 'sender-key-*';
+  if (nome.startsWith('pre-key-'))          return 'pre-key-*';
+  if (nome.startsWith('app-state-sync-'))   return 'app-state-sync-*';
+  return nome;
+}
+
+async function _varrer(dir, prefixo, acc) {
+  let itens = [];
+  try { itens = await readdir(dir, { withFileTypes: true }); } catch (e) { return; }
+  for (const item of itens) {
+    const caminho = dir + '/' + item.name;
+    if (item.isDirectory()) { await _varrer(caminho, prefixo + item.name + '/', acc); continue; }
+    try {
+      const st = await statAsync(caminho);
+      const fam = prefixo + _familiaDe(item.name);
+      const cur = acc.familias.get(fam) || { arquivos: 0, bytes: 0 };
+      cur.arquivos++; cur.bytes += st.size;
+      acc.familias.set(fam, cur);
+      acc.total += st.size; acc.arquivos++;
+      acc.maiores.push({ arquivo: prefixo + item.name, kb: Math.round(st.size / 1024), em: st.mtime });
+    } catch (e) {}
+  }
+}
+
+app.get('/manutencao/disco', async (_req, res) => {
+  const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0 };
+  await _varrer(SESSAO_DIR, '', acc);
+  await _varrer(UPLOAD_DIR, 'tmp-uploads/', acc);
+  const familias = [...acc.familias.entries()]
+    .map(([nome, v]) => ({ nome, arquivos: v.arquivos, mb: +(v.bytes / 1048576).toFixed(2) }))
+    .sort((a, b) => b.mb - a.mb).slice(0, 25);
+  const maiores = acc.maiores.sort((a, b) => b.kb - a.kb).slice(0, 15);
+  res.json({ ok: true, totalMB: +(acc.total / 1048576).toFixed(2), arquivos: acc.arquivos, familias, maiores });
+});
+
 app.post('/manutencao/faxina', async (req, res) => {
   const emergencia = req.body?.emergencia === true;
   const alvo = Number(req.body?.alvo || 500);
