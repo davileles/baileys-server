@@ -300,6 +300,32 @@ async function confirmarEnvio(chatId, s, acao, editar) {
   return falar(chatId, `✅ Enviado em *${res.ok}/${res.total}* grupo(s).`, null, editar);
 }
 
+// ── STATUS PARA O TELEGRAM ───────────────────────────────────────────────────
+// Le o retrato injetado por dep.status() e monta uma mensagem curta e legivel
+// para o operador conferir a saude do servidor do celular, sem abrir /status.
+function formatarStatusBot(st) {
+  st = st || {};
+  const wa = st.conectado ? '🟢 conectado'
+    : (st.logout ? '🔴 logout — precisa parear' : '🔴 desconectado');
+  const surdez = (st.surdezEstado && st.surdezEstado !== 'ok') ? ('⚠️ ' + st.surdezEstado) : '🟢 ok';
+  const tg = st.telegramConectado ? '🟢' : '🔴';
+  const partes = [
+    '*TSP — status do servidor* 📟',
+    '',
+    'WhatsApp: ' + wa,
+    'Inbound: ' + surdez + (st.minSemUpsert != null ? (' (última msg há ' + st.minSemUpsert + ' min)') : ''),
+    'Telegram: ' + tg,
+    'Publicações hoje: ' + (st.publicacoesHoje != null ? st.publicacoesHoje : '?'),
+    'Fila: ' + (st.filaTotal != null ? st.filaTotal : '?') + ' item(ns)'
+      + (st.filaPendentes != null ? (' — ' + st.filaPendentes + ' pendente(s)') : ''),
+    (st.logout && st.logoutMin != null) ? ('⚠️ Logout há ' + st.logoutMin + ' min — /pair ou /qr') : null,
+    'Uptime: ' + (st.uptimeMin != null ? (st.uptimeMin + ' min') : '?'),
+    '',
+    '_Comandos:_ /reconectar · /pair · /menu',
+  ].filter(Boolean);
+  return partes.join('\n');
+}
+
 // ── ROTEADOR ─────────────────────────────────────────────────────────────────
 function autorizado(chatId) {
   return ADMINS.size === 0 ? false : ADMINS.has(String(chatId));
@@ -323,6 +349,16 @@ async function tratarTexto(chatId, texto) {
   if (/^\/msg/i.test(t))    { const s = abrir(chatId, 'msg'); s.passo = 'texto';
     return falar(chatId, '*Mensagem livre* 📢\n\nEscreva o texto que vai para os grupos.',
       teclado([[['❌ Cancelar', 'a:cancelar']]])); }
+
+  if (/^\/status/i.test(t)) {
+    const st = (dep && dep.status) ? dep.status() : {};
+    return falar(chatId, formatarStatusBot(st));
+  }
+  if (/^\/reconectar/i.test(t)) {
+    return falar(chatId,
+      '🔄 *Reconectar WhatsApp?*\n\nIsso derruba e reabre o socket. A captura para por alguns segundos e volta sozinha.',
+      teclado([[['✅ Confirmar', 'a:reconectar:go'], ['❌ Cancelar', 'a:cancelar']]]));
+  }
 
   const s = sessao(chatId);
   if (!s) return falar(chatId, MENU, MENU_KB());
@@ -371,6 +407,11 @@ async function tratarBotao(chatId, msgId, data) {
       s2.passo = 'texto';     return falar(chatId, '*Mensagem livre* 📢\n\nEscreva o texto.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
     }
     if (chave === 'cancelar') { sessoes.delete(String(chatId)); return falar(chatId, 'Cancelado.', MENU_KB(), msgId); }
+    if (chave === 'reconectar' && valor === 'go') {
+      try { if (dep && dep.forcarReconexao) dep.forcarReconexao('bot-telegram'); }
+      catch (e) { return falar(chatId, '❌ Falha ao disparar reconexão: ' + e.message, null, msgId); }
+      return falar(chatId, '🔄 Reconexão disparada. Aguarde ~10s e mande /status para conferir.', null, msgId);
+    }
     if (!s) return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
     if (chave === 'refazer') {
       if (s.fluxo === 'cupom') { const s2 = abrir(chatId, 'cupom'); s2.passo = 'loja'; return pedirPassoCupom(chatId, s2, msgId); }
@@ -466,6 +507,8 @@ export async function bootBotTsp(deps) {
     { command: 'cupom',    description: 'Criar um cupom' },
     { command: 'oferta',   description: 'Criar uma oferta a partir de um link' },
     { command: 'msg',      description: 'Mensagem livre para os grupos' },
+    { command: 'status',   description: 'Ver a saúde do servidor (WhatsApp, fila, publicações)' },
+    { command: 'reconectar', description: 'Reconectar o WhatsApp (com confirmação)' },
     { command: 'cancelar', description: 'Cancelar o que está em andamento' },
   ]});
 }
