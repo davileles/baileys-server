@@ -11,7 +11,7 @@ import cors from 'cors';
 import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync, stat as statAsync } from 'fs/promises';
 import { join } from 'path';
 import QRCode from 'qrcode';
@@ -447,6 +447,20 @@ const UPLOAD_DIR    = './tmp-uploads';
 
 [SESSAO_DIR, UPLOAD_DIR].forEach(d => { if (!existsSync(d)) mkdirSync(d, { recursive: true }); });
 
+// ── ESCRITA ATOMICA DE ARQUIVOS DE ESTADO ────────────────────────────────────
+// Grava em <arquivo>.tmp e faz rename() — no MESMO diretorio, para o rename ser
+// atomico (rename entre filesystems diferentes nao e). Um SIGKILL/ENOSPC no meio
+// de um write nunca mais deixa JSON truncado (a causa raiz classica de Bad MAC
+// e de fila/agendamentos corrompidos apos redeploy). O .tmp orfao, se sobrar, e
+// varrido pela faxina periodica (filtro *.tmp). Serve para qualquer conteudo
+// (JSON ou string de sessao). A sessao do WhatsApp ja usa escrita atomica
+// propria (useAuthStateAtomico); este helper cobre o RESTO dos JSONs de estado.
+function escreverAtomico(caminho, dados, encoding = 'utf-8') {
+  const tmp = caminho + '.tmp';
+  writeFileSync(tmp, dados, encoding);
+  renameSync(tmp, caminho);
+}
+
 // ── AUTH STATE ATÔMICO ────────────────────────────────────────────────────────
 // Substitui o useMultiFileAuthState do Baileys mantendo o MESMO formato de
 // arquivos (100% compatível com a sessão existente em ./sessao), mas com duas
@@ -608,7 +622,7 @@ function salvarCuponsVistos() {
     for (const k of Object.keys(_cuponsVistos)) {
       if (agora - _cuponsVistos[k] > CUPONS_VISTOS_TTL_MS) delete _cuponsVistos[k];
     }
-    writeFileSync(CUPONS_VISTOS_PATH, JSON.stringify(_cuponsVistos), 'utf-8');
+    escreverAtomico(CUPONS_VISTOS_PATH, JSON.stringify(_cuponsVistos), 'utf-8');
   } catch(e) { console.warn('[DEDUP] Erro ao salvar cupons_vistos:', e.message); }
 }
 
@@ -754,7 +768,7 @@ function limparFila() {
 function salvarFila() {
   try {
     limparFila();
-    writeFileSync(FILA_PATH, JSON.stringify(filaPendentes), 'utf-8');
+    escreverAtomico(FILA_PATH, JSON.stringify(filaPendentes), 'utf-8');
   } catch(e) { console.log('[FILA] Erro ao salvar fila:', e.message); }
 }
 
@@ -1310,7 +1324,7 @@ function carregarAgendamentos() {
 }
 
 function salvarAgendamentos() {
-  try { writeFileSync(AGEND_PATH, JSON.stringify(agendamentos), 'utf-8'); } catch(e) {}
+  try { escreverAtomico(AGEND_PATH, JSON.stringify(agendamentos), 'utf-8'); } catch(e) {}
 }
 
 carregarAgendamentos();
@@ -3008,7 +3022,7 @@ async function registrarEnvioHistorico(oferta) {
       const caminhoLote = SESSAO_DIR + '/' + local;
       const dirLote = caminhoLote.slice(0, caminhoLote.lastIndexOf('/'));
       if (!existsSync(dirLote)) mkdirSync(dirLote, { recursive: true });
-      writeFileSync(caminhoLote, JSON.stringify({ registros: regs }), 'utf-8');
+      escreverAtomico(caminhoLote, JSON.stringify({ registros: regs }), 'utf-8');
       agendarPush(local);
       return;
     }
@@ -3054,7 +3068,7 @@ async function registrarEnvioHistorico(oferta) {
     const caminho = SESSAO_DIR + '/' + local;
     const dir = caminho.slice(0, caminho.lastIndexOf('/'));
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(caminho, JSON.stringify({ registros: regs }), 'utf-8');
+    escreverAtomico(caminho, JSON.stringify({ registros: regs }), 'utf-8');
     agendarPush(local);
 
     // ── DIVULGADO: marca o dedup e coloca o produto sob vigilancia de preco ──
@@ -3655,7 +3669,7 @@ function carregarUltimosMsgIds() {
 function salvarUltimosMsgIds(mapa) {
   try {
     if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
-    writeFileSync(TG_ULTIMOS_IDS_PATH, JSON.stringify(mapa), 'utf-8');
+    escreverAtomico(TG_ULTIMOS_IDS_PATH, JSON.stringify(mapa), 'utf-8');
   } catch (e) { console.warn('[TG] Erro ao salvar tg_ultimos_ids:', e.message); }
 }
 
@@ -3735,7 +3749,7 @@ async function iniciarTelegram() {
   });
 
   const sessionSalva = tgClient.session.save();
-  writeFileSync(TG_SESSION_PATH, sessionSalva, 'utf-8');
+  escreverAtomico(TG_SESSION_PATH, sessionSalva, 'utf-8');
   tgConectado = true;
   tgAuthState = 'ok';
   tgConta = await tgClient.getMe().then(u => ({ id: u.id?.toString(), username: u.username || null, phone: u.phone || null, nome: ((u.firstName||'')+' '+(u.lastName||'')).trim() })).catch(() => null);
@@ -3910,7 +3924,7 @@ async function iniciarTelegramTenant(tenantId) {
       password:    () => new Promise((res, rej) => { st.authState = 'aguardando_senha';    st.resolve = res; st.reject = rej; }),
       onError: (e) => { st.authState = 'erro'; st.erro = e.message; },
     });
-    writeFileSync(p, client.session.save(), 'utf-8');
+    escreverAtomico(p, client.session.save(), 'utf-8');
     st.conectado = true; st.authState = 'ok';
     st.conta = await client.getMe()
       .then(u => ({ id: u.id?.toString(), username: u.username || null, phone: u.phone || null }))
@@ -6108,7 +6122,7 @@ function _salvarHealth() {
   const agora = Date.now();
   if (agora - _healthGravadoEm < 60 * 1000) return; // throttle: 1 write/min
   _healthGravadoEm = agora;
-  try { writeFileSync(HEALTH_PATH, JSON.stringify(_health), 'utf-8'); }
+  try { escreverAtomico(HEALTH_PATH, JSON.stringify(_health), 'utf-8'); }
   catch (e) { console.warn('[WATCHDOG] Falha ao gravar health.json:', e.message); }
 }
 
@@ -9423,7 +9437,7 @@ function salvarAwinVistos() {
     const t = new Date(v).getTime();
     if (isFinite(t) && t < limite) delete _awinVistos[k];
   }
-  try { writeFileSync(AWIN_VISTOS_PATH, JSON.stringify(_awinVistos)); }
+  try { escreverAtomico(AWIN_VISTOS_PATH, JSON.stringify(_awinVistos)); }
   catch (e) { console.log('[AWIN] Falha ao gravar vistos:', e.message); }
 }
 
@@ -10250,7 +10264,7 @@ app.post('/manutencao/asin-ml', async (req, res) => {
       const caminho = SESSAO_DIR + '/' + local;
       const dir = caminho.slice(0, caminho.lastIndexOf('/'));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(caminho, JSON.stringify({ registros: regs }), 'utf-8');
+      escreverAtomico(caminho, JSON.stringify({ registros: regs }), 'utf-8');
       agendarPush(local);
     }
 
@@ -11667,7 +11681,7 @@ function _censoDiaRef() {
 })();
 
 function salvarCenso() {
-  try { writeFileSync(CENSO_FILE, JSON.stringify(_censo, null, 2), 'utf-8'); }
+  try { escreverAtomico(CENSO_FILE, JSON.stringify(_censo, null, 2), 'utf-8'); }
   catch(e) { console.error('[CENSO] Falha ao gravar censo:', e.message); }
 }
 
@@ -11710,7 +11724,7 @@ function registrarHistoricoCenso(grupos) {
   const chaves = Object.keys(_censoHist.dias).sort();
   while (chaves.length > CENSO_HIST_DIAS) delete _censoHist.dias[chaves.shift()];
   try {
-    writeFileSync(CENSO_HIST_FILE, JSON.stringify(_censoHist, null, 2), 'utf-8');
+    escreverAtomico(CENSO_HIST_FILE, JSON.stringify(_censoHist, null, 2), 'utf-8');
     agendarPush(CENSO_HIST_ARQ);
   } catch(e) { console.error('[CENSO] Falha ao gravar historico:', e.message); }
 }
@@ -11831,7 +11845,7 @@ function salvarMembrosLog() {
     try {
       if (_membrosLog.eventos.length > MEMBROS_LOG_MAX)
         _membrosLog.eventos = _membrosLog.eventos.slice(-MEMBROS_LOG_MAX);
-      writeFileSync(MEMBROS_LOG_FILE, JSON.stringify(_membrosLog), 'utf-8');
+      escreverAtomico(MEMBROS_LOG_FILE, JSON.stringify(_membrosLog), 'utf-8');
       agendarPush(MEMBROS_LOG_ARQ);
     } catch(e) { console.error('[MEMBROS] Falha ao gravar ledger:', e.message); }
   }, 5000);
@@ -12006,7 +12020,7 @@ app.post('/grupos/censo/importar', (req, res) => {
   while (chaves.length > CENSO_HIST_DIAS) delete _censoHist.dias[chaves.shift()];
 
   try {
-    writeFileSync(CENSO_HIST_FILE, JSON.stringify(_censoHist, null, 2), 'utf-8');
+    escreverAtomico(CENSO_HIST_FILE, JSON.stringify(_censoHist, null, 2), 'utf-8');
     agendarPush(CENSO_HIST_ARQ);
   } catch(e) { return res.status(500).json({ ok:false, erro:'falha ao gravar: ' + e.message }); }
 
@@ -12368,7 +12382,7 @@ function salvarHistoricoSeats() {
     if (antes !== historicoSeats.length) {
       console.log('[HIST-SEATS] Retenção: ' + (antes - historicoSeats.length) + ' registro(s) antigo(s) removido(s).');
     }
-    writeFileSync(HIST_SEATS_PATH, JSON.stringify(historicoSeats), 'utf-8');
+    escreverAtomico(HIST_SEATS_PATH, JSON.stringify(historicoSeats), 'utf-8');
   } catch (e) {
     console.warn('[HIST-SEATS] Erro ao salvar:', e.message);
   }
