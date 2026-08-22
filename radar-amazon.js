@@ -2564,6 +2564,50 @@ export function comRastreio(p) {
 }
 
 /** Ledger para o coletor de comissoes traduzir (ref + data) -> produto. */
+/**
+ * Reparo do ledger: troca o `asin` das atribuicoes cujo id ficou sendo a URL
+ * curta do ML em vez do MLB/MLBU.
+ *
+ * A origem foi radar-ml.js linha 879, que usava idDeUrl() — regex que so casa
+ * MLB+digitos — com fallback `|| r.link`. Produto do catalogo unificado (MLBU)
+ * devolvia null e o meli.la ia parar no campo asin. Em agosto foram 15 de 84
+ * atribuicoes ML.
+ *
+ * A ETIQUETA (`ref`) nao e tocada: ela vem de tagMlDoProduto(asin, categoria),
+ * que decide pela CATEGORIA e nao pelo asin, entao ela ja estava correta. O que
+ * quebrou foi so a volta do relatorio para o produto, que casa por asin.
+ *
+ * @param {Object} mapa  { 'https://meli.la/xxx': 'MLBU123456' }
+ * @returns {{ reparadas:number, semMapa:number }}
+ */
+export function repararAsinAtribuicoes(mapa = {}, { simular = false } = {}) {
+  const r = rastreio();
+  let reparadas = 0, semMapa = 0;
+  for (const a of (r.atribuicoes || [])) {
+    const atual = String(a.asin || '');
+    if (!atual.startsWith('http')) continue;
+    const novo = mapa[atual];
+    if (!novo) { semMapa++; continue; }
+    if (!simular) { a.asinAntigo = atual; a.asin = novo; }
+    reparadas++;
+  }
+  if (reparadas && !simular) {
+    salvarRastreio();
+    console.log('[RASTREIO] Reparo — ' + reparadas + ' atribuicao(oes) com asin de URL corrigida(s).');
+  }
+  return { reparadas, semMapa };
+}
+
+/** URLs curtas ainda presentes no campo asin do ledger, para montar o mapa. */
+export function urlsNoAsinDeAtribuicoes() {
+  const out = new Set();
+  for (const a of (rastreio().atribuicoes || [])) {
+    const v = String(a.asin || '');
+    if (v.startsWith('http')) out.add(v);
+  }
+  return [...out];
+}
+
 export function listarAtribuicoes(desde = null) {
   const todas = rastreio().atribuicoes || [];
   if (!desde) return todas;
