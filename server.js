@@ -1026,10 +1026,31 @@ async function conectarConta(id) {
   return c;
 }
 
+// ── TETO DE TEMPO NO ENVIO (evita worker pendurado) ─────────────────────────
+// sock.sendMessage pode ficar pendurado indefinidamente num socket zumbi que
+// nao rejeitou a promessa (TCP meio-aberto sem close limpo). Isso trava o
+// worker da fila e nenhum disparo sai — o modo de falha que estamos atacando.
+// O teto e GENEROSO de proposito: o keepalive do Baileys ja mata socket morto
+// em ~35s emitindo close (que rejeita o envio com erro de conexao, retryable).
+// 60s fica ACIMA dessa janela, entao no caso normal o keepalive rejeita antes;
+// este teto so pega o envio que ficou preso mesmo. A mensagem de erro inclui
+// 'timed out' de proposito: cai no MESMO ramo retryable que enviarMensagem ja
+// trata, sem inventar um caminho novo de falha (e sem aumentar risco de envio
+// duplicado alem do que ja existe hoje).
+const ENVIO_TIMEOUT_MS = 60000;
+function _enviarComTeto(promessaEnvio) {
+  return Promise.race([
+    promessaEnvio,
+    new Promise((_, rej) => setTimeout(
+      () => rej(new Error('sendMessage timed out (' + Math.round(ENVIO_TIMEOUT_MS/1000) + 's)')),
+      ENVIO_TIMEOUT_MS)),
+  ]);
+}
+
 async function enviarPelaConta(id, destino, conteudo) {
   const c = contasExtras.get(id);
   if (!c?.conectado || !c.sock) throw new Error('conta ' + id + ' nao conectada');
-  const r = await c.sock.sendMessage(destino, conteudo);
+  const r = await _enviarComTeto(c.sock.sendMessage(destino, conteudo));
   try {
     if (r?.key?.id && r?.message) {
       c.enviadas.set(r.key.id, r.message);
@@ -1082,7 +1103,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
     if (!ok) throw new Error('WhatsApp não conectado após aguardar reconexão.');
   }
   try {
-    const resultado = await sock.sendMessage(destino, conteudo);
+    const resultado = await _enviarComTeto(sock.sendMessage(destino, conteudo));
     guardarMensagemEnviada(resultado);
     registrarPublicacaoHealth(destino);
     return resultado;
@@ -2166,6 +2187,9 @@ async function chamarClaude(system, userContent, maxTokens) {
           system,
           messages: [{ role: 'user', content: userContent }],
         }),
+        // Sem isto, uma conexao presa com a API prende o worker de classificacao
+        // por ate ~5min (default do undici). 45s corta e a proxima tentativa assume.
+        signal: AbortSignal.timeout(45000),
       });
       const data = await response.json();
       if (data.error) { console.log('API erro (tentativa '+(tentativa+1)+'/3):', JSON.stringify(data.error)); continue; }
