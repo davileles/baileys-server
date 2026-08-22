@@ -981,6 +981,10 @@ export function registrarCupomBase(c) {
   if (!chave) return null;
   const agora = Date.now();
   const anterior = E().cupons[chave];
+  // Momento real da captura: o declarado pela fonte, se confiavel, senao agora.
+  // Nunca no futuro — data torta de fonte externa nao pode esticar validade.
+  const declarada = Date.parse(c?.capturadoEm || '');
+  const capturaMs = Number.isFinite(declarada) && declarada <= agora ? declarada : agora;
 
   const reg = {
     chave,
@@ -999,7 +1003,10 @@ export function registrarCupomBase(c) {
     // num grupo apagava a anotacao — inclusive a que explicava por que ele tinha
     // sido desativado, deixando o registro sem historia.
     observacao: c.observacao !== undefined ? c.observacao : (anterior?.observacao ?? null),
-    capturadoEm: anterior?.capturadoEm || new Date(agora).toISOString(),
+    // Data da PUBLICACAO quando a fonte informa (Telegram passa msg.date). Sem
+    // isto, uma mensagem lida com atraso — backlog de reconexao — registrava a
+    // captura no momento da leitura e o TTL de 24h nascia inteiro de novo.
+    capturadoEm: anterior?.capturadoEm || new Date(capturaMs).toISOString(),
     atualizadoEm: new Date(agora).toISOString(),
     // Quando a fonte declara a expiracao real (o ML publica expiration_date em
     // cada cupom da conta), ela vence o padrao de 24h — que existe so para
@@ -1011,7 +1018,7 @@ export function registrarCupomBase(c) {
       // confiavel; aplicado por cima da validade lida da conta do ML, matava em
       // 24h um cupom que valia ate domingo so porque ele reapareceu num canal.
       const anteriorMs = Date.parse(anterior?.validadeAte || '');
-      const padraoMs = agora + CUPOM_VALIDADE_PADRAO_MS;
+      const padraoMs = capturaMs + CUPOM_VALIDADE_PADRAO_MS;
       return new Date(anteriorMs > padraoMs ? anteriorMs : padraoMs).toISOString();
     })(),
     // Reaparecer no grupo nao deve ressuscitar cupom que o operador desativou.
