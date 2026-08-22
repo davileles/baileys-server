@@ -876,7 +876,13 @@ export async function processarTextoMl(texto) {
     }
 
     const p = {
-      asin: idDeUrl(url) || r.link, id: idDeUrl(url),
+      // idProdutoMl, nao idDeUrl: idDeUrl so casa MLB+digitos e devolve null
+      // para o catalogo unificado (MLBU). Com o fallback antigo (|| r.link) o
+      // asin virava o meli.la curto — 23% das ofertas ML de agosto sairam
+      // assim, furando o dedup por produto e sujando o ledger de atribuicoes
+      // com refs do tipo 'httpsmelila1oand8j', que o coletor de comissoes nao
+      // casa com nada. Sem id de produto e melhor null do que um id falso.
+      asin: idProdutoMl(url), id: idProdutoMl(url),
       titulo: dados.titulo || '',
       marca: dados.marca || '',
       imagemUrl: dados.imagem,
