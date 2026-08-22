@@ -7504,6 +7504,48 @@ function forcarReconexao(motivo) {
   _agendarReconexao(1000);
 }
 
+// ── SUPERVISOR DE ESTADO DO WEBSOCKET (socket-zumbi) ─────────────────────────
+// A escada de surdez detecta o zumbi so pela AUSENCIA de upsert (20 min). Este
+// supervisor e um sinal ORTOGONAL e mais rapido, baseado no estado REAL do
+// websocket. O zumbi classico: o keepalive do Baileys mata o socket morto e
+// emite 'close', mas o handler o descarta como "sock antigo" (novaSock !== sock)
+// e retorna SEM restaurar o estado — fica 'conectado=true' com o WS fechado, e
+// nenhuma reconexao e agendada. Ninguem recebe nada e nada avisa.
+//
+// Seguranca (o risco aqui e derrubar conexao SAUDAVEL):
+//   - readyState de TCP meio-aberto ainda aparece OPEN; quem vira 'close' e o
+//     keepalive. Por isso NAO tentamos adivinhar meio-aberto — checamos so o
+//     estado CLOSED explicito (o zumbi ja com close mal-tratado).
+//   - CONNECTING/CLOSING ficam de fora: sao transicoes normais de handshake e
+//     reconexao. Agir nelas criaria tempestade de reconexao.
+//   - So age quando ACREDITAMOS estar conectados (conectado===true, marcado so
+//     no evento 'open') mas o WS esta CLOSED — contradicao genuina.
+//   - Exige 2 leituras seguidas (60s) e pula se ja ha reconexao em voo
+//     (isConnecting / _reconnectTimer / isResetting), para nao brigar com uma
+//     reconexao legitima em andamento.
+//   - So a conta PRINCIPAL. As secundarias tem ciclo proprio (conectarConta).
+let _wsZumbiPolls = 0;
+const _WS_ZUMBI_POLLS_ACAO = 2;   // 2 leituras seguidas = ~60s de inconsistencia
+setInterval(() => {
+  try {
+    if (Date.now() - _bootEm < 60 * 1000) return;   // carencia pos-boot
+    if (isConnecting || _reconnectTimer || isResetting) { _wsZumbiPolls = 0; return; }
+    const wsFechado = !!(sock && sock.ws && sock.ws.isClosed);
+    // Contradicao: cremos conectados, mas nao ha socket OU o WS esta CLOSED.
+    const inconsistente = conectado === true && (!sock || wsFechado);
+    if (!inconsistente) { _wsZumbiPolls = 0; return; }
+    _wsZumbiPolls++;
+    if (_wsZumbiPolls < _WS_ZUMBI_POLLS_ACAO) {
+      console.warn('[SUPERVISOR-WS] Estado inconsistente (conectado=true, WS '
+        + (sock ? 'CLOSED' : 'ausente') + '). Confirmacao ' + _wsZumbiPolls + '/' + _WS_ZUMBI_POLLS_ACAO + '...');
+      return;
+    }
+    _wsZumbiPolls = 0;
+    console.error('[SUPERVISOR-WS] Socket-zumbi confirmado: conectado=true com o websocket fechado. Forcando reconexao.');
+    forcarReconexao('supervisor-ws-zumbi');
+  } catch (e) { console.error('[SUPERVISOR-WS] Erro no ciclo:', e.message); }
+}, 30 * 1000).unref?.();
+
 app.post('/reconectar', async (req, res) => {
   forcarReconexao('endpoint-/reconectar');
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
