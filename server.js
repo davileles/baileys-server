@@ -6100,6 +6100,28 @@ function _persistirSurdez() {
   _salvarHealth();
 }
 
+// ── LOGOUT (401) ────────────────────────────────────────────────────────────
+// Caso distinto da surdez e sem escada de autocura: sessao encerrada do lado do
+// WhatsApp so volta com novo pareamento. Ate 22/08/2026 o ramo loggedOut era um
+// console.log solitario, e como os dois watchdogs comecam com
+// `if (!conectado || !sock) return` — ambos existem para socket VIVO e surdo —
+// ninguem cobria a queda real. Resultado: 20h mudo com /status dizendo 'ok'.
+//
+// Declarado aqui, acima do ciclo do watchdog, porque o reaviso le estas
+// variaveis. Persistido em health.json pelo mesmo motivo da escada acima: sem
+// isso um restart zera o relogio e o reaviso de 60 min nunca chega.
+let _logoutEm            = _health.logoutEm || 0;
+let _logoutAvisoEm       = _health.logoutAvisoEm || 0;
+let _logoutSocketTentado = !!_health.logoutSocketTentado;
+
+function _persistirLogout() {
+  _health.logoutEm            = _logoutEm;
+  _health.logoutAvisoEm       = _logoutAvisoEm;
+  _health.logoutSocketTentado = _logoutSocketTentado;
+  _healthGravadoEm = 0;
+  _salvarHealth();
+}
+
 // Guarda contra restart em loop: se o creds.json estiver mesmo morto, o degrau
 // o degrau 3 se repetiria a cada ciclo eternamente. Um exit por hora, no maximo —
 // depois disso a escada para em 'alertado' e espera intervencao humana.
@@ -6179,6 +6201,29 @@ setInterval(async () => {
   try {
     const h = horaSP();
     if (h < SURDEZ_INICIO_H || h >= SURDEZ_FIM_H) return;
+
+    // ── REAVISO DE LOGOUT ────────────────────────────────────────────────
+    // Precisa vir ANTES do bail de !conectado: logout e exatamente o caso em
+    // que conectado=false, e era por isso que o alerta nunca se repetia.
+    // Nao ha escada de autocura aqui — logout so se resolve com novo pareamento.
+    if (_logoutEm && !conectado) {
+      if (Date.now() - _logoutAvisoEm >= SURDEZ_REAVISO_MS) {
+        _logoutAvisoEm = Date.now();
+        _persistirLogout();
+        const min = Math.round((Date.now() - _logoutEm) / 60000);
+        console.warn('[WATCHDOG] Logout persiste ha ' + min + ' min. Reavisando operador.');
+        await _avisarOperador(
+          'CRITICO — WhatsApp ainda DESCONECTADO ha ' + min + ' min (logout).\n\n'
+          + 'Captura, radar e envio seguem parados. Fila acumulando: '
+          + filaPendentes.length + ' item(ns).\n\n'
+          + 'So se resolve pareando de novo: /pair (codigo de 8 digitos, so o celular) '
+          + 'ou /qr. Se o QR vier vazio, POST /reset-sessao-completo antes.',
+          { critico: true }
+        ).catch(() => {});
+      }
+      return;   // sem escada: nao ha o que curar sozinho num logout
+    }
+
     if (!conectado || !sock) return;              // queda real tem tratamento proprio
     const agora = Date.now();
     if (agora - _bootEm < 10 * 60 * 1000) return; // carencia de aquecimento pos-boot
@@ -6558,6 +6603,12 @@ async function conectar() {
         isConnecting = false;
         _reconectarTentativas = 0;
         _erros500Consecutivos = 0;
+        if (_logoutEm) {
+          const min = Math.round((Date.now() - _logoutEm) / 60000);
+          _logoutEm = 0; _logoutAvisoEm = 0; _logoutSocketTentado = false;
+          _persistirLogout();
+          _avisarOperador('OK — WhatsApp reconectado apos ' + min + ' min de logout. Captura e radar normalizados.').catch(() => {});
+        }
         resetarHealthTimer();
         console.log('[WA] ✓ WhatsApp conectado!');
         // Aquece o cache de nomes: a fila mostra de qual grupo veio cada oferta.
@@ -6578,9 +6629,48 @@ async function conectar() {
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log('[WA] Conexão fechada. Código:', codigo);
         if (codigo === DisconnectReason.loggedOut) {
+          // ── LOGOUT (401) ────────────────────────────────────────────────
+          // Ate 22/08/2026 este ramo era so um console.log, e por isso o
+          // servico ficou 20h mudo sem ninguem saber: o watchdog de surdez e o
+          // de capturas comecam com `if (!conectado || !sock) return`, porque
+          // ambos existem para pegar socket VIVO e surdo — queda real estava
+          // delegada a este ramo, que nao avisava nada. Os tres sinais
+          // concordavam em ficar quietos e /status seguia com surdezEstado 'ok'.
           console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr');
           _reconectarTentativas = 0;
-          // NÃO reconecta automaticamente
+          _logoutEm = Date.now();
+          _logoutAvisoEm = Date.now();
+          _persistirLogout();
+
+          _avisarOperador(
+            'CRITICO — WhatsApp DESCONECTADO (logout)\n\n'
+            + 'A sessao foi encerrada do lado do WhatsApp. Reconexao automatica NAO '
+            + 'se aplica: e preciso parear de novo.\n\n'
+            + 'Captura de grupos, radar e envio estao PARADOS. O Telegram segue '
+            + 'funcionando e a fila continua acumulando.\n\n'
+            + 'Correcao — caminho preferido (SO o celular, sem Wi-Fi):\n'
+            + '1) Abrir /pair e informar o numero com DDI\n'
+            + '2) No celular: WhatsApp > Dispositivos conectados > Conectar com numero de telefone\n'
+            + '3) Digitar o codigo de 8 digitos\n\n'
+            + 'Alternativa por QR (precisa de tela e Wi-Fi): abrir /qr. '
+            + 'Se o QR vier vazio, POST /reset-sessao-completo antes.\n\n'
+            + '(Este aviso se repete a cada 60 min entre 7h e 22h enquanto persistir.)',
+            { critico: true }
+          ).catch(() => {});
+
+          // UMA tentativa de socket novo, so para existir QR em /qr.
+          // Sem isto o qrAtual fica null para sempre (o evento 'qr' so vem de um
+          // socket vivo) e a propria instrucao acima nao funciona: o operador
+          // abre /qr e encontra tela vazia.
+          // Tentativa UNICA de proposito: se o WhatsApp derrubou a sessao do
+          // lado dele, insistir em loop pode ser lido como abuso. Se este
+          // socket tambem cair, nada e reagendado — resta o /reset-sessao-completo.
+          if (!_logoutSocketTentado) {
+            _logoutSocketTentado = true;
+            _persistirLogout();
+            console.log('[WA] Logout — subindo socket unico para gerar QR.');
+            _agendarReconexao(5000);
+          }
         } else {
           const delay = _delayReconexao(codigo);
           if (delay >= 0) _agendarReconexao(delay);
