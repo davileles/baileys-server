@@ -7868,6 +7868,34 @@ const filaRadar = []; // { id, mensagem, grupo, tentativas }
 let radarWorkerRodando = false;
 let radarUltimoEnvioMs = 0;
 
+// Fase 2: a filaRadar vivia SO em memoria — qualquer restart (deploy, crash,
+// degrau 3 do watchdog) descartava tudo que estava esperando o intervalo de
+// 3 min, e o retry desistia em 30s (3x10s): exatamente quando o socket cai por
+// alguns minutos, a oferta era jogada fora. Agora persiste (escrita atomica) a
+// cada mudanca e retenta com o mesmo backoff da outbox, com teto para nao girar
+// para sempre num destino envenenado.
+const FILA_RADAR_PATH = SESSAO_DIR + '/fila_radar.json';
+const RADAR_MAX_TENTATIVAS = 12;
+function salvarFilaRadar() {
+  try { escreverAtomico(FILA_RADAR_PATH, JSON.stringify(filaRadar)); }
+  catch (e) { console.error('[RADAR] Erro ao salvar fila:', e.message); }
+}
+function carregarFilaRadar() {
+  try {
+    if (!existsSync(FILA_RADAR_PATH)) return;
+    const lista = JSON.parse(readFileSync(FILA_RADAR_PATH, 'utf-8'));
+    if (Array.isArray(lista)) {
+      filaRadar.push(...lista.filter(x => x && x.mensagem && x.grupo));
+      if (filaRadar.length) console.log('[RADAR] ' + filaRadar.length + ' item(ns) recuperado(s) do disco.');
+    }
+  } catch (e) { console.error('[RADAR] Erro ao carregar fila:', e.message); }
+}
+carregarFilaRadar();
+// Retoma o worker depois que o socket do boot teve tempo de subir.
+if (filaRadar.length) {
+  setTimeout(() => { radarWorker().catch(e => { console.error('[RADAR] Worker erro:', e.message); radarWorkerRodando = false; }); }, 15000);
+}
+
 async function radarWorker() {
   if (radarWorkerRodando) return;
   radarWorkerRodando = true;
@@ -7892,16 +7920,26 @@ async function radarWorker() {
       console.log('[RADAR] Enviando oferta "' + item.id + '" para ' + item.grupo + ' (' + filaRadar.length + ' na fila)');
       await enviarMensagem(item.grupo, { text: item.mensagem });
       filaRadar.shift();
+      salvarFilaRadar();
       radarUltimoEnvioMs = Date.now();
       console.log('[RADAR] ✓ Oferta "' + item.id + '" enviada. Restam ' + filaRadar.length + '.');
     } catch(e) {
       console.error('[RADAR] ✗ Erro ao enviar "' + item.id + '":', e.message);
       item.tentativas = (item.tentativas || 0) + 1;
-      if (item.tentativas >= 3) {
-        console.error('[RADAR] Desistindo após 3 tentativas: ' + item.id);
+      if (item.tentativas >= RADAR_MAX_TENTATIVAS) {
+        console.error('[RADAR] Desistindo após ' + item.tentativas + ' tentativas: ' + item.id);
         filaRadar.shift();
+        salvarFilaRadar();
+        _avisarOperador('Radar CDV: desisti de enviar "' + item.id + '" para ' + (NOMES_GRUPOS.get(item.grupo) || item.grupo)
+          + ' apos ' + item.tentativas + ' tentativas. Ultimo erro: ' + e.message).catch(() => {});
+        continue;
       }
-      await new Promise(r => setTimeout(r, 10000));
+      salvarFilaRadar();
+      // Backoff crescente (1, 2, 5, 10, 20, 30 min): socket caido costuma voltar
+      // em minutos; martelar a cada 10s so queimava as tentativas.
+      const esperaRetry = outboxBackoffMs(item.tentativas);
+      console.log('[RADAR] Proxima tentativa em ' + Math.round(esperaRetry / 60000) + ' min.');
+      await new Promise(r => setTimeout(r, esperaRetry));
     }
   }
   radarWorkerRodando = false;
@@ -7917,6 +7955,7 @@ app.post('/radar/enviar', (req, res) => {
 
   const posicao = filaRadar.length;
   filaRadar.push({ id: id || ('r_' + Date.now()), mensagem, grupo: grupoId, tentativas: 0 });
+  salvarFilaRadar();
 
   const agora = Date.now();
   const decorrido = agora - radarUltimoEnvioMs;
