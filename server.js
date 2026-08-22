@@ -12,7 +12,7 @@ import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
-import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync } from 'fs/promises';
+import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync, stat as statAsync } from 'fs/promises';
 import { join } from 'path';
 import QRCode from 'qrcode';
 
@@ -5166,6 +5166,81 @@ function _agendarReconexao(delay) {
   if (_reconnectTimer) { clearTimeout(_reconnectTimer); }
   _reconnectTimer = setTimeout(() => { _reconnectTimer = null; conectar(); }, delay);
 }
+
+// ── FAXINA DE DISCO DO VOLUME ────────────────────────────────────────────────
+// O Baileys grava um arquivo por sessao (`session-<user>.<device>.json`) e um
+// por chave de grupo (`sender-key-...json`). Com 34 grupos e milhares de
+// participantes esses arquivos so crescem: nada no Baileys os expira. Em
+// 21/08/2026 o volume do Railway bateu 100% e o processo entrou em ENOSPC —
+// nao conseguia mais gravar creds, o watchdog escalou ate o degrau 3 e o
+// servico ficou 502 ate alguem intervir a mao.
+//
+// A faxina apaga por IDADE, nao por quantidade: sessao que nao e tocada ha
+// semanas e de contato que nao fala com a gente. Vale a mesma regra do reset:
+// `session-*` e `sender-key-*` sao seguros (o remetente redistribui via retry
+// receipt); `pre-key-*`, `creds.json` e `app-state-sync-*` NUNCA sao tocados,
+// sob pena de "Bad MAC" permanente ate novo QR.
+const FAXINA_DIAS   = Number(process.env.FAXINA_DIAS || 21);
+const FAXINA_INTERV = 6 * 60 * 60 * 1000;   // 6h
+
+async function faxinaDisco(motivo = 'periodica') {
+  const corte = Date.now() - FAXINA_DIAS * 24 * 60 * 60 * 1000;
+  let apagados = 0, mantidos = 0, bytes = 0;
+  try {
+    for (const arq of await readdir(SESSAO_DIR)) {
+      if (!(arq.startsWith('session-') || arq.startsWith('sender-key'))) continue;
+      const caminho = SESSAO_DIR + '/' + arq;
+      try {
+        const st = await statAsync(caminho);
+        if (st.mtimeMs < corte) {
+          bytes += st.size;
+          await unlink(caminho).catch(() => {});
+          apagados++;
+        } else { mantidos++; }
+      } catch (e) { /* arquivo sumiu no meio da varredura */ }
+    }
+    console.log('[FAXINA] ' + motivo + ': ' + apagados + ' arquivo(s) com mais de ' +
+      FAXINA_DIAS + ' dia(s) apagado(s) (' + Math.round(bytes / 1024) + ' KB), ' +
+      mantidos + ' mantido(s).');
+  } catch (e) {
+    console.error('[FAXINA] Erro:', e.message);
+  }
+  return { apagados, mantidos, bytes };
+}
+
+// Faxina de emergencia: ignora a idade e apaga do mais antigo para o mais novo
+// ate sobrar `alvo` arquivos. So e chamada quando o disco ja estourou — nesse
+// ponto perder segmentacao de sessao e barato perto de ficar fora do ar.
+async function faxinaEmergencia(alvo = 500) {
+  try {
+    const lista = [];
+    for (const arq of await readdir(SESSAO_DIR)) {
+      if (!(arq.startsWith('session-') || arq.startsWith('sender-key'))) continue;
+      try {
+        const st = await statAsync(SESSAO_DIR + '/' + arq);
+        lista.push({ arq, mtime: st.mtimeMs });
+      } catch (e) {}
+    }
+    if (lista.length <= alvo) return { apagados: 0, total: lista.length };
+    lista.sort((a, b) => a.mtime - b.mtime);
+    const cortar = lista.slice(0, lista.length - alvo);
+    for (const item of cortar) await unlink(SESSAO_DIR + '/' + item.arq).catch(() => {});
+    console.warn('[FAXINA] EMERGENCIA: ' + cortar.length + ' arquivo(s) apagado(s) — ' +
+      lista.length + ' passou do alvo de ' + alvo + '.');
+    return { apagados: cortar.length, total: lista.length };
+  } catch (e) {
+    console.error('[FAXINA] Erro na emergencia:', e.message);
+    return { apagados: 0, total: 0 };
+  }
+}
+
+// Endpoint manual: util quando o disco ja encheu e o painel e a unica via.
+app.post('/manutencao/faxina', async (req, res) => {
+  const emergencia = req.body?.emergencia === true;
+  const alvo = Number(req.body?.alvo || 500);
+  const r = emergencia ? await faxinaEmergencia(alvo) : await faxinaDisco('manual');
+  res.json({ ok: true, emergencia, ...r });
+});
 
 async function limparSessaoEReconectar() {
   if (isResetting) { console.log('[WA] Reset já em andamento, ignorando chamada duplicada.'); return; }
@@ -11453,6 +11528,15 @@ app.get('/historico-seats/rotas', (req, res) => {
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
+
+// Faxina do volume: uma no arranque (antes que o disco aperte de novo) e uma a
+// cada 6h. Roda solta de proposito — nada no boot deve esperar por ela.
+faxinaDisco('arranque').then(r => {
+  // Volume ja estourado no arranque: o corte por idade nao adiantou, entao
+  // apara pelo excedente. Sem isso o processo volta a ENOSPC em minutos.
+  if (r.apagados === 0 && r.mantidos > 2000) return faxinaEmergencia(500);
+}).catch(() => {});
+setInterval(() => { faxinaDisco('periodica').catch(() => {}); }, FAXINA_INTERV);
 
 // Vitrine publica: carrega o historico do disco e liga a varredura periodica
 // que mantem dados/feed.json e dados/cupons.json em dia no repositorio.
