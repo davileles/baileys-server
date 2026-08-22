@@ -1924,7 +1924,9 @@ function linkDoCupomTSP(loja, codigo, dados = {}) {
 function brlCupom(n) {
   const v = Number(n);
   if (!isFinite(v)) return String(n);
-  return Number.isInteger(v) ? String(v) : v.toFixed(2).replace('.', ',');
+  const [inteiro, dec] = Number.isInteger(v) ? [String(v), null] : v.toFixed(2).split('.');
+  const comMilhar = inteiro.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  return dec ? comMilhar + ',' + dec : comMilhar;
 }
 
 function varsDoCupomTSP(dados) {
@@ -1962,11 +1964,21 @@ function varsDoCupomTSP(dados) {
   // exatamente no teto. Com teto de PRODUTO, o desconto maximo e simplesmente o
   // percentual sobre esse teto — sao contas diferentes e a mensagem tem de dizer
   // qual delas esta mostrando.
+  // Teto UTIL do cupom: a partir dele o percentual ja bateu no limite e cada
+  // real a mais compra desconto nenhum. E a conta que o cliente faz de cabeca
+  // errado ("25% com limite de R$ 100" nao diz sozinho que a compra ideal e de
+  // R$ 400), entao a mensagem faz por ele.
+  const tetoUtil = (isPct && limite && Number(valor) > 0)
+    ? (() => {
+        const ideal = Math.ceil(100 * Number(limite) / Number(valor));
+        return maximo ? Math.min(ideal, Number(maximo)) : ideal;
+      })()
+    : null;
+  const teto_str = tetoUtil ? `Bom para compras de até R$ ${brlCupom(tetoUtil)}` : '';
+
   let importante = '';
-  if (isPct && limite && Number(valor) > 0) {
-    const ideal = Math.ceil(100 * Number(limite) / Number(valor));
-    const tetoIdeal = maximo ? Math.min(ideal, Number(maximo)) : ideal;
-    importante = `Ideal para compras de até R$ ${tetoIdeal}.`;
+  if (tetoUtil) {
+    importante = `Ideal para compras de até R$ ${brlCupom(tetoUtil)}.`;
   } else if (isPct && maximo) {
     const economia = Math.floor(Number(maximo) * Number(valor) / 100);
     importante = `Só vale para produtos de até R$ ${brlCupom(maximo)} — economia máxima de R$ ${economia}.`;
@@ -1978,8 +1990,12 @@ function varsDoCupomTSP(dados) {
   // dobrava a altura da mensagem sem acrescentar informacao.
   const curtas = [];
   if (temMin) curtas.push(`Acima de R$ ${brlCupom(minimo)}`);
-  if (maximo) curtas.push(`produtos até R$ ${brlCupom(maximo)}`);
-  if (isPct && limite) curtas.push(`limite de R$ ${brlCupom(limite)}`);
+  if (maximo && !tetoUtil) curtas.push(`produtos até R$ ${brlCupom(maximo)}`);
+  // Com teto calculado, ele entra no lugar do "limite de R$ X": os dois dizem a
+  // mesma coisa e o teto e o que orienta a compra. Sem teto (cupom de valor
+  // fixo em reais), o limite bruto e tudo o que ha para informar.
+  if (tetoUtil) curtas.push(`bom para compras de até R$ ${brlCupom(tetoUtil)}`);
+  else if (isPct && limite) curtas.push(`limite de R$ ${brlCupom(limite)}`);
   const condicao_curta = curtas.length
     ? curtas.join(' · ')
     : (dados.minimoDesconhecido ? 'Confira as condições na loja' : 'Sem valor mínimo');
@@ -1992,6 +2008,7 @@ function varsDoCupomTSP(dados) {
     valor_str:  `${valor}${tipoStr}`,
     validade,
     condicao_curta,
+    teto_str,
     codigo:     codigo ? String(codigo).toUpperCase() : '',
     importante,
     aviso:      String(dados.aviso || dados.observacao || '').trim(),
@@ -2092,7 +2109,7 @@ function formatarCupomLoteTSP(lista) {
   return renderTemplate(corpo, {
     ...base,
     codigo: '', valor_str: '', valor: '', validade: '', condicao_curta: '',
-    importante: '', aviso: '',
+    teto_str: '', importante: '', aviso: '',
     minimo: '', maximo: '', limite: '',
     itens, condicao_comum,
     qtd: String(lista.length),
