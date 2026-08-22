@@ -292,6 +292,27 @@ export async function processarTextoShopee(texto, opcoes = {}) {
 
     const p = normalizarShopee(node);
     if (!p.preco) { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
+
+    // ── MODO LEITURA ──────────────────────────────────────────────────────
+    // Para ANTES de marcarRastreio, e isso e obrigatorio, nao economia: aquele
+    // caminho passa por refDoDisparo(), que GRAVA uma atribuicao no ledger.
+    // Uma leitura de madrugada geraria atribuicao para produto que nunca foi
+    // divulgado, e o coletor de comissoes passaria a casar receita com um
+    // disparo que nao existiu. Tambem nao gera link de afiliado nem resolve
+    // cupom: leitura so precisa de preco.
+    // A checagem de p.link fica depois daqui de proposito — produto sem link
+    // de afiliado ainda tem preco valido para a serie.
+    if (opcoes.leitura) {
+      saida.push({ produto: {
+        asin: p.asin || String(p.itemId), itemId: p.itemId, shopId: p.shopId,
+        titulo: p.titulo || '', loja: 'Shopee',
+        preco: p.preco, precoDe: p.precoDe ?? null,
+        disponivel: p.disponivel !== false, link: p.link || '',
+      }, leitura: true });
+      if (ids.length > 1) await new Promise(r => setTimeout(r, 400));
+      continue;
+    }
+
     if (!p.link)  { saida.push({ produto: p, descartadoPor: 'sem link de afiliado' }); continue; }
 
     await marcarRastreio(p, node);
