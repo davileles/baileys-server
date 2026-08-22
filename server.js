@@ -774,6 +774,139 @@ function salvarFila() {
 
 const filaPendentes = [];
 carregarFila();
+
+// ── OUTBOX DE ENTREGAS QUE FALHARAM (Fase 2: nenhum disparo se perde) ────────
+// Nos despachos para varios grupos (oferta do radar, cupom), uma falha num
+// destino era SO registrada em `falhas` e devolvida ao chamador — que apenas
+// logava. Se o socket caia no destino 13 de 33, os 21 restantes falhavam um a
+// um e esses grupos NUNCA recebiam a oferta, com a funcao devolvendo "sucesso"
+// porque 12 sairam. Faturamento perdido em silencio.
+//
+// Esta outbox guarda, em disco, SO o que falhou, e um worker retenta com
+// backoff quando o socket volta. O caminho feliz (socket ok) nao muda uma
+// linha — a outbox so existe na excecao.
+//
+// Garantias e limites, de proposito:
+//   - Idempotente por (id, jid): o mesmo destino da mesma oferta entra uma vez.
+//     Quem ja recebeu no despacho original nunca esta aqui.
+//   - So o TENANT PADRAO entra. O retry roda fora do AsyncLocalStorage da
+//     requisicao original; retentar item de operador secundario sairia pelo
+//     numero ERRADO — a pior falha do modelo hospedado. Secundarios mantem o
+//     comportamento antigo (falha devolvida ao chamador).
+//   - Reenvia SO TEXTO: card de link (linkPreview, com thumbnail em bytes) e
+//     imagem de cupom nao sao persistidos. O link segue no texto e gera
+//     comissao igual; perder o card no retry e trivial perto de perder a oferta.
+//   - TTL: item com mais de OUTBOX_TTL_H horas e descartado sem enviar.
+//     Promocao que falhou ontem nao ressuscita hoje com preco/cupom vencido.
+//   - Teto de tentativas: destino envenenado (bot removido do grupo, grupo
+//     extinto) nao gira para sempre — desiste e avisa o operador.
+//   - Risco assumido: envio que falhou por 'timed out' mas foi entregue gera
+//     duplicata no retry. E o mesmo tradeoff do retry ja existente em
+//     enviarMensagem, e a alternativa (perder 21 grupos) e claramente pior.
+const OUTBOX_PATH           = SESSAO_DIR + '/outbox_falhas.json';
+const OUTBOX_MAX_TENTATIVAS = 12;
+const OUTBOX_TTL_MS         = Math.max(1, parseInt(process.env.OUTBOX_TTL_H || '6', 10)) * 60 * 60 * 1000;
+const outboxFalhas = [];   // { id, jid, texto, conta, origem, tentativas, proximaEm, criadoEm, ultimoErro }
+let _outboxRodando = false;
+
+// Backoff em minutos por tentativa: 1, 2, 5, 10, 20, 30, 30... (socket que
+// cai costuma voltar em minutos; nao adianta martelar a cada 10s).
+function outboxBackoffMs(tentativa) {
+  const m = [1, 2, 5, 10, 20, 30];
+  return m[Math.min(Math.max(tentativa, 1) - 1, m.length - 1)] * 60 * 1000;
+}
+
+function salvarOutbox() {
+  try { escreverAtomico(OUTBOX_PATH, JSON.stringify(outboxFalhas)); }
+  catch (e) { console.error('[OUTBOX] Erro ao salvar:', e.message); }
+}
+
+function carregarOutbox() {
+  try {
+    if (!existsSync(OUTBOX_PATH)) return;
+    const lista = JSON.parse(readFileSync(OUTBOX_PATH, 'utf-8'));
+    if (Array.isArray(lista)) {
+      outboxFalhas.push(...lista.filter(x => x && x.jid && x.texto));
+      if (outboxFalhas.length) console.log('[OUTBOX] ' + outboxFalhas.length + ' entrega(s) pendente(s) recuperada(s) do disco.');
+    }
+  } catch (e) { console.error('[OUTBOX] Erro ao carregar:', e.message); }
+}
+
+// Chamado no catch dos despachos. Devolve true se enfileirou.
+function outboxEnfileirar({ id, jid, texto, conta, origem, erro }) {
+  try {
+    if (!jid || !texto) return false;
+    if ((tenantContexto() || TENANT_PADRAO) !== TENANT_PADRAO) return false;   // ver cabecalho
+    const chaveId = String(id || '');
+    if (outboxFalhas.some(x => x.id === chaveId && x.jid === jid)) return false; // idempotente
+    outboxFalhas.push({
+      id: chaveId, jid, texto,
+      conta: (conta && conta !== 'principal') ? conta : null,
+      origem: origem || 'envio',
+      tentativas: 0,
+      proximaEm: Date.now() + outboxBackoffMs(1),
+      criadoEm: Date.now(),
+      ultimoErro: erro || null,
+    });
+    salvarOutbox();
+    console.warn('[OUTBOX] Entrega guardada para retry: ' + (origem || 'envio') + ' #' + chaveId + ' -> ' + jid + ' (' + outboxFalhas.length + ' pendente(s)).');
+    return true;
+  } catch (e) { console.error('[OUTBOX] Erro ao enfileirar:', e.message); return false; }
+}
+
+async function outboxWorker() {
+  if (_outboxRodando) return;
+  _outboxRodando = true;
+  try {
+    const agora = Date.now();
+    // TTL primeiro: o que envelheceu sai sem ser enviado.
+    let mudou = false;
+    for (let i = outboxFalhas.length - 1; i >= 0; i--) {
+      const it = outboxFalhas[i];
+      if (agora - (it.criadoEm || agora) > OUTBOX_TTL_MS) {
+        console.warn('[OUTBOX] Descartando entrega expirada (' + Math.round(OUTBOX_TTL_MS / 3600000) + 'h): ' + it.origem + ' #' + it.id + ' -> ' + it.jid);
+        outboxFalhas.splice(i, 1); mudou = true;
+      }
+    }
+    if (mudou) salvarOutbox();
+    if (!outboxFalhas.length) return;
+    if (!conectado || !sock) return;   // socket caido: os itens esperam o proximo ciclo
+
+    const prontos = outboxFalhas.filter(x => (x.proximaEm || 0) <= agora);
+    for (const item of prontos) {
+      if (!conectado || !sock) break;  // caiu no meio: para e volta no proximo ciclo
+      try {
+        await enviarMensagem(item.jid, { text: item.texto }, 0, item.conta ? { conta: item.conta } : {});
+        const idx = outboxFalhas.indexOf(item);
+        if (idx >= 0) outboxFalhas.splice(idx, 1);
+        salvarOutbox();
+        console.log('[OUTBOX] ✓ Entrega recuperada: ' + item.origem + ' #' + item.id + ' -> ' + item.jid
+          + ' (tentativa ' + (item.tentativas + 1) + '; ' + outboxFalhas.length + ' restante(s)).');
+        if (outboxFalhas.length) await new Promise(r => setTimeout(r, msEntreGrupos()));
+      } catch (e) {
+        item.tentativas = (item.tentativas || 0) + 1;
+        item.ultimoErro = e.message;
+        if (item.tentativas >= OUTBOX_MAX_TENTATIVAS) {
+          const idx = outboxFalhas.indexOf(item);
+          if (idx >= 0) outboxFalhas.splice(idx, 1);
+          console.error('[OUTBOX] ✗ Desistindo apos ' + item.tentativas + ' tentativas: ' + item.origem + ' #' + item.id + ' -> ' + item.jid + ': ' + e.message);
+          _avisarOperador('Outbox: desisti de entregar ' + item.origem + ' #' + item.id + ' no grupo '
+            + (NOMES_GRUPOS.get(item.jid) || item.jid) + ' apos ' + item.tentativas + ' tentativas.\nUltimo erro: ' + e.message
+            + '\nSe o bot foi removido do grupo, ajuste os destinos na aba Grupos.').catch(() => {});
+        } else {
+          item.proximaEm = Date.now() + outboxBackoffMs(item.tentativas);
+          console.warn('[OUTBOX] Falha (' + item.tentativas + '/' + OUTBOX_MAX_TENTATIVAS + ') ' + item.origem + ' #' + item.id + ' -> ' + item.jid
+            + ': ' + e.message + '. Proxima em ' + Math.round(outboxBackoffMs(item.tentativas) / 60000) + ' min.');
+        }
+        salvarOutbox();
+      }
+    }
+  } catch (e) { console.error('[OUTBOX] Erro no ciclo:', e.message); }
+  finally { _outboxRodando = false; }
+}
+
+carregarOutbox();
+setInterval(() => { outboxWorker().catch(() => {}); }, 60 * 1000).unref?.();
 let contadorId = filaPendentes.length > 0
   ? filaPendentes.reduce((max, o) => Math.max(max, parseInt(o.id)||0), 0) + 1
   : 1;
@@ -2498,6 +2631,7 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
   // Mesma conta em todos os grupos: o cupom e as copias dele saem juntos, e
   // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
   const op = { conta: contaDoTurno() };
+  const _execId = oferta?.id ? String(oferta.id) : ('c_' + Date.now());
   // Sentinela do modo so-admins: detecta o descarte silencioso antes do despacho.
   await verificarAdminGruposCupons(op.conta);
   // Cupom e de LOJA, nao de produto: nao tem categoria para casar com nicho.
@@ -2540,6 +2674,7 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
     } catch(e) {
       console.error('[CUPONS] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
+      outboxEnfileirar({ id: _execId, jid, texto, conta: op.conta, origem: 'cupom', erro: e.message });
     }
   }
 
@@ -2770,6 +2905,9 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   const enviados = [], falhas = [];
   const preview = oferta ? await montarLinkPreview(oferta, mensagem) : null;
   const op = { conta: contaDoTurno() };
+  // Um id por despacho: todos os destinos desta execucao compartilham a chave
+  // de idempotencia da outbox (id, jid).
+  const _execId = oferta?.id ? String(oferta.id) : ('o_' + Date.now());
 
   for (const jid of alvos) {
     if (soCupons.has(jid)) continue;
@@ -2791,6 +2929,7 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
     } catch (e) {
       console.error('[MKT] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
+      outboxEnfileirar({ id: _execId, jid, texto, conta: op.conta, origem: 'oferta', erro: e.message });
     }
   }
   if (!enviados.length) throw new Error('Nenhum grupo recebeu a oferta.');
