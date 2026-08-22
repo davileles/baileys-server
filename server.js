@@ -344,11 +344,17 @@ process.on('unhandledRejection', (err) => console.error('[FATAL] unhandledReject
 // na base de cupons durante os redeploys, e nao uma segunda rotina escrevendo
 // por cima.
 let _encerrando = false;
-async function encerrarComFlush(sinal) {
+// `codigo` decide se o Railway ressuscita o container. SIGTERM/SIGINT saem com
+// 0 (encerramento pedido pela plataforma). Ja o restart de autocura PRECISA
+// sair com codigo != 0: com exit(0) o Railway entende que o processo terminou
+// com sucesso e NAO sobe container novo — foi o que derrubou o servico das
+// 12:46 do dia 22/08/2026 (degrau 3 do watchdog matou o processo e ninguem
+// subiu no lugar; todo o painel ficou em 502 ate o proximo deploy).
+async function encerrarComFlush(sinal, codigo = 0) {
   if (_encerrando) return;                 // SIGTERM seguido de SIGINT nao reentra
   _encerrando = true;
   const pendentes = pushesPendentes();
-  if (!pendentes.length) { console.log('[SYNC] ' + sinal + ' — nada no debounce.'); process.exit(0); }
+  if (!pendentes.length) { console.log('[SYNC] ' + sinal + ' — nada no debounce.'); process.exit(codigo); }
 
   console.log('[SYNC] ' + sinal + ' — enviando ' + pendentes.length + ' arquivo(s) do debounce: '
     + pendentes.join(', '));
@@ -363,7 +369,7 @@ async function encerrarComFlush(sinal) {
     if (r === estourou) console.error('[SYNC] Flush nao terminou em 20s — pode haver perda: ' + pendentes.join(', '));
     else console.log('[SYNC] Flush concluido no encerramento.');
   } catch (e) { console.error('[SYNC] Falha no flush de encerramento:', e.message); }
-  process.exit(0);
+  process.exit(codigo);
 }
 process.on('SIGTERM', () => encerrarComFlush('SIGTERM'));
 process.on('SIGINT',  () => encerrarComFlush('SIGINT'));
@@ -5667,6 +5673,23 @@ function _replacerSemThumb(chave, valor) {
   return BufferJSON.replacer.call(this, chave, valor);
 }
 
+// Segunda camada, agora para a MEMORIA. O replacer acima protege o disco, mas
+// o objeto guardado no Map continuava com o thumb: 4000 mensagens x ~30 KB sao
+// ~120 MB de RAM parada. Aqui a poda e IN-PLACE (delete no proprio objeto), sem
+// clonar: o clone da versao de 21/08 destruia o prototipo do protobuf e
+// quebrava a gravacao com "this.constructor.toObject is not a function".
+// Deletar depois do envio e inofensivo — a thumbnail so serve ao preview de
+// quem envia, e o reenvio por retry receipt busca a midia real no CDN.
+function _podarThumbInPlace(m, prof = 0) {
+  if (!m || typeof m !== 'object' || Buffer.isBuffer(m) || prof > 8) return m;
+  for (const k of Object.keys(m)) {
+    if (k === 'jpegThumbnail' || k === 'thumbnail') { try { delete m[k]; } catch (e) {} continue; }
+    const v = m[k];
+    if (v && typeof v === 'object' && !Buffer.isBuffer(v)) _podarThumbInPlace(v, prof + 1);
+  }
+  return m;
+}
+
 const mensagensEnviadas = new Map(); // id -> { m: mensagem, em: ms }
 
 function obterMensagemEnviada(id) {
@@ -5723,7 +5746,9 @@ function _agendarSalvarEnviadas() {
       // as thumbnails dentro e e ele que precisa encolher — sem isso o store so
       // seria podado no proximo envio, e o disco cheio nao espera.
       if (r?.m && agora - (r.em || 0) <= ENVIADAS_TTL_MS) {
-        mensagensEnviadas.set(id, { em: r.em, m: r.m });
+        // Arquivo gravado por versao antiga pode trazer thumbnail dentro: poda
+        // aqui tambem, senao a RAM carrega o legado ate o TTL expirar.
+        mensagensEnviadas.set(id, { em: r.em, m: _podarThumbInPlace(r.m) });
         n++;
       }
     }
@@ -5736,7 +5761,7 @@ function _agendarSalvarEnviadas() {
 function guardarMensagemEnviada(info) {
   try {
     if (info?.key?.id && info.message) {
-      mensagensEnviadas.set(info.key.id, { m: info.message, em: Date.now() });
+      mensagensEnviadas.set(info.key.id, { m: _podarThumbInPlace(info.message), em: Date.now() });
       _agendarSalvarEnviadas();
     }
   } catch(e) {}
@@ -5827,6 +5852,10 @@ const SURDEZ_FIM_H         = 22;
 const SURDEZ_SILENCIO_MS   = 20 * 60 * 1000;     // 20 min sem NENHUM upsert = surdo
 const SURDEZ_POS_CURA_MS   = 10 * 60 * 1000;     // espera pos-reconexao antes de alertar
 const SURDEZ_REAVISO_MS    = 60 * 60 * 1000;
+// Valvula de escape: SURDEZ_EXIT=off desliga APENAS o degrau 3 (matar o
+// processo). Os degraus 1 e 2 e os alertas continuam. Serve para os casos em
+// que reiniciar custa mais caro que ficar surdo por algumas horas.
+const SURDEZ_EXIT_LIGADO   = String(process.env.SURDEZ_EXIT || 'on').toLowerCase() !== 'off';
 
 const _bootEm = Date.now();
 let _watchdogAvisoEm = 0;
@@ -5965,7 +5994,11 @@ setInterval(async () => {
     if (_surdezEstado === 'cura2') {
       if (agora - _surdezCuraEm < SURDEZ_POS_CURA_MS) return;
       const ultimoExit = _health.ultimoExitEm || 0;
-      if (agora - ultimoExit < EXIT_COOLDOWN_MS) {
+      if (!SURDEZ_EXIT_LIGADO) {
+        console.warn('[WATCHDOG] Degrau 3 desligado por SURDEZ_EXIT=off. Indo direto para alerta.');
+        _surdezEstado  = 'alertado';
+        _surdezAvisoEm = agora;
+      } else if (agora - ultimoExit < EXIT_COOLDOWN_MS) {
         console.warn('[WATCHDOG] Degrau 3 pulado: ja houve restart ha menos de 60 min. Indo direto para alerta.');
         _surdezEstado  = 'alertado';
         _surdezAvisoEm = agora;
@@ -5982,7 +6015,9 @@ setInterval(async () => {
           { critico: true }
         ).catch(() => {});
         // encerrarComFlush faz o flush da fila e chama process.exit.
-        setTimeout(() => { encerrarComFlush('watchdog-surdez-degrau3'); }, 1500);
+        // Codigo 1: sem isso o Railway trata a saida como sucesso e o container
+        // nao volta — o remedio vira a doenca.
+        setTimeout(() => { encerrarComFlush('watchdog-surdez-degrau3', 1); }, 1500);
         return;
       }
     } else if (agora - _surdezAvisoEm < SURDEZ_REAVISO_MS) {
