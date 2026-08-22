@@ -5655,15 +5655,16 @@ const ENVIADAS_MAX_MB = Number(process.env.ENVIADAS_MAX_MB || 20);
 // retry receipt nao depende dela (a midia real vive no CDN do WhatsApp, o
 // destinatario baixa por directPath). Guardar o thumb no store e pagar 30 KB
 // por mensagem para nada.
-function _semThumb(m) {
-  if (!m || typeof m !== 'object') return m;
-  const out = Array.isArray(m) ? [] : {};
-  for (const k in m) {
-    if (k === 'jpegThumbnail' || k === 'thumbnail') continue;
-    const v = m[k];
-    out[k] = (v && typeof v === 'object' && !Buffer.isBuffer(v)) ? _semThumb(v) : v;
-  }
-  return out;
+//
+// A poda acontece na SERIALIZACAO, nao no objeto. A versao anterior clonava a
+// mensagem campo a campo para tirar o thumb — e o clone virava objeto simples,
+// perdendo o prototipo do protobuf do Baileys. Na hora de gravar, quebrava com
+// "this.constructor.toObject is not a function" e o enviadas.json parou de ser
+// persistido inteiro (22/08/2026). Um replacer descarta a chave no JSON e
+// deixa o objeto em memoria intacto para o getMessage.
+function _replacerSemThumb(chave, valor) {
+  if (chave === 'jpegThumbnail' || chave === 'thumbnail') return undefined;
+  return BufferJSON.replacer.call(this, chave, valor);
 }
 
 const mensagensEnviadas = new Map(); // id -> { m: mensagem, em: ms }
@@ -5694,7 +5695,7 @@ function _agendarSalvarEnviadas() {
       for (;;) {
         const obj = {};
         for (const [id, r] of mensagensEnviadas) obj[id] = { em: r.em, m: r.m };
-        payload = JSON.stringify(obj, BufferJSON.replacer);
+        payload = JSON.stringify(obj, _replacerSemThumb);
         if (Buffer.byteLength(payload) <= limite || mensagensEnviadas.size <= 50) break;
         const descartar = Math.max(1, Math.floor(mensagensEnviadas.size * 0.2));
         for (let i = 0; i < descartar; i++) {
@@ -5722,7 +5723,7 @@ function _agendarSalvarEnviadas() {
       // as thumbnails dentro e e ele que precisa encolher — sem isso o store so
       // seria podado no proximo envio, e o disco cheio nao espera.
       if (r?.m && agora - (r.em || 0) <= ENVIADAS_TTL_MS) {
-        mensagensEnviadas.set(id, { em: r.em, m: _semThumb(r.m) });
+        mensagensEnviadas.set(id, { em: r.em, m: r.m });
         n++;
       }
     }
@@ -5735,7 +5736,7 @@ function _agendarSalvarEnviadas() {
 function guardarMensagemEnviada(info) {
   try {
     if (info?.key?.id && info.message) {
-      mensagensEnviadas.set(info.key.id, { m: _semThumb(info.message), em: Date.now() });
+      mensagensEnviadas.set(info.key.id, { m: info.message, em: Date.now() });
       _agendarSalvarEnviadas();
     }
   } catch(e) {}
