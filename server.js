@@ -43,8 +43,6 @@ import {
   listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
   podeCapturar, LOJAS_MONITORAVEIS, semearMonitorDasFontes,
-  jaDivulgado, registrarVisto, descontoMinimoRadar, horasDedup,
-  podeLerPreco, registrarLeitura, leituraForaJanelaAtiva,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
   recarregarRadarTenants, refDeterministico,
 } from './radar-amazon.js';
@@ -65,7 +63,6 @@ import {
   simular as simularPrecos, descartarCandidato, publicarAgora as publicarPrecoAgora,
   carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
   semearVitrinePorDesempenho, rankingEpc, estadoEpc,
-  registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -546,6 +543,16 @@ app.use((req, res, next) => {
 let sock         = null;
 let conectado    = false;
 let qrAtual      = null;
+
+// ── PAREAMENTO POR CODIGO (sem QR) ──────────────────────────────────────────
+// Alternativa ao QR para quando so ha o celular em maos: o WhatsApp aceita
+// vincular um dispositivo digitando um codigo de 8 caracteres em
+// Dispositivos conectados > Conectar dispositivo > Conectar com numero de
+// telefone. Exige sessao NAO registrada — por isso /pair reseta antes.
+let pairNumero   = null;   // numero alvo, so digitos, com DDI (ex 5511999999999)
+let pairCodigo   = null;   // codigo de 8 caracteres devolvido pelo WhatsApp
+let pairErro     = null;   // ultima falha ao solicitar o codigo
+let pairPedidoEm = 0;      // timestamp do pedido (expira em 10 min)
 
 // ── GERENCIADOR DE CONEXÃO ────────────────────────────────────────────────────
 // Flag que indica se já existe um processo de conexão ativo.
@@ -1052,7 +1059,11 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
   const contaId = opcoes.conta;
   if (contaId && contaId !== 'principal' && tentativa === 0) {
     if (contaDisponivel(contaId)) {
-      try { return await enviarPelaConta(contaId, destino, conteudo); }
+      try {
+        const _r = await enviarPelaConta(contaId, destino, conteudo);
+        registrarPublicacaoHealth(destino);
+        return _r;
+      }
       catch (e) {
         console.warn('[WA] Envio pela conta ' + contaId + ' falhou (' + e.message + ') — indo pela principal.');
         const c = contasExtras.get(contaId); if (c) c.ultimoErro = e.message;
@@ -1069,6 +1080,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
   try {
     const resultado = await sock.sendMessage(destino, conteudo);
     guardarMensagemEnviada(resultado);
+    registrarPublicacaoHealth(destino);
     return resultado;
   } catch (err) {
     const retryable = err.message?.includes('Connection Closed') ||
@@ -2983,25 +2995,9 @@ async function registrarEnvioHistorico(oferta) {
       codigo:        d.codigo || (d.cupom && d.cupom.codigo) || null,
       valor:         d.valor ?? null,           // cupom: 12 / 'pct' ou 30 / 'reais'
       tipo:          d.tipo ?? null,
-      // ── PRECOS ──
-      // Ate aqui so 'preco' e 'precoFinal' eram gravados, e 'desconto' misturava
-      // duas unidades: REAIS quando havia cupom, PERCENTUAL quando nao havia.
-      // Consequencia: em toda oferta com cupom o de->por era sobrescrito e
-      // perdido — 262 das 297 ofertas ML de agosto ficaram sem ele. Sem o
-      // de->por nao ha como calibrar o piso de desconto com numero real.
-      // O campo 'desconto' fica como estava para nao quebrar consumidor antigo.
-      precoDe:       d.precoDe ?? null,          // de (etiqueta da loja)
-      preco:         d.preco ?? null,            // por (praticado)
-      precoFinal:    d.precoFinal ?? null,       // com cupom
+      preco:         d.preco ?? null,
+      precoFinal:    d.precoFinal ?? null,
       desconto:      (d.cupom && d.cupom.desconto) ?? d.desconto ?? null,
-      descontoPct:   (Number(d.precoDe) > 0 && Number(d.preco) > 0 && d.precoDe > d.preco)
-                       ? Math.round(1000 * (d.precoDe - d.preco) / d.precoDe) / 10 : null,
-      cupomReais:    (d.cupom && Number(d.cupom.desconto) > 0) ? Number(d.cupom.desconto) : null,
-      cupomPct:      (d.cupom && Number(d.cupom.desconto) > 0 && Number(d.preco) > 0)
-                       ? Math.round(1000 * d.cupom.desconto / d.preco) / 10 : null,
-      descontoTotalPct: (Number(d.precoDe) > 0 && Number(d.precoFinal) > 0 && d.precoDe > d.precoFinal)
-                       ? Math.round(1000 * (d.precoDe - d.precoFinal) / d.precoDe) / 10 : null,
-      precoDeReferencia: !!d.precoDeReferencia,  // 'de' que veio do texto do grupo, nao de fonte verificavel
       asin:          d.asin || null,
       link:          d.link || d.urlLoja || null,
       origem:        oferta.grupoOrigem || oferta.origem || null,
@@ -3016,25 +3012,6 @@ async function registrarEnvioHistorico(oferta) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(caminho, JSON.stringify({ registros: regs }), 'utf-8');
     agendarPush(local);
-
-    // ── DIVULGADO: marca o dedup e coloca o produto sob vigilancia de preco ──
-    // Este e o unico ponto por onde TODA oferta enviada passa, venha da fila,
-    // do auto-envio ou de uma lista. Marcar o dedup aqui e nao na captura e
-    // deliberado: produto capturado e descartado nao consumiu divulgacao
-    // nenhuma e precisa continuar elegivel.
-    if (ehOfertaMarketplace(oferta.tipoConteudo) && d.asin) {
-      try { registrarVisto({ asin: d.asin, loja: d.loja, preco: d.preco }); }
-      catch (e) { console.warn('[DEDUP] Falha ao marcar ' + d.asin + ':', e.message); }
-      // Vigilancia de preco: entra pela DIVULGACAO, nao pela captura. Captura
-      // sao ~100 produtos/dia e a lista estouraria; divulgado sao ~20 distintos.
-      try {
-        vigiarProdutoDivulgado({
-          asin: d.asin, loja: d.loja, nome: d.titulo,
-          url: d.link || d.urlLoja || null,
-          preco: Number(d.preco), precoDe: Number(d.precoDe),
-        });
-      } catch (e) { console.warn('[PRECOS] Falha ao vigiar ' + d.asin + ':', e.message); }
-    }
   } catch (e) {
     console.warn('[HIST-ENVIOS] Falha ao registrar #' + (oferta && oferta.id) + ':', e.message);
   }
@@ -5010,37 +4987,6 @@ async function baixarImagemProduto(url) {
   return null;
 }
 
-/**
- * Doa para a serie de precos o que uma leitura fora da janela encontrou.
- *
- * Duas coisas que esta funcao NAO faz, de proposito:
- *   1. nao chama registrarVisto() — o dedup e do DISPARO. Se a leitura das 03h
- *      marcasse o produto como visto, ele entraria na janela das 09h ja
- *      descartado, e a leitura teria custado uma divulgacao.
- *   2. nao enfileira nem avalia gatilho — leitura e so leitura.
- */
-async function lerPrecosParaSerie(produtos, jid, motivo) {
-  let gravados = 0, freados = 0;
-  for (const p of produtos || []) {
-    if (!p?.asin || !Number.isFinite(p.preco)) continue;
-    const freio = podeLerPreco(p);
-    if (!freio.ok) { freados++; continue; }
-    registrarLeitura(p);
-    try {
-      registrarLeituraPreco(p.asin, {
-        nome: p.titulo, loja: p.loja, preco: p.preco,
-        precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
-      });
-      gravados++;
-    } catch (e) { console.warn('[LEITURA] Falha ao gravar serie de ' + p.asin + ':', e.message); }
-  }
-  if (gravados || freados) {
-    console.log('[LEITURA] ' + jid.split('@')[0] + ' (' + motivo + ') — '
-      + gravados + ' preco(s) na serie' + (freados ? ', ' + freados + ' freado(s)' : '') + '.');
-  }
-  return { gravados, freados };
-}
-
 async function processarRadarMarketplace(jid, texto) {
   if (!texto) return;
 
@@ -5055,28 +5001,12 @@ async function processarRadarMarketplace(jid, texto) {
     try { resultados.push(...await processarTextoAmazon(texto)); }
     catch (e) { console.error('[MKT] Falha no pipeline Amazon:', e.message); }
   } else if (/amazon|amzn|a\.co/i.test(texto)) {
-    if (podeAmazon.modo === 'leitura' && leituraForaJanelaAtiva()) {
-      // O pipeline da Amazon nao gera link de afiliado (a tag e aplicada depois,
-      // no envio), entao ele ja serve de leitura sem nenhuma adaptacao.
-      try {
-        const lidos = await processarTextoAmazon(texto);
-        await lerPrecosParaSerie(lidos.map(r => r.produto), jid, podeAmazon.motivo);
-      } catch (e) { console.warn('[LEITURA] Amazon:', e.message); }
-    } else {
-      console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
-    }
+    console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
   }
 
   if (ehLinkMl(texto)) {
     const podeMl = podeCapturar(jid, 'Mercado Livre');
-    if (!podeMl.ok && podeMl.modo === 'leitura' && leituraForaJanelaAtiva() && credenciaisMlOk()) {
-      // Fora da janela: le preco e alimenta a serie, mas NAO gera link nem
-      // enfileira. Sem incorporar cupom — cupom so importa para quem vai sair.
-      try {
-        const lidos = await processarTextoMl(texto, { leitura: true });
-        await lerPrecosParaSerie(lidos.map(r => r.produto), jid, podeMl.motivo);
-      } catch (e) { console.warn('[LEITURA] ML:', e.message); }
-    } else if (!podeMl.ok) {
+    if (!podeMl.ok) {
       console.log('[MONITOR] ML ignorado em ' + jid.split('@')[0] + ' — ' + podeMl.motivo);
     } else if (!credenciaisMlOk()) {
       console.warn('[ML] Link detectado mas ML_CLIENT_ID/ML_CLIENT_SECRET nao configurados.');
@@ -5131,35 +5061,6 @@ async function processarRadarMarketplace(jid, texto) {
       continue;
     }
     const p = r.produto;
-
-    // ── SERIE DE PRECOS ───────────────────────────────────────────────────
-    // Dentro da janela tambem se le: o dado ja esta na mao, e a serie fica com
-    // pontos intradiarios que a varredura horaria sozinha nao pega.
-    try {
-      registrarLeituraPreco(p.asin, {
-        nome: p.titulo, loja: p.loja, preco: p.preco,
-        precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
-      });
-    } catch (e) { /* serie e conveniencia: nunca segura o pipeline */ }
-
-    // ── GATE CENTRAL: DEDUP + PISO DE DESCONTO ────────────────────────────
-    // Estes dois gates sairam dos pipelines de loja com a promessa de subirem
-    // para ca e NUNCA subiram: jaDivulgado/registrarVisto ficaram exportados e
-    // sem nenhum chamador, radar_vistos.json nunca foi escrito, e
-    // 'descontoMinimo'/'dedupHoras' seguiam editaveis em tela sem fazer nada.
-    // O custo apareceu em 21/08: 7 pares do mesmo produto ML sairam para os
-    // mesmos 22 grupos com 2 a 4 minutos de intervalo.
-    if (jaDivulgado(p)) {
-      console.log('[MKT] ' + (p.asin || '?') + ' descartado — ja divulgado nas ultimas '
-        + horasDedup() + 'h (' + (p.titulo || '').slice(0, 50) + ')');
-      continue;
-    }
-    const _pisoDesc = descontoMinimoRadar();
-    if (!p.ehDeal && Number(p.desconto || 0) < _pisoDesc) {
-      console.log('[MKT] ' + (p.asin || '?') + ' descartado — desconto '
-        + Number(p.desconto || 0) + '% abaixo do piso de ' + _pisoDesc + '%');
-      continue;
-    }
 
     // Cupom citado no post original que nao existe na base: sem a regra
     // (percentual, minimo, teto) o radar nao calcula o desconto e a oferta sai
@@ -5228,36 +5129,6 @@ async function processarRadarMarketplace(jid, texto) {
       try { semearCacheTrilhas({ [p.asin]: { ...p.trilha, fonte: 'pagina-' + String(p.loja || '').toLowerCase() } }); }
       catch (e) { /* cache e conveniencia: falha aqui nunca segura o pipeline */ }
     }
-
-    // ── VEREDITO PELO HISTORICO DE PRECO (SOMBRA) ─────────────────────────
-    // Anexa a estatistica do proprio produto e diz se ele PASSARIA num gate por
-    // historico — sem descartar nada. O 'de' da loja e etiqueta declarada; a
-    // mediana de 30 dias e o que o produto realmente custou. Em sombra por
-    // desenho: enquanto a serie nao tiver maturidade, quase tudo cai em
-    // 'sem serie' e um gate ligado agora cortaria no escuro. Ausencia de dado
-    // nunca pode virar sinal.
-    try {
-      const _st = estatisticasPreco(p.asin);
-      if (_st) {
-        const _ref = _st.mediana30 ?? null;
-        const _final = Number(r.precoFinal ?? p.preco);
-        oferta.dadosExtraidos.stats = {
-          dias: _st.dias, min90: _st.min90, mediana30: _st.mediana30,
-          dePor: _st.dePor || null,
-          quedaVsMediana: (_ref > 0 && Number.isFinite(_final))
-            ? Math.round(1000 * (_ref - _final) / _ref) / 10 : null,
-          veredito: _st.dias < 5 ? 'sem maturidade'
-                  : (_ref > 0 && _final >= _ref) ? 'REPROVARIA: nao caiu contra a mediana de 30d'
-                  : 'passaria',
-          modo: 'sombra',
-        };
-        console.log('[SOMBRA] ' + (p.asin || '?') + ' — ' + oferta.dadosExtraidos.stats.veredito
-          + ' (serie ' + _st.dias + 'd, mediana30 ' + (_ref ?? '—')
-          + ', agora ' + _final + ')');
-      } else {
-        oferta.dadosExtraidos.stats = { dias: 0, veredito: 'sem serie', modo: 'sombra' };
-      }
-    } catch (e) { /* sombra nunca segura o pipeline */ }
 
     const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
     oferta.dadosExtraidos.categoria          = _cls.categoria;
@@ -6068,9 +5939,22 @@ function _salvarHealth() {
 //      -> (process.exit no proprio degrau 2+: Railway sobe container novo)
 //      -> alertado (esgotou o automatico; so novo QR resolve)
 // Voltar a receber upsert em qualquer degrau derruba o estado para 'ok'.
-let _surdezEstado  = 'ok';
-let _surdezCuraEm  = 0;
-let _surdezAvisoEm = 0;
+// 22/08/2026: a escada vivia SO em memoria. Como o degrau 3 e o proprio deploy
+// reiniciam o processo, todo restart devolvia o estado para 'ok' e a regua
+// recomecava do zero (20 min + 10 + 10 = 40 min de silencio novo a cada
+// restart) — foi assim que um dia inteiro de surdez passou sem alerta. Agora os
+// marcos vivem em health.json e sobrevivem ao container novo.
+let _surdezEstado  = _health.surdezEstado  || 'ok';
+let _surdezCuraEm  = _health.surdezCuraEm  || 0;
+let _surdezAvisoEm = _health.surdezAvisoEm || 0;
+
+function _persistirSurdez() {
+  _health.surdezEstado  = _surdezEstado;
+  _health.surdezCuraEm  = _surdezCuraEm;
+  _health.surdezAvisoEm = _surdezAvisoEm;
+  _healthGravadoEm = 0;   // marco de escada e raro: grava na hora, sem throttle
+  _salvarHealth();
+}
 
 // Guarda contra restart em loop: se o creds.json estiver mesmo morto, o degrau
 // o degrau 3 se repetiria a cada ciclo eternamente. Um exit por hora, no maximo —
@@ -6126,6 +6010,8 @@ function registrarUpsertHealth() {
   if (_surdezEstado !== 'ok') {
     const estadoAnterior = _surdezEstado;
     _surdezEstado = 'ok';
+    _surdezCuraEm = 0; _surdezAvisoEm = 0;
+    _persistirSurdez();
     console.log('[WATCHDOG] Inbound recebendo upserts de novo (estava: ' + estadoAnterior + ').');
     if (estadoAnterior === 'alertado') {
       _avisarOperador('OK — Watchdog: inbound do WhatsApp voltou a receber mensagens. Sistema normalizado.').catch(() => {});
@@ -6152,7 +6038,10 @@ setInterval(async () => {
     if (!conectado || !sock) return;              // queda real tem tratamento proprio
     const agora = Date.now();
     if (agora - _bootEm < 10 * 60 * 1000) return; // carencia de aquecimento pos-boot
-    const ref      = Math.max(_health.ultimoUpsertEm || 0, _bootEm);
+    // NAO usar Math.max(..., _bootEm) aqui: isso fazia cada restart renovar a
+    // carencia inteira — exatamente o defeito (c) que a v2 dizia ter corrigido.
+    // O boot so serve de referencia quando nunca houve upsert nenhum.
+    const ref      = _health.ultimoUpsertEm || _bootEm;
     const silencio = agora - ref;
     if (silencio < SURDEZ_SILENCIO_MS) return;
 
@@ -6160,6 +6049,7 @@ setInterval(async () => {
     if (_surdezEstado === 'ok') {
       _surdezEstado = 'cura1';
       _surdezCuraEm = agora;
+      _persistirSurdez();
       console.warn('[WATCHDOG] Socket surdo ha ' + Math.round(silencio / 60000) + ' min (zero upserts). Degrau 1: reconexao de socket...');
       try { forcarReconexao('watchdog-surdez'); } catch (e) { console.error('[WATCHDOG] Degrau 1 falhou:', e.message); }
       return;
@@ -6170,6 +6060,7 @@ setInterval(async () => {
       if (agora - _surdezCuraEm < SURDEZ_POS_CURA_MS) return;
       _surdezEstado = 'cura2';
       _surdezCuraEm = agora;
+      _persistirSurdez();
       console.warn('[WATCHDOG] Reconexao nao resolveu. Degrau 2: limpando sessions e sender keys...');
       _avisarOperador('Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min. Reconexao nao resolveu — limpando sessao (degrau 2 de 3). Sem acao necessaria por enquanto.').catch(() => {});
       try { await limparSessaoEReconectar(); } catch (e) { console.error('[WATCHDOG] Degrau 2 falhou:', e.message); }
@@ -6184,10 +6075,12 @@ setInterval(async () => {
         console.warn('[WATCHDOG] Degrau 3 desligado por SURDEZ_EXIT=off. Indo direto para alerta.');
         _surdezEstado  = 'alertado';
         _surdezAvisoEm = agora;
+        _persistirSurdez();
       } else if (agora - ultimoExit < EXIT_COOLDOWN_MS) {
         console.warn('[WATCHDOG] Degrau 3 pulado: ja houve restart ha menos de 60 min. Indo direto para alerta.');
         _surdezEstado  = 'alertado';
         _surdezAvisoEm = agora;
+        _persistirSurdez();
       } else {
         console.warn('[WATCHDOG] Reset de sessao nao resolveu. Degrau 3: encerrando o processo para o Railway subir um container novo.');
         _health.ultimoExitEm = agora;
@@ -6210,6 +6103,7 @@ setInterval(async () => {
       return;
     } else {
       _surdezAvisoEm = agora;
+      _persistirSurdez();
     }
     const min = Math.round((Date.now() - ref) / 60000);
     console.warn('[WATCHDOG] Surdez persiste apos a escada completa (' + min + ' min). Alertando operador.');
@@ -6222,12 +6116,109 @@ setInterval(async () => {
       + 'Correcao (exige celular em maos):\n'
       + '1) No WhatsApp do celular, desconecte o dispositivo antigo em Dispositivos conectados\n'
       + '2) POST /reset-sessao-completo\n'
-      + '3) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n\n'
+      + '3) Escanear o QR em https://baileys-server-production-ebfe.up.railway.app/qr\n'
+      + '   OU, so com o celular: https://baileys-server-production-ebfe.up.railway.app/pair (codigo de 8 digitos)\n\n'
       + '(Este aviso se repete a cada 60 min enquanto persistir.)',
       { critico: true }
     );
   } catch (e) { console.error('[WATCHDOG] Erro no ciclo de surdez:', e.message); }
 }, 5 * 60 * 1000);
+
+// ── WATCHDOG DE SAIDA: OFERTAS PARARAM DE SER PUBLICADAS ────────────────────
+// 22/08/2026: o servidor ficou surdo as 20h07 e passou o dia inteiro sem
+// publicar UMA oferta. Toda a instrumentacao existente media ENTRADA (upserts,
+// capturas) — nada media o unico numero que representa faturamento: quantas
+// ofertas sairam para os grupos de destino. Enquanto a escada de surdez se
+// reiniciava a cada restart, ninguem foi avisado de que a operacao estava
+// parada.
+//
+// Este ciclo e proposital e deliberadamente BURRO: nao interessa a causa
+// (surdez, radar desligado, classificador quebrado, quota estourada, fila
+// travada, sender key ruim). Se em horario comercial nao sai oferta nenhuma
+// por PUBLICACAO_SILENCIO_MIN, alerta. Silencio de saida e sempre anomalia.
+const PUBLICACAO_INICIO_H     = 8;                        // hora SP
+const PUBLICACAO_FIM_H        = 22;
+const PUBLICACAO_SILENCIO_MS  = Math.max(30, parseInt(process.env.PUBLICACAO_SILENCIO_MIN || '120', 10)) * 60 * 1000;
+const PUBLICACAO_REAVISO_MS   = 60 * 60 * 1000;
+let _publicacaoAvisoEm = _health.publicacaoAvisoEm || 0;
+
+// Conjunto de destinos que contam como "oferta publicada". Avisos internos
+// (grupo operador), respostas e mensagens de teste NAO entram — se entrassem,
+// o proprio alerta do watchdog silenciaria o watchdog.
+function _ehDestinoDeReceita(destino) {
+  try {
+    if (!destino || typeof destino !== 'string' || !destino.endsWith('@g.us')) return false;
+    const alvos = new Set([...(radarDestinos() || []), ...(GRUPOS['tsp_cupons'] || [])]);
+    return alvos.has(destino);
+  } catch (e) { return false; }
+}
+
+function registrarPublicacaoHealth(destino) {
+  try {
+    // So a operacao padrao: envio de outro operador nao mede a saude desta.
+    if ((tenantContexto() || TENANT_PADRAO) !== TENANT_PADRAO) return;
+    if (!_ehDestinoDeReceita(destino)) return;
+    const agora = Date.now();
+    _health.ultimaPublicacaoEm = agora;
+    const hoje = new Date(agora).toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+    if (!_health.publicacoesDia || _health.publicacoesDia.data !== hoje) {
+      _health.publicacoesDia = { data: hoje, n: 0 };
+    }
+    _health.publicacoesDia.n++;
+    _salvarHealth();
+    if (_publicacaoAvisoEm) {
+      _publicacaoAvisoEm = 0;
+      _health.publicacaoAvisoEm = 0;
+      _healthGravadoEm = 0; _salvarHealth();
+      _avisarOperador('OK — Watchdog de saida: ofertas voltaram a ser publicadas nos grupos.').catch(() => {});
+    }
+  } catch (e) { console.warn('[WATCHDOG-SAIDA] Falha ao registrar publicacao:', e.message); }
+}
+
+function publicacoesHoje() {
+  const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+  return (_health.publicacoesDia && _health.publicacoesDia.data === hoje) ? _health.publicacoesDia.n : 0;
+}
+
+setInterval(async () => {
+  try {
+    const h = horaSP();
+    if (h < PUBLICACAO_INICIO_H || h >= PUBLICACAO_FIM_H) return;
+    const agora = Date.now();
+    if (agora - _bootEm < 15 * 60 * 1000) return;     // carencia de aquecimento
+    if (radarConfig().ativo === false) return;        // radar desligado de proposito
+    const ref      = _health.ultimaPublicacaoEm || _bootEm;
+    const silencio = agora - ref;
+    if (silencio < PUBLICACAO_SILENCIO_MS) return;
+    if (_publicacaoAvisoEm && (agora - _publicacaoAvisoEm) < PUBLICACAO_REAVISO_MS) return;
+
+    _publicacaoAvisoEm = agora;
+    _health.publicacaoAvisoEm = agora;
+    _healthGravadoEm = 0; _salvarHealth();
+
+    const min = Math.round(silencio / 60000);
+    const horas = (min / 60).toFixed(1);
+    // Diagnostico junto do alerta: sem isso o operador recebe "parou" e ainda
+    // precisa abrir /status para descobrir por onde comecar.
+    const minInbound = _health.ultimoUpsertEm ? Math.round((agora - _health.ultimoUpsertEm) / 60000) : null;
+    let causa;
+    if (!conectado || !sock)            causa = 'WhatsApp DESCONECTADO (parear em /pair ou /qr).';
+    else if (_surdezEstado !== 'ok')    causa = 'socket SURDO (escada em: ' + _surdezEstado + ') — nada entra, logo nada sai.';
+    else if (minInbound && minInbound > 30) causa = 'nao chega mensagem ha ' + minInbound + ' min, apesar de conectado — provavel surdez.';
+    else                                causa = 'inbound OK — o problema esta no pipeline (radar, classificador, quotas ou fila).';
+
+    await _avisarOperador(
+      'CRITICO — NENHUMA OFERTA PUBLICADA ha ' + horas + 'h\n\n'
+      + 'Ofertas publicadas hoje: ' + publicacoesHoje() + '.\n'
+      + 'Ultima publicacao: ' + (_health.ultimaPublicacaoEm ? new Date(_health.ultimaPublicacaoEm).toLocaleString('pt-BR', { timeZone:'America/Sao_Paulo' }) : 'nenhuma desde o boot') + '.\n\n'
+      + 'Diagnostico: ' + causa + '\n\n'
+      + 'Enquanto isso a operacao esta sem gerar comissao.\n'
+      + '(Reaviso a cada 60 min ate voltar a publicar.)',
+      { critico: true }
+    );
+    console.warn('[WATCHDOG-SAIDA] Alerta enviado: ' + min + ' min sem publicar.');
+  } catch (e) { console.error('[WATCHDOG-SAIDA] Erro no ciclo:', e.message); }
+}, 10 * 60 * 1000);
 
 // ── HEARTBEAT ATIVO (opt-in) ─────────────────────────────────────────────────
 // A surdez so e detectada pela AUSENCIA de upserts — sinal ambiguo: grupo
@@ -6379,6 +6370,31 @@ async function conectar() {
     });
     sock = novaSock;
     sock.ev.on('creds.update', saveCreds);
+    // Pareamento por codigo: so faz sentido enquanto a sessao nao esta
+    // registrada. O socket precisa de alguns segundos de websocket aberto
+    // antes de aceitar o pedido, por isso o retry espacado.
+    if (pairNumero && !novaSock.authState?.creds?.registered) {
+      const numeroAlvo = pairNumero;
+      (async () => {
+        for (let tentativa = 1; tentativa <= 4; tentativa++) {
+          await new Promise(r => setTimeout(r, tentativa === 1 ? 4000 : 4000));
+          if (novaSock !== sock) return;
+          if (novaSock.authState?.creds?.registered) return;
+          if (pairNumero !== numeroAlvo) return;
+          if (pairCodigo) return;
+          try {
+            const codigo = await novaSock.requestPairingCode(numeroAlvo);
+            pairCodigo = String(codigo || '').replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+            pairErro   = null;
+            console.log('[WA] Codigo de pareamento gerado: ' + pairCodigo);
+            return;
+          } catch (e) {
+            pairErro = e?.message || String(e);
+            console.warn('[WA] Falha ao gerar codigo de pareamento (tentativa ' + tentativa + '): ' + pairErro);
+          }
+        }
+      })();
+    }
     // Escuta o no bruto de retry: e o aviso de que alguem nao decifrou o que
     // mandamos. Sem isso, uma campanha inteira pode nao chegar sem deixar
     // rastro nenhum no log — todo sendMessage tera retornado sucesso.
@@ -6393,6 +6409,7 @@ async function conectar() {
       if (connection === 'open') {
         conectado = true;
         qrAtual = null;
+        pairNumero = null; pairCodigo = null; pairErro = null; pairPedidoEm = 0;
         errosDescripto = 0;
         isConnecting = false;
         _reconectarTentativas = 0;
@@ -7004,7 +7021,7 @@ app.get('/', (req, res) => {
   const emBuffer  = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
   const statusWA  = conectado ? 'WhatsApp conectado' : qrAtual ? 'Aguardando QR' : 'Desconectado';
   const statusTG  = tgConectado ? 'Telegram conectado' : 'Telegram desconectado';
-  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>CDV Server</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h1{color:#ffa500}p{color:#aaa;font-size:14px}.links{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:8px}a{color:#ffa500;text-decoration:none;border:1px solid #333;padding:9px 20px;border-radius:8px;font-size:14px}a:hover{border-color:#ffa500}</style></head><body><h1>CDV Baileys Server</h1><p>${statusWA}</p><p>${statusTG}</p>${emBuffer>0?'<p>'+emBuffer+' item(ns) na janela</p>':''}<div class="links">${!conectado?'<a href="/qr">Escanear QR WhatsApp</a>':''}${!tgConectado?'<a href="/tg-auth">Conectar Telegram</a>':''}<a href="/painel">Painel${pendentes>0?' ('+pendentes+')':''}</a><a href="/status">Status</a><a href="/grupos">Grupos</a></div></body></html>`);
+  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>CDV Server</title><style>body{font-family:sans-serif;background:#0d0d0d;color:#f0f0f0;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h1{color:#ffa500}p{color:#aaa;font-size:14px}.links{display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-top:8px}a{color:#ffa500;text-decoration:none;border:1px solid #333;padding:9px 20px;border-radius:8px;font-size:14px}a:hover{border-color:#ffa500}</style></head><body><h1>CDV Baileys Server</h1><p>${statusWA}</p><p>${statusTG}</p>${emBuffer>0?'<p>'+emBuffer+' item(ns) na janela</p>':''}<div class="links">${!conectado?'<a href="/qr">Escanear QR WhatsApp</a>':''}${!conectado?'<a href="/pair">Conectar por codigo</a>':''}${!tgConectado?'<a href="/tg-auth">Conectar Telegram</a>':''}<a href="/painel">Painel${pendentes>0?' ('+pendentes+')':''}</a><a href="/status">Status</a><a href="/grupos">Grupos</a></div></body></html>`);
 });
 
 app.get('/qr', (req, res) => {
@@ -7242,7 +7259,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 app.get('/fila-envio', (req, res) => {
@@ -11692,6 +11709,134 @@ app.post('/reset-sessao-completo', async (req, res) => {
   isResetting = false;
 
   _agendarReconexao(2000);
+});
+
+// ── CONECTAR SEM QR: PAREAMENTO POR CODIGO ──────────────────────────────────
+// Cenario alvo: operador com o celular na mao e sem computador. O QR exige uma
+// segunda tela; o codigo de 8 caracteres nao. Como o WhatsApp so aceita o
+// pedido de codigo com a sessao ainda NAO registrada, este fluxo apaga as
+// credenciais antes (mesmo filtro de preservacao do reset completo) e so
+// entao sobe o socket pedindo o codigo.
+
+async function limparCredenciaisSessao() {
+  try {
+    const arquivos = await readdir(SESSAO_DIR);
+    for (const arq of arquivos) {
+      if (PRESERVAR_NO_RESET.has(arq)) continue;
+      await unlink(SESSAO_DIR + '/' + arq).catch(() => {});
+    }
+    console.log('[PAIR] Credenciais apagadas. Sessao pronta para novo pareamento.');
+    return true;
+  } catch (e) {
+    console.error('[PAIR] Erro ao apagar sessao:', e.message);
+    return false;
+  }
+}
+
+app.post('/pair', async (req, res) => {
+  const bruto  = String(req.body?.numero || req.query?.numero || '');
+  const numero = bruto.replace(/\D/g, '');
+  if (numero.length < 10 || numero.length > 15) {
+    return res.status(400).json({ ok:false, erro:'numero invalido: use DDI + DDD + numero, so digitos (ex 5511999999999)' });
+  }
+  if (isResetting) return res.status(409).json({ ok:false, erro:'reset em andamento, tente em alguns segundos' });
+
+  console.log('[PAIR] Pareamento por codigo solicitado para ' + numero);
+  isResetting = true;
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  conectado = false;
+  qrAtual   = null;
+  const sockRef = sock;
+  sock = null;
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+  if (sockRef) { try { sockRef.end(new Error('pair-codigo')); } catch(e) {} }
+
+  await limparCredenciaisSessao();
+
+  pairNumero   = numero;
+  pairCodigo   = null;
+  pairErro     = null;
+  pairPedidoEm = Date.now();
+  errosDescripto = 0;
+  _reconectarTentativas = 0;
+  isResetting = false;
+
+  _agendarReconexao(1500);
+  res.json({ ok:true, mensagem:'Gerando codigo para ' + numero + '. Consulte /pair/status.' });
+});
+
+app.get('/pair/status', (req, res) => {
+  const expirado = pairPedidoEm > 0 && (Date.now() - pairPedidoEm) > 10 * 60 * 1000;
+  res.json({
+    ok: true,
+    conectado,
+    numero: pairNumero,
+    codigo: expirado ? null : pairCodigo,
+    erro: pairErro,
+    expirado,
+    aguardando: !!pairNumero && !pairCodigo && !pairErro && !expirado,
+  });
+});
+
+app.get('/pair', (req, res) => {
+  res.type('html').send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conectar por codigo</title><style>
+*{box-sizing:border-box}body{background:#0d0d0d;color:#f0f0f0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:24px;display:flex;flex-direction:column;align-items:center;gap:14px}
+h1{color:#ffa500;font-size:1.3rem;margin:8px 0 0}
+.card{width:100%;max-width:420px;background:#151515;border:1px solid #2a2a2a;border-radius:14px;padding:18px}
+label{display:block;font-size:.85rem;color:#aaa;margin-bottom:6px}
+input{width:100%;padding:14px;font-size:1.1rem;border-radius:10px;border:1px solid #333;background:#0d0d0d;color:#fff}
+button{width:100%;margin-top:12px;padding:14px;font-size:1rem;font-weight:600;border:0;border-radius:10px;background:#ffa500;color:#111}
+button:disabled{opacity:.5}
+#codigo{font-size:2.1rem;letter-spacing:.28em;color:#ffa500;text-align:center;font-weight:700;margin:10px 0}
+ol{color:#ccc;font-size:.9rem;line-height:1.6;padding-left:18px}
+.msg{font-size:.9rem;color:#aaa;text-align:center}
+.err{color:#ff6b6b}.ok{color:#4ade80}
+</style></head><body>
+<h1>Conectar WhatsApp por codigo</h1>
+<div class="card">
+  <label>Numero da conta (DDI + DDD + numero)</label>
+  <input id="num" type="tel" inputmode="numeric" placeholder="5511999999999">
+  <button id="btn">Gerar codigo</button>
+  <p class="msg" id="msg"></p>
+  <div id="codigo"></div>
+</div>
+<div class="card">
+  <ol>
+    <li>Antes de tudo: no WhatsApp do celular, va em <b>Dispositivos conectados</b> e desconecte o dispositivo antigo.</li>
+    <li>Digite o numero acima e toque em <b>Gerar codigo</b>.</li>
+    <li>No WhatsApp: <b>Dispositivos conectados > Conectar dispositivo > Conectar com numero de telefone</b>.</li>
+    <li>Digite o codigo de 8 caracteres que aparecer aqui. Ele vale poucos minutos.</li>
+  </ol>
+</div>
+<script>
+var t=null;
+function msg(txt,cls){var m=document.getElementById('msg');m.textContent=txt;m.className='msg '+(cls||'');}
+document.getElementById('btn').onclick=async function(){
+  var n=document.getElementById('num').value.replace(/\D/g,'');
+  if(n.length<10){msg('Numero invalido.','err');return;}
+  this.disabled=true;document.getElementById('codigo').textContent='';
+  msg('Reiniciando a sessao e pedindo o codigo...');
+  try{
+    var r=await fetch('/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:n})});
+    var j=await r.json();
+    if(!j.ok){msg(j.erro||'Falhou.','err');this.disabled=false;return;}
+    if(t)clearInterval(t);
+    t=setInterval(checar,2500);
+  }catch(e){msg('Erro: '+e.message,'err');this.disabled=false;}
+};
+async function checar(){
+  try{
+    var r=await fetch('/pair/status');var j=await r.json();
+    if(j.conectado){clearInterval(t);msg('WhatsApp conectado!','ok');document.getElementById('codigo').textContent='';return;}
+    if(j.codigo){document.getElementById('codigo').textContent=j.codigo.replace(/(.{4})(.{4})/,'$1-$2');msg('Digite este codigo no WhatsApp.');return;}
+    if(j.erro){msg('Erro: '+j.erro,'err');document.getElementById('btn').disabled=false;return;}
+    msg('Aguardando o codigo...');
+  }catch(e){}
+}
+checar();
+</script></body></html>`);
 });
 // ═══════════════════════════════════════════════════════════════════════════
 // HISTÓRICO SEATS.AERO — BLOCO ÚNICO
