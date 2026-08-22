@@ -805,7 +805,21 @@ function urlCanonicaMl(u) {
   catch (e) { return String(u).split('#')[0].split('?')[0]; }
 }
 
-export async function processarTextoMl(texto) {
+/**
+ * @param {string} texto
+ * @param {object} opcoes
+ *   leitura=true  para ANTES do createLink e devolve so { produto }, sem link
+ *                 de afiliado, sem mensagem e sem cupom.
+ *
+ * O modo leitura existe para o radar poder alimentar a serie de precos 24h,
+ * inclusive fora da janela de disparo do grupo. Parar antes do createLink NAO
+ * e economia de requisicao: e obrigatorio. gerarLinksAfiliadoMl GRUDA a
+ * etiqueta de nicho no produto na primeira geracao, e ela nao gira depois —
+ * o relatorio do ML nao separa resultado por data de disparo. Gerar link numa
+ * leitura noturna queimaria a etiqueta de um produto que nao vai ser divulgado,
+ * e quando ele voltasse na janela a segmentacao ja estaria perdida.
+ */
+export async function processarTextoMl(texto, opcoes = {}) {
   // URLs completas, nao so o MLB: o createLink recebe a URL de origem.
   const urls = [...new Set(String(texto || '').match(REGEX_URL_ML) || [])]
     .map(u => u.replace(/[)\]}.,;!]+$/, ''));
@@ -850,6 +864,22 @@ export async function processarTextoMl(texto) {
 
   const titulos = {};
   for (const [url, d] of dadosPorUrl) if (d?.titulo) titulos[url] = d.titulo;
+
+  // ── MODO LEITURA: para aqui, antes de qualquer link de afiliado. ──
+  if (opcoes.leitura) {
+    const so = [];
+    for (const url of canonicas) {
+      const dados = dadosPorUrl.get(url);
+      if (!dados || !Number.isFinite(dados.preco)) continue;
+      so.push({ produto: {
+        asin: idProdutoMl(url), id: idProdutoMl(url),
+        titulo: dados.titulo || '', loja: 'Mercado Livre',
+        preco: dados.preco, precoDe: dados.precoDe ?? null,
+        disponivel: dados.disponivel, link: url, trilha: dados.trilha || null,
+      }, leitura: true });
+    }
+    return so;
+  }
 
   let links;
   try { links = await gerarLinksAfiliadoMl(canonicas, { titulos }); }
