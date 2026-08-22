@@ -116,6 +116,11 @@ const CFG_PADRAO = {
   ativo: true,
   descontoMinimo: 5,      // % — abaixo disso descarta, salvo se for deal relampago
   dedupHoras: 24,
+  // Leitura de preco fora da janela de disparo. Ligada, o radar continua lendo
+  // 24h para alimentar a serie de precos, mas so dispara dentro da janela.
+  leituraForaJanela: true,
+  leituraTtlHoras: 6,      // nao rele o mesmo produto antes disso
+  leituraTetoHora: 120,    // teto de leituras por loja por hora
   // Vazio de proposito: resolvido no uso via credencialTsp — um tenant novo
   // NAO pode nascer com a partner tag da operacao original.
   partnerTag: '',
@@ -810,16 +815,33 @@ export function removerMonitor(jid) {
  * Devolve { ok, motivo } — o motivo alimenta o log, para um silencio no radar
  * sempre ter explicacao.
  */
+/**
+ * Tres estados, nao dois:
+ *   'nao'     nem le nem dispara — o grupo ou a loja estao desligados por decisao
+ *   'leitura' le preco e alimenta a serie, mas NAO dispara — so razao TEMPORAL
+ *   'disparo' o caminho completo de sempre
+ *
+ * A separacao existe porque a janela protege o DISPARO, nao a leitura: o grupo
+ * posta o dia inteiro e as janelas cobrem entre 22% e 50% do dia, entao o que
+ * era jogado fora era justamente o volume que enche a serie de precos.
+ *
+ * Grupo sem cadastro, desativado ou com a loja desmarcada continua bloqueio
+ * total — senao a tela de configuracao deixa de significar o que diz.
+ *
+ * `ok` mantem exatamente a semantica anterior (true so no disparo), para os
+ * pontos de chamada que ainda nao olham `modo` nao mudarem de comportamento.
+ */
 export function podeCapturar(jid, loja, quando = new Date()) {
+  const nao = (motivo) => ({ ok: false, modo: 'nao', motivo });
   const cfg = monitorDoGrupo(jid);
-  if (!cfg)             return { ok: false, motivo: 'grupo sem cadastro de monitoramento' };
-  if (cfg.ativo === false) return { ok: false, motivo: 'monitoramento desativado neste grupo' };
-  if (!cfg.lojas?.length)  return { ok: false, motivo: 'nenhuma loja selecionada' };
-  if (!cfg.lojas.includes(loja)) return { ok: false, motivo: loja + ' nao monitorada neste grupo' };
+  if (!cfg)             return nao('grupo sem cadastro de monitoramento');
+  if (cfg.ativo === false) return nao('monitoramento desativado neste grupo');
+  if (!cfg.lojas?.length)  return nao('nenhuma loja selecionada');
+  if (!cfg.lojas.includes(loja)) return nao(loja + ' nao monitorada neste grupo');
 
   const dia = diaSemanaSP(quando);
   if (cfg.dias === 'uteis' && (dia === 0 || dia === 6)) {
-    return { ok: false, motivo: 'fora dos dias uteis' };
+    return { ok: false, modo: 'leitura', motivo: 'fora dos dias uteis' };
   }
 
   const agora   = minutosAgoraSP(quando);
@@ -829,11 +851,73 @@ export function podeCapturar(jid, loja, quando = new Date()) {
     const fim = paraMinutos(j.fim, 23 * 60 + 59);
     // Janela que vira a meia-noite (22:00-02:00) e um bloco unico partido em dois.
     const dentro = ini <= fim ? (agora >= ini && agora <= fim) : (agora >= ini || agora <= fim);
-    if (dentro) return { ok: true, motivo: 'dentro da janela ' + j.inicio + '-' + j.fim };
+    if (dentro) return { ok: true, modo: 'disparo', motivo: 'dentro da janela ' + j.inicio + '-' + j.fim };
   }
   const hhmm = String(Math.floor(agora / 60)).padStart(2, '0') + ':' + String(agora % 60).padStart(2, '0');
-  return { ok: false, motivo: 'fora das janelas ' +
+  return { ok: false, modo: 'leitura', motivo: 'fora das janelas ' +
     janelas.map(j => j.inicio + '-' + j.fim).join(', ') + ' (agora ' + hhmm + ' SP)' };
+}
+
+// ── FREIO DA LEITURA FORA DA JANELA ─────────────────────────────────────────
+// Ler 24h nao gasta cota no ML (e leitura de pagina), mas leitura sem freio e o
+// padrao que rende bloqueio de IP; na Amazon a Creators API tem cota de verdade.
+// Um grupo que reposta o mesmo link 40 vezes numa madrugada viraria 40
+// requisicoes para zero informacao nova, porque a serie guarda o menor preco do
+// DIA — o segundo ponto do mesmo dia quase nunca muda a conta.
+//
+// Em memoria de proposito: perder o freio num restart custa uma releitura a
+// mais por produto, e nao vale um arquivo em disco para isso.
+const _ultimaLeitura = new Map();   // 'loja:id' -> ts
+const _leiturasPorHora = new Map(); // 'loja:YYYY-MM-DDTHH' -> n
+
+export function leituraForaJanelaAtiva() {
+  return E().cfg.leituraForaJanela !== false;
+}
+export function leituraTtlHoras() {
+  const h = Number(E().cfg.leituraTtlHoras);
+  return isFinite(h) && h > 0 ? h : 6;
+}
+export function leituraTetoHora() {
+  const n = Number(E().cfg.leituraTetoHora);
+  return isFinite(n) && n > 0 ? n : 120;
+}
+
+/** Vale a pena gastar uma requisicao lendo este produto agora? */
+export function podeLerPreco(p) {
+  const k = chaveDedupProduto(p);
+  if (!k) return { ok: false, motivo: 'sem identidade de produto' };
+
+  const ant = _ultimaLeitura.get(k);
+  if (ant && Date.now() - ant < leituraTtlHoras() * 3600e3) {
+    return { ok: false, motivo: 'lido ha menos de ' + leituraTtlHoras() + 'h' };
+  }
+
+  const loja = String(p.loja || 'outros');
+  const hora = new Date().toISOString().slice(0, 13);
+  const kh = loja + ':' + hora;
+  const usadas = _leiturasPorHora.get(kh) || 0;
+  if (usadas >= leituraTetoHora()) {
+    return { ok: false, motivo: 'teto de ' + leituraTetoHora() + ' leitura(s)/h em ' + loja };
+  }
+  return { ok: true };
+}
+
+/** Marca a leitura consumida. NUNCA toca no dedup de divulgacao. */
+export function registrarLeitura(p) {
+  const k = chaveDedupProduto(p);
+  if (!k) return;
+  _ultimaLeitura.set(k, Date.now());
+  const kh = String(p.loja || 'outros') + ':' + new Date().toISOString().slice(0, 13);
+  _leiturasPorHora.set(kh, (_leiturasPorHora.get(kh) || 0) + 1);
+
+  // Limpeza barata: so quando o mapa cresce, e so o que ja venceu.
+  if (_ultimaLeitura.size > 5000) {
+    const corte = Date.now() - leituraTtlHoras() * 3600e3;
+    for (const [kk, ts] of _ultimaLeitura) if (ts < corte) _ultimaLeitura.delete(kk);
+  }
+  if (_leiturasPorHora.size > 200) {
+    for (const kk of _leiturasPorHora.keys()) if (!kk.endsWith(new Date().toISOString().slice(0, 13))) _leiturasPorHora.delete(kk);
+  }
 }
 
 /**
@@ -2077,6 +2161,12 @@ export function salvarItemVitrine(item) {
     nicho: item.nicho !== undefined
       ? (String(item.nicho || '').trim() || null)
       : (anterior?.nicho || null),
+    // Ultima vez que este produto foi DIVULGADO. E o relogio da vigilancia
+    // automatica de preco: decide a camada de varredura (quente/fria) e o
+    // expurgo. Distinto de 'ultimoDisparo', que so conta disparo do monitor.
+    divulgadoEm: item.divulgadoEm !== undefined
+      ? (item.divulgadoEm || null)
+      : (anterior?.divulgadoEm || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
     ultimoDisparo: anterior?.ultimoDisparo || null,
