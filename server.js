@@ -12554,6 +12554,20 @@ bootBotTsp({
   enviarMensagem,
   radarDestinos,
   salvarFila,
+  // Operacao pelo celular: /reconectar (com confirmacao) e /status no proprio bot.
+  forcarReconexao,
+  status: () => ({
+    conectado, sockAtivo: !!sock,
+    surdezEstado: _surdezEstado,
+    logout: !!_logoutEm,
+    logoutMin: _logoutEm ? Math.round((Date.now() - _logoutEm) / 60000) : null,
+    minSemUpsert: _health.ultimoUpsertEm ? Math.round((Date.now() - _health.ultimoUpsertEm) / 60000) : null,
+    telegramConectado: tgConectado,
+    publicacoesHoje: publicacoesHoje(),
+    filaTotal: filaPendentes.length,
+    filaPendentes: filaPendentes.filter(o => o.status === 'pendente' && !o.autoAgendado).length,
+    uptimeMin: Math.round((Date.now() - _bootEm) / 60000),
+  }),
 }).catch(e => console.warn('[BOT-TSP] Falha no boot:', e.message));
 
 // Monitor de queda de preco. As funcoes de montagem e envio sao injetadas em
