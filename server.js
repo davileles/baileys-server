@@ -39,6 +39,7 @@ import {
   buscarProdutos, normalizar,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarPoolRastreio, salvarPoolRastreio, listarAtribuicoes,
+  repararAsinAtribuicoes, urlsNoAsinDeAtribuicoes,
   listarPoolMl, salvarPoolMl,
   listarListas, listaPorId, salvarLista, removerLista, atualizarExecucaoLista, cupomDaLista,
   listarMonitor, monitorDoGrupo, salvarMonitor, removerMonitor,
@@ -145,7 +146,7 @@ import {
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
-  buscarDadosProdutoMl,
+  buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -10017,6 +10018,135 @@ app.get('/rastreio/atribuicoes', (req, res) => {
   const desde = String(req.query?.desde || '') || null;
   const lista = listarAtribuicoes(desde);
   res.json({ ok:true, total:lista.length, atribuicoes:lista.slice(-500) });
+});
+
+// ── BACKFILL: asin de URL curta -> MLB/MLBU ─────────────────────────────────
+// Repara o estrago de radar-ml.js:879, que gravava o meli.la no campo asin
+// quando idDeUrl() nao casava o id (todo produto de catalogo unificado, MLBU).
+// Em agosto foram 68 de 297 registros ML, 23%.
+//
+// Por que endpoint e nao commit direto no repo de dados: o shard vive em TRES
+// lugares — _histEnvioCache (memoria), ./sessao no volume do Railway e o
+// GitHub. _registrosDoShard le a memoria primeiro e o disco depois, e so cai no
+// GitHub se nao achar nenhum dos dois. Editar o repo por fora seria sobrescrito
+// no proximo envio, sem erro nenhum e sem aviso.
+//
+// Idempotente: so toca em asin que comeca com http. Rodar duas vezes nao muda
+// nada na segunda.
+//
+// GET  /manutencao/asin-ml            previa, sem escrever
+// POST /manutencao/asin-ml            aplica  (body: { meses:['2026-08'] })
+const _MESES_BACKFILL_MAX = 6;
+
+function _mesesDeBackfill(pedidos) {
+  if (Array.isArray(pedidos) && pedidos.length) {
+    return pedidos.map(m => String(m).slice(0, 7)).filter(m => /^\d{4}-\d{2}$/.test(m))
+                  .slice(0, _MESES_BACKFILL_MAX);
+  }
+  const out = [];
+  const hoje = new Date();
+  for (let i = 0; i < _MESES_BACKFILL_MAX; i++) {
+    out.push(new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year: 'numeric', month: '2-digit' })
+      .format(new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth() - i, 15))));
+  }
+  return out;
+}
+
+async function _levantarBackfillAsinMl(meses) {
+  const achados = [];      // { mes, local, reg }
+  const urls = new Set();
+  for (const mes of meses) {
+    const local = 'historico_envios_' + mes + '.json';
+    let regs;
+    try { regs = await _registrosDoShard(local); } catch (e) { continue; }
+    for (const r of (regs || [])) {
+      if (r.tipoConteudo !== 'oferta_ml') continue;
+      const a = String(r.asin || '');
+      if (!a.startsWith('http')) continue;
+      achados.push({ mes, local, reg: r });
+      urls.add(a);
+    }
+  }
+  for (const u of urlsNoAsinDeAtribuicoes()) urls.add(u);
+  return { achados, urls: [...urls] };
+}
+
+/**
+ * meli.la -> MLB/MLBU. Sequencial e com pausa: sao redirects na infra do ML e
+ * uma rajada de dezenas em paralelo e o padrao que rende bloqueio de IP.
+ */
+async function _resolverUrlsMl(urls, { pausaMs = 700 } = {}) {
+  const mapa = {}, falhas = {};
+  for (const u of urls) {
+    try {
+      const alvo = await resolverLinkMl(u);
+      const id = idProdutoMl(alvo);
+      if (id) mapa[u] = id;
+      else falhas[u] = 'sem id de produto apos resolver: ' + String(alvo).slice(0, 90);
+    } catch (e) { falhas[u] = e.message; }
+    await new Promise(r => setTimeout(r, pausaMs));
+  }
+  return { mapa, falhas };
+}
+
+app.get('/manutencao/asin-ml', async (req, res) => {
+  try {
+    const meses = _mesesDeBackfill(String(req.query?.meses || '').split(',').filter(Boolean));
+    const { achados, urls } = await _levantarBackfillAsinMl(meses);
+    const porMes = {};
+    for (const a of achados) porMes[a.mes] = (porMes[a.mes] || 0) + 1;
+    res.json({ ok:true, simulacao:true, meses, registrosAfetados:achados.length, porMes,
+               urlsUnicas:urls.length,
+               amostra: achados.slice(0, 10).map(a => ({ mes:a.mes, id:a.reg.id,
+                 asin:a.reg.asin, titulo:String(a.reg.titulo || '').slice(0, 60) })) });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+app.post('/manutencao/asin-ml', async (req, res) => {
+  try {
+    const meses = _mesesDeBackfill(req.body?.meses);
+    const { achados, urls } = await _levantarBackfillAsinMl(meses);
+    if (!achados.length && !urls.length) {
+      return res.json({ ok:true, nada:true, meses, mensagem:'nenhum asin de URL encontrado' });
+    }
+
+    console.log('[BACKFILL-ASIN] Resolvendo ' + urls.length + ' URL(s) curta(s)...');
+    const { mapa, falhas } = await _resolverUrlsMl(urls);
+
+    // ── Historico de envios ──
+    const shardsTocados = new Set();
+    let reparados = 0, semMapa = 0;
+    for (const { local, reg } of achados) {
+      const novo = mapa[String(reg.asin)];
+      if (!novo) { semMapa++; continue; }
+      reg.asinAntigo = reg.asin;   // rastro do reparo, para auditoria
+      reg.asin = novo;
+      shardsTocados.add(local);
+      reparados++;
+    }
+    for (const local of shardsTocados) {
+      const regs = _histEnvioCache.get(local);
+      if (!regs) continue;
+      const caminho = SESSAO_DIR + '/' + local;
+      const dir = caminho.slice(0, caminho.lastIndexOf('/'));
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      writeFileSync(caminho, JSON.stringify({ registros: regs }), 'utf-8');
+      agendarPush(local);
+    }
+
+    // ── Ledger de atribuicoes ──
+    const led = repararAsinAtribuicoes(mapa);
+
+    console.log('[BACKFILL-ASIN] ' + reparados + ' registro(s) e ' + led.reparadas
+      + ' atribuicao(oes) reparada(s) em ' + shardsTocados.size + ' shard(s).');
+    res.json({ ok:true, meses, urlsResolvidas:Object.keys(mapa).length,
+               historico:{ afetados:achados.length, reparados, semMapa,
+                           shards:[...shardsTocados] },
+               ledger:led, falhas });
+  } catch (e) {
+    console.error('[BACKFILL-ASIN] Falhou:', e.message);
+    res.status(500).json({ ok:false, erro:e.message });
+  }
 });
 
 // Repara a base inteira de uma vez. Existe porque os itens cadastrados antes
