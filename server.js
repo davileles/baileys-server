@@ -5183,13 +5183,54 @@ function _agendarReconexao(delay) {
 const FAXINA_DIAS   = Number(process.env.FAXINA_DIAS || 21);
 const FAXINA_INTERV = 6 * 60 * 60 * 1000;   // 6h
 
+// Sobra de escrita atomica: `writeFile(tmp)` + `rename` deixa .tmp para tras
+// se o processo morre no meio — foi o caso do enviadas.json.tmp de 117 MB que
+// sobreviveu ao ENOSPC e continuou ocupando metade do volume depois.
+// Feeds da Awin sao cache: o proximo /awin/feeds/atualizar rebaixa tudo.
+async function faxinaAuxiliar() {
+  let n = 0, bytes = 0;
+  const agora = Date.now();
+  const alvos = [
+    { dir: SESSAO_DIR,            filtro: a => a.endsWith('.tmp'), idadeH: 1  },
+    { dir: SESSAO_DIR + '/feeds', filtro: a => a.endsWith('.csv.gz'), idadeH: 48 },
+    { dir: UPLOAD_DIR,            filtro: () => true,              idadeH: 6  },
+  ];
+  for (const alvo of alvos) {
+    try {
+      for (const arq of await readdir(alvo.dir)) {
+        if (!alvo.filtro(arq)) continue;
+        const caminho = alvo.dir + '/' + arq;
+        try {
+          const st = await statAsync(caminho);
+          if (!st.isFile()) continue;
+          if (agora - st.mtimeMs < alvo.idadeH * 3600 * 1000) continue;
+          bytes += st.size;
+          await unlink(caminho).catch(() => {});
+          n++;
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+  if (n) console.log('[FAXINA] Auxiliar: ' + n + ' arquivo(s) temporario(s)/cache removido(s) (' +
+    Math.round(bytes / 1048576) + ' MB).');
+  return { apagados: n, bytes };
+}
+
 async function faxinaDisco(motivo = 'periodica') {
   const corte = Date.now() - FAXINA_DIAS * 24 * 60 * 60 * 1000;
   let apagados = 0, mantidos = 0, bytes = 0;
+  await faxinaAuxiliar();
   try {
-    for (const arq of await readdir(SESSAO_DIR)) {
+    // Inclui as contas extras: 'paulo' sozinho tinha 22 mil sessions (45 MB),
+    // trinta vezes mais que a conta principal — sao elas que crescem sem freio.
+    const pastas = [SESSAO_DIR];
+    try {
+      for (const c of await readdir(CONTAS_DIR)) pastas.push(CONTAS_DIR + '/' + c);
+    } catch (e) {}
+    for (const pasta of pastas)
+    for (const arq of await readdir(pasta)) {
       if (!(arq.startsWith('session-') || arq.startsWith('sender-key'))) continue;
-      const caminho = SESSAO_DIR + '/' + arq;
+      const caminho = pasta + '/' + arq;
       try {
         const st = await statAsync(caminho);
         if (st.mtimeMs < corte) {
@@ -5214,17 +5255,22 @@ async function faxinaDisco(motivo = 'periodica') {
 async function faxinaEmergencia(alvo = 500) {
   try {
     const lista = [];
-    for (const arq of await readdir(SESSAO_DIR)) {
+    const pastas = [SESSAO_DIR];
+    try {
+      for (const c of await readdir(CONTAS_DIR)) pastas.push(CONTAS_DIR + '/' + c);
+    } catch (e) {}
+    for (const pasta of pastas)
+    for (const arq of await readdir(pasta)) {
       if (!(arq.startsWith('session-') || arq.startsWith('sender-key'))) continue;
       try {
-        const st = await statAsync(SESSAO_DIR + '/' + arq);
-        lista.push({ arq, mtime: st.mtimeMs });
+        const st = await statAsync(pasta + '/' + arq);
+        lista.push({ arq: pasta + '/' + arq, mtime: st.mtimeMs });
       } catch (e) {}
     }
     if (lista.length <= alvo) return { apagados: 0, total: lista.length };
     lista.sort((a, b) => a.mtime - b.mtime);
     const cortar = lista.slice(0, lista.length - alvo);
-    for (const item of cortar) await unlink(SESSAO_DIR + '/' + item.arq).catch(() => {});
+    for (const item of cortar) await unlink(item.arq).catch(() => {});
     console.warn('[FAXINA] EMERGENCIA: ' + cortar.length + ' arquivo(s) apagado(s) — ' +
       lista.length + ' passou do alvo de ' + alvo + '.');
     return { apagados: cortar.length, total: lista.length };
@@ -5512,6 +5558,27 @@ function registrarRetryReceipt(node) {
 const ENVIADAS_PATH   = SESSAO_DIR + '/enviadas.json';
 const ENVIADAS_TTL_MS = 48 * 60 * 60 * 1000;
 const ENVIADAS_MAX    = 4000;
+// Teto de BYTES, nao so de contagem. Oferta e mensagem com imagem, e o
+// jpegThumbnail vai junto no objeto — em base64 cada uma passava de 30 KB.
+// 4000 delas viraram 121 MB de enviadas.json e estouraram o volume de 500 MB
+// em 21/08/2026. A contagem sozinha nao protege: o que enche disco e tamanho.
+const ENVIADAS_MAX_MB = Number(process.env.ENVIADAS_MAX_MB || 20);
+
+// A thumbnail existe so para preview no chat de quem envia; o reenvio por
+// retry receipt nao depende dela (a midia real vive no CDN do WhatsApp, o
+// destinatario baixa por directPath). Guardar o thumb no store e pagar 30 KB
+// por mensagem para nada.
+function _semThumb(m) {
+  if (!m || typeof m !== 'object') return m;
+  const out = Array.isArray(m) ? [] : {};
+  for (const k in m) {
+    if (k === 'jpegThumbnail' || k === 'thumbnail') continue;
+    const v = m[k];
+    out[k] = (v && typeof v === 'object' && !Buffer.isBuffer(v)) ? _semThumb(v) : v;
+  }
+  return out;
+}
+
 const mensagensEnviadas = new Map(); // id -> { m: mensagem, em: ms }
 
 function obterMensagemEnviada(id) {
@@ -5532,10 +5599,23 @@ function _agendarSalvarEnviadas() {
       while (mensagensEnviadas.size > ENVIADAS_MAX) {
         mensagensEnviadas.delete(mensagensEnviadas.keys().next().value);
       }
-      const obj = {};
-      for (const [id, r] of mensagensEnviadas) obj[id] = { em: r.em, m: r.m };
+      // Serializa, mede e, se passar do teto, descarta do mais ANTIGO para o
+      // mais novo ate caber. Retry receipt de mensagem velha e raro; ficar sem
+      // disco derruba o servidor inteiro.
+      const limite = ENVIADAS_MAX_MB * 1048576;
+      let payload;
+      for (;;) {
+        const obj = {};
+        for (const [id, r] of mensagensEnviadas) obj[id] = { em: r.em, m: r.m };
+        payload = JSON.stringify(obj, BufferJSON.replacer);
+        if (Buffer.byteLength(payload) <= limite || mensagensEnviadas.size <= 50) break;
+        const descartar = Math.max(1, Math.floor(mensagensEnviadas.size * 0.2));
+        for (let i = 0; i < descartar; i++) {
+          mensagensEnviadas.delete(mensagensEnviadas.keys().next().value);
+        }
+      }
       const tmp = ENVIADAS_PATH + '.tmp';
-      await writeFileAsync(tmp, JSON.stringify(obj, BufferJSON.replacer));
+      await writeFileAsync(tmp, payload);
       await renameAsync(tmp, ENVIADAS_PATH);
     } catch (e) { console.error('[ENTREGA] Erro ao persistir enviadas.json:', e.message); }
   }, 3000);
@@ -5560,7 +5640,7 @@ function _agendarSalvarEnviadas() {
 function guardarMensagemEnviada(info) {
   try {
     if (info?.key?.id && info.message) {
-      mensagensEnviadas.set(info.key.id, { m: info.message, em: Date.now() });
+      mensagensEnviadas.set(info.key.id, { m: _semThumb(info.message), em: Date.now() });
       _agendarSalvarEnviadas();
     }
   } catch(e) {}
