@@ -3101,6 +3101,7 @@ async function enfileirarCupomTSP(c, ctx = {}) {
     tinhaMultiplos = false,
     codigosLista = [],
     somenteFila = false,
+    motivoRetencao = null,
     jaRegistrado = false,
   } = ctx;
 
@@ -3161,6 +3162,15 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   const bloqueioTemporal = !veredito.auto && /^(fora da janela|intervalo minimo)/.test(veredito.motivo);
   if (autoEnvioModo() === 'on' && bloqueioTemporal && !somenteFila) oferta.autoAgendado = true;
 
+  // Retencao por idade: o gate de CONTEUDO pode ter dito 'aprovado', mas o item
+  // nao vai sair sozinho — e o card precisa dizer por que, senao o operador ve
+  // 'aprovado' num cupom parado e nao entende o que aconteceu.
+  if (somenteFila && motivoRetencao) {
+    oferta.autoAvaliacao.auto   = false;
+    oferta.autoAvaliacao.motivo = motivoRetencao;
+    oferta.retidoPorIdade       = true;
+  }
+
   // MODO SOMBRA: decide e loga, mas nao envia. Serve para medir a taxa de
   // acerto do gate contra a aprovacao manual antes de ligar 'on'.
   if (autoEnvioModo() === 'sombra') {
@@ -3211,7 +3221,10 @@ async function enfileirarCupomTSP(c, ctx = {}) {
   // Alerta de novo cupom no grupo do operador
   try {
     await enviarMensagem(GRUPOS.operador, {
-      text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+      text: (oferta.retidoPorIdade
+              ? `*Cupom retido (mensagem antiga)* ⏸️\n\n${rotulo}\n${oferta.autoAvaliacao.motivo}\n\n`
+              : '*Novo cupom capturado* ✅\n\n')
+            + 'Aprove aqui: https://davileles.github.io/tudo-sobre-promos/'
     });
   } catch(e) { console.warn('[FILA] Falha ao enviar alerta de cupom:', e.message); }
 
@@ -3229,7 +3242,8 @@ async function enfileirarCupomTSP(c, ctx = {}) {
 // base de cupons segue com um registro por codigo, que e o que o casamento com
 // as ofertas do radar consulta.
 async function despacharBlocoCupons(bloco, ctx = {}) {
-  const { origem = 'desconhecida', textoOriginal = '', imagens = [] } = ctx;
+  const { origem = 'desconhecida', textoOriginal = '', imagens = [],
+          somenteFila = false, motivoRetencao = null } = ctx;
 
   const oferta = {
     id: gerarId(),
@@ -3256,6 +3270,24 @@ async function despacharBlocoCupons(bloco, ctx = {}) {
     modo: autoEnvioModo(),
     avaliadoEm: new Date().toISOString(),
   };
+
+  // Retencao por idade vence o agendamento: sem autoAgendado o worker de
+  // espacamento nao pega o item, entao ele fica esperando aprovacao manual.
+  if (somenteFila) {
+    oferta.autoAvaliacao.auto   = false;
+    oferta.autoAvaliacao.motivo = motivoRetencao || 'retido: mensagem antiga (backlog)';
+    oferta.retidoPorIdade       = true;
+    filaPendentes.unshift(oferta);
+    salvarFila();
+    console.warn(`[TG-BACKLOG] Lote #${oferta.id} retido para aprovacao manual — ${rotulo}`);
+    try {
+      await enviarMensagem(GRUPOS.operador, {
+        text: `*Lote de cupons retido (mensagem antiga)* ⏸️\n\n${rotulo}\n${oferta.autoAvaliacao.motivo}`
+          + '\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+      });
+    } catch(e) { console.warn('[FILA] Falha ao avisar operador do lote retido:', e.message); }
+    return { oferta, retido: true };
+  }
 
   // Bloqueio temporal: o lote inteiro fica agendado e o worker de espacamento
   // manda quando liberar. Nada de quebrar o lote so porque o relogio nao ajudou.
@@ -3369,14 +3401,14 @@ async function enfileirarLoteCupomTSP(lista, ctx = {}) {
 // duplicada no grupo de clientes. Uma cadeia de promises basta (processo unico).
 let _tgChain = Promise.resolve();
 
-function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null) {
+function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null, postadoEm = null) {
   _tgChain = _tgChain
-    .then(() => _processarMensagemTelegram(texto, canalUsername, imagemBase64))
+    .then(() => _processarMensagemTelegram(texto, canalUsername, imagemBase64, postadoEm))
     .catch(e => console.error('[TG] Erro na cadeia:', e.message));
   return _tgChain;
 }
 
-async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null) {
+async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null, postadoEm = null) {
   if (!texto?.trim()) return;
   console.log('[TG] Nova mensagem recebida:', texto.slice(0, 80));
 
@@ -3405,11 +3437,32 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
       : [campos];
     const codigosLista = lista.map(x => x.codigo).filter(Boolean);
 
+    // Mensagem antiga = backlog de reconexao/redeploy, nao noticia. NUNCA sai
+    // sozinha: vai para a fila como pendente. Descartar perderia cupom que ainda
+    // pode estar valido; auto-enviar foi o que jogou nos grupos, as 6h20, um
+    // cupom que o canal tinha postado a meia-noite.
+    const idadeMs  = postadoEm ? Date.now() - postadoEm : 0;
+    const idadeMin = Math.round(idadeMs / 60000);
+    const atrasado = !!postadoEm && idadeMs > TG_IDADE_MAX_MS;
+    if (atrasado) {
+      console.warn(`[TG-BACKLOG] Mensagem de ${idadeMin} min atras — retida para aprovacao manual: ${texto.slice(0, 60)}`);
+    }
+
+    // Captura conta da PUBLICACAO, nao do momento em que o servidor conseguiu
+    // ler. Sem isto o TTL de 24h renasce inteiro a cada replay e um cupom ja
+    // vencido volta a figurar como vigente na base.
+    if (postadoEm) {
+      const isoPost = new Date(postadoEm).toISOString();
+      for (const c of lista) if (!c.capturadoEm) c.capturadoEm = isoPost;
+    }
+
     const ctxCupom = {
       origem: `telegram:@${canalUsername}`,
       textoOriginal: texto,
       imagens: imagemBase64 ? [{ imagemBase64, mime: 'image/jpeg' }] : [],
       tinhaMultiplos, codigosLista,
+      somenteFila: atrasado,
+      motivoRetencao: atrasado ? `retido: mensagem de ${idadeMin} min atras (backlog)` : null,
     };
 
     // Mensagem com varios cupons vira UMA mensagem no grupo, nao N. O canal
@@ -3454,6 +3507,39 @@ async function _processarMensagemTelegram(texto, canalUsername = 'desconhecido',
 const TG_API_ID   = parseInt(process.env.TG_API_ID   || '0');
 const TG_API_HASH = process.env.TG_API_HASH || '';
 const TG_SESSION_PATH = SESSAO_DIR + '/telegram_session.txt';
+// Corte do polling PERSISTIDO. Em memoria, um redeploy zerava o mapa e as 20
+// ultimas mensagens do canal voltavam a valer como novas: foi assim que um
+// cupom postado a meia-noite saiu nos grupos as 6h20 da manha.
+const TG_ULTIMOS_IDS_PATH = SESSAO_DIR + '/tg_ultimos_ids.json';
+// Acima disto a mensagem e backlog (reconexao/redeploy), nao noticia. Nao e
+// descartada — vai para a fila como pendente, com o motivo visivel no card.
+const TG_IDADE_MAX_MS = 45 * 60 * 1000;
+
+function carregarUltimosMsgIds() {
+  try {
+    if (existsSync(TG_ULTIMOS_IDS_PATH)) {
+      const m = JSON.parse(readFileSync(TG_ULTIMOS_IDS_PATH, 'utf-8'));
+      console.log('[TG] Corte do polling carregado:', Object.keys(m).length, 'canal(is)');
+      return m;
+    }
+  } catch (e) { console.warn('[TG] Erro ao carregar tg_ultimos_ids:', e.message); }
+  return {};
+}
+
+function salvarUltimosMsgIds(mapa) {
+  try {
+    if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
+    writeFileSync(TG_ULTIMOS_IDS_PATH, JSON.stringify(mapa), 'utf-8');
+  } catch (e) { console.warn('[TG] Erro ao salvar tg_ultimos_ids:', e.message); }
+}
+
+// gramJS entrega msg.date em SEGUNDOS. Normaliza para ms e devolve null quando
+// o campo nao vier — sem data, o gate de idade nao opina (comportamento atual).
+function msgDateMs(msg) {
+  const d = Number(msg?.date);
+  if (!Number.isFinite(d) || d <= 0) return null;
+  return d < 1e12 ? d * 1000 : d;
+}
 const TG_CANAIS_MONITORADOS = (process.env.TG_GRUPO || '@juaocupons,@canaldetestetsp').split(',').map(s => s.trim().replace('@','').toLowerCase());
 // Blacklist: channelIds numéricos ou substrings de title/username a ignorar (separados por vírgula).
 // TG_CANAIS_IGNORADOS_BASE fica no código para canais que nunca devem ser capturados,
@@ -3573,7 +3659,7 @@ async function iniciarTelegram() {
 
   // ── POLLING de segurança: busca últimas msgs dos canais monitorados a cada 5 min ──
   // Garante captura mesmo se algum update MTProto for perdido
-  const _ultimosMsgIds = {}; // channelId → último msgId processado
+  const _ultimosMsgIds = carregarUltimosMsgIds(); // channelId → último msgId processado
   const _pollingInterval = setInterval(async () => {
     for (const canal of TG_CANAIS_MONITORADOS) {
       try {
@@ -3588,6 +3674,7 @@ async function iniciarTelegram() {
           const ultimoId = _ultimosMsgIds[cid] || 0;
           if (msg.id <= ultimoId) continue; // já processado
           _ultimosMsgIds[cid] = msg.id;
+          salvarUltimosMsgIds(_ultimosMsgIds);
           // Verificar blacklist
           const bloqueado = _ignoradosIds.has(cid) ||
             TG_CANAIS_IGNORADOS_RAW().some(t => canal.includes(t));
@@ -3597,7 +3684,7 @@ async function iniciarTelegram() {
           if (_msgProcessadas.has(dedupKeyPolling)) continue;
           _msgProcessadas.set(dedupKeyPolling, Date.now());
           console.log(`[TG] Polling ACEITA @${canal} msgId=${msg.id}: ${msg.message.slice(0,60)}`);
-          await processarMensagemTelegram(msg.message, canal, null);
+          await processarMensagemTelegram(msg.message, canal, null, msgDateMs(msg));
         }
       } catch(e) { /* silencioso — canal pode estar temporariamente inacessível */ }
     }
@@ -3650,7 +3737,7 @@ async function iniciarTelegram() {
       }
 
       console.log('[TG] Nova mensagem:', texto.slice(0, 80));
-      await processarMensagemTelegram(texto, username, imagemBase64);
+      await processarMensagemTelegram(texto, username, imagemBase64, msgDateMs(msg));
     } catch (err) { console.error('[TG] Erro no handler NewMessage:', err.message); }
   }, new NewMessage({}));
 }
@@ -3728,7 +3815,7 @@ async function iniciarTelegramTenant(tenantId) {
           try { const b = await client.downloadMedia(msg, {}); if (b) imagemBase64 = b.toString('base64'); } catch {}
         }
         console.log('[TG:' + tenantId + '] captura de "' + (username || title) + '": ' + texto.slice(0, 60));
-        await comContextoTenant(tenantId, () => processarMensagemTelegram(texto, username || title, imagemBase64));
+        await comContextoTenant(tenantId, () => processarMensagemTelegram(texto, username || title, imagemBase64, msgDateMs(msg)));
       } catch (e) { console.error('[TG:' + tenantId + '] erro no handler:', e.message); }
     }, new NewMessage({}));
     console.log('[TG:' + tenantId + '] conectado.');
