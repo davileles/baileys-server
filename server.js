@@ -1918,6 +1918,15 @@ function linkDoCupomTSP(loja, codigo, dados = {}) {
 // Variaveis do template de cupom. Toda a regra de negocio (o que e teto de
 // desconto, o que e teto de produto, quando se pode afirmar "sem minimo") vive
 // AQUI — o template so escolhe onde cada frase aparece.
+// Dinheiro na mensagem: inteiro sai sem casas, quebrado sai com virgula. Antes
+// um minimo de 9.9 virava "R$ 9.9" no grupo — ponto decimal e duas casas
+// faltando sao o tipo de detalhe que faz a mensagem parecer automatica.
+function brlCupom(n) {
+  const v = Number(n);
+  if (!isFinite(v)) return String(n);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2).replace('.', ',');
+}
+
 function varsDoCupomTSP(dados) {
   const loja   = nomeLojaExibicao(dados.loja);
   const tipo   = dados.tipo   || 'reais';
@@ -1936,9 +1945,9 @@ function varsDoCupomTSP(dados) {
   const tipoStr = isPct ? '%' : ' reais';
 
   const partes = [];
-  if (temMin) partes.push(`em compras acima de R$ ${minimo}`);
-  if (maximo) partes.push(`em produtos de até R$ ${maximo}`);
-  if (isPct && limite) partes.push(`com limite de R$ ${limite} de desconto`);
+  if (temMin) partes.push(`em compras acima de R$ ${brlCupom(minimo)}`);
+  if (maximo) partes.push(`em produtos de até R$ ${brlCupom(maximo)}`);
+  if (isPct && limite) partes.push(`com limite de R$ ${brlCupom(limite)} de desconto`);
 
   // "Sem valor minimo" e uma AFIRMACAO. So pode ser feita quando a fonte disse
   // que nao ha minimo. Quando ela apenas nao informou (caso comum nas ofertas
@@ -1960,8 +1969,20 @@ function varsDoCupomTSP(dados) {
     importante = `Ideal para compras de até R$ ${tetoIdeal}.`;
   } else if (isPct && maximo) {
     const economia = Math.floor(Number(maximo) * Number(valor) / 100);
-    importante = `Só vale para produtos de até R$ ${maximo} — economia máxima de R$ ${economia}.`;
+    importante = `Só vale para produtos de até R$ ${brlCupom(maximo)} — economia máxima de R$ ${economia}.`;
   }
+
+  // Versao enxuta das MESMAS condicoes, para a linha que fica embaixo do codigo
+  // dentro de um lote. Numa lista de oito cupons a frase completa repetia
+  // "Válido em compras acima de / com limite de / de desconto" oito vezes e
+  // dobrava a altura da mensagem sem acrescentar informacao.
+  const curtas = [];
+  if (temMin) curtas.push(`Acima de R$ ${brlCupom(minimo)}`);
+  if (maximo) curtas.push(`produtos até R$ ${brlCupom(maximo)}`);
+  if (isPct && limite) curtas.push(`limite de R$ ${brlCupom(limite)}`);
+  const condicao_curta = curtas.length
+    ? curtas.join(' · ')
+    : (dados.minimoDesconhecido ? 'Confira as condições na loja' : 'Sem valor mínimo');
 
   return {
     gatilho:    String(dados.gatilho || '').trim(),
@@ -1970,6 +1991,7 @@ function varsDoCupomTSP(dados) {
     valor:      String(valor),
     valor_str:  `${valor}${tipoStr}`,
     validade,
+    condicao_curta,
     codigo:     codigo ? String(codigo).toUpperCase() : '',
     importante,
     aviso:      String(dados.aviso || dados.observacao || '').trim(),
@@ -2053,21 +2075,24 @@ function formatarCupomLoteTSP(lista) {
       (comum && assinaturaCondicaoCupom(c) === comum) ? corpoItem : corpoExcecao,
       varsDoCupomTSP(c)))
     .filter(t => t && t.trim())
-    .join('\n');
+    // Linha em branco entre um cupom e outro: colados, oito codigos viravam um
+    // paredao onde nao dava para saber qual condicao pertencia a qual codigo.
+    .join('\n\n');
 
   const refComum = comum ? lista.find(c => assinaturaCondicaoCupom(c) === comum) : null;
   const temExcecao = !!comum && lista.some(c => assinaturaCondicaoCupom(c) !== comum);
   const condicao_comum = refComum
     ? varsDoCupomTSP(refComum).validade
         .replace(/^Válido /, temExcecao ? 'Válidos ' : 'Todos válidos ')
-        .replace(/\.$/, temExcecao ? ' — exceto onde indicado (↳).' : '.')
+        .replace(/\.$/, temExcecao ? ' — exceto onde indicado abaixo do código.' : '.')
     : '';
 
   const base = varsDoCupomTSP(lista[0]);
   const corpo = (templateCupomLote()?.corpo || '').trim();
   return renderTemplate(corpo, {
     ...base,
-    codigo: '', valor_str: '', valor: '', validade: '', importante: '', aviso: '',
+    codigo: '', valor_str: '', valor: '', validade: '', condicao_curta: '',
+    importante: '', aviso: '',
     minimo: '', maximo: '', limite: '',
     itens, condicao_comum,
     qtd: String(lista.length),
