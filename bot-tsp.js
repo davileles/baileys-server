@@ -315,7 +315,8 @@ function formatarStatusBot(st) {
     'WhatsApp: ' + wa,
     'Inbound: ' + surdez + (st.minSemUpsert != null ? (' (última msg há ' + st.minSemUpsert + ' min)') : ''),
     'Telegram: ' + tg,
-    'Publicações hoje: ' + (st.publicacoesHoje != null ? st.publicacoesHoje : '?'),
+    'Entregas hoje: ' + (st.publicacoesHoje != null ? st.publicacoesHoje : '?') + ' msg em grupos'
+      + (st.despachosHoje != null ? (' · ' + st.despachosHoje + ' despacho(s)') : ''),
     'Fila: ' + (st.filaTotal != null ? st.filaTotal : '?') + ' item(ns)'
       + (st.filaPendentes != null ? (' — ' + st.filaPendentes + ' pendente(s)') : ''),
     (st.logout && st.logoutMin != null) ? ('⚠️ Logout há ' + st.logoutMin + ' min — /pair ou /qr') : null,
