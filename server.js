@@ -357,6 +357,11 @@ let _encerrando = false;
 async function encerrarComFlush(sinal, codigo = 0) {
   if (_encerrando) return;                 // SIGTERM seguido de SIGINT nao reentra
   _encerrando = true;
+  // Primeiro a sessao Signal, sempre: e o unico estado que, perdido, corrompe
+  // entregas futuras (replay -> "Aguardando mensagem"). Teto curto: 3s cobrem
+  // qualquer rajada de gravacoes e cabem folgados no draining de 25s.
+  try { await _flushTodasSessoes(3000); }
+  catch (e) { console.error('[AUTH] Falha ao drenar sessao no encerramento:', e.message); }
   const pendentes = pushesPendentes();
   if (!pendentes.length) { console.log('[SYNC] ' + sinal + ' — nada no debounce.'); process.exit(codigo); }
 
@@ -529,7 +534,33 @@ async function useAuthStateAtomico(pasta) {
       },
     },
     saveCreds: () => writeData(creds, 'creds.json'),
+    // Drena a cadeia de escrita ate estabilizar (ou ate maxMs). Usado antes de
+    // QUALQUER process.exit: keys.set() ja faz await da gravacao, mas um exit que
+    // chega com esse await em voo perde session-*/sender-key-* ja avancados na
+    // memoria — e no proximo boot o bot cifra com contador repetido, que o
+    // destinatario descarta como replay ("Aguardando mensagem").
+    flush: async (maxMs = 3000) => {
+      const fim = Date.now() + maxMs;
+      let ultima = null;
+      while (Date.now() < fim) {
+        const atual = cadeiaEscrita;
+        if (atual === ultima) break;      // ninguem enfileirou nada desde a ultima espera
+        ultima = atual;
+        await Promise.race([atual, new Promise(r => setTimeout(r, Math.max(0, fim - Date.now())))]);
+      }
+    },
   };
+}
+
+// Registro dos flushes de sessao (principal + contas secundarias), por pasta:
+// reconexao substitui o anterior em vez de acumular cadeias mortas.
+const _flushsSessao = new Map();   // pasta -> flush()
+async function _flushTodasSessoes(maxMs = 3000) {
+  const fns = [..._flushsSessao.values()];
+  if (!fns.length) return;
+  const t0 = Date.now();
+  await Promise.all(fns.map(f => f(maxMs).catch(() => {})));
+  console.log('[AUTH] Sessao(oes) drenada(s) antes do exit em ' + (Date.now() - t0) + ' ms (' + fns.length + ' pasta(s)).');
 }
 
 const app    = express();
@@ -1125,7 +1156,8 @@ async function conectarConta(id) {
   try {
     const dir = CONTAS_DIR + '/' + id;
     await mkdirAsync(dir, { recursive: true });
-    const { state, saveCreds } = await useAuthStateAtomico(dir);
+    const { state, saveCreds, flush: flushSessao } = await useAuthStateAtomico(dir);
+    _flushsSessao.set(dir, flushSessao);
     const { version } = await fetchLatestBaileysVersion();
     const s = makeWASocket({
       version,
@@ -6818,7 +6850,8 @@ async function conectar() {
   isConnecting = true;
 
   try {
-    const { state, saveCreds } = await useAuthStateAtomico(SESSAO_DIR);
+    const { state, saveCreds, flush: flushSessao } = await useAuthStateAtomico(SESSAO_DIR);
+    _flushsSessao.set(SESSAO_DIR, flushSessao);
     const { version }          = await fetchLatestBaileysVersion();
     const novaSock = makeWASocket({
       version,
