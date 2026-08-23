@@ -7822,6 +7822,28 @@ setInterval(() => {
   } catch (e) { console.error('[SUPERVISOR-WS] Erro no ciclo:', e.message); }
 }, 30 * 1000).unref?.();
 
+// ── REABASTECIMENTO PERIODICO DE PRE-KEYS ────────────────────────────────────
+// O Baileys so confere/reabastece as pre-keys no evento 'open'. Numa conexao
+// que fica dias de pe, com membros entrando e reinstalando em dezenas de
+// grupos, as 30 pre-keys do servidor se esgotam — e o handshake de um aparelho
+// novo com o bot fica sem one-time pre-key. Conferir a cada hora custa 1 IQ de
+// leitura (+1 de upload so se restarem <= 5). Cobre principal e secundarias,
+// porque contaDoTurno() alterna quem despacha.
+setInterval(async () => {
+  const alvos = [];
+  if (conectado && sock) alvos.push({ nome: 'principal', s: sock });
+  for (const [id, c] of contasExtras) if (c?.conectado && c.sock) alvos.push({ nome: id, s: c.sock });
+  for (const { nome, s } of alvos) {
+    try {
+      if (typeof s.uploadPreKeysToServerIfRequired !== 'function') continue;
+      await Promise.race([
+        s.uploadPreKeysToServerIfRequired(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 30s')), 30000)),
+      ]);
+    } catch (e) { console.warn('[PREKEYS] ' + nome + ': conferencia falhou — ' + e.message); }
+  }
+}, 60 * 60 * 1000).unref?.();
+
 app.post('/reconectar', async (req, res) => {
   forcarReconexao('endpoint-/reconectar');
   res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
