@@ -610,15 +610,27 @@ let _conexaoPromise = null; // apenas para expor no /status
 
 // Aguarda sock disponível com polling leve.
 // Dispara conectar() uma única vez se não estiver conectando.
+// Instante do ultimo 'open' da conta principal. Logo apos o open o Baileys
+// ainda processa o lote offline e o app-state sync; enviar nesse primeiro
+// segundo compete com isso e e a janela mais fragil para cifrar. Pre-keys NAO
+// sao o motivo (o Baileys as sobe ANTES de emitir open) — e so estabilizacao.
+let _abertoEm = 0;
+const ESTABILIZACAO_POS_OPEN_MS = 3000;
+function _sockEstavel() {
+  return conectado && !!sock && (Date.now() - _abertoEm) >= ESTABILIZACAO_POS_OPEN_MS;
+}
+
 async function aguardarSock(ms = 20000) {
-  if (conectado && sock) return true;
-  console.log('[WA] aguardarSock: aguardando conexão...');
-  if (!isConnecting && !sock) conectar();
+  if (_sockEstavel()) return true;
+  if (!(conectado && sock)) {
+    console.log('[WA] aguardarSock: aguardando conexão...');
+    if (!isConnecting && !sock) conectar();
+  }
   const inicio = Date.now();
-  while ((!conectado || !sock) && Date.now() - inicio < ms) {
+  while (!_sockEstavel() && Date.now() - inicio < ms) {
     await new Promise(r => setTimeout(r, 500));
   }
-  return conectado && !!sock;
+  return _sockEstavel();
 }
 
 // Alias mantido para compatibilidade com /qr route
@@ -6910,6 +6922,7 @@ async function conectar() {
       if (qr) { qrAtual = await QRCode.toDataURL(qr); }
       if (connection === 'open') {
         conectado = true;
+        _abertoEm = Date.now();
         qrAtual = null;
         pairNumero = null; pairCodigo = null; pairErro = null; pairPedidoEm = 0;
         errosDescripto = 0;
