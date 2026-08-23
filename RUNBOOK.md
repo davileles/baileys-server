@@ -17,7 +17,7 @@ servidor já degradado.
 | `GET /health` | **200** = saudável. **503** = degradado; o corpo diz o `motivo`. É o endpoint para monitor externo (UptimeRobot/BetterStack). |
 | `GET /status` | Retrato completo em JSON (`conectado`, `surdezEstado`, `ultimoUpsertEm`, `publicacoesHoje`, fila…). Sempre 200. |
 | Bot Telegram `/status` | O mesmo retrato, pelo celular. |
-| `publicacoesHoje` | **O número que importa.** Se está em 0 num dia útil depois das 10h, algo está errado mesmo que `conectado` seja `true`. |
+| `publicacoesHoje` | **O número que importa.** Se está em 0 num dia útil depois das 10h, algo está errado mesmo que `conectado` seja `true`. Conta **entregas** (1 por grupo que recebeu), não ofertas: uma oferta em 30 grupos soma 30. `despachosHoje` é o par: 1 por oferta/cupom distinto. |
 
 Sinais de **degradação** em `/status` ou `/health`:
 
