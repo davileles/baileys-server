@@ -2690,6 +2690,7 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
         + falhas.map(f => (NOMES_GRUPOS.get(f.jid) || f.jid) + ': ' + f.erro).join('\n') });
     } catch(_) {}
   }
+  if (enviados.length) _despachoContar();
   return { enviados, falhas, pulados };
 }
 
@@ -2940,6 +2941,7 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   // (e nao nos dois callers) para cobrir tanto o auto-envio quanto a aprovacao
   // manual pelo painel, sem risco de um dos caminhos ficar de fora.
   if (oferta) registrarPublicacao(oferta, enviados.length);
+  if (enviados.length) _despachoContar();
   return { enviados, falhas };
 }
 
@@ -6582,6 +6584,28 @@ function outboxHoje() {
   return { enfileiradas: d.enfileiradas || 0, recuperadas: d.recuperadas || 0, desistidas: d.desistidas || 0 };
 }
 
+// ── DESPACHOS DISTINTOS DO DIA ───────────────────────────────────────────────
+// publicacoesDia conta ENTREGAS (uma por grupo que recebeu) — e o que o
+// watchdog de saida precisa medir, mas le-lo como "ofertas" engana: uma
+// oferta em 30 grupos soma 30. Este contador e o par dele: 1 por despacho
+// (oferta do radar ou cupom), independente de quantos grupos. Juntos dao a
+// leitura honesta: "120 entregas · 4 despachos".
+function _despachoContar() {
+  try {
+    if ((tenantContexto() || TENANT_PADRAO) !== TENANT_PADRAO) return;
+    const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+    if (!_health.despachosDia || _health.despachosDia.data !== hoje) {
+      _health.despachosDia = { data: hoje, n: 0 };
+    }
+    _health.despachosDia.n++;
+    _salvarHealth();
+  } catch (e) { /* contador nunca derruba o fluxo de envio */ }
+}
+function despachosHoje() {
+  const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+  return (_health.despachosDia && _health.despachosDia.data === hoje) ? _health.despachosDia.n : 0;
+}
+
 // ── RESUMO DIARIO AO OPERADOR ────────────────────────────────────────────────
 // Uma mensagem por dia, depois das RESUMO_DIARIO_HORA (padrao 21h SP, fim da
 // janela de envio do CDV), com o que importa: publicacoes, o que a outbox
@@ -6612,7 +6636,7 @@ setInterval(async () => {
     const uptimeH = ((Date.now() - _bootEm) / 3600000).toFixed(1);
 
     const texto = 'Watchdog — resumo do dia ' + d + '/' + m + '\n\n'
-      + '📤 Publicacoes: ' + publicacoesHoje() + ' oferta(s) nos grupos\n'
+      + '📤 Entregas: ' + publicacoesHoje() + ' mensagem(ns) em grupos · ' + despachosHoje() + ' despacho(s) distinto(s)\n'
       + '🔁 Outbox: ' + ob.enfileiradas + ' guardada(s), ' + ob.recuperadas + ' recuperada(s), '
         + ob.desistidas + ' perdida(s) — ' + outboxFalhas.length + ' pendente(s) agora\n'
       + '📥 Fila de aprovacao: ' + pendAprov + ' pendente(s)\n'
@@ -7831,6 +7855,7 @@ app.get('/health', (req, res) => {
     minSemUpsert,
     telegramConectado: tgConectado,
     publicacoesHoje: publicacoesHoje(),
+    despachosHoje: despachosHoje(),
     filaTotal: filaPendentes.length,
     uptimeSeg: Math.round((agora - _bootEm) / 1000),
   });
@@ -12888,6 +12913,7 @@ bootBotTsp({
     minSemUpsert: _health.ultimoUpsertEm ? Math.round((Date.now() - _health.ultimoUpsertEm) / 60000) : null,
     telegramConectado: tgConectado,
     publicacoesHoje: publicacoesHoje(),
+    despachosHoje: despachosHoje(),
     filaTotal: filaPendentes.length,
     filaPendentes: filaPendentes.filter(o => o.status === 'pendente' && !o.autoAgendado).length,
     uptimeMin: Math.round((Date.now() - _bootEm) / 60000),
