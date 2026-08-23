@@ -2180,20 +2180,6 @@ function varsDoCupomTSP(dados) {
   const isPct  = tipo === 'pct';
   const tipoStr = isPct ? '%' : ' reais';
 
-  const partes = [];
-  if (temMin) partes.push(`em compras acima de R$ ${brlCupom(minimo)}`);
-  if (maximo) partes.push(`em produtos de até R$ ${brlCupom(maximo)}`);
-  if (isPct && limite) partes.push(`com limite de R$ ${brlCupom(limite)} de desconto`);
-
-  // "Sem valor minimo" e uma AFIRMACAO. So pode ser feita quando a fonte disse
-  // que nao ha minimo. Quando ela apenas nao informou (caso comum nas ofertas
-  // da rede), a mensagem manda conferir as condicoes em vez de prometer algo.
-  const validade = partes.length
-    ? 'Válido ' + partes.join(', ') + '.'
-    : (dados.minimoDesconhecido
-        ? 'Confira as condições de uso na página da loja.'
-        : 'Válido sem valor mínimo de compra.');
-
   // Com teto de desconto, a compra "ideal" e aquela em que o percentual bate
   // exatamente no teto. Com teto de PRODUTO, o desconto maximo e simplesmente o
   // percentual sobre esse teto — sao contas diferentes e a mensagem tem de dizer
@@ -2208,11 +2194,45 @@ function varsDoCupomTSP(dados) {
         return maximo ? Math.min(ideal, Number(maximo)) : ideal;
       })()
     : null;
-  const teto_str = tetoUtil ? `Bom para compras de até R$ ${brlCupom(tetoUtil)}` : '';
+  // Quanto o cliente economiza NA MELHOR HIPOTESE. "Limite de R$ 100 de
+  // desconto" e "desconto de até R$ 100" dizem a mesma coisa para quem ja
+  // entendeu que existe um teto — e nada para quem nao entendeu. Anunciar o par
+  // (compra ideal, desconto maximo) e o que torna o teto visivel: um numero
+  // explica o outro. Com teto de produto junto, o desconto alcancavel pode ser
+  // MENOR que o limite bruto (25% com limite R$ 100 mas produto ate R$ 300 rende
+  // R$ 75), e e esse numero — nao o limite do regulamento — que vai na mensagem.
+  const descontoMax = (isPct && tetoUtil)
+    ? Math.min(Number(limite), Math.floor(Number(tetoUtil) * Number(valor) / 100))
+    : null;
+
+  const partes = [];
+  if (temMin) partes.push(`em compras acima de R$ ${brlCupom(minimo)}`);
+  if (maximo) partes.push(`em produtos de até R$ ${brlCupom(maximo)}`);
+  // Com teto util calculado, o "limite de R$ X de desconto" sai daqui: a frase
+  // de teto (teto_str) ja informa o mesmo limite E a compra em que ele e
+  // atingido. Mantido apenas quando nao ha teto calculavel.
+  if (isPct && limite && !tetoUtil) partes.push(`com limite de R$ ${brlCupom(limite)} de desconto`);
+
+  // "Sem valor minimo" e uma AFIRMACAO. So pode ser feita quando a fonte disse
+  // que nao ha minimo. Quando ela apenas nao informou (caso comum nas ofertas
+  // da rede), a mensagem manda conferir as condicoes em vez de prometer algo.
+  const validade = partes.length
+    ? 'Válido ' + partes.join(', ') + '.'
+    : (dados.minimoDesconhecido
+        ? 'Confira as condições de uso na página da loja.'
+        : 'Válido sem valor mínimo de compra.');
+
+  const teto_str = tetoUtil
+    ? (descontoMax
+        ? `Bom para compras de até R$ ${brlCupom(tetoUtil)} e desconto de até R$ ${brlCupom(descontoMax)}`
+        : `Bom para compras de até R$ ${brlCupom(tetoUtil)}`)
+    : '';
 
   let importante = '';
   if (tetoUtil) {
-    importante = `Ideal para compras de até R$ ${brlCupom(tetoUtil)}.`;
+    importante = descontoMax
+      ? `Ideal para compras de até R$ ${brlCupom(tetoUtil)} — desconto máximo de R$ ${brlCupom(descontoMax)}.`
+      : `Ideal para compras de até R$ ${brlCupom(tetoUtil)}.`;
   } else if (isPct && maximo) {
     const economia = Math.floor(Number(maximo) * Number(valor) / 100);
     importante = `Só vale para produtos de até R$ ${brlCupom(maximo)} — economia máxima de R$ ${economia}.`;
@@ -2228,7 +2248,10 @@ function varsDoCupomTSP(dados) {
   // Com teto calculado, ele entra no lugar do "limite de R$ X": os dois dizem a
   // mesma coisa e o teto e o que orienta a compra. Sem teto (cupom de valor
   // fixo em reais), o limite bruto e tudo o que ha para informar.
-  if (tetoUtil) curtas.push(`bom para compras de até R$ ${brlCupom(tetoUtil)}`);
+  if (tetoUtil) {
+    curtas.push(`bom para compras de até R$ ${brlCupom(tetoUtil)}`);
+    if (descontoMax) curtas.push(`desconto de até R$ ${brlCupom(descontoMax)}`);
+  }
   else if (isPct && limite) curtas.push(`limite de R$ ${brlCupom(limite)}`);
   const condicao_curta = curtas.length
     ? curtas.join(' · ')
