@@ -5691,6 +5691,20 @@ function resetarHealthTimer() {
 var errosDescripto  = 0;
 var ERROS_SOFT_MAX  = 8;   // 8 falhas seguidas → cura cirúrgica (só sender keys, sem reconectar)
 var ERROS_DESCR_MAX = 20;  // 20 falhas seguidas → limpa sessions+sender keys (pre-keys preservadas)
+
+// ── CONTAGEM DE INDECIFRAVEIS POR GRUPO ──────────────────────────────────────
+// errosDescripto e GLOBAL e zera com qualquer mensagem decifrada de QUALQUER
+// grupo: de dia isso mascara (raramente chega a 8), de madrugada com um unico
+// grupo ativo chega facil — e a cura apagava as sender keys de TODOS os grupos
+// por culpa de um so, disparando tempestade de redistribuicao em dezenas de
+// grupos e uma janela de surdez geral. Isso e "Aguardando mensagem" que NOS
+// causamos. Agora a cura cirurgica e POR GRUPO (so o grupo com chave velha e
+// tocado) e o reset global so acontece quando a sessao esta SISTEMICAMENTE
+// quebrada: varios grupos distintos falhando ao mesmo tempo.
+const _indecifraveisPorGrupo = new Map();   // jid -> { n, curas, ultimaEm }
+const ERROS_GRUPO_SOFT      = 8;            // 8 seguidas DO MESMO grupo -> cura so desse grupo
+const ERROS_GRUPO_CURAS_MAX = 3;            // apos 3 curas sem resolver, para e avisa (o remetente nao redistribui)
+const ERROS_GRUPOS_HARD_MIN = 3;            // reset global exige >= 3 grupos distintos falhando (janela 10 min)
 var isResetting     = false; // true durante limpeza de sessão — bloqueia conexões/timers concorrentes
 var _reconnectTimer = null;  // referência única do timer de reconexão pendente (evita corrida)
 
@@ -5884,7 +5898,7 @@ async function limparSessaoEReconectar() {
       }
     }
   } catch(e) {}
-  errosDescripto = 0;
+  errosDescripto = 0; _indecifraveisPorGrupo.clear();
   isResetting = false;
   _agendarReconexao(3000);
 }
@@ -5899,6 +5913,30 @@ async function limparSessaoEReconectar() {
 // cirurgia — e trauma. Acima do teto, o problema nao e de chave de grupo:
 // escalamos para reset de sessao, que reconstroi o estado de forma ordenada.
 const SENDER_KEYS_TETO = 25;
+
+// Cura cirurgica POR GRUPO: apaga as sender keys dos remetentes DESTE grupo
+// (o bot manda retry receipt e eles redistribuem) e a memory de distribuicao
+// da NOSSA key para este grupo (o proximo envio redistribui). Nenhum outro
+// grupo e tocado. Nome no disco: sender-key-<grupo>--<remetente>--<device>.json
+// e sender-key-memory-<grupo>.json (fixFileName troca ':' por '-').
+async function limparSenderKeysDoGrupo(jid, cura) {
+  try {
+    const fix = (x) => x.replace(/\//g, '__').replace(/:/g, '-');
+    const prefKeys = fix('sender-key-' + jid) + '--';
+    const arqMem   = fix('sender-key-memory-' + jid) + '.json';
+    const arquivos = await readdir(SESSAO_DIR);
+    let n = 0;
+    for (const arq of arquivos) {
+      if (arq.startsWith(prefKeys) || arq === arqMem) { await unlink(SESSAO_DIR + '/' + arq).catch(() => {}); n++; }
+    }
+    console.log('[WA] Cura cirúrgica do grupo ' + (NOMES_GRUPOS.get(jid) || jid) + ' (ciclo ' + cura + '): ' + n + ' arquivo(s) de sender key apagado(s). Conexão mantida; só este grupo redistribui.');
+    if (cura >= ERROS_GRUPO_CURAS_MAX) {
+      _avisarOperador('Watchdog — grupo indecifrável: ' + (NOMES_GRUPOS.get(jid) || jid)
+        + ' segue com mensagens que o bot não decifra após ' + cura + ' curas. O remetente não está redistribuindo a chave.'
+        + '\nSe for grupo-fonte, a captação dele está parada. Verifique se o bot segue no grupo; em último caso, sair e entrar.').catch(() => {});
+    }
+  } catch (e) { console.error('[WA] Erro na cura por grupo:', e.message); }
+}
 
 async function limparSenderKeys() {
   try {
@@ -6925,7 +6963,7 @@ async function conectar() {
         _abertoEm = Date.now();
         qrAtual = null;
         pairNumero = null; pairCodigo = null; pairErro = null; pairPedidoEm = 0;
-        errosDescripto = 0;
+        errosDescripto = 0; _indecifraveisPorGrupo.clear();
         isConnecting = false;
         _reconectarTentativas = 0;
         _erros500Consecutivos = 0;
@@ -7075,13 +7113,32 @@ async function conectar() {
       }
       for (const msg of messages) {
         if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
-          errosDescripto++;
-          console.warn('[WA] Mensagem indecifrável de ' + (msg.key?.remoteJid || '?') + ' (' + errosDescripto + ' seguidas). Baileys enviou retry receipt ao remetente.');
-          if (errosDescripto === ERROS_SOFT_MAX) { limparSenderKeys(); }
-          else if (errosDescripto >= ERROS_DESCR_MAX) { errosDescripto = 0; await limparSessaoEReconectar(); return; }
+          const jidInd = msg.key?.remoteJid || '?';
+          errosDescripto++;                                          // global: /status e gatilho do hard
+          const g = _indecifraveisPorGrupo.get(jidInd) || { n: 0, curas: 0, ultimaEm: 0 };
+          g.n++; g.ultimaEm = Date.now();
+          _indecifraveisPorGrupo.set(jidInd, g);
+          console.warn('[WA] Mensagem indecifrável de ' + jidInd + ' (' + g.n + ' seguidas neste grupo; ' + errosDescripto + ' no total). Baileys enviou retry receipt ao remetente.');
+          // Cura POR GRUPO a cada 8 seguidas dele, ate ERROS_GRUPO_CURAS_MAX; depois
+          // so avisa — apagar mais nao adianta se o remetente nao redistribui.
+          if (g.n % ERROS_GRUPO_SOFT === 0 && g.curas < ERROS_GRUPO_CURAS_MAX) { g.curas++; limparSenderKeysDoGrupo(jidInd, g.curas); }
+          // Reset global SO com falha sistemica: >= ERROS_GRUPOS_HARD_MIN grupos
+          // distintos acima do limiar nos ultimos 10 min. Um grupo so, por mais
+          // que falhe, nunca derruba a sessao dos outros.
+          const agoraInd = Date.now();
+          const gruposFalhando = [..._indecifraveisPorGrupo.values()]
+            .filter(x => x.n >= ERROS_GRUPO_SOFT && (agoraInd - x.ultimaEm) < 10 * 60 * 1000).length;
+          if (errosDescripto >= ERROS_DESCR_MAX && gruposFalhando >= ERROS_GRUPOS_HARD_MIN) {
+            console.error('[WA] Falha sistêmica de decifração: ' + gruposFalhando + ' grupos distintos. Resetando sessão.');
+            errosDescripto = 0; _indecifraveisPorGrupo.clear();
+            await limparSessaoEReconectar(); return;
+          }
           continue;
         }
-        if (msg.message) errosDescripto = 0; // decifrou com sucesso → sessão saudável
+        if (msg.message) {
+          errosDescripto = 0;                                        // decifrou → sessão saudável
+          if (msg.key?.remoteJid) _indecifraveisPorGrupo.delete(msg.key.remoteJid); // e ESTE grupo voltou a falar
+        }
         // Campanha: resposta de um contato cancela o follow-up dele na hora.
         // Sem isto o sistema cobra quem ja respondeu — o pior erro possivel
         // numa campanha de recuperacao.
@@ -12539,7 +12596,7 @@ app.post('/reset-sessao-completo', async (req, res) => {
     }
     console.log('[RESET] Sessão apagada completamente. Aguardando novo QR...');
   } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
-  errosDescripto = 0;
+  errosDescripto = 0; _indecifraveisPorGrupo.clear();
   _reconectarTentativas = 0;
   isResetting = false;
 
@@ -12592,7 +12649,7 @@ app.post('/pair', async (req, res) => {
   pairCodigo   = null;
   pairErro     = null;
   pairPedidoEm = Date.now();
-  errosDescripto = 0;
+  errosDescripto = 0; _indecifraveisPorGrupo.clear();
   _reconectarTentativas = 0;
   isResetting = false;
 
