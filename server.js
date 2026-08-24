@@ -10064,6 +10064,15 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
 
   const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta);
   marcarDisparo(asin);
+  // O historico durvel e o unico ponto por onde toda oferta enviada deve
+  // passar: alem da contagem, e la que rodam registrarVisto (dedup) e
+  // vigiarProdutoDivulgado. Sem isto, produto disparado por lista continuava
+  // elegivel no radar e saia duas vezes no mesmo dia.
+  oferta.status         = 'enviado';
+  oferta.enviadoEm      = new Date().toISOString();
+  oferta.gruposEnviados = r.enviados;
+  oferta.falhas         = r.falhas;
+  registrarEnvioHistorico(oferta);
   return { ok:true, nome:o.nome, grupos:r.enviados.length, cupom:o.cupom?.codigo || null,
            aviso:o.avisoCupom || null, preco:o.produto.preco };
 }
@@ -10964,6 +10973,13 @@ app.post('/vitrine/disparar', async (req, res) => {
     try {
       const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta);
       marcarDisparo(o.asin);
+      // Mesma razao de dispararProdutoDaLista: sem o registro no historico o
+      // disparo avulso nao conta, nao marca dedup e nao entra na vigilancia.
+      oferta.status         = 'enviado';
+      oferta.enviadoEm      = new Date().toISOString();
+      oferta.gruposEnviados = r.enviados;
+      oferta.falhas         = r.falhas;
+      registrarEnvioHistorico(oferta);
       enviados.push({ asin:o.asin, nome:o.nome, grupos:r.enviados.length,
                       cupom:o.cupom?.codigo || null, aviso:o.avisoCupom || null });
     } catch (e) {
