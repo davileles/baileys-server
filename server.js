@@ -5975,6 +5975,15 @@ async function limparSenderKeysDoGrupo(jid, cura) {
     }
     console.log('[WA] Cura cirúrgica do grupo ' + (NOMES_GRUPOS.get(jid) || jid) + ' (ciclo ' + cura + '): ' + n + ' arquivo(s) de sender key apagado(s). Conexão mantida; só este grupo redistribui.');
     if (cura >= ERROS_GRUPO_CURAS_MAX) {
+      // So avisa se o grupo e de LEITURA (fonte do radar ou monitorado). Em grupo
+      // de DESTINO o bot nao le nada: indecifravel ali e conversa de membro que
+      // nunca seria processada — avisar gera alarme falso e induz o operador a
+      // "sair e entrar" de um grupo saudavel (perdendo admin e a base de membros).
+      if (!(ehFonteRadar(jid) || GRUPOS_MONITORADOS.includes(jid))) {
+        console.log('[WA] ' + (NOMES_GRUPOS.get(jid) || jid) + ' segue indecifravel apos ' + cura
+          + ' cura(s), mas e grupo de DESTINO (nao lemos dele) — nenhuma captacao afetada, sem aviso ao operador.');
+        return;
+      }
       _avisarOperador('Watchdog — grupo indecifrável: ' + (NOMES_GRUPOS.get(jid) || jid)
         + ' segue com mensagens que o bot não decifra após ' + cura + ' curas. O remetente não está redistribuindo a chave.'
         + '\nSe for grupo-fonte, a captação dele está parada. Verifique se o bot segue no grupo; em último caso, sair e entrar.').catch(() => {});
