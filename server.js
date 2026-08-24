@@ -5325,7 +5325,11 @@ async function processarRadarMarketplace(jid, texto) {
       // no envio), entao ele ja serve de leitura sem nenhuma adaptacao.
       try {
         const lidos = await processarTextoAmazon(texto);
-        await lerPrecosParaSerie(lidos.map(r => r.produto), jid, podeAmazon.motivo);
+        // Em modo sem API o preco vem do texto do grupo. Alimentar a serie com
+        // numero digitado por terceiro envenenaria a mediana — mesma razao pela
+        // qual Magalu e Awin nunca entram. So le quando veio da API.
+        await lerPrecosParaSerie(
+          lidos.map(r => r.produto).filter(p => p && !p.semApi), jid, podeAmazon.motivo);
       } catch (e) { console.warn('[LEITURA] Amazon:', e.message); }
     } else {
       console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
@@ -5413,10 +5417,13 @@ async function processarRadarMarketplace(jid, texto) {
     // Dentro da janela tambem se le: o dado ja esta na mao, e a serie fica com
     // pontos intradiarios que a varredura horaria sozinha nao pega.
     try {
-      registrarLeituraPreco(p.asin, {
-        nome: p.titulo, loja: p.loja, preco: p.preco,
-        precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
-      });
+      // p.semApi: preco lido do texto do grupo, nao de fonte verificavel.
+      if (!p.semApi) {
+        registrarLeituraPreco(p.asin, {
+          nome: p.titulo, loja: p.loja, preco: p.preco,
+          precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
+        });
+      }
     } catch (e) { /* serie e conveniencia: nunca segura o pipeline */ }
 
     // ── GATE CENTRAL: DEDUP + PISO DE DESCONTO ────────────────────────────
@@ -5482,6 +5489,10 @@ async function processarRadarMarketplace(jid, texto) {
         // Magalu nao tem fonte verificavel de preco: o painel precisa avisar
         // antes da aprovacao que aquele valor veio do texto do grupo.
         precoDeReferencia: !!r.precoDeReferencia,
+        // Amazon em modo sem API: preco tambem vem do texto, mas a operacao
+        // decidiu publicar direto enquanto a conta nao fica elegivel. Sem este
+        // campo o gate abaixo mandaria tudo para a fila.
+        autoEnvioMesmoSemVerificar: !!r.autoEnvioMesmoSemVerificar,
       },
       imagens: imagem ? [imagem] : [],
       // Nome do grupo resolvido na captura: no painel o jid sozinho nao diz nada,
@@ -5567,7 +5578,12 @@ async function processarRadarMarketplace(jid, texto) {
     // Excecao: precoDeReferencia marca oferta cujo preco veio do TEXTO do grupo
     // e nao de fonte verificavel (caso da Magalu). Anunciar valor nao conferido
     // sem revisao humana ja produziu 'De/Por' inexistente — essas vao para a fila.
-    if (autoEnvioModoOferta() === 'on' && !oferta.dadosExtraidos.precoDeReferencia && !oferta.cupomForaDaBase) {
+    // Preco nao verificado segura a oferta na fila — salvo quando o proprio
+    // pipeline marcou que pode sair assim (Amazon sem API). A Magalu nao marca,
+    // entao continua exigindo aprovacao manual como antes.
+    const _seguraPorPreco = oferta.dadosExtraidos.precoDeReferencia
+                         && !oferta.dadosExtraidos.autoEnvioMesmoSemVerificar;
+    if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
         oferta.status = 'enviado';
@@ -5591,7 +5607,7 @@ async function processarRadarMarketplace(jid, texto) {
     salvarFila();
     const _motivoFila = autoEnvioModoOferta() !== 'on' ? ''
       : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
-      : oferta.dadosExtraidos.precoDeReferencia ? ' — preco nao verificado, exige aprovacao manual'
+      : _seguraPorPreco ? ' — preco nao verificado, exige aprovacao manual'
       : '';
     console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)' + _motivoFila);
   }
