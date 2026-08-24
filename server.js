@@ -48,6 +48,7 @@ import {
   podeLerPreco, registrarLeitura, leituraForaJanelaAtiva,
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
   recarregarRadarTenants, refDeterministico,
+  sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -13067,6 +13068,54 @@ faxinaDisco('arranque').then(r => {
   if (r.apagados === 0 && r.mantidos > 2000) return faxinaEmergencia(500);
 }).catch(() => {});
 setInterval(() => { faxinaDisco('periodica').catch(() => {}); }, FAXINA_INTERV);
+
+// ── SONDA DE LIBERACAO DA CREATORS API (AMAZON) ──────────────────────────────
+// A conta de Associados esta sem elegibilidade e o getItems devolve 403. Em vez
+// de descobrir a liberacao por acaso, uma sonda barata (1 ASIN, 1 chamada) bate
+// de tempos em tempos e avisa o operador no minuto em que a API voltar. Sucesso
+// ja limpa a marca de indisponibilidade dentro do modulo, entao o pipeline
+// retoma o caminho com API sozinho — este aviso e so para o humano saber.
+const AMZ_SONDA_MS = Number(process.env.AMZ_SONDA_MIN || 30) * 60 * 1000;
+let _amzAvisado = false;
+
+async function sondaApiAmazon() {
+  // Nada a sondar enquanto a API estiver respondendo normalmente.
+  if (!apiAmazonIndisponivel()) return;
+  const r = await sondarApiAmazon();
+  if (!r.ok) {
+    _amzAvisado = false;   // segue fora do ar: proximo sucesso volta a avisar
+    console.log('[AMZ-SONDA] Creators API ainda indisponivel — HTTP ' + r.status);
+    return;
+  }
+  if (_amzAvisado) return;
+  _amzAvisado = true;
+  console.log('[AMZ-SONDA] Creators API LIBERADA — pipeline voltou ao caminho com API.');
+  try {
+    await enviarMensagem(GRUPOS['operador'], { text:
+      '\u2705 *Creators API da Amazon liberada*\n\n'
+      + 'A conta de Associados passou a responder ao getItems. '
+      + 'O radar ja voltou sozinho ao caminho com API: preco conferido, imagem, '
+      + 'estoque e nota.\n\n'
+      + 'A oferta Amazon volta a sair pelo auto-envio normal, com todos os '
+      + 'filtros de sempre (preco confirmado, em estoque, piso de desconto e dedup).\n\n'
+      + 'Lembretes:\n'
+      + '\u2022 desligar a divulgacao Amazon na ferramenta externa, para nao duplicar\n'
+      + '\u2022 se quiser, reativar a Amazon no monitor de precos' });
+  } catch (e) { console.warn('[AMZ-SONDA] Falha ao avisar o operador:', e.message); }
+}
+
+setInterval(() => { sondaApiAmazon().catch(() => {}); }, AMZ_SONDA_MS).unref?.();
+// Uma sondagem no arranque, depois que o socket teve tempo de abrir.
+setTimeout(() => { sondaApiAmazon().catch(() => {}); }, 90000).unref?.();
+
+// Estado da API Amazon para o painel/diagnostico.
+app.get('/mkt/amazon/estado', (req, res) => {
+  res.json({ ok: true, api: estadoApiAmazon(), disparoSemApi: disparoSemApiLiberado(),
+             sondaMin: AMZ_SONDA_MS / 60000 });
+});
+app.post('/mkt/amazon/sondar', async (req, res) => {
+  res.json({ ok: true, resultado: await sondarApiAmazon(), api: estadoApiAmazon() });
+});
 
 // Vitrine publica: carrega o historico do disco e liga a varredura periodica
 // que mantem dados/feed.json e dados/cupons.json em dia no repositorio.
