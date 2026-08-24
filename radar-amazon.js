@@ -2027,6 +2027,52 @@ export function estadoApiAmazon() {
   return { indisponivel: apiAmazonIndisponivel(), ate: _apiIndisponivelAte || null, motivo: _apiUltimoMotivo };
 }
 
+// FREIO DE DIVULGACAO NO MODO SEM API.
+// Enquanto a conta nao fica elegivel, a divulgacao da Amazon sai por fora (a
+// operacao decidiu usar outra ferramenta). O pipeline continua reconhecendo o
+// link e resolvendo o ASIN — so nao publica. Ligar aqui exige apenas a variavel
+// AMZ_DISPARO_SEM_API=on no Railway; quando a Creators API voltar, este freio
+// deixa de valer sozinho, porque o caminho normal (com API) nem passa por ele.
+export function disparoSemApiLiberado() {
+  return String(process.env.AMZ_DISPARO_SEM_API || 'off').toLowerCase() === 'on';
+}
+
+// ASIN de sondagem: qualquer item estavel do catalogo serve, a sonda so olha o
+// status HTTP. Configuravel para o dia em que este sair de linha.
+const ASIN_SONDA = process.env.AMZ_ASIN_SONDA || 'B0CQXG17RL';
+
+/**
+ * Bate na Creators API para descobrir se a conta ja ficou elegivel. Nao lanca:
+ * devolve { ok, status, motivo }. Em caso de sucesso limpa a marca de
+ * indisponibilidade, e o pipeline volta ao caminho com API na hora.
+ */
+export async function sondarApiAmazon() {
+  try {
+    const token = await getToken();
+    const partnerTag = E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
+    const res = await fetch(API_BASE + '/catalog/v1/getItems', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json',
+                 'x-marketplace': MARKETPLACE },
+      body: JSON.stringify({
+        itemIds: [ASIN_SONDA], itemIdType: 'ASIN', marketplace: MARKETPLACE,
+        partnerTag, partnerType: 'Associates', resources: ['itemInfo.title'],
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (res.ok) {
+      _apiIndisponivelAte = 0;
+      _apiUltimoMotivo = null;
+      return { ok: true, status: res.status };
+    }
+    const corpo = (await res.text()).slice(0, 200);
+    if (res.status === 401 || res.status === 403) marcarApiIndisponivel(res.status, corpo);
+    return { ok: false, status: res.status, motivo: corpo };
+  } catch (e) {
+    return { ok: false, status: 0, motivo: e.message };
+  }
+}
+
 // Preco do texto do grupo. Pega o MENOR valor plausivel (o post costuma trazer
 // "de X por Y") e trata o maior como candidato a 'de', validado pelas mesmas
 // travas das outras lojas.
@@ -2067,8 +2113,17 @@ export async function processarTextoAmazonSemApi(texto, opcoes = {}) {
 
   const { preco, precoDe, precoDeFonte } = precoAmazonDoTexto(texto);
   const saida = [];
+  const liberado = disparoSemApiLiberado();
 
   for (const asin of asins) {
+    // Freio ligado: reconhece e registra, mas nao publica. O descarte aparece
+    // no log do radar como qualquer outro, entao da para ver o volume que a
+    // Amazon traria se a divulgacao estivesse ligada por aqui.
+    if (!liberado) {
+      saida.push({ produto: { asin, loja: 'Amazon', preco: preco ?? null },
+                   descartadoPor: 'Amazon sem API: divulgação desligada neste servidor (AMZ_DISPARO_SEM_API=off)' });
+      continue;
+    }
     // Sem preco a mensagem sairia com "Por: R$ " vazio. Mesma regra das demais
     // lojas: nao publica. Vale ainda mais aqui, porque estas vao direto ao ar.
     if (!preco) {
