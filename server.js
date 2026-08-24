@@ -8381,6 +8381,81 @@ app.get('/operacao/historico-envios', async (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
 });
 
+// ── BACKFILL DO HISTORICO DE ENVIOS ──────────────────────────────────────────
+// Reparo de lacunas: ate o commit fb053c9 o disparo por LISTA e o disparo
+// avulso da vitrine nao chamavam registrarEnvioHistorico, entao saiam sem
+// deixar registro. A reconstrucao vem de fontes que gravaram no momento do
+// disparo (rastreio.json e o ultimoDisparo da vitrine), nunca de estimativa.
+//
+// Passa pelo servidor, e nao por commit direto no repo, de proposito: o shard
+// vive em cache de memoria e no disco do container, e uma edicao so no GitHub
+// seria sobrescrita no proximo append. Aqui o append entra pelo MESMO caminho
+// dos envios reais.
+//
+// Cada registro entra com backfill:true — o dado reconstruido nunca se confunde
+// com o gravado ao vivo. Idempotente por id: repetir a chamada nao duplica.
+app.post('/operacao/historico-envios/backfill', async (req, res) => {
+  try {
+    const mes  = String(req.body?.mes || '').trim();
+    const itens = Array.isArray(req.body?.registros) ? req.body.registros : [];
+    if (!/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ ok:false, erro:'mes deve ser YYYY-MM' });
+    if (!itens.length) return res.status(400).json({ ok:false, erro:'nenhum registro enviado' });
+
+    const local = 'historico_envios_' + mes + '.json';
+    const regs  = await _registrosDoShard(local);
+    const jaTem = new Set(regs.map(r => String(r.id)));
+
+    const inseridos = [], repetidos = [];
+    for (const it of itens) {
+      const id = String(it.id || '').trim();
+      if (!id) continue;
+      if (jaTem.has(id)) { repetidos.push(id); continue; }
+      jaTem.add(id);
+      regs.push({
+        id,
+        enviadoEm:     it.enviadoEm || null,
+        tipoConteudo:  it.tipoConteudo || null,
+        subtipo:       it.subtipo ?? null,
+        loja:          it.loja ?? null,
+        titulo:        it.titulo ? String(it.titulo).slice(0, 120) : null,
+        codigo:        it.codigo ?? null,
+        valor:         it.valor ?? null,
+        tipo:          it.tipo ?? null,
+        precoDe:       it.precoDe ?? null,
+        preco:         it.preco ?? null,
+        precoFinal:    it.precoFinal ?? it.preco ?? null,
+        desconto:      it.desconto ?? null,
+        descontoPct:   it.descontoPct ?? null,
+        asin:          it.asin ?? null,
+        link:          it.link ?? null,
+        origem:        it.origem ?? null,
+        gruposDestino: it.gruposDestino ?? null,
+        autoEnviado:   !!it.autoEnviado,
+        temImagem:     !!it.temImagem,
+        mensagens:     it.mensagens ?? 1,
+        // Procedencia do registro: reconstruido, e de onde veio o numero.
+        backfill:      true,
+        backfillFonte: it.backfillFonte || 'nao informado',
+        backfillEm:    new Date().toISOString(),
+      });
+      inseridos.push(id);
+    }
+
+    regs.sort((a, b) => String(a.enviadoEm || '').localeCompare(String(b.enviadoEm || '')));
+
+    const caminho = SESSAO_DIR + '/' + local;
+    const dir = caminho.slice(0, caminho.lastIndexOf('/'));
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    escreverAtomico(caminho, JSON.stringify({ registros: regs }), 'utf-8');
+    agendarPush(local);
+
+    console.log('[BACKFILL] ' + local + ' — ' + inseridos.length + ' inserido(s), '
+      + repetidos.length + ' ja existia(m). Total no shard: ' + regs.length + '.');
+    res.json({ ok:true, mes, inseridos: inseridos.length, repetidos: repetidos.length,
+               totalNoShard: regs.length });
+  } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
+});
+
 // conteudoOriginal chega como string (captura unica) ou array (itens que o
 // agrupador juntou). A aba Fila precisa do texto cru da fonte para comparar
 // com a mensagem formatada — e a unica forma de flagrar no painel um cupom
