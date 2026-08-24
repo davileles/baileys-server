@@ -49,6 +49,7 @@ import {
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
   recarregarRadarTenants, refDeterministico,
   sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
+  contasAmazonSeparadas,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -5329,8 +5330,9 @@ async function processarRadarMarketplace(jid, texto) {
         // Em modo sem API o preco vem do texto do grupo. Alimentar a serie com
         // numero digitado por terceiro envenenaria a mediana — mesma razao pela
         // qual Magalu e Awin nunca entram. So le quando veio da API.
-        await lerPrecosParaSerie(
-          lidos.map(r => r.produto).filter(p => p && !p.semApi), jid, podeAmazon.motivo);
+        // Amazon esta fora da vigilancia de precos neste momento: a leitura fora
+        // da janela nao tem serie para alimentar.
+        await lerPrecosParaSerie([], jid, podeAmazon.motivo);
       } catch (e) { console.warn('[LEITURA] Amazon:', e.message); }
     } else {
       console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
@@ -5419,7 +5421,9 @@ async function processarRadarMarketplace(jid, texto) {
     // pontos intradiarios que a varredura horaria sozinha nao pega.
     try {
       // p.semApi: preco lido do texto do grupo, nao de fonte verificavel.
-      if (!p.semApi) {
+      // Amazon: leitura de catalogo restrita a montagem da oferta — nao alimenta
+      // serie (ver LOJAS_MONITORAVEIS_PRECO em monitor-precos.js).
+      if (!p.semApi && p.loja !== 'Amazon') {
         registrarLeituraPreco(p.asin, {
           nome: p.titulo, loja: p.loja, preco: p.preco,
           precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
@@ -13154,8 +13158,10 @@ const AMZ_SONDA_MS = Number(process.env.AMZ_SONDA_MIN || 30) * 60 * 1000;
 let _amzAvisado = false;
 
 async function sondaApiAmazon() {
-  // Nada a sondar enquanto a API estiver respondendo normalmente.
-  if (!apiAmazonIndisponivel()) return;
+  // Com contas separadas, a leitura vem de uma conta que ja responde 200 — a
+  // marca de indisponibilidade nunca acende e a sonda precisa rodar assim
+  // mesmo, porque quem esta sendo medida e a conta de divulgacao.
+  if (!contasAmazonSeparadas() && !apiAmazonIndisponivel()) return;
   const r = await sondarApiAmazon();
   if (!r.ok) {
     _amzAvisado = false;   // segue fora do ar: proximo sucesso volta a avisar
@@ -13175,7 +13181,9 @@ async function sondaApiAmazon() {
       + 'filtros de sempre (preco confirmado, em estoque, piso de desconto e dedup).\n\n'
       + 'Lembretes:\n'
       + '\u2022 desligar a divulgacao Amazon na ferramenta externa, para nao duplicar\n'
-      + '\u2022 se quiser, reativar a Amazon no monitor de precos' });
+      + '\u2022 REMOVER as variaveis AMZ_*_LEITURA do Railway: a leitura volta a\n'
+      + '  sair da propria conta e as duas deixam de se cruzar\n'
+      + '\u2022 reativar a Amazon no monitor de precos (LOJAS_MONITORAVEIS_PRECO)' });
   } catch (e) { console.warn('[AMZ-SONDA] Falha ao avisar o operador:', e.message); }
 }
 
@@ -13186,7 +13194,7 @@ setTimeout(() => { sondaApiAmazon().catch(() => {}); }, 90000).unref?.();
 // Estado da API Amazon para o painel/diagnostico.
 app.get('/mkt/amazon/estado', (req, res) => {
   res.json({ ok: true, api: estadoApiAmazon(), disparoSemApi: disparoSemApiLiberado(),
-             sondaMin: AMZ_SONDA_MS / 60000 });
+             contasSeparadas: contasAmazonSeparadas(), sondaMin: AMZ_SONDA_MS / 60000 });
 });
 app.post('/mkt/amazon/sondar', async (req, res) => {
   res.json({ ok: true, resultado: await sondarApiAmazon(), api: estadoApiAmazon() });
