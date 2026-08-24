@@ -56,7 +56,11 @@ const DIAS_RETENCAO = 120;
 // A Amazon le em LOTE de 10 ASINs por chamada (getItems da Creators API), o que
 // a torna a loja mais barata de vigiar das tres — 250 produtos custam 25
 // chamadas, contra 250 na Shopee e no ML, que so aceitam um item por vez.
-export const LOJAS_MONITORAVEIS_PRECO = ['Amazon', 'Shopee', 'Mercado Livre'];
+// Amazon FORA da vigilancia por decisao de operacao: a credencial de catalogo
+// hoje e de outra conta e o uso dela esta restrito a montagem das ofertas. Para
+// devolver, basta reincluir 'Amazon' na lista — a serie do mes continua no
+// shard e volta a ser alimentada de onde parou.
+export const LOJAS_MONITORAVEIS_PRECO = ['Shopee', 'Mercado Livre'];
 
 // ASIN sintetico de outra rede que mora na mesma vitrine. Nao e produto Amazon
 // e nao pode ir para o getItems.
