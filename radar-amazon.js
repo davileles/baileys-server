@@ -19,6 +19,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
 import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp, tagAmazonDoGrupo, trocasDeLinkDoGrupo } from './config-tsp.js';
+import { resolverPrecoDe, FONTE_TEXTO } from './preco-de.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -1504,7 +1505,14 @@ export async function buscarProdutos(asins) {
       signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) {
-      console.error('[MKT] getItems', res.status, (await res.text()).slice(0, 300));
+      const corpo = (await res.text()).slice(0, 300);
+      console.error('[MKT] getItems', res.status, corpo);
+      // 401/403 nao e falha de rede: a conta de Associados perdeu elegibilidade
+      // (AssociateNotEligible) ou a credencial caiu. Marca a API como fora do ar
+      // por um tempo para o pipeline usar o modo sem API sem gastar uma chamada
+      // condenada por mensagem. Quando a conta voltar, o TTL expira e o caminho
+      // normal e retomado sozinho — sem deploy.
+      if (res.status === 401 || res.status === 403) marcarApiIndisponivel(res.status, corpo);
       continue;
     }
     const data = await res.json();
@@ -1991,11 +1999,133 @@ export const VARIAVEIS_CUPOM_LOTE = [
  * Dedup e piso de desconto sao aplicados pelo chamador (server.js).
  * @returns {Promise<Array<{ produto, mensagem, descartadoPor? }>>}
  */
+// ── MODO SEM API (conta de Associados sem elegibilidade) ──────────────────
+// A Creators API so libera o catalogo depois das vendas qualificadas. Enquanto
+// isso o getItems devolve 403 AssociateNotEligible — mas o LINK de afiliado
+// nunca dependeu dela: amazon.com.br/dp/{ASIN}?tag={tag} rastreia igual. O que
+// se perde e o enriquecimento (preco conferido, imagem, estoque, nota), e ai o
+// caminho e o mesmo ja usado na Magalu: ler titulo e preco do TEXTO do grupo.
+const API_INDISPONIVEL_MS = 30 * 60 * 1000;
+let _apiIndisponivelAte = 0;
+let _apiUltimoMotivo = null;
+
+function marcarApiIndisponivel(status, corpo) {
+  const primeiro = !apiAmazonIndisponivel();
+  _apiIndisponivelAte = Date.now() + API_INDISPONIVEL_MS;
+  _apiUltimoMotivo = 'HTTP ' + status + ' ' + String(corpo || '').slice(0, 120);
+  if (primeiro) {
+    console.warn('[MKT] Creators API indisponivel (' + _apiUltimoMotivo
+      + ') — Amazon passa ao modo sem API por ' + (API_INDISPONIVEL_MS / 60000) + ' min.');
+  }
+}
+
+export function apiAmazonIndisponivel() {
+  return Date.now() < _apiIndisponivelAte;
+}
+
+export function estadoApiAmazon() {
+  return { indisponivel: apiAmazonIndisponivel(), ate: _apiIndisponivelAte || null, motivo: _apiUltimoMotivo };
+}
+
+// Preco do texto do grupo. Pega o MENOR valor plausivel (o post costuma trazer
+// "de X por Y") e trata o maior como candidato a 'de', validado pelas mesmas
+// travas das outras lojas.
+function precoAmazonDoTexto(texto) {
+  const achados = [...String(texto || '').matchAll(/R\$\s*([\d.]+,\d{2}|\d+)/gi)]
+    .map(m => Number(m[1].replace(/\./g, '').replace(',', '.')))
+    .filter(v => isFinite(v) && v > 0);
+  if (!achados.length) return { preco: null, precoDe: null, precoDeFonte: null };
+  const preco = Math.min(...achados);
+  const maior = Math.max(...achados);
+  const r = resolverPrecoDe({
+    preco, rotulo: 'Amazon texto',
+    candidatos: [{ fonte: FONTE_TEXTO, valor: maior > preco ? maior : null }],
+  });
+  return { preco, precoDe: r.precoDe, precoDeFonte: r.fonte };
+}
+
+// Titulo: primeira linha util do post (nao e URL, nao comeca com R$).
+function tituloAmazonDoTexto(texto, asin) {
+  const linha = String(texto || '').split('\n')
+    .map(l => l.trim())
+    .find(l => l && !/^https?:\/\//i.test(l) && !/^R\$/i.test(l) && l.length > 8);
+  if (linha) return linha.replace(/^[*_~`]+|[*_~`]+$/g, '').slice(0, 140);
+  return 'Oferta Amazon ' + asin;
+}
+
+/**
+ * Pipeline Amazon sem Creators API. Mesmo contrato de saida do pipeline normal
+ * (produto, cupom, precoFinal, mensagem), para os chamadores nao mudarem.
+ *
+ * O que NAO vem: imagem, estoque, nota, avaliacoes, vendedor e selo de deal.
+ * O preco sai marcado com precoDeReferencia — nao foi conferido em fonte
+ * verificavel — e por isso tambem nao alimenta a serie do monitor de precos.
+ */
+export async function processarTextoAmazonSemApi(texto, opcoes = {}) {
+  const asins = await extrairAsins(texto);
+  if (!asins.length) return [];
+
+  const { preco, precoDe, precoDeFonte } = precoAmazonDoTexto(texto);
+  const saida = [];
+
+  for (const asin of asins) {
+    // Sem preco a mensagem sairia com "Por: R$ " vazio. Mesma regra das demais
+    // lojas: nao publica. Vale ainda mais aqui, porque estas vao direto ao ar.
+    if (!preco) {
+      saida.push({ produto: { asin, loja: 'Amazon' },
+                   descartadoPor: 'sem preço identificável no texto do grupo (modo sem API)' });
+      continue;
+    }
+
+    const p = {
+      asin,
+      titulo: tituloAmazonDoTexto(texto, asin),
+      marca: '',
+      imagemUrl: null,
+      link: 'https://www.amazon.com.br/dp/' + asin,
+      preco,
+      precoTexto: 'R$ ' + preco.toFixed(2).replace('.', ','),
+      precoDe,
+      precoDeTexto: precoDe ? 'R$ ' + precoDe.toFixed(2).replace('.', ',') : null,
+      precoDeFonte: precoDeFonte || null,
+      desconto: (precoDe && precoDe > preco) ? Math.round((1 - preco / precoDe) * 100) : 0,
+      disponivel: true,            // sem fonte para conferir estoque
+      vendedor: null,
+      ehDeal: false, dealTermina: null,
+      nota: null, avaliacoes: null,
+      loja: 'Amazon',
+      precoDeReferencia: true,     // preco veio do texto, nao de fonte verificavel
+      semApi: true,
+    };
+
+    const cupom = melhorCupom(p.loja, p.preco, texto);
+    saida.push({
+      produto: p,
+      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado,
+                       generico: !!cupom.generico } : null,
+      precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      precoDeReferencia: true,
+      // A operacao decidiu publicar Amazon sem espera de aprovacao enquanto a
+      // conta nao fica elegivel. Este campo e o que o gate de auto-envio le —
+      // a Magalu segue indo para a fila, porque nao o marca.
+      autoEnvioMesmoSemVerificar: true,
+      mensagem: formatarOfertaAmazon(p, { ...opcoes, cupom }),
+    });
+  }
+  return saida;
+}
+
 export async function processarTextoAmazon(texto, opcoes = {}) {
+  // Conta sem elegibilidade: nem tenta a API, vai direto ao modo sem API.
+  if (apiAmazonIndisponivel()) return processarTextoAmazonSemApi(texto, opcoes);
+
   const asins = await extrairAsins(texto);
   if (!asins.length) return [];
 
   const itens = await buscarProdutos(asins);
+  // A chamada acima pode ter acabado de descobrir o 403: cai para o modo sem
+  // API na mesma mensagem, em vez de perder a oferta e so acertar na proxima.
+  if (!itens.length && apiAmazonIndisponivel()) return processarTextoAmazonSemApi(texto, opcoes);
   const saida = [];
 
   for (const item of itens) {
