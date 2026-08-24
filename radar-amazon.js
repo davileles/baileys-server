@@ -1428,6 +1428,19 @@ function credLeitura(nome) {
   return credencialTsp(nome + '_LEITURA') || credencialTsp(nome);
 }
 
+// Tag de DIVULGACAO (a que monetiza), nunca a de leitura. Piso de afiliacao de
+// todo link Amazon que sai daqui.
+export function tagDivulgacaoAmazon() {
+  return E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG') || null;
+}
+
+export function linkAmazonComTag(asin, tag = null) {
+  const base = 'https://www.amazon.com.br/dp/' + asin;
+  const t = tag || tagDivulgacaoAmazon();
+  if (!t) { console.warn('[MKT] Sem tag de divulgacao: link Amazon sairia sem afiliacao.'); return base; }
+  return base + '?tag=' + encodeURIComponent(t);
+}
+
 export function contasAmazonSeparadas() {
   return !!(credencialTsp('AMZ_CLIENT_ID_LEITURA') && credencialTsp('AMZ_CLIENT_SECRET_LEITURA'));
 }
@@ -1569,8 +1582,15 @@ export function normalizar(item) {
     imagemUrl: item?.images?.primary?.medium?.url || item?.images?.primary?.large?.url || null,
     // O detailPageURL volta da API ja colado na tag da conta autenticada e com
     // linkCode=ogi. Como quem monetiza e outra conta, o link e remontado do
-    // zero a partir do ASIN — a tag de divulgacao entra depois, no comRastreio.
-    link: 'https://www.amazon.com.br/dp/' + item.asin,
+    // zero a partir do ASIN — ja COM a tag de divulgacao.
+    //
+    // A tag entra aqui, e nao so no comRastreio, porque nem todo caminho passa
+    // por ele: /mkt/montar (aba Criar Oferta), a base de produtos e a vitrine
+    // usam produto.link direto. Antes isso funcionava porque o link vinha da
+    // API com tag embutida; ao remontar do ASIN essa garantia se perdeu e a
+    // oferta saia sem afiliacao. O comRastreio continua sobrescrevendo com a
+    // tag do pool quando houver, e comTagDoGrupo com a tag do grupo.
+    link: linkAmazonComTag(item.asin),
     preco: preco?.amount ?? null,
     precoTexto: preco?.displayAmount || null,
     precoDe: de?.amount ?? null,
@@ -2180,7 +2200,7 @@ export async function processarTextoAmazonSemApi(texto, opcoes = {}) {
       titulo: tituloAmazonDoTexto(texto, asin),
       marca: '',
       imagemUrl: null,
-      link: 'https://www.amazon.com.br/dp/' + asin,
+      link: linkAmazonComTag(asin),
       preco,
       precoTexto: 'R$ ' + preco.toFixed(2).replace('.', ','),
       precoDe,
