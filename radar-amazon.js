@@ -2102,7 +2102,14 @@ export async function sondarApiAmazon() {
       return { ok: true, status: res.status };
     }
     const corpo = (await res.text()).slice(0, 200);
-    if (res.status === 401 || res.status === 403) marcarApiIndisponivel(res.status, corpo);
+    // CUIDADO: _apiIndisponivelAte governa o caminho de LEITURA do catalogo.
+    // Com contas separadas quem le e a conta de leitura, que responde 200 — o
+    // 403 aqui e da conta de DIVULGACAO e nao diz nada sobre a leitura. Marcar
+    // o estado global neste caso derrubaria o pipeline inteiro para o modo sem
+    // API (e, com o freio ligado, faria a Amazon parar de gerar oferta).
+    if (!contasAmazonSeparadas() && (res.status === 401 || res.status === 403)) {
+      marcarApiIndisponivel(res.status, corpo);
+    }
     return { ok: false, status: res.status, motivo: corpo };
   } catch (e) {
     return { ok: false, status: 0, motivo: e.message };
