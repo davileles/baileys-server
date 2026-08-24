@@ -1415,9 +1415,26 @@ const API_BASE       = 'https://creatorsapi.amazon';
 const MARKETPLACE    = 'www.amazon.com.br';
 
 
+// ── CREDENCIAL DE LEITURA x TAG DE DIVULGACAO ────────────────────────────────
+// A conta que LE o catalogo e a que RECEBE a comissao passam a ser configuraveis
+// em separado. A Creators API exige que o partnerTag enviado no getItems
+// pertenca a conta autenticada — por isso a leitura tem tag propria. O link
+// publicado nao usa nada disso: e remontado a partir do ASIN e recebe a tag de
+// divulgacao no comRastreio.
+//
+// Sem as variaveis _LEITURA definidas, tudo cai no comportamento antigo (uma
+// conta so), entao ligar e desligar e questao de variavel de ambiente.
+function credLeitura(nome) {
+  return credencialTsp(nome + '_LEITURA') || credencialTsp(nome);
+}
+
+export function contasAmazonSeparadas() {
+  return !!(credencialTsp('AMZ_CLIENT_ID_LEITURA') && credencialTsp('AMZ_CLIENT_SECRET_LEITURA'));
+}
+
 async function getToken() {
   if (E().token.valor && Date.now() < E().token.expiraEm) return E().token.valor;
-  const amzId = credencialTsp('AMZ_CLIENT_ID'), amzSecret = credencialTsp('AMZ_CLIENT_SECRET');
+  const amzId = credLeitura('AMZ_CLIENT_ID'), amzSecret = credLeitura('AMZ_CLIENT_SECRET');
   if (!amzId || !amzSecret) {
     throw new Error('AMZ_CLIENT_ID / AMZ_CLIENT_SECRET nao configurados.');
   }
@@ -1460,7 +1477,9 @@ const RECURSOS = [
  */
 export async function sondarRecursos(asin, recursos) {
   const token = await getToken();
-  const partnerTag = E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
+  // Tag da conta AUTENTICADA (leitura). Nao e a tag que vai no link publicado.
+  const partnerTag = credencialTsp('AMZ_PARTNER_TAG_LEITURA')
+                  || E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
   const res = await fetch(API_BASE + '/catalog/v1/getItems', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'x-marketplace': MARKETPLACE },
@@ -1479,7 +1498,9 @@ export async function sondarRecursos(asin, recursos) {
 export async function buscarProdutos(asins) {
   if (!asins.length) return [];
   const token = await getToken();
-  const partnerTag = E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
+  // Tag da conta AUTENTICADA (leitura). Nao e a tag que vai no link publicado.
+  const partnerTag = credencialTsp('AMZ_PARTNER_TAG_LEITURA')
+                  || E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
   if (!partnerTag) throw new Error('partnerTag nao configurado.');
 
   const lotes = [];
@@ -1546,7 +1567,10 @@ export function normalizar(item) {
     titulo: item?.itemInfo?.title?.displayValue || '',
     marca: item?.itemInfo?.byLineInfo?.brand?.displayValue || '',
     imagemUrl: item?.images?.primary?.medium?.url || item?.images?.primary?.large?.url || null,
-    link: item.detailPageURL,          // ja vem com o partnerTag aplicado
+    // O detailPageURL volta da API ja colado na tag da conta autenticada e com
+    // linkCode=ogi. Como quem monetiza e outra conta, o link e remontado do
+    // zero a partir do ASIN — a tag de divulgacao entra depois, no comRastreio.
+    link: 'https://www.amazon.com.br/dp/' + item.asin,
     preco: preco?.amount ?? null,
     precoTexto: preco?.displayAmount || null,
     precoDe: de?.amount ?? null,
@@ -2048,7 +2072,19 @@ const ASIN_SONDA = process.env.AMZ_ASIN_SONDA || 'B0CQXG17RL';
  */
 export async function sondarApiAmazon() {
   try {
-    const token = await getToken();
+    // Token proprio, sempre da conta de DIVULGACAO: e a elegibilidade dela que
+    // esta sendo medida. Usar o getToken() daria o token da conta de leitura,
+    // que responde 200 e faria a sonda mentir.
+    const cid = credencialTsp('AMZ_CLIENT_ID'), csec = credencialTsp('AMZ_CLIENT_SECRET');
+    if (!cid || !csec) return { ok: false, status: 0, motivo: 'credenciais de divulgacao ausentes' };
+    const rt = await fetch(TOKEN_ENDPOINT, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'client_credentials', client_id: cid,
+                             client_secret: csec, scope: 'creatorsapi::default' }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!rt.ok) return { ok: false, status: rt.status, motivo: 'token: ' + (await rt.text()).slice(0, 150) };
+    const token = (await rt.json()).access_token;
     const partnerTag = E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
     const res = await fetch(API_BASE + '/catalog/v1/getItems', {
       method: 'POST',
