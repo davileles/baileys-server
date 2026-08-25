@@ -385,7 +385,11 @@ async function precoDeApiMl(id) {
 // token (linkbuilder) seguia dizendo que estava tudo bem. Aqui o bloqueio e
 // nomeado, contado, e a API oficial (quando autorizada) assume a leitura.
 const ERRO_ANTIBOT_ML = 'pagina bloqueada pelo antibot do ML';
-const RE_ANTIBOT_ML = /suspicious-traffic|\/gz\/account-verification|Para continuar, confirme que/i;
+// Duas variantes ja vistas: /gz/account-verification ("suspicious-traffic",
+// pede confirmacao da conta) e /captcha/wall ("Seguridad — Mercado Libre",
+// assets abuse-captcha) — esta ultima e a que o IP do Railway recebe.
+const RE_ANTIBOT_URL_ML = /\/captcha\/wall|\/gz\/account-verification/i;
+const RE_ANTIBOT_ML = /abuse-captcha|suspicious-traffic|\/gz\/account-verification|\/captcha\/wall|Para continuar, confirme que/i;
 
 let _antibot = { desde: null, ultimoEm: null, ultimaUrl: null, bloqueios: 0 };
 export function estadoAntibotMl() { return { ..._antibot, ativo: !!_antibot.desde }; }
@@ -405,7 +409,7 @@ function registrarPaginaMlOk() {
 
 /** Pagina do ML ou URL final que caiu na tela antibot. Pagina real tem JSON-LD. */
 function paginaMlBloqueada(res, html, ld) {
-  return RE_ANTIBOT_ML.test(res?.url || '') || (!ld && RE_ANTIBOT_ML.test(html || ''));
+  return RE_ANTIBOT_URL_ML.test(res?.url || '') || (!ld && RE_ANTIBOT_ML.test(html || ''));
 }
 
 function apiMlAutorizada() {
