@@ -803,7 +803,9 @@ async function lerPreco(item) {
   }
   if (item.loja === 'Mercado Livre') {
     if (!tokenAffOk()) throw new Error('Mercado Livre nao configurado (ML_AFF_TOKEN)');
-    const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin));
+    // asin junto: com a pagina bloqueada pelo antibot, e o MLB salvo que permite
+    // o fallback pela API oficial em URL /up/MLBU.
+    const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin), { id: item.asin });
     return { preco: d.preco, precoDe: d.precoDe, disponivel: d.disponivel !== false, titulo: d.titulo };
   }
   if (ehItemAmazon(item)) {

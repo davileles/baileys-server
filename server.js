@@ -150,6 +150,7 @@ import {
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
+  verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -173,6 +174,37 @@ async function avisarTokenMlCaiu(motivo) {
     await enviarMensagem(GRUPOS['operador'], { text: texto });
     console.error('[ML-AFF] Operador avisado: token caiu (' + motivo + ')');
   } catch (e) { console.error('[ML-AFF] Falha ao avisar operador:', e.message); }
+}
+
+// Antibot do ML: a pagina de produto vem como tela de verificacao (HTTP 200,
+// sem dados) enquanto o linkbuilder segue normal — o teste do token nao
+// enxerga. Em 25/08 o radar ML passou o dia descartando tudo em silencio.
+// Um aviso por 6h basta: o bloqueio dura horas e cada leitura barrada passa
+// por aqui.
+let _avisoAntibotMl = 0;
+async function avisarAntibotMl(detalhe) {
+  if (Date.now() - _avisoAntibotMl < 6 * 60 * 60 * 1000) return;
+  _avisoAntibotMl = Date.now();
+  const api = estadoMl();
+  const texto = '⚠️ *Mercado Livre bloqueando a leitura de páginas (antibot)*\n\n'
+    + 'Detalhe: ' + detalhe + '\n\n'
+    + (api.autorizado
+        ? 'A API oficial está autorizada: preço e estoque seguem por ela enquanto a página estiver bloqueada.'
+        : 'Fallback pela API oficial DESLIGADO — sem ele, ofertas ML do radar são descartadas e itens ML das listas ficam adiados.\n'
+          + 'Autorize em ' + ML_REDIRECT_URI.replace(/\/ml\/callback$/, '/ml/conectar'))
+    + '\n\nAmazon, Shopee e Magalu seguem normalmente.';
+  try {
+    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    console.error('[ML] Operador avisado: antibot (' + detalhe + ')');
+  } catch (e) { console.error('[ML] Falha ao avisar operador sobre antibot:', e.message); }
+}
+
+// Pagina usada pela sonda do antibot: variavel para trocar sem deploy; sem ela,
+// um item ML da propria vitrine (e o que o radar e as listas de fato leem).
+function urlSondaProdutoMl() {
+  return process.env.ML_URL_TESTE_PRODUTO
+    || listarVitrine().find(i => i.loja === 'Mercado Livre' && i.url)?.url
+    || 'https://www.mercadolivre.com.br/p/MLB38655102';
 }
 
 // Sincroniza os cupons do ML de hora em hora. Cupom esgotado que continua ativo
@@ -283,9 +315,11 @@ setTimeout(() => sincronizarCampanhasMlAgendado().catch(() => {}), 20000);
 // uma chamada e irrelevante perto de descobrir tarde que o radar parou.
 setInterval(() => {
   if (tokenAffOk()) verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+  if (tokenAffOk()) verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
 }, 30 * 60 * 1000);
 setTimeout(() => {
   if (tokenAffOk()) verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+  if (tokenAffOk()) verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
 }, 45000);
 
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
@@ -5042,6 +5076,7 @@ const PRESERVAR_NO_RESET = new Set([
   'fila_pendentes.json',    // fila de aprovacao
   'agendamentos.json',      // envios agendados
   'telegram_session.txt',   // sessao do Telegram (independente do WhatsApp)
+  'ml_token.json',          // OAuth da API oficial do ML (refresh token) — sem ele o fallback de preco volta a "nao autorizado"
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
@@ -5413,6 +5448,9 @@ async function processarRadarMarketplace(jid, texto) {
   for (const r of resultados) {
     if (!r.mensagem) {
       console.log('[MKT] ' + (r.produto?.asin || r.produto?.itemId || '?') + ' descartado — ' + r.descartadoPor);
+      // Descarte por antibot nao e do produto: o operador precisa saber que o
+      // radar ML esta cego, nao que um item ficou sem preco.
+      if (/antibot/i.test(r.descartadoPor || '')) avisarAntibotMl(r.descartadoPor).catch(() => {});
       continue;
     }
     const p = r.produto;
@@ -10341,6 +10379,20 @@ setInterval(async () => {
 
     try {
       const r = await dispararProdutoDaLista(asin, cupomDaLista(lista));
+      // Bloqueio do antibot e da infra, nao do item: adia 10 min em vez de
+      // consumir a fila (25/08: uma lista inteira virou "pulado" em sequencia).
+      // Depois de 6 tentativas (1h) desiste deste item e segue, para a lista
+      // nao ficar presa para sempre.
+      if (!r.ok && /antibot/i.test(r.motivo || '') && (ex.bloqueios || 0) < 6) {
+        ex.bloqueios = (ex.bloqueios || 0) + 1;
+        ex.proximoEm = Date.now() + 10 * 60000;
+        atualizarExecucaoLista(lista.id, ex);
+        console.warn('[LISTA] "' + lista.nome + '" — item ' + (ex.indice + 1) + '/' + lista.produtos.length
+          + ' adiado 10 min (' + ex.bloqueios + '/6): ' + r.motivo);
+        avisarAntibotMl(r.motivo).catch(() => {});
+        return;
+      }
+      ex.bloqueios = 0;
       if (r.ok) ex.enviados.push({ asin, nome:r.nome, cupom:r.cupom, em:new Date().toISOString() });
       else      ex.pulados.push({ asin, motivo:r.motivo, em:new Date().toISOString() });
     } catch (e) {
@@ -11600,7 +11652,7 @@ app.get('/sonda-url', async (req, res) => {
 });
 
 // ── MERCADO LIVRE: OAuth ─────────────────────────────────────────────────────
-app.get('/ml/status', (req, res) => res.json({ ok:true, ...estadoMl() }));
+app.get('/ml/status', (req, res) => res.json({ ok:true, ...estadoMl(), antibot: estadoAntibotMl() }));
 
 app.get('/ml/conectar', (req, res) => {
   if (!credenciaisMlOk()) {
@@ -11634,8 +11686,11 @@ app.get('/ml/webhook', (req, res) => res.sendStatus(200));
 app.get('/ml/aff/status', async (req, res) => {
   if (req.query.verificar === '1' && tokenAffOk()) {
     await verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+    await verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
   }
-  res.json({ ok:true, urlTeste: ML_AFF_URL_TESTE, ...saudeAff() });
+  // paginaProduto e independente do token: o linkbuilder pode estar ok com
+  // toda pagina de produto bloqueada pelo antibot.
+  res.json({ ok:true, urlTeste: ML_AFF_URL_TESTE, ...saudeAff(), paginaProduto: saudePaginaMl() });
 });
 
 app.get('/ml/aff/inspecionar', (req, res) => res.json({ ok:true, ...inspecionarTokenAff() }));

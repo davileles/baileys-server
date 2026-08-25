@@ -376,8 +376,140 @@ async function precoDeApiMl(id) {
   }
 }
 
-/** Busca a pagina do produto com o cookie e extrai o que der. */
-export async function buscarDadosProdutoMl(url) {
+// ── ANTIBOT DA PAGINA DE PRODUTO ─────────────────────────────────────────
+// O ML nao responde 403 quando desconfia do trafego: devolve HTTP 200 com a
+// tela /gz/account-verification ("suspicious-traffic") no lugar da pagina, sem
+// JSON-LD nenhum. Ate 25/08 isso passava despercebido — o preco saia null, o
+// produto era descartado como "sem preco na pagina", o radar ML ficou o dia
+// inteiro mudo, listas de envio foram consumidas item a item e o teste do
+// token (linkbuilder) seguia dizendo que estava tudo bem. Aqui o bloqueio e
+// nomeado, contado, e a API oficial (quando autorizada) assume a leitura.
+const ERRO_ANTIBOT_ML = 'pagina bloqueada pelo antibot do ML';
+const RE_ANTIBOT_ML = /suspicious-traffic|\/gz\/account-verification|Para continuar, confirme que/i;
+
+let _antibot = { desde: null, ultimoEm: null, ultimaUrl: null, bloqueios: 0 };
+export function estadoAntibotMl() { return { ..._antibot, ativo: !!_antibot.desde }; }
+function registrarAntibotMl(url) {
+  _antibot.bloqueios++;
+  _antibot.ultimoEm = new Date().toISOString();
+  _antibot.ultimaUrl = url;
+  if (!_antibot.desde) {
+    _antibot.desde = _antibot.ultimoEm;
+    console.warn('[ML] Antibot: pagina de produto bloqueada (' + url + ')');
+  }
+}
+function registrarPaginaMlOk() {
+  if (_antibot.desde) console.log('[ML] Antibot: pagina de produto voltou a abrir.');
+  _antibot.desde = null;
+}
+
+/** Pagina do ML ou URL final que caiu na tela antibot. Pagina real tem JSON-LD. */
+function paginaMlBloqueada(res, html, ld) {
+  return RE_ANTIBOT_ML.test(res?.url || '') || (!ld && RE_ANTIBOT_ML.test(html || ''));
+}
+
+function apiMlAutorizada() {
+  if (!tokAtual()) carregarToken();
+  return credenciaisMlOk() && !!tokAtual()?.refresh_token;
+}
+
+/**
+ * Preco/estoque pela API oficial, quando a pagina nao serviu. Item (MLB) vai
+ * em /items; catalogo (/p/MLB) passa por /products -> buy_box_winner -> /items.
+ * Catalogo unificado (/up/MLBU) nao tem endpoint publico: so resolve quando a
+ * URL original trazia o wid, ou quando quem chamou ja tinha o MLB do anuncio
+ * (opcoes.id — e o caso da vitrine). Devolve null quando nao da para saber;
+ * quem chama decide o que fazer sem preco.
+ */
+async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
+  if (!apiMlAutorizada()) return null;
+  const s = String(urlResolvida || '');
+  const catalogo = (s.match(/\/p\/(MLB\d{6,})/i) || [])[1] || null;
+  const dica = /^MLB\d{6,}$/i.test(String(opcoes.id || '')) ? String(opcoes.id).toUpperCase() : null;
+  // Anuncio explicito (wid da URL, MLB salvo na vitrine) vence o catalogo: e
+  // aquele vendedor que o post apontou, nao o vencedor do buy box de agora.
+  let itemId = (dica && dica !== catalogo) ? dica
+             : (catalogo ? null : (idDeUrl(s) || idDeUrl(urlOriginal)));
+  const rotulo = itemId || catalogo || s;
+  if (!catalogo && !itemId) return null;
+  try {
+    if (!itemId) {
+      const prod = await apiMl('/products/' + encodeURIComponent(catalogo));
+      itemId = prod?.buy_box_winner?.item_id || null;
+      if (!itemId) return null;                 // catalogo sem vencedor: nada a vender
+    }
+    const it = await apiMl('/items/' + encodeURIComponent(itemId));
+    if (!it?.id) return null;
+    const p = normalizarMl(it);
+    if (!p.preco) return null;
+    console.log('[ML] ' + rotulo + ' — preco lido pela API oficial (R$ ' + p.preco + ')');
+    return {
+      titulo: p.titulo || null, preco: p.preco, precoDe: p.precoDe, imagem: p.imagemUrl,
+      disponivel: p.disponivel, precoDeFonte: p.precoDe ? FONTE_API : null,
+      precoDeDescartes: [], descontoDeclarado: null, marca: p.marca,
+      nota: null, avaliacoes: null, vendedor: p.vendedor, achouLd: false,
+      trilha: null, cuponsPagina: [], fonte: 'api', itemId,
+    };
+  } catch (e) {
+    console.warn('[ML] API oficial nao respondeu para ' + rotulo + ':', e.message);
+    return null;
+  }
+}
+
+// ── SONDA DA PAGINA DE PRODUTO ───────────────────────────────────────────
+// Complemento de verificarTokenAff: o linkbuilder pode seguir respondendo
+// enquanto o antibot barra toda pagina de produto — foi o cenario de 25/08.
+let _saudePagina = { ok: null, verificadoEm: null, url: null, erro: null, avisado: false };
+export function saudePaginaMl() { return { ..._saudePagina, antibot: estadoAntibotMl() }; }
+
+/**
+ * Abre uma pagina de produto com o cookie e diz se o antibot barrou.
+ * @param {function} aoBloquear  avisa o operador uma vez por bloqueio; rearma
+ *                               quando a pagina volta a abrir.
+ */
+export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
+  const cookie = cookieAff();
+  if (!cookie || !urlTeste) return _saudePagina;
+  try {
+    const res = await fetch(urlTeste, {
+      headers: {
+        'Cookie': cookie,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(25000),
+    });
+    const html = await res.text();
+    const bloqueado = paginaMlBloqueada(res, html, extrairLdProduto(html));
+    const antes = _saudePagina.ok;
+    _saudePagina = {
+      ok: res.ok && !bloqueado,
+      verificadoEm: new Date().toISOString(),
+      url: urlTeste,
+      erro: bloqueado ? ERRO_ANTIBOT_ML : (res.ok ? null : 'HTTP ' + res.status),
+      avisado: bloqueado ? _saudePagina.avisado : false,
+    };
+    if (bloqueado) registrarAntibotMl(urlTeste); else registrarPaginaMlOk();
+    if (bloqueado && !_saudePagina.avisado && typeof aoBloquear === 'function') {
+      _saudePagina.avisado = true;
+      await aoBloquear('sonda periodica em ' + urlTeste);
+    }
+    if (!bloqueado && antes === false) console.log('[ML] Sonda: pagina de produto voltou a abrir.');
+    return _saudePagina;
+  } catch (e) {
+    _saudePagina = { ..._saudePagina, ok: false, verificadoEm: new Date().toISOString(), url: urlTeste, erro: e.message };
+    return _saudePagina;
+  }
+}
+
+/**
+ * Busca a pagina do produto com o cookie e extrai o que der.
+ * @param {object} [opcoes.id]  MLB do anuncio, quando quem chama ja o tem
+ *   (vitrine, monitor): e o que permite o fallback pela API em URL /up/MLBU.
+ */
+export async function buscarDadosProdutoMl(url, opcoes = {}) {
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
   // Aceita pagina de produto, encurtador e perfil de afiliado.
@@ -397,11 +529,31 @@ export async function buscarDadosProdutoMl(url) {
   const html = await res.text();
 
   const ld = extrairLdProduto(html);
+
+  // Tela antibot no lugar da pagina: nomeia o bloqueio e tenta a API oficial.
+  // Sem API autorizada, o erro diz o que fazer — melhor que "sem preco".
+  if (paginaMlBloqueada(res, html, ld)) {
+    registrarAntibotMl(alvoUrl);
+    const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
+    if (viaApi) return { ...viaApi, bloqueado: true };
+    throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada() ? '' : ' — autorize a API oficial em /ml/conectar para o fallback'));
+  }
+  registrarPaginaMlOk();
+
   const oferta = ld?.offers
     ? (Array.isArray(ld.offers) ? ld.offers[0] : ld.offers)
     : null;
 
   const preco = Number(oferta?.price ?? oferta?.lowPrice) || null;
+
+  // Pagina abriu mas o JSON-LD nao trouxe preco (layout novo, anuncio pausado,
+  // sem oferta): a API oficial responde o que a pagina calou, inclusive o
+  // status — "pausado ou sem estoque" e mais util que "sem preco na pagina".
+  if (!preco) {
+    const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
+    if (viaApi) return viaApi;
+  }
+
   const titulo = ld?.name || metaConteudo(html, 'og:title') || null;
   const imagem = (Array.isArray(ld?.image) ? ld.image[0] : ld?.image) || metaConteudo(html, 'og:image') || null;
 
@@ -827,6 +979,7 @@ export async function processarTextoMl(texto, opcoes = {}) {
 
   // Encurtador precisa virar URL canonica antes de ir para o painel.
   const canonicas = [];
+  const dicasMlb = new Map();   // url canonica -> MLB do anuncio, quando a URL trazia
   for (const u of urls) {
     let alvo = u;
     if (!idProdutoMl(alvo)) {
@@ -842,7 +995,13 @@ export async function processarTextoMl(texto, opcoes = {}) {
         alvo = prod.url;
       } catch (e) { console.warn('[ML] Falha no perfil social:', e.message); continue; }
     }
-    if (idProdutoMl(alvo)) canonicas.push(urlCanonicaMl(alvo));
+    if (idProdutoMl(alvo)) {
+      const canon = urlCanonicaMl(alvo);
+      canonicas.push(canon);
+      // wid/MLB do anuncio some na canonizacao; guardado para o fallback pela API.
+      const mlb = idDeUrl(alvo) || idDeUrl(u);
+      if (mlb && !dicasMlb.has(canon)) dicasMlb.set(canon, mlb);
+    }
     else console.warn('[ML] Sem id de produto apos resolver:', u);
   }
   if (!canonicas.length) return [];
@@ -858,7 +1017,7 @@ export async function processarTextoMl(texto, opcoes = {}) {
   const dadosPorUrl = new Map();
   const falhaDados = new Map();
   for (const url of canonicas) {
-    try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url)); }
+    try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url, { id: dicasMlb.get(url) || null })); }
     catch (e) { falhaDados.set(url, e.message); }
   }
 
@@ -881,16 +1040,30 @@ export async function processarTextoMl(texto, opcoes = {}) {
     return so;
   }
 
+  // So quem teve dados lidos vai ao createLink. A geracao GRUDA a etiqueta de
+  // nicho no produto (ver gerarLinksAfiliadoMl), entao gerar link para um
+  // candidato que vai ser descartado logo depois queima a etiqueta a troco de
+  // nada — em 25/08, com o antibot barrando toda pagina, foi um createLink por
+  // link capturado, o dia inteiro, sem uma oferta sequer sair.
+  const descartes = [];
+  for (const url of canonicas) {
+    if (dadosPorUrl.has(url)) continue;
+    descartes.push({ produto: { loja: 'Mercado Livre', asin: idProdutoMl(url), titulo: url, link: url },
+                     descartadoPor: 'dados do produto: ' + (falhaDados.get(url) || 'nao lidos') });
+  }
+  const legiveis = canonicas.filter(u => dadosPorUrl.has(u));
+  if (!legiveis.length) return descartes;
+
   let links;
-  try { links = await gerarLinksAfiliadoMl(canonicas, { titulos }); }
+  try { links = await gerarLinksAfiliadoMl(legiveis, { titulos }); }
   catch (e) {
     console.error('[ML] createLink falhou:', e.message);
-    return canonicas.map(u => ({ produto: { loja: 'Mercado Livre', link: u },
-                                 descartadoPor: 'painel de afiliados: ' + e.message }));
+    return [...descartes, ...legiveis.map(u => ({ produto: { loja: 'Mercado Livre', link: u },
+                                                 descartadoPor: 'painel de afiliados: ' + e.message }))];
   }
 
-  const saida = [];
-  for (const url of canonicas) {
+  const saida = [...descartes];
+  for (const url of legiveis) {
     const r = links.get(url) || links.get(idDeUrl(url)) || { erro: 'sem resposta do painel' };
     if (r.erro) {
       saida.push({ produto: { loja: 'Mercado Livre', titulo: url, link: url },
@@ -899,11 +1072,6 @@ export async function processarTextoMl(texto, opcoes = {}) {
     }
 
     const dados = dadosPorUrl.get(url);
-    if (!dados) {
-      saida.push({ produto: { loja: 'Mercado Livre', link: r.link },
-                   descartadoPor: 'dados do produto: ' + (falhaDados.get(url) || 'nao lidos') });
-      continue;
-    }
 
     const p = {
       // idProdutoMl, nao idDeUrl: idDeUrl so casa MLB+digitos e devolve null
@@ -1371,7 +1539,9 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     if (r.erro) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: r.erro }); continue; }
 
     let dados;
-    try { dados = await buscarDadosProdutoMl(url); }
+    // O MLB salvo na vitrine e o que permite o fallback pela API quando a URL
+    // e /up/MLBU (catalogo unificado, sem endpoint publico).
+    try { dados = await buscarDadosProdutoMl(url, { id: salvo.asin }); }
     catch (e) {
       descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'dados do produto: ' + e.message });
       continue;
