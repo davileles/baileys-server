@@ -202,9 +202,13 @@ async function avisarAntibotMl(detalhe) {
 // Pagina usada pela sonda do antibot: variavel para trocar sem deploy; sem ela,
 // um item ML da propria vitrine (e o que o radar e as listas de fato leem).
 function urlSondaProdutoMl() {
-  return process.env.ML_URL_TESTE_PRODUTO
-    || listarVitrine().find(i => i.loja === 'Mercado Livre' && i.url)?.url
-    || 'https://www.mercadolivre.com.br/p/MLB38655102';
+  if (process.env.ML_URL_TESTE_PRODUTO) return process.env.ML_URL_TESTE_PRODUTO;
+  // So pagina de produto direta (/p/MLB ou /up/MLBU). O encurtador meli.la
+  // abre o perfil social do afiliado, que nao tem JSON-LD de produto nem a
+  // tela antibot — a sonda passaria em falso com o bloqueio ativo.
+  const direto = listarVitrine().find(i => i.loja === 'Mercado Livre'
+    && /mercadolivre\.com\.br\/.*\/(?:p|up)\/MLBU?\d{6,}/i.test(i.url || ''));
+  return direto?.url || 'https://www.mercadolivre.com.br/p/MLB38655102';
 }
 
 // Sincroniza os cupons do ML de hora em hora. Cupom esgotado que continua ativo
