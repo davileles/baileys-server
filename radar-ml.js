@@ -418,46 +418,70 @@ function apiMlAutorizada() {
 }
 
 /**
- * Preco/estoque pela API oficial, quando a pagina nao serviu. Item (MLB) vai
- * em /items; catalogo (/p/MLB) passa por /products -> buy_box_winner -> /items.
- * Catalogo unificado (/up/MLBU) nao tem endpoint publico: so resolve quando a
- * URL original trazia o wid, ou quando quem chamou ja tinha o MLB do anuncio
- * (opcoes.id — e o caso da vitrine). Devolve null quando nao da para saber;
- * quem chama decide o que fazer sem preco.
+ * Preco pela API oficial, quando a pagina nao serviu.
+ *
+ * O que este app consegue ler (medido em 25/08 com o token autorizado):
+ *   /products/{id}          200  nome, fotos, status do produto de catalogo
+ *   /products/{id}/items    200  todas as ofertas, com price/original_price/frete,
+ *                                na ordem do buy box (o 1o e o que a pagina mostra)
+ *   /items/{id}             403  anuncio de terceiro — em qualquer item
+ *   /user-products/{MLBU}   403  catalogo unificado de terceiro
+ * Ou seja: so CATALOGO tem fallback. Anuncio classico (/MLB-...) e /up/MLBU
+ * ficam sem — quem chama recebe null e mantem o erro de bloqueio.
+ *
+ * O id de catalogo vem da URL (/p/MLB...) ou de opcoes.id: na vitrine o asin
+ * salvo de link meli.la costuma ser o id de catalogo (MLB curto), e e o que
+ * salva os 58 itens da vitrine cujo link nem chega a resolver com o antibot.
  */
 async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
   if (!apiMlAutorizada()) return null;
   const s = String(urlResolvida || '');
-  const catalogo = (s.match(/\/p\/(MLB\d{6,})/i) || [])[1] || null;
-  const dica = /^MLB\d{6,}$/i.test(String(opcoes.id || '')) ? String(opcoes.id).toUpperCase() : null;
-  // Anuncio explicito (wid da URL, MLB salvo na vitrine) vence o catalogo: e
-  // aquele vendedor que o post apontou, nao o vencedor do buy box de agora.
-  let itemId = (dica && dica !== catalogo) ? dica
-             : (catalogo ? null : (idDeUrl(s) || idDeUrl(urlOriginal)));
-  const rotulo = itemId || catalogo || s;
-  if (!catalogo && !itemId) return null;
-  try {
-    if (!itemId) {
-      const prod = await apiMl('/products/' + encodeURIComponent(catalogo));
-      itemId = prod?.buy_box_winner?.item_id || null;
-      if (!itemId) return null;                 // catalogo sem vencedor: nada a vender
+  const daUrl = (s.match(/\/p\/(MLB\d{5,})/i) || [])[1] || null;
+  const dica  = /^MLB\d{5,}$/i.test(String(opcoes.id || '')) ? String(opcoes.id).toUpperCase() : null;
+  const candidatos = [...new Set([daUrl, dica].filter(Boolean))];
+  if (!candidatos.length) return null;
+
+  for (const catalogo of candidatos) {
+    let prod;
+    // 404 aqui = o id e de anuncio, nao de catalogo: tenta o proximo candidato.
+    try { prod = await apiMl('/products/' + encodeURIComponent(catalogo)); }
+    catch (e) {
+      if (/\b404\b/.test(e.message)) continue;
+      console.warn('[ML] API oficial /products/' + catalogo + ':', e.message);
+      return null;
     }
-    const it = await apiMl('/items/' + encodeURIComponent(itemId));
-    if (!it?.id) return null;
-    const p = normalizarMl(it);
-    if (!p.preco) return null;
-    console.log('[ML] ' + rotulo + ' — preco lido pela API oficial (R$ ' + p.preco + ')');
-    return {
-      titulo: p.titulo || null, preco: p.preco, precoDe: p.precoDe, imagem: p.imagemUrl,
-      disponivel: p.disponivel, precoDeFonte: p.precoDe ? FONTE_API : null,
-      precoDeDescartes: [], descontoDeclarado: null, marca: p.marca,
-      nota: null, avaliacoes: null, vendedor: p.vendedor, achouLd: false,
-      trilha: null, cuponsPagina: [], fonte: 'api', itemId,
-    };
-  } catch (e) {
-    console.warn('[ML] API oficial nao respondeu para ' + rotulo + ':', e.message);
-    return null;
+    try {
+      // Sequencial, nunca em paralelo: o refresh_token do ML e de uso unico e
+      // duas renovacoes simultaneas derrubariam a sessao.
+      const ofertas = await apiMl('/products/' + encodeURIComponent(catalogo) + '/items?limit=10');
+      const lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
+      const venc = lista[0] || null;
+      if (!venc) {
+        console.log('[ML] ' + catalogo + ' — catalogo sem oferta ativa na API oficial');
+        return null;
+      }
+      const preco = Number(venc.price);
+      const original = Number(venc.original_price) || null;
+      const precoDe = original && original > preco ? original : null;
+      const imagem = (prod?.pictures || []).map(pic => pic?.url).find(Boolean) || null;
+      console.log('[ML] ' + catalogo + ' — preco lido pela API oficial (catalogo, ' + lista.length
+        + ' oferta(s), vencedor ' + venc.item_id + ': R$ ' + preco + ')');
+      return {
+        titulo: prod?.name || null, preco, precoDe, imagem,
+        disponivel: String(prod?.status || 'active') === 'active',
+        precoDeFonte: precoDe ? FONTE_API : null, precoDeDescartes: [], descontoDeclarado: null,
+        marca: (prod?.attributes || []).find(a => a?.id === 'BRAND')?.value_name || '',
+        nota: null, avaliacoes: null, vendedor: venc.seller_id ? String(venc.seller_id) : null,
+        achouLd: false, trilha: null, cuponsPagina: [], fonte: 'api',
+        itemId: venc.item_id || null, catalogoId: catalogo,
+        freteGratis: !!venc.shipping?.free_shipping,
+      };
+    } catch (e) {
+      console.warn('[ML] API oficial /products/' + catalogo + '/items:', e.message);
+      return null;
+    }
   }
+  return null;
 }
 
 // ── SONDA DA PAGINA DE PRODUTO ───────────────────────────────────────────
@@ -540,7 +564,9 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
     registrarAntibotMl(alvoUrl);
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
     if (viaApi) return { ...viaApi, bloqueado: true };
-    throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada() ? '' : ' — autorize a API oficial em /ml/conectar para o fallback'));
+    throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
+      ? ' — API oficial nao cobre este anuncio (so catalogo /p/)'
+      : ' — autorize a API oficial em /ml/conectar para o fallback'));
   }
   registrarPaginaMlOk();
 
