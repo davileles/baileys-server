@@ -150,7 +150,7 @@ import {
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
-  verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl,
+  verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -11721,6 +11721,44 @@ app.post('/ml/aff/sonda', async (req, res) => {
       },
     }));
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Sonda de PAGINA com o cookie de afiliado: devolve trechos que casam com
+// ?grep= (regex) e uma amostra, para inspecionar paginas do painel (wishlist,
+// listas) sem despejar o HTML inteiro. Mesma exposicao de /ml/aff/sonda.
+app.get('/ml/aff/pagina', async (req, res) => {
+  const url = String(req.query.url || '');
+  if (!url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
+  const cookie = cookieAff();
+  if (!cookie) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
+  try {
+    const r = await fetch(url, {
+      redirect: 'follow',
+      headers: {
+        'Cookie': cookie,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      signal: AbortSignal.timeout(25000),
+    });
+    const html = await r.text();
+    const trechos = [];
+    if (req.query.grep) {
+      let re; try { re = new RegExp(String(req.query.grep), 'gi'); } catch (e) { re = null; }
+      if (re) {
+        const ctx = Math.min(Number(req.query.ctx) || 80, 400);
+        let m; while ((m = re.exec(html)) && trechos.length < 40) {
+          trechos.push(html.slice(Math.max(0, m.index - ctx), m.index + m[0].length + ctx));
+          if (m[0].length === 0) re.lastIndex++;
+        }
+      }
+    }
+    res.json({ ok: r.ok, status: r.status, urlFinal: r.url, tamanho: html.length,
+               titulo: (html.match(/<title[^>]*>([^<]*)<\/title>/i) || [])[1] || null,
+               bloqueado: /captcha\/wall|abuse-captcha|account-verification/i.test(r.url + html.slice(0, 5000)),
+               trechos, amostra: html.slice(0, Math.min(Number(req.query.amostra) || 0, 3000)) });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // Sonda do painel de afiliados: descobre quais endpoints o token abre.
