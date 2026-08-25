@@ -27,6 +27,7 @@ import {
   processarTextoAmazon,
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
+  cupomExpirado, cupomRestrito, cupomGeralDisponivel, desativarExpirados,
   cupomCitadoDesconhecido,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
@@ -11473,6 +11474,10 @@ app.get('/cupons/base', (req, res) => {
     ok: true,
     total: itens.length,
     vigentes: itens.filter(c => c.ativo !== false && new Date(c.validadeAte).getTime() > agora).length,
+    // Restritos sao vigentes que ficam fora da escolha automatica: o painel
+    // precisa distinguir os dois numeros para o operador nao contar com um
+    // cupom que o robo nunca vai usar sozinho.
+    restritos: itens.filter(c => cupomRestrito(c)).length,
     itens,
   });
 });
@@ -11513,10 +11518,28 @@ app.post('/cupons/loja/:loja', (req, res) => {
 });
 
 app.post('/cupons/base/:chave', (req, res) => {
-  const reg = atualizarCupomBase(req.params.chave, req.body || {});
+  // atualizarCupomBase lanca quando o painel tenta ligar um cupom vencido. O
+  // 409 carrega a explicacao: o operador precisa saber que o caminho e mexer na
+  // validade, nao insistir no interruptor.
+  let reg;
+  try {
+    reg = atualizarCupomBase(req.params.chave, req.body || {});
+  } catch (e) {
+    console.log('[CUPONS] Edicao recusada — ' + req.params.chave + ': ' + e.message);
+    return res.status(409).json({ ok:false, erro: e.message });
+  }
   if (!reg) return res.status(404).json({ ok:false, erro:'Cupom nao encontrado: ' + req.params.chave });
-  console.log('[CUPONS] Editado via painel — ' + reg.chave);
+  console.log('[CUPONS] Editado via painel — ' + reg.chave
+    + (reg.restrito ? ' (restrito a produtos especificos)' : ''));
   res.json({ ok:true, cupom: reg });
+});
+
+// Forca a sincronizacao de expirados sem esperar a proxima listagem. Existe
+// para o painel poder pedir a limpeza explicitamente depois de uma virada de
+// dia com a aba aberta.
+app.post('/cupons/expirados/sincronizar', (req, res) => {
+  const n = desativarExpirados();
+  res.json({ ok:true, desativados:n });
 });
 
 app.delete('/cupons/base/:chave', (req, res) => {
