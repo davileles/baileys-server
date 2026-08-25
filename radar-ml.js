@@ -563,7 +563,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   if (paginaMlBloqueada(res, html, ld)) {
     registrarAntibotMl(alvoUrl);
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
-    if (viaApi) return { ...viaApi, bloqueado: true };
+    if (viaApi) return { ...viaApi, bloqueado: true, urlFinal: alvoUrl };
     throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
       ? ' — API oficial nao cobre este anuncio (so catalogo /p/)'
       : ' — autorize a API oficial em /ml/conectar para o fallback'));
@@ -581,7 +581,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   // status — "pausado ou sem estoque" e mais util que "sem preco na pagina".
   if (!preco) {
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
-    if (viaApi) return viaApi;
+    if (viaApi) return { ...viaApi, urlFinal: alvoUrl };
   }
 
   const titulo = ld?.name || metaConteudo(html, 'og:title') || null;
@@ -615,6 +615,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
 
   return {
     titulo, preco, precoDe, imagem, disponivel,
+    urlFinal: alvoUrl,            // pagina do produto ja resolvida (link curto -> canonica)
     precoDeFonte: resolvido.fonte,
     precoDeDescartes: resolvido.descartes,
     descontoDeclarado,
@@ -1554,7 +1555,30 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
   const prontos = [], descartados = [];
 
   for (const salvo of itens) {
-    const url = urlCanonicaMl(salvo.url || ('https://www.mercadolivre.com.br/p/' + salvo.asin));
+    const bruta = salvo.url || ('https://www.mercadolivre.com.br/p/' + salvo.asin);
+    let url = urlCanonicaMl(bruta);
+
+    // Dados ANTES do createLink, pelas mesmas razoes do radar (processarTextoMl):
+    // nao queimar etiqueta de nicho em item que vai ser descartado — e porque
+    // a leitura resolve o link curto. O asin salvo vai junto: na vitrine ele
+    // costuma ser o id de catalogo, que e o que o fallback pela API aceita.
+    let dados;
+    try { dados = await buscarDadosProdutoMl(bruta, { id: salvo.asin }); }
+    catch (e) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'dados do produto: ' + e.message });
+      continue;
+    }
+
+    // Link curto (meli.la, /sec/) nao entra no createLink: o painel responde
+    // "URL Invalid.". 58 dos 72 itens ML da vitrine estavam assim, e nenhum
+    // envio ML por lista aconteceu em agosto por causa disso. Vai a pagina do
+    // produto resolvida ou, se a leitura veio da API, a URL canonica do catalogo.
+    if (RE_ENCURTADOR_ML.test(url)) {
+      if (dados.catalogoId) url = 'https://www.mercadolivre.com.br/p/' + dados.catalogoId;
+      else if (dados.urlFinal && idProdutoMl(dados.urlFinal) && !RE_ENCURTADOR_ML.test(dados.urlFinal)) {
+        url = urlCanonicaMl(dados.urlFinal);
+      }
+    }
 
     let links;
     // O nome salvo na vitrine e o que da a categoria — e por isso que o item
@@ -1567,15 +1591,6 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     }
     const r = links.get(url) || links.get(salvo.asin) || links.get(idDeUrl(url)) || { erro: 'sem resposta do painel' };
     if (r.erro) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: r.erro }); continue; }
-
-    let dados;
-    // O MLB salvo na vitrine e o que permite o fallback pela API quando a URL
-    // e /up/MLBU (catalogo unificado, sem endpoint publico).
-    try { dados = await buscarDadosProdutoMl(url, { id: salvo.asin }); }
-    catch (e) {
-      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'dados do produto: ' + e.message });
-      continue;
-    }
 
     const p = {
       asin: salvo.asin, id: salvo.asin,
