@@ -26,7 +26,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { listarCuponsBase, cupomVigente } from './radar-amazon.js';
+import { listarCuponsBase, cupomGeralDisponivel } from './radar-amazon.js';
 
 const SESSAO_DIR = './sessao';
 const ARQ_LOCAL  = SESSAO_DIR + '/publicadas.json';
@@ -174,7 +174,11 @@ function linkDaLoja(loja, codigo) {
 
 function montarCupons() {
   const itens = listarCuponsBase()
-    .filter(cupomVigente)
+    // Vitrine publica de cupons e o caso mais generico que existe: o visitante
+    // chega sem produto na mao. Cupom de selecao fechada aqui vira promessa
+    // quebrada no checkout, entao fica de fora — ele so aparece atrelado ao
+    // produto especifico em que vale.
+    .filter(cupomGeralDisponivel)
     .map(c => ({
       codigo:     c.codigo,
       loja:       c.loja,
