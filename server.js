@@ -10385,14 +10385,15 @@ setInterval(async () => {
       const r = await dispararProdutoDaLista(asin, cupomDaLista(lista));
       // Bloqueio do antibot e da infra, nao do item: adia 10 min em vez de
       // consumir a fila (25/08: uma lista inteira virou "pulado" em sequencia).
-      // Depois de 6 tentativas (1h) desiste deste item e segue, para a lista
-      // nao ficar presa para sempre.
-      if (!r.ok && /antibot/i.test(r.motivo || '') && (ex.bloqueios || 0) < 6) {
+      // Depois de 3 tentativas (30 min) desiste deste item e segue: o bloqueio
+      // dura horas, e um item sem cobertura da API (anuncio de terceiro, /up/)
+      // travando a lista por 1h custava mais que pula-lo.
+      if (!r.ok && /antibot/i.test(r.motivo || '') && (ex.bloqueios || 0) < 3) {
         ex.bloqueios = (ex.bloqueios || 0) + 1;
         ex.proximoEm = Date.now() + 10 * 60000;
         atualizarExecucaoLista(lista.id, ex);
         console.warn('[LISTA] "' + lista.nome + '" — item ' + (ex.indice + 1) + '/' + lista.produtos.length
-          + ' adiado 10 min (' + ex.bloqueios + '/6): ' + r.motivo);
+          + ' adiado 10 min (' + ex.bloqueios + '/3): ' + r.motivo);
         avisarAntibotMl(r.motivo).catch(() => {});
         return;
       }
