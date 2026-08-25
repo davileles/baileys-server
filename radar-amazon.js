@@ -1040,6 +1040,9 @@ export function carregarCuponsBase() {
       // como vencido. O prazo real vem da conta do ML (expiration_date, texto do
       // card ou EXPIRED_ACTION do input-code) e e a unica fonte que manda.
       console.log('[CUPONS] Base carregada — ' + Object.keys(E().cupons).length + ' cupom(ns).');
+      // Um redeploy pode acontecer horas depois do vencimento: alinhar o estado
+      // logo na carga evita que o painel abra mostrando morto com toggle ligado.
+      desativarExpirados();
     }
   } catch (e) { console.log('[CUPONS] Erro ao carregar base:', e.message); E().cupons = {}; }
   return E().cupons;
@@ -1117,6 +1120,13 @@ export function registrarCupomBase(c) {
     // sobreviver a recaptura: sem isso o sync do ML trata todo cupom conhecido
     // como "nunca ativado" e nunca desativa nada.
     confirmadoNoMl: c.confirmadoNoMl === true || anterior?.confirmadoNoMl === true,
+    // Cupom que so vale numa selecao fechada de produtos (linha especifica,
+    // marca, itens escolhidos pelo vendedor). Nao pode entrar em oferta
+    // generica: o desconto anunciado simplesmente nao existiria no checkout do
+    // produto errado, e a mensagem vira reclamacao. Sobrevive a recaptura pelo
+    // mesmo motivo do 'ativo': reaparecer num grupo nao devolve o cupom ao uso
+    // geral.
+    restrito: c.restrito !== undefined ? c.restrito === true : (anterior?.restrito === true),
   };
   E().cupons[chave] = reg;
   salvarCuponsBase();
@@ -1125,16 +1135,61 @@ export function registrarCupomBase(c) {
   return reg;
 }
 
+/** Cupom cuja validade ja passou. Data ilegivel conta como expirada. */
+export function cupomExpirado(reg) {
+  if (!reg) return true;
+  const ms = new Date(reg.validadeAte).getTime();
+  return !Number.isFinite(ms) || ms <= Date.now();
+}
+
+/**
+ * Rebaixa para ativo:false todo cupom que ja venceu.
+ *
+ * cupomVigente() ja reprovava o expirado no calculo, mas o registro continuava
+ * com ativo:true — o painel mostrava "expirado" ao lado de um interruptor
+ * ligado, e um clique em "ativar todos" da loja ressuscitava o morto. Aqui o
+ * estado passa a refletir a realidade: vencido e desligado, ponto. So grava
+ * quando houve mudanca, para nao escrever o arquivo a cada listagem.
+ */
+export function desativarExpirados() {
+  let n = 0;
+  for (const reg of Object.values(E().cupons)) {
+    if (reg.ativo === false) continue;
+    if (!cupomExpirado(reg)) continue;
+    reg.ativo = false;
+    reg.atualizadoEm = new Date().toISOString();
+    n++;
+  }
+  if (n) {
+    console.log('[CUPONS] ' + n + ' cupom(ns) expirado(s) desativado(s) automaticamente.');
+    salvarCuponsBase();
+  }
+  return n;
+}
+
 export function listarCuponsBase() {
+  // Sincroniza antes de entregar: o painel e o feed publico leem daqui, e os
+  // dois precisam ver o mesmo estado que o motor de disparo enxerga.
+  desativarExpirados();
   return Object.values(E().cupons).sort((a, b) => (a.loja || '').localeCompare(b.loja || '', 'pt-BR'));
 }
 
 export function atualizarCupomBase(chave, campos = {}) {
   const reg = E().cupons[chave];
   if (!reg) return null;
-  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja', 'confirmadoNoMl']) {
+  // Ativar cupom vencido e sempre erro do operador (ou de um clique em massa).
+  // Recusar aqui, e nao so ignorar, para o painel poder dizer o porque — a
+  // saida certa e estender a validade, nao ligar o interruptor.
+  const esticaValidade = campos.validadeAte !== undefined
+    && new Date(campos.validadeAte).getTime() > Date.now();
+  if (campos.ativo === true && cupomExpirado(reg) && !esticaValidade) {
+    throw new Error('cupom ' + (reg.codigo || chave) + ' esta expirado — ajuste a validade antes de ativar');
+  }
+  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja', 'confirmadoNoMl', 'restrito']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
   }
+  // Mexer na validade nao pode deixar um vencido ligado por descuido.
+  if (cupomExpirado(reg)) reg.ativo = false;
   reg.atualizadoEm = new Date().toISOString();
   salvarCuponsBase();
   return reg;
@@ -1153,6 +1208,9 @@ export function definirAtivoPorLoja(loja, ativo) {
   let n = 0;
   for (const reg of Object.values(E().cupons)) {
     if (normalizarTexto(reg.loja) !== alvo) continue;
+    // "Ativar todos" nunca ressuscita vencido: o clique em massa e atalho de
+    // operacao, nao autorizacao para anunciar cupom que o checkout ja recusa.
+    if (ativo === true && cupomExpirado(reg)) continue;
     if (reg.ativo === ativo) continue;
     reg.ativo = ativo;
     reg.atualizadoEm = new Date().toISOString();
@@ -1164,6 +1222,23 @@ export function definirAtivoPorLoja(loja, ativo) {
 
 export function cupomVigente(reg) {
   return !!reg && reg.ativo !== false && new Date(reg.validadeAte).getTime() > Date.now();
+}
+
+/** Cupom marcado como valido so numa selecao fechada de produtos. */
+export function cupomRestrito(reg) {
+  return !!reg && reg.restrito === true;
+}
+
+/**
+ * Cupom que pode ser escolhido SOZINHO pelo sistema para uma oferta qualquer.
+ *
+ * Distincao central: cupomVigente() responde "esta valido?", esta responde
+ * "posso usar sem alguem ter mandado?". O cupom restrito e vigente — entra
+ * normalmente quando o operador vincula o codigo ao produto — mas fica fora de
+ * toda escolha automatica e de toda vitrine generica de cupons da loja.
+ */
+export function cupomGeralDisponivel(reg) {
+  return cupomVigente(reg) && !cupomRestrito(reg);
 }
 
 /**
@@ -1198,7 +1273,9 @@ export function melhorCupomAplicavel(loja, preco) {
   const alvo = normalizarTexto(loja);
   let melhor = null, melhorDesc = 0;
   for (const reg of Object.values(E().cupons)) {
-    if (!cupomVigente(reg)) continue;
+    // cupomGeralDisponivel e nao cupomVigente: escolha automatica nunca pode
+    // cair num cupom de selecao fechada, que so vale nos produtos combinados.
+    if (!cupomGeralDisponivel(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
     const d = calcularDesconto(reg, preco);
     if (d > melhorDesc) { melhor = reg; melhorDesc = d; }
@@ -1222,7 +1299,7 @@ export function ultimoCupomDaLoja(loja) {
   const alvo = normalizarTexto(loja);
   let recente = null;
   for (const reg of Object.values(E().cupons)) {
-    if (!cupomVigente(reg)) continue;
+    if (!cupomGeralDisponivel(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
     if (!recente || new Date(reg.capturadoEm) > new Date(recente.capturadoEm)) recente = reg;
   }
