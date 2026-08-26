@@ -484,6 +484,34 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
   return null;
 }
 
+/**
+ * Leitura LEVE pela API oficial: so o preco de tabela do catalogo, 1 chamada.
+ * E o leitor do monitor de precos — canal oficial, sem antibot, sem cookie.
+ * Nao serve para divulgar: nao tem preco em destaque (Pix/saldo MP) nem cupom
+ * do anuncio; isso so a pagina (buscarDadosProdutoMl) da.
+ * Devolve null quando o id nao e de catalogo (404) ou nao ha oferta ativa;
+ * outros erros (429, 5xx, token) sobem para quem chama decidir o fallback.
+ */
+export async function precoCatalogoApiMl(id) {
+  const cat = /^MLB\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;
+  if (!cat || !apiMlAutorizada()) return null;
+  let ofertas;
+  try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=1'); }
+  catch (e) {
+    if (/\b404\b/.test(e.message)) return null;      // id de anuncio, nao de catalogo
+    throw e;
+  }
+  const venc = (ofertas?.results || []).find(r => Number(r?.price) > 0) || null;
+  if (!venc) return null;
+  const preco = Number(venc.price);
+  const original = Number(venc.original_price) || null;
+  return {
+    preco, precoDe: original && original > preco ? original : null, disponivel: true,
+    itemId: venc.item_id || null, catalogoId: cat,
+    freteGratis: !!venc.shipping?.free_shipping, fonte: 'api',
+  };
+}
+
 // ── SONDA DA PAGINA DE PRODUTO ───────────────────────────────────────────
 // Complemento de verificarTokenAff: o linkbuilder pode seguir respondendo
 // enquanto o antibot barra toda pagina de produto — foi o cenario de 25/08.
