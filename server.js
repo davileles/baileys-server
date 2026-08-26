@@ -5121,6 +5121,7 @@ const PRESERVAR_NO_RESET = new Set([
   'publicadas.json',        // historico da vitrine publica
   'rastreio.json',          // ledger ref -> produto (rastreio de desempenho)
   'health.json',            // marcos de saude do inbound (regua do watchdog)
+  'capturas_brutas.json',   // diario cru das capturas do radar (diagnostico)
   'categorias.json',        // taxonomia de categorias (grupos de nicho)
   'categorias_cache.json',  // cache asin -> trilha de categoria
   'contas',                 // credenciais dos numeros secundarios de envio
@@ -5141,6 +5142,50 @@ function enfileirarPorGrupo(jid, fn) {
 
 // Desembrulha wrappers comuns do WhatsApp (mensagens efêmeras, view-once,
 // documento com legenda, etc.) até chegar ao conteúdo real.
+// ── DIARIO DE CAPTURAS BRUTAS DO RADAR ──────────────────────────────────────
+// Guarda o payload como o Baileys entregou, ANTES de qualquer interpretacao
+// nossa. Existe porque em 26/08 uma oferta saiu sem o cupom que o print do
+// grupo mostrava, e nao havia como decidir entre "o texto chegou incompleto",
+// "foi edicao de mensagem" ou "erro nosso" — o texto interpretado era a unica
+// evidencia, e ela e justamente a que estava sob suspeita. Anel de 200: e
+// diagnostico, nao historico.
+const CAPTURAS_PATH = SESSAO_DIR + '/capturas_brutas.json';
+const CAPTURAS_MAX  = 200;
+let capturasBrutas = [];
+
+// Corta binario e texto longo: jpegThumbnail sozinho estoura o arquivo, e o que
+// interessa aqui e a ESTRUTURA da mensagem, nao a midia.
+function _podarPayload(_chave, valor) {
+  if (typeof valor === 'string' && valor.length > 400) return valor.slice(0, 400) + '…[' + valor.length + ']';
+  if (valor && valor.type === 'Buffer' && Array.isArray(valor.data)) return '[buffer ' + valor.data.length + 'B]';
+  return valor;
+}
+
+function carregarCapturasBrutas() {
+  try {
+    if (existsSync(CAPTURAS_PATH)) capturasBrutas = JSON.parse(readFileSync(CAPTURAS_PATH, 'utf-8')) || [];
+  } catch (e) { capturasBrutas = []; }
+}
+carregarCapturasBrutas();
+
+function registrarCapturaBruta(jid, msg, texto, tipo, ehEdicao) {
+  try {
+    capturasBrutas.unshift({
+      em: new Date().toISOString(),
+      jid, grupo: NOMES_GRUPOS.get(jid) || null,
+      msgId: msg?.key?.id || null,
+      edicao: !!ehEdicao,
+      tipo: tipo || null,
+      // Texto EXATAMENTE como sera entregue ao pipeline, com escapes visiveis.
+      texto: String(texto || ''),
+      // Estrutura crua: as chaves que o Baileys entregou, sem midia.
+      payload: JSON.parse(JSON.stringify(msg?.message || {}, _podarPayload)),
+    });
+    if (capturasBrutas.length > CAPTURAS_MAX) capturasBrutas.length = CAPTURAS_MAX;
+    escreverAtomico(CAPTURAS_PATH, JSON.stringify(capturasBrutas), 'utf-8');
+  } catch (e) { /* diagnostico nunca segura a captura */ }
+}
+
 const _WRAPPERS_WA = ['ephemeralMessage','viewOnceMessage','viewOnceMessageV2','viewOnceMessageV2Extension','documentWithCaptionMessage','deviceSentMessage'];
 function desembrulharMessage(m) {
   let atual = m, prof = 0;
@@ -5241,6 +5286,81 @@ async function avisarCupomAnuncioSemBase(aviso, p, jid, foiParaFila = false) {
     await enviarMensagem(GRUPOS['operador'], { text: texto });
     console.log('[CUPOM-ANUNCIO] ' + aviso.percentual + ' campanha ' + (aviso.idCampanhaLoja || '—'));
   } catch (e) { console.error('[CUPOM-ANUNCIO] Falha ao avisar operador:', e.message); }
+}
+
+// ── PRECO DECLARADO NO POST x PRECO QUE VAMOS PUBLICAR ──────────────────────
+// O grupo-fonte escreve o preco que o comprador realmente paga. Se o nosso
+// calculo fica bem acima dele, alguma condicao nao foi capturada — cupom que
+// nao chegou no texto, campanha do anuncio que a pagina nao entregou, preco que
+// mudou entre o post e a leitura. Em 26/08 o post dizia R$ 2.971,59 e saiu
+// R$ 3.399,99 para 30 grupos sem que nada reclamasse.
+//
+// Calibrado contra as capturas reais do dia: piso de 10% e a faixa util. Abaixo
+// disso o ruido domina (desconto Pix de 5%, 'de' desatualizado no post) e o
+// gate reteria uma oferta em cada cinco. Divergencia maior que 60% quase sempre
+// e outro numero no texto (frete, parcela, brinde), nao o preco do produto.
+const DIVERGENCIA_PRECO_MIN = 0.10;
+const DIVERGENCIA_PRECO_MAX = 0.60;
+
+// Condicoes que EXPLICAM um preco menor no post sem haver cupom nenhum. Post de
+// recorrencia da Amazon anuncia o valor com 'Programe e Poupe' aplicado; cobrar
+// alarme disso seria alarme diario e o operador para de ler.
+const RE_PRECO_EXPLICADO = /programe e poupe|recorr[êe]ncia|assinatur|assine|primeira compra|1[ªa]\s*compra|cashback|clube/i;
+
+function precosDeclaradosNoTexto(texto) {
+  // Parcela nunca e preco do produto: '12x de R$ 99' viraria divergencia de 90%.
+  const limpo = String(texto || '').replace(/\d+\s*x\s*(?:de\s*)?R\$\s*[\d.]+,?\d*/gi, ' ');
+  return [...limpo.matchAll(/R\$\s*([\d.]{1,12},\d{2}|\d{2,7})(?![\d,])/gi)]
+    .map(m => Number(m[1].replace(/\./g, '').replace(',', '.')))
+    .filter(v => Number.isFinite(v) && v > 0);
+}
+
+/**
+ * Divergencia relevante entre o preco do post e o que vamos publicar, ou null.
+ * So olha ofertas SEM cupom aplicado: quando o cupom entrou, a diferenca que
+ * sobra e desconto de meio de pagamento, e ai o post e que esta otimista.
+ */
+function divergenciaPrecoPost(texto, precoFinal, temCupom) {
+  if (temCupom) return null;
+  const final = Number(precoFinal);
+  if (!Number.isFinite(final) || final <= 0) return null;
+  if (RE_PRECO_EXPLICADO.test(String(texto || ''))) return null;
+  const declarados = precosDeclaradosNoTexto(texto);
+  if (!declarados.length) return null;
+  const declarado = Math.min(...declarados);
+  const queda = 1 - declarado / final;
+  if (queda < DIVERGENCIA_PRECO_MIN || queda > DIVERGENCIA_PRECO_MAX) return null;
+  return {
+    declarado, calculado: Math.round(final * 100) / 100,
+    diferencaPct: Math.round(queda * 1000) / 10,
+  };
+}
+
+const AVISOS_PRECO_DIVERGENTE = new Map();
+const AVISO_PRECO_DIVERGENTE_TTL_MS = 6 * 3600e3;
+
+async function avisarPrecoDivergente(div, p, jid) {
+  const chave = 'div:' + (p.asin || p.titulo || '?');
+  const agora = Date.now();
+  const visto = AVISOS_PRECO_DIVERGENTE.get(chave);
+  if (visto && agora - visto < AVISO_PRECO_DIVERGENTE_TTL_MS) return;
+  AVISOS_PRECO_DIVERGENTE.set(chave, agora);
+
+  const brl = (v) => 'R$ ' + Number(v).toFixed(2).replace('.', ',');
+  const grupo = jid ? (NOMES_GRUPOS.get(jid) || jid.split('@')[0]) : '—';
+  const texto = '💸 *Post anuncia preço menor que o nosso*\n\n'
+    + '*Oferta* ' + (p.titulo || p.asin || '—') + '\n'
+    + '*No post* ' + brl(div.declarado) + '\n'
+    + '*Nosso cálculo* ' + brl(div.calculado) + ' (' + div.diferencaPct + '% acima)\n'
+    + (p.link ? '*Link* ' + p.link + '\n' : '')
+    + '*Grupo de origem* ' + grupo + '\n\n'
+    + 'Nenhum cupom foi aplicado nesta oferta. Provável cupom ou condição que não '
+    + 'chegou no texto capturado. Ela está na fila de aprovação e não auto-envia.';
+
+  try {
+    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    console.log('[PRECO-DIV] ' + (p.asin || '?') + ' — post ' + div.declarado + ' x nosso ' + div.calculado);
+  } catch (e) { console.error('[PRECO-DIV] Falha ao avisar operador:', e.message); }
 }
 
 // ── CUPOM ML CITADO FORA DA BASE: TENTAR INCORPORAR ANTES DO PIPELINE ────────
@@ -5378,7 +5498,7 @@ async function lerPrecosParaSerie(produtos, jid, motivo) {
   return { gravados, freados };
 }
 
-async function processarRadarMarketplace(jid, texto) {
+async function processarRadarMarketplace(jid, texto, opcoes = {}) {
   if (!texto) return;
 
   // Uma mensagem pode trazer link de mais de uma loja; cada pipeline cuida dos
@@ -5511,7 +5631,11 @@ async function processarRadarMarketplace(jid, texto) {
     // 'descontoMinimo'/'dedupHoras' seguiam editaveis em tela sem fazer nada.
     // O custo apareceu em 21/08: 7 pares do mesmo produto ML sairam para os
     // mesmos 22 grupos com 2 a 4 minutos de intervalo.
-    if (jaDivulgado(p)) {
+    // Edicao passa pelo dedup de proposito: a versao corrigida do post e
+    // justamente a que traz o cupom/preco que faltava, e jaDivulgado() compara
+    // preco BRUTO — cupom novo nao muda o preco de tabela, entao a correcao
+    // seria descartada em silencio. Ela nunca auto-envia: vai para aprovacao.
+    if (jaDivulgado(p) && !opcoes.edicao) {
       console.log('[MKT] ' + (p.asin || '?') + ' descartado — ja divulgado nas ultimas '
         + horasDedup() + 'h (' + (p.titulo || '').slice(0, 50) + ')');
       continue;
@@ -5538,6 +5662,11 @@ async function processarRadarMarketplace(jid, texto) {
 
     // Cupom declarado pelo proprio anuncio sem correspondente na base.
     if (r.avisoCupomPagina) avisarCupomAnuncioSemBase(r.avisoCupomPagina, p, jid, _cupomForaDaBase).catch(() => {});
+
+    // O post declara um preco bem abaixo do que vamos publicar e nenhum cupom
+    // entrou: sinal de condicao nao capturada. Nao auto-envia e avisa.
+    const _divPreco = divergenciaPrecoPost(texto, r.precoFinal ?? p.preco, !!r.cupom);
+    if (_divPreco) avisarPrecoDivergente(_divPreco, p, jid).catch(() => {});
 
     const imagem = await baixarImagemProduto(p.imagemUrl);
 
@@ -5641,6 +5770,9 @@ async function processarRadarMarketplace(jid, texto) {
     if (_cupomForaDaBase) {
       oferta.cupomForaDaBase = { codigos: _cupSemBase, anuncio: !!r.avisoCupomPagina };
     }
+    if (_divPreco) oferta.precoDivergente = _divPreco;
+    // Versao corrigida de um post que ja saiu: sempre passa pelo operador.
+    if (opcoes.edicao) oferta.revisaoDeEdicao = true;
 
     // Cruzamento com os desejos de compra registrados. Fire-and-forget: roda em
     // paralelo e nunca lanca, para nao interferir no pipeline de ofertas.
@@ -5661,7 +5793,8 @@ async function processarRadarMarketplace(jid, texto) {
     // entao continua exigindo aprovacao manual como antes.
     const _seguraPorPreco = oferta.dadosExtraidos.precoDeReferencia
                          && !oferta.dadosExtraidos.autoEnvioMesmoSemVerificar;
-    if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase) {
+    if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
+        && !oferta.precoDivergente && !oferta.revisaoDeEdicao) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
         oferta.status = 'enviado';
@@ -5685,6 +5818,9 @@ async function processarRadarMarketplace(jid, texto) {
     salvarFila();
     const _motivoFila = autoEnvioModoOferta() !== 'on' ? ''
       : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
+      : oferta.precoDivergente ? ' — post anuncia R$ ' + oferta.precoDivergente.declarado
+          + ' e calculamos R$ ' + oferta.precoDivergente.calculado + ', exige aprovacao manual'
+      : oferta.revisaoDeEdicao ? ' — versao editada do post, exige aprovacao manual'
       : _seguraPorPreco ? ' — preco nao verificado, exige aprovacao manual'
       : '';
     console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)' + _motivoFila);
@@ -5699,7 +5835,14 @@ async function processarMensagem(msg) {
     // de marketplace. Um grupo pode estar so em um dos dois.
     const _ehRadar = ehFonteRadar(jid);
     if (!GRUPOS_MONITORADOS.includes(jid) && !_ehRadar) return;
-    const m    = desembrulharMessage(msg.message);
+    // Edicao de mensagem no grupo-fonte: o WhatsApp entrega a versao nova
+    // dentro de protocolMessage.editedMessage. Sem este desembrulho o tipo caia
+    // em 'protocolMessage', que esta em _TIPOS_IGNORADOS, e a correcao sumia sem
+    // log — inclusive quando ela era exatamente o cupom que faltava no post.
+    let m = desembrulharMessage(msg.message);
+    const _editado  = m?.protocolMessage?.editedMessage;
+    const _ehEdicao = !!_editado;
+    if (_ehEdicao) m = desembrulharMessage(_editado);
     const tipo = _TIPOS_TRATADOS.find(t => m && m[t]) || Object.keys(m || {})[0];
     let texto = '', imagemB64 = null;
     if (tipo === 'conversation') { texto = m.conversation; }
@@ -5721,7 +5864,7 @@ async function processarMensagem(msg) {
     }
     if (!texto && !imagemB64) return;
 
-    console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo, texto ? '| texto: '+texto.slice(0,60) : '| imagem');
+    console.log('[MSG] Capturada de', jid.split('@')[0], '— tipo:', tipo + (_ehEdicao ? ' (EDICAO)' : ''), texto ? '| texto: '+texto.slice(0,60) : '| imagem');
     ultimaCapturaPorGrupo.set(jid, Date.now());
     registrarCapturaHealth();
 
@@ -5744,7 +5887,8 @@ async function processarMensagem(msg) {
     // Radar de marketplace: sai antes do buffer de agrupamento, que e do
     // pipeline de emissoes CDV e nao sabe lidar com link de produto.
     if (_ehRadar) {
-      await processarRadarMarketplace(jid, texto);
+      registrarCapturaBruta(jid, msg, texto, tipo, _ehEdicao);
+      await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao });
       if (!GRUPOS_MONITORADOS.includes(jid)) return;
     }
 
@@ -8324,6 +8468,17 @@ app.get('/radar/fila', (req, res) => {
       preview: item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
     })),
   });
+});
+
+// Diario cru das capturas do radar. Serve para responder "o que o WhatsApp
+// realmente entregou?" sem depender do texto ja interpretado.
+app.get('/radar/capturas', (req, res) => {
+  const n = Math.min(Number(req.query.n) || 20, CAPTURAS_MAX);
+  const busca = String(req.query.busca || '').toLowerCase();
+  let itens = capturasBrutas;
+  if (busca) itens = itens.filter(x => (x.texto || '').toLowerCase().includes(busca)
+                                    || (x.msgId || '').toLowerCase().includes(busca));
+  res.json({ ok: true, total: capturasBrutas.length, itens: itens.slice(0, n) });
 });
 
 app.get('/painel', (req, res) => {
