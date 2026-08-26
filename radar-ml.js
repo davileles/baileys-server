@@ -420,66 +420,76 @@ function apiMlAutorizada() {
 /**
  * Preco pela API oficial, quando a pagina nao serviu.
  *
- * O que este app consegue ler (medido em 25/08 com o token autorizado):
- *   /products/{id}          200  nome, fotos, status do produto de catalogo
- *   /products/{id}/items    200  todas as ofertas, com price/original_price/frete,
- *                                na ordem do buy box (o 1o e o que a pagina mostra)
+ * O que este app consegue ler (medido com o token autorizado):
+ *   /products/{MLB}         200  nome, fotos, status do produto de catalogo
+ *   /products/{MLB}/items   200  ofertas com price/original_price/frete, na
+ *                                ordem do buy box (a 1a e a que a pagina mostra)
+ *   /products/{MLBU}/items  200  MESMO endpoint serve o catalogo unificado,
+ *                                embora /products/{MLBU} e /user-products/{MLBU}
+ *                                respondam 403 — e por isso que a checagem e
+ *                                feita em /items, nunca no produto
  *   /items/{id}             403  anuncio de terceiro — em qualquer item
- *   /user-products/{MLBU}   403  catalogo unificado de terceiro
- * Ou seja: so CATALOGO tem fallback. Anuncio classico (/MLB-...) e /up/MLBU
- * ficam sem — quem chama recebe null e mantem o erro de bloqueio.
+ * Logo: catalogo (/p/MLB) E catalogo unificado (/up/MLBU) tem fallback; so o
+ * anuncio classico (produto.mercadolivre.com.br/MLB-...) fica de fora.
  *
- * O id de catalogo vem da URL (/p/MLB...) ou de opcoes.id: na vitrine o asin
- * salvo de link meli.la costuma ser o id de catalogo (MLB curto), e e o que
- * salva os 58 itens da vitrine cujo link nem chega a resolver com o antibot.
+ * O id vem da URL (/p/MLB..., /up/MLBU...) ou de opcoes.id: na vitrine o asin
+ * salvo de link meli.la costuma ser o id de catalogo, e e o que salva os itens
+ * cujo link nem chega a resolver com o antibot.
+ *
+ * Titulo: /products/{MLBU} e 403, entao no unificado nao ha nome pela API —
+ * quem chama usa o nome que ja tinha (vitrine, texto do post).
  */
 async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
   if (!apiMlAutorizada()) return null;
   const s = String(urlResolvida || '');
-  const daUrl = (s.match(/\/p\/(MLB\d{5,})/i) || [])[1] || null;
-  const dica  = /^MLB\d{5,}$/i.test(String(opcoes.id || '')) ? String(opcoes.id).toUpperCase() : null;
+  const daUrl = (s.match(/\/(?:p|up)\/(MLBU?\d{5,})/i) || [])[1]
+             || (String(urlOriginal || '').match(/\/(?:p|up)\/(MLBU?\d{5,})/i) || [])[1] || null;
+  const dica  = /^MLBU?\d{5,}$/i.test(String(opcoes.id || '')) ? String(opcoes.id).toUpperCase() : null;
   const candidatos = [...new Set([daUrl, dica].filter(Boolean))];
   if (!candidatos.length) return null;
 
   for (const catalogo of candidatos) {
-    let prod;
-    // 404 aqui = o id e de anuncio, nao de catalogo: tenta o proximo candidato.
-    try { prod = await apiMl('/products/' + encodeURIComponent(catalogo)); }
-    catch (e) {
-      if (/\b404\b/.test(e.message)) continue;
-      console.warn('[ML] API oficial /products/' + catalogo + ':', e.message);
-      return null;
-    }
+    let lista;
+    // A checagem e sempre em /items: e o unico endpoint que responde 200 tanto
+    // para MLB quanto para MLBU. 404 = o id e de anuncio, nao de catalogo.
     try {
-      // Sequencial, nunca em paralelo: o refresh_token do ML e de uso unico e
-      // duas renovacoes simultaneas derrubariam a sessao.
       const ofertas = await apiMl('/products/' + encodeURIComponent(catalogo) + '/items?limit=10');
-      const lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
-      const venc = lista[0] || null;
-      if (!venc) {
-        console.log('[ML] ' + catalogo + ' — catalogo sem oferta ativa na API oficial');
-        return null;
-      }
-      const preco = Number(venc.price);
-      const original = Number(venc.original_price) || null;
-      const precoDe = original && original > preco ? original : null;
-      const imagem = (prod?.pictures || []).map(pic => pic?.url).find(Boolean) || null;
-      console.log('[ML] ' + catalogo + ' — preco lido pela API oficial (catalogo, ' + lista.length
-        + ' oferta(s), vencedor ' + venc.item_id + ': R$ ' + preco + ')');
-      return {
-        titulo: prod?.name || null, preco, precoDe, imagem,
-        disponivel: String(prod?.status || 'active') === 'active',
-        precoDeFonte: precoDe ? FONTE_API : null, precoDeDescartes: [], descontoDeclarado: null,
-        marca: (prod?.attributes || []).find(a => a?.id === 'BRAND')?.value_name || '',
-        nota: null, avaliacoes: null, vendedor: venc.seller_id ? String(venc.seller_id) : null,
-        achouLd: false, trilha: null, cuponsPagina: [], fonte: 'api',
-        itemId: venc.item_id || null, catalogoId: catalogo,
-        freteGratis: !!venc.shipping?.free_shipping,
-      };
+      lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
     } catch (e) {
+      if (/\b404\b/.test(e.message)) continue;
       console.warn('[ML] API oficial /products/' + catalogo + '/items:', e.message);
       return null;
     }
+    const venc = lista[0] || null;
+    if (!venc) {
+      console.log('[ML] ' + catalogo + ' — catalogo sem oferta ativa na API oficial');
+      return null;
+    }
+
+    // Nome e fotos so existem em /products/{MLB}; no unificado da 403. Sem eles
+    // o produto ainda sai, com o nome que quem chamou ja tinha.
+    let prod = null;
+    if (/^MLB\d/i.test(catalogo)) {
+      try { prod = await apiMl('/products/' + encodeURIComponent(catalogo)); }
+      catch (e) { console.warn('[ML] API oficial /products/' + catalogo + ' (nome):', e.message); }
+    }
+
+    const preco = Number(venc.price);
+    const original = Number(venc.original_price) || null;
+    const precoDe = original && original > preco ? original : null;
+    const imagem = (prod?.pictures || []).map(pic => pic?.url).find(Boolean) || null;
+    console.log('[ML] ' + catalogo + ' — preco lido pela API oficial (catalogo, ' + lista.length
+      + ' oferta(s), vencedor ' + venc.item_id + ': R$ ' + preco + ')');
+    return {
+      titulo: prod?.name || null, preco, precoDe, imagem,
+      disponivel: String(prod?.status || 'active') === 'active',
+      precoDeFonte: precoDe ? FONTE_API : null, precoDeDescartes: [], descontoDeclarado: null,
+      marca: (prod?.attributes || []).find(a => a?.id === 'BRAND')?.value_name || '',
+      nota: null, avaliacoes: null, vendedor: venc.seller_id ? String(venc.seller_id) : null,
+      achouLd: false, trilha: null, cuponsPagina: [], fonte: 'api',
+      itemId: venc.item_id || null, catalogoId: catalogo,
+      freteGratis: !!venc.shipping?.free_shipping,
+    };
   }
   return null;
 }
@@ -493,7 +503,8 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
  * outros erros (429, 5xx, token) sobem para quem chama decidir o fallback.
  */
 export async function precoCatalogoApiMl(id) {
-  const cat = /^MLB\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;
+  // MLBU (catalogo unificado) tambem serve: /products/{MLBU}/items responde 200.
+  const cat = /^MLBU?\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;
   if (!cat || !apiMlAutorizada()) return null;
   let ofertas;
   try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=1'); }
@@ -593,7 +604,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
     if (viaApi) return { ...viaApi, bloqueado: true, urlFinal: alvoUrl };
     throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
-      ? ' — API oficial nao cobre este anuncio (so catalogo /p/)'
+      ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
       : ' — autorize a API oficial em /ml/conectar para o fallback'));
   }
   registrarPaginaMlOk();
