@@ -226,7 +226,10 @@ export async function resolverLinkMl(url) {
 async function resolverEncurtadorMl(url, tentativas = 6) {
   let atual = url;
   for (let i = 0; i < tentativas; i++) {
-    if (idDeUrl(atual)) return atual;
+    // idProdutoMl, nao idDeUrl: idDeUrl ignora o catalogo unificado (MLBU),
+    // entao o laco dava mais um hop e batia na propria pagina do produto —
+    // requisicao inutil e, com o antibot ligado, tocando o endereco bloqueado.
+    if (idProdutoMl(atual)) return atual;
     const res = await fetch(atual, {
       method: 'GET', redirect: 'manual',
       headers: {
@@ -392,7 +395,18 @@ const RE_ANTIBOT_URL_ML = /\/captcha\/wall|\/gz\/account-verification/i;
 const RE_ANTIBOT_ML = /abuse-captcha|suspicious-traffic|\/gz\/account-verification|\/captcha\/wall|Para continuar, confirme que/i;
 
 let _antibot = { desde: null, ultimoEm: null, ultimaUrl: null, bloqueios: 0 };
-export function estadoAntibotMl() { return { ..._antibot, ativo: !!_antibot.desde }; }
+
+// Validade do diagnostico. A sonda roda de 30 em 30 min; se ela parar (crash,
+// tarefa nao agendada, URL de teste sumida), o estado congela em "bloqueado" e
+// o desvio da pagina viraria permanente — o sistema deixaria de ler a pagina
+// para sempre por causa de uma flag presa. Passado esse prazo sem confirmacao,
+// o bloqueio e tratado como desconhecido e a proxima leitura testa a pagina.
+const VALIDADE_ANTIBOT_MS = 60 * 60 * 1000;
+
+export function estadoAntibotMl() {
+  const fresco = !!_antibot.ultimoEm && (Date.now() - Date.parse(_antibot.ultimoEm) < VALIDADE_ANTIBOT_MS);
+  return { ..._antibot, ativo: !!_antibot.desde, confirmadoAgora: !!_antibot.desde && fresco };
+}
 function registrarAntibotMl(url) {
   _antibot.bloqueios++;
   _antibot.ultimoEm = new Date().toISOString();
@@ -439,13 +453,21 @@ function apiMlAutorizada() {
  * Titulo: /products/{MLBU} e 403, entao no unificado nao ha nome pela API —
  * quem chama usa o nome que ja tinha (vitrine, texto do post).
  */
-async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
-  if (!apiMlAutorizada()) return null;
-  const s = String(urlResolvida || '');
-  const daUrl = (s.match(/\/(?:p|up)\/(MLBU?\d{5,})/i) || [])[1]
+/**
+ * Ids de catalogo que a API pode tentar, deduzidos SEM rede. Serve tanto para
+ * o fallback quanto para decidir, antes de qualquer requisicao, se vale a pena
+ * abrir a pagina quando o antibot esta ativo.
+ */
+function idsCatalogoMl(urlResolvida, urlOriginal, opcoes = {}) {
+  const daUrl = (String(urlResolvida || '').match(/\/(?:p|up)\/(MLBU?\d{5,})/i) || [])[1]
              || (String(urlOriginal || '').match(/\/(?:p|up)\/(MLBU?\d{5,})/i) || [])[1] || null;
   const dica  = /^MLBU?\d{5,}$/i.test(String(opcoes.id || '')) ? String(opcoes.id).toUpperCase() : null;
-  const candidatos = [...new Set([daUrl, dica].filter(Boolean))];
+  return [...new Set([daUrl, dica].filter(Boolean))];
+}
+
+async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
+  if (!apiMlAutorizada()) return null;
+  const candidatos = idsCatalogoMl(urlResolvida, urlOriginal, opcoes);
   if (!candidatos.length) return null;
 
   for (const catalogo of candidatos) {
@@ -664,6 +686,24 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   // Aceita pagina de produto, encurtador e perfil de afiliado.
   let alvoUrl = url;
   try { alvoUrl = await resolverLinkMl(url); } catch (e) { /* segue com a original */ }
+
+  // ── BLOQUEIO ATIVO: nao insistir na pagina ──────────────────────────────
+  // Bater na pagina a cada produto capturado so para descobrir o que a sonda
+  // ja sabe alimenta o proprio bloqueio: sao dezenas de requisicoes recusadas
+  // por dia, exatamente o padrao que o antibot mede. Enquanto o bloqueio
+  // estiver ativo, quem sonda e SO verificarPaginaProdutoMl, de 30 em 30 min,
+  // com uma requisicao. O resto vai direto para a API oficial; o que a API nao
+  // cobre falha rapido, sem tocar no endereco bloqueado. Assim que a sonda
+  // conseguir abrir uma pagina, o bloqueio e dado por encerrado e este desvio
+  // deixa de valer sozinho, sem ninguem precisar reativar nada.
+  if (estadoAntibotMl().confirmadoAgora && !opcoes.forcarPagina) {
+    const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
+    if (viaApi) return { ...viaApi, bloqueado: true, urlFinal: alvoUrl };
+    throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
+      ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
+      : ' — autorize a API oficial em /ml/conectar para o fallback'));
+  }
+
   const res = await fetch(alvoUrl, {
     headers: {
       'Cookie': cookie,
