@@ -193,7 +193,8 @@ async function avisarTokenMlCaiu(motivo) {
     + '3. Atualize ML_AFF_TOKEN no Railway\n\n'
     + 'Amazon, Shopee e Magalu seguem normalmente.';
   try {
-    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    await registrarAlerta({ nivel:'critico', origem:'ml', chave:'ml:aff-token',
+      titulo:'Token de afiliado do Mercado Livre parou de funcionar', corpo:texto });
     console.error('[ML-AFF] Operador avisado: token caiu (' + motivo + ')');
   } catch (e) { console.error('[ML-AFF] Falha ao avisar operador:', e.message); }
 }
@@ -216,7 +217,8 @@ async function avisarAntibotMl(detalhe) {
           + 'Autorize em ' + ML_REDIRECT_URI.replace(/\/ml\/callback$/, '/ml/conectar'))
     + '\n\nAmazon, Shopee e Magalu seguem normalmente.';
   try {
-    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    await registrarAlerta({ nivel:'critico', origem:'ml', chave:'ml:token-oauth',
+      titulo:'Token do Mercado Livre parou de funcionar', corpo:texto });
     console.error('[ML] Operador avisado: antibot (' + detalhe + ')');
   } catch (e) { console.error('[ML] Falha ao avisar operador sobre antibot:', e.message); }
 }
@@ -276,8 +278,9 @@ async function sincronizarCuponsMlAgendado() {
     // Cupom que saiu do ar e noticia operacional: o operador pode estar contando
     // com ele para as ofertas do dia.
     if ((d.desativados || []).length) {
-      await enviarMensagem(GRUPOS['operador'], {
-        text: '🎫 *Cupons do Mercado Livre desativados*\n\n'
+      await registrarAlerta({ nivel:'info', origem:'ml', chave:'ml:cupons-desativados',
+        titulo:'Cupons do Mercado Livre desativados (' + d.desativados.length + ')',
+        corpo: '🎫 *Cupons do Mercado Livre desativados*\n\n'
             + d.desativados.map(c => '• ' + c).join('\n')
             + '\n\nO ML recusou o código na hora de ativar — vencido ou esgotado. '
             + 'Saíram da base e não entram mais nas ofertas. Nada a fazer.'
@@ -287,8 +290,9 @@ async function sincronizarCuponsMlAgendado() {
     // Cupom que o sync conseguiu adicionar sozinho na conta. Vale avisar: a
     // partir dai o ML passa a informar validade e esgotamento dele.
     if ((d.ativadosAgora || []).length) {
-      await enviarMensagem(GRUPOS['operador'], {
-        text: '✅ *Cupons ativados na sua conta do ML*\n\n'
+      await registrarAlerta({ nivel:'info', origem:'ml', chave:'ml:cupons-ativados',
+        titulo:'Cupons ativados na conta do ML (' + d.ativadosAgora.length + ')',
+        corpo: '✅ *Cupons ativados na sua conta do ML*\n\n'
             + d.ativadosAgora.map(c => '• ' + c).join('\n')
             + '\n\nEntraram automaticamente. A validade real é lida no próximo sync.'
       }).catch(() => {});
@@ -303,8 +307,9 @@ async function sincronizarCuponsMlAgendado() {
     if (d.canalAtivacaoOk === false && d.recusasIgnoradas) {
       if (Date.now() - _avisoCanalMl > 12 * 3600 * 1000) {
         _avisoCanalMl = Date.now();
-        await enviarMensagem(GRUPOS['operador'], {
-          text: '⚠️ *Ativação de cupom no ML fora do ar*\n\n'
+        await registrarAlerta({ nivel:'critico', origem:'ml', chave:'ml:ativacao-cupom-fora',
+          titulo:'Ativação de cupom no ML fora do ar',
+          corpo: '⚠️ *Ativação de cupom no ML fora do ar*\n\n'
               + 'O ML recusou os ' + d.recusasIgnoradas + ' código(s) testados nesta passada, '
               + 'inclusive os que estão ativos na conta. Nenhum cupom foi desativado.\n\n'
               + 'Cupom novo do Telegram não está entrando na sua conta até isso voltar.'
@@ -325,8 +330,9 @@ async function sincronizarCuponsMlAgendado() {
       }
 
       if (vale.length) {
-        await enviarMensagem(GRUPOS['operador'], {
-          text: '➕ *Confira estes cupons no Mercado Livre*\n\n'
+        await registrarAlerta({ nivel:'info', origem:'ml', chave:'ml:cupons-conferir',
+          titulo:'Cupons do ML para conferir (' + vale.length + ')',
+          corpo: '➕ *Confira estes cupons no Mercado Livre*\n\n'
               + vale.map(x => '• ' + x.codigo + (x.mensagem ? ' — _' + x.mensagem + '_' : '')).join('\n')
               + '\n\nO ML respondeu algo que o sync não reconhece. Tente em: '
               + 'mercadolivre.com.br/cupons → Inserir código.'
@@ -536,6 +542,148 @@ function escreverAtomico(caminho, dados, encoding = 'utf-8') {
   writeFileSync(tmp, dados, encoding);
   renameSync(tmp, caminho);
 }
+
+// ── CENTRAL DE ALERTAS ────────────────────────────────────────────────────────
+// Antes: 29 pontos espalhados chamavam enviarMensagem(GRUPOS.operador) ou
+// _avisarOperador direto, cada um com seu proprio Map de throttle, e TUDO caia
+// no mesmo grupo. O volume de aviso informativo (sync de cupom, sonda liberada,
+// espelho de categoria) afogava o que exige acao — token caido, oferta retida.
+//
+// Aqui todo alerta vira um registro com NIVEL, e o nivel decide o destino:
+//   critico  — a operacao parou. Vai para o grupo do operador.
+//   atencao  — dinheiro na mesa, exige decisao sua. Vai para o grupo.
+//   info     — registro. NAO vai para o WhatsApp: so aparece na tela.
+// Os tres aparecem em GET /alertas. Quando existir um segundo grupo, basta
+// apontar DESTINO_POR_NIVEL para ele — nenhum ponto de chamada muda.
+const ALERTAS_PATH = SESSAO_DIR + '/alertas.json';
+const ALERTAS_MAX  = 500;
+const NIVEIS_ALERTA = ['critico', 'atencao', 'info'];
+
+// Grupo por nivel. null = nao envia no WhatsApp, so registra para a tela.
+// Fase de teste: o operador recebe critico e atencao; info fica so na pagina.
+const DESTINO_POR_NIVEL = { critico: 'operador', atencao: 'operador', info: null };
+
+let alertas = [];
+try {
+  if (existsSync(ALERTAS_PATH)) alertas = JSON.parse(readFileSync(ALERTAS_PATH, 'utf-8')) || [];
+} catch (e) { alertas = []; }
+
+function salvarAlertas() {
+  try { escreverAtomico(ALERTAS_PATH, JSON.stringify(alertas), 'utf-8'); }
+  catch (e) { console.error('[ALERTA] Falha ao salvar:', e.message); }
+}
+
+// Throttle central: a chave identifica o alerta (ex. 'ml:antibot',
+// 'cupom-sem-base:Amazon:XPTO'). Repeticao dentro da janela nao vira mensagem
+// nova — mas o registro em tela ganha um contador, para o volume nao sumir.
+const _ULTIMO_ALERTA = new Map();
+const JANELA_ALERTA_PADRAO_MS = 6 * 3600e3;
+
+function gerarIdAlerta() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+/**
+ * Registra um alerta e, conforme o nivel, entrega no WhatsApp.
+ * @param {object} a
+ *   nivel     'critico' | 'atencao' | 'info'
+ *   chave     identidade para throttle e agrupamento na tela
+ *   titulo    uma linha, sem markdown
+ *   corpo     texto ja formatado que vai para o WhatsApp
+ *   origem    rotulo curto da area (ml, radar, watchdog, whatsapp, amazon...)
+ *   ofertaId  liga o alerta a uma oferta da fila, quando houver
+ *   janelaMs  throttle proprio; 0 desliga
+ */
+async function registrarAlerta(a = {}) {
+  const nivel = NIVEIS_ALERTA.includes(a.nivel) ? a.nivel : 'info';
+  const chave = String(a.chave || (a.origem || 'geral') + ':' + (a.titulo || ''));
+  const janela = a.janelaMs === 0 ? 0 : (Number(a.janelaMs) || JANELA_ALERTA_PADRAO_MS);
+  const agora = Date.now();
+
+  // Repetido dentro da janela: soma no registro que ja existe em vez de criar
+  // outro. A tela mostra "3x" e o grupo nao recebe nada de novo.
+  const anterior = _ULTIMO_ALERTA.get(chave);
+  const repetido = janela > 0 && anterior && (agora - anterior) < janela;
+  if (repetido) {
+    const reg = alertas.find(x => x.chave === chave);
+    if (reg) {
+      reg.repeticoes = (reg.repeticoes || 1) + 1;
+      reg.ultimaEm = new Date(agora).toISOString();
+      salvarAlertas();
+    }
+    return { registrado: false, enviado: false, repetido: true };
+  }
+  _ULTIMO_ALERTA.set(chave, agora);
+
+  const reg = {
+    id: gerarIdAlerta(),
+    em: new Date(agora).toISOString(),
+    ultimaEm: new Date(agora).toISOString(),
+    nivel, chave,
+    origem: a.origem || 'geral',
+    titulo: String(a.titulo || '').slice(0, 200),
+    corpo: String(a.corpo || '').slice(0, 4000),
+    ofertaId: a.ofertaId != null ? String(a.ofertaId) : null,
+    repeticoes: 1,
+    lido: false,
+    enviado: false,
+  };
+  alertas.unshift(reg);
+  if (alertas.length > ALERTAS_MAX) alertas.length = ALERTAS_MAX;
+
+  const destino = a.soRegistrar ? null : DESTINO_POR_NIVEL[nivel];
+  if (destino && GRUPOS[destino]) {
+    try {
+      await enviarMensagem(GRUPOS[destino], { text: reg.corpo || reg.titulo });
+      reg.enviado = true;
+    } catch (e) { console.error('[ALERTA] Falha ao entregar (' + nivel + '):', e.message); }
+  }
+  salvarAlertas();
+  console.log('[ALERTA] ' + nivel.toUpperCase() + ' ' + chave
+    + (reg.enviado ? ' — no grupo' : destino ? ' — falhou no grupo' : ' — so na tela'));
+  return { registrado: true, enviado: reg.enviado, repetido: false };
+}
+
+// ── PULSO POR LOJA: PLATAFORMA QUE PAROU DE RENDER OFERTA ───────────────────
+// Grupo-fonte que para de trazer oferta de uma loja e falha silenciosa: o radar
+// segue "no ar", o watchdog segue verde, e simplesmente nao sai mais nada
+// daquela plataforma. Sem esta medida ninguem percebe ate o faturamento cair.
+const PULSO_PATH = SESSAO_DIR + '/pulso_lojas.json';
+const PULSO_LIMITE_MS   = 12 * 3600e3;   // silencio que vira alerta
+const PULSO_ESQUECER_MS = 7 * 24 * 3600e3; // loja parada ha uma semana nao e novidade
+let pulsoLojas = {};
+try {
+  if (existsSync(PULSO_PATH)) pulsoLojas = JSON.parse(readFileSync(PULSO_PATH, 'utf-8')) || {};
+} catch (e) { pulsoLojas = {}; }
+
+function registrarPulsoLoja(loja) {
+  const nome = String(loja || '').trim();
+  if (!nome) return;
+  pulsoLojas[nome] = Date.now();
+  try { escreverAtomico(PULSO_PATH, JSON.stringify(pulsoLojas), 'utf-8'); } catch (e) {}
+}
+
+async function verificarPulsoLojas() {
+  const agora = Date.now();
+  for (const [loja, ts] of Object.entries(pulsoLojas)) {
+    const parado = agora - Number(ts || 0);
+    if (parado < PULSO_LIMITE_MS) continue;
+    // Loja que nunca mais apareceu deixou de ser operada: alertar todo dia sobre
+    // ela seria ruido permanente.
+    if (parado > PULSO_ESQUECER_MS) continue;
+    const horas = Math.floor(parado / 3600e3);
+    await registrarAlerta({
+      nivel: 'critico', origem: 'radar', chave: 'pulso:' + loja,
+      titulo: loja + ' sem oferta ha ' + horas + 'h',
+      corpo: '🛑 *' + loja + ' parada ha ' + horas + 'h*\n\n'
+        + 'Nenhuma oferta desta loja saiu de grupo monitorado desde '
+        + new Date(Number(ts)).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) + '.\n\n'
+        + 'Vale conferir: janela de captura na aba Grupos, antibot/token da loja '
+        + 'e se os grupos-fonte continuam publicando.',
+    }).catch(() => {});
+  }
+}
+setInterval(() => { verificarPulsoLojas().catch(() => {}); }, 30 * 60 * 1000);
 
 // ── AUTH STATE ATÔMICO ────────────────────────────────────────────────────────
 // Substitui o useMultiFileAuthState do Baileys mantendo o MESMO formato de
@@ -3005,7 +3153,18 @@ async function espelharCategoriaNoOperador(oferta, cls) {
                 : 'abaixo do limiar \u2014 ficaria so no grupo geral') + '`\n\n';
     const preview = await montarLinkPreview(oferta, oferta.mensagemFormatada);
     const corpo = cabecalho + oferta.mensagemFormatada;
-    await enviarMensagem(jid, preview ? { text: corpo, linkPreview: preview } : { text: corpo });
+    // Espelho e diagnostico do classificador, nao acao: na fase de teste dos
+    // niveis ele fica so na tela, para nao competir com o que exige decisao.
+    // O card do preview so existe no WhatsApp, entao o registro guarda o texto.
+    if (DESTINO_POR_NIVEL.info) {
+      await enviarMensagem(jid, preview ? { text: corpo, linkPreview: preview } : { text: corpo });
+    }
+    registrarAlerta({
+      nivel: 'info', origem: 'categorias',
+      chave: 'espelho:' + (oferta?.id || cls.categoria),
+      titulo: 'Espelho de categoria — ' + String(cls.nome || cls.categoria),
+      corpo, ofertaId: oferta?.id || null, soRegistrar: true,
+    }).catch(() => {});
     console.log('[CAT] Espelho "' + cls.categoria + '" enviado ao operador \u2014 oferta #' + oferta.id);
   } catch (e) {
     console.warn('[CAT] Falha ao espelhar no operador:', e.message);
@@ -5135,6 +5294,8 @@ const PRESERVAR_NO_RESET = new Set([
   'rastreio.json',          // ledger ref -> produto (rastreio de desempenho)
   'health.json',            // marcos de saude do inbound (regua do watchdog)
   'capturas_brutas.json',   // diario cru das capturas do radar (diagnostico)
+  'alertas.json',           // central de alertas (tela + historico)
+  'pulso_lojas.json',       // ultima oferta por loja (alerta de plataforma parada)
   'categorias.json',        // taxonomia de categorias (grupos de nicho)
   'categorias_cache.json',  // cache asin -> trilha de categoria
   'contas',                 // credenciais dos numeros secundarios de envio
@@ -5276,7 +5437,12 @@ async function avisarCupomDesconhecido(loja, codigos, p, jid, foiParaFila = fals
           + 'considerar nas próximas.');
 
   try {
-    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    await registrarAlerta({
+      nivel: foiParaFila ? 'atencao' : 'info', origem: 'radar',
+      chave: 'cupom-sem-base:' + loja + ':' + novos.join(','),
+      titulo: 'Cupom citado fora da base — ' + loja + ' (' + novos.join(', ') + ')',
+      corpo: texto, ofertaId: p?.id || null,
+    });
     console.log('[CUPOM-SEM-BASE] ' + loja + ' — ' + novos.join(', ') + ' (grupo ' + grupo + ')');
   } catch (e) { console.error('[CUPOM-SEM-BASE] Falha ao avisar operador:', e.message); }
 }
@@ -5315,7 +5481,12 @@ async function avisarCupomAnuncioSemBase(aviso, p, jid, foiParaFila = false) {
           + 'para importar os cupons da conta com código e campanha.');
 
   try {
-    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    await registrarAlerta({
+      nivel: foiParaFila ? 'atencao' : 'info', origem: 'radar',
+      chave: 'cupom-anuncio:' + (aviso.idCampanhaLoja || aviso.percentual),
+      titulo: 'Cupom no anúncio fora da base — ' + aviso.percentual,
+      corpo: texto, ofertaId: p?.id || null,
+    });
     console.log('[CUPOM-ANUNCIO] ' + aviso.percentual + ' campanha ' + (aviso.idCampanhaLoja || '—'));
   } catch (e) { console.error('[CUPOM-ANUNCIO] Falha ao avisar operador:', e.message); }
 }
@@ -5390,7 +5561,11 @@ async function avisarPrecoDivergente(div, p, jid) {
     + 'chegou no texto capturado. Ela está na fila de aprovação e não auto-envia.';
 
   try {
-    await enviarMensagem(GRUPOS['operador'], { text: texto });
+    await registrarAlerta({
+      nivel: 'atencao', origem: 'radar', chave: chave,
+      titulo: 'Post anuncia R$ ' + div.declarado + ' e calculamos R$ ' + div.calculado,
+      corpo: texto, ofertaId: p?.id || null,
+    });
     console.log('[PRECO-DIV] ' + (p.asin || '?') + ' — post ' + div.declarado + ' x nosso ' + div.calculado);
   } catch (e) { console.error('[PRECO-DIV] Falha ao avisar operador:', e.message); }
 }
@@ -5816,6 +5991,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     if (_cupomForaDaBase) {
       oferta.cupomForaDaBase = { codigos: _cupSemBase, anuncio: !!r.avisoCupomPagina };
     }
+    // Prova de vida da plataforma: chegou a virar oferta de grupo monitorado.
+    registrarPulsoLoja(p.loja);
     if (_reservaThumb) oferta.miniaturaFonte = _reservaThumb;
     if (_divPreco) oferta.precoDivergente = _divPreco;
     // Versao corrigida de um post que ja saiu: sempre passa pelo operador.
@@ -5824,7 +6001,12 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // Cruzamento com os desejos de compra registrados. Fire-and-forget: roda em
     // paralelo e nunca lanca, para nao interferir no pipeline de ofertas.
     casarDesejosComOferta(oferta, {
-      enviarAviso: (texto) => enviarMensagem(GRUPOS['operador'], { text: texto })
+      enviarAviso: (texto) => registrarAlerta({
+        nivel: 'atencao', origem: 'desejos',
+        chave: 'desejo:' + (p.asin || oferta.id),
+        titulo: 'Oferta casou com desejo de cliente — ' + (p.titulo || '').slice(0, 60),
+        corpo: texto, ofertaId: oferta.id,
+      })
     }).catch(() => {});
 
     // Modo da oferta: 'off' (tudo para a fila, padrao) | 'on' (dispara direto
@@ -6753,6 +6935,28 @@ async function _avisarOperador(texto, opcoes = {}) {
   // Tres canais independentes. O e-mail so entra em alertas criticos para nao
   // virar ruido — mas nesses, ele e o que garante que a mensagem chega mesmo
   // com WhatsApp surdo e bot do Telegram desligado.
+  //
+  // O registro na central e feito AQUI e nao em cada chamador: sao 15 pontos de
+  // watchdog, e um deles ficar de fora significa uma falha de infra que nao
+  // aparece na tela. Aviso de normalizacao ('OK — ...') e info: e o fim de um
+  // incidente, nao um novo. Este canal nunca depende so do WhatsApp, entao o
+  // envio continua sendo feito abaixo, fora de registrarAlerta.
+  try {
+    const _normalizou = /^OK\b|^\u2705/.test(String(texto || '').trim());
+    const _prim = String(texto || '').split('\n').find(l => l.trim()) || 'Alerta do servidor';
+    registrarAlerta({
+      nivel: _normalizou ? 'info' : (opcoes.critico ? 'critico' : 'atencao'),
+      origem: 'watchdog',
+      chave: 'watchdog:' + _prim.replace(/[^a-zA-Z ]/g, '').trim().slice(0, 60),
+      soRegistrar: true,
+      titulo: _prim.replace(/[*_`]/g, '').slice(0, 160),
+      corpo: texto,
+      // O envio e feito por este proprio canal (Telegram + WhatsApp + e-mail),
+      // entao a central so registra.
+      janelaMs: 30 * 60 * 1000,
+    }).catch(() => {});
+  } catch (e) { /* registro nunca segura o alerta */ }
+
   let entregue = false;
   let viaTelegram = false, viaWhats = false, viaEmail = false;
   try { viaTelegram = !!(await notificarAdminsTelegram(texto)); entregue = entregue || viaTelegram; }
@@ -8522,6 +8726,59 @@ app.get('/radar/fila', (req, res) => {
 
 // Diario cru das capturas do radar. Serve para responder "o que o WhatsApp
 // realmente entregou?" sem depender do texto ja interpretado.
+// ── TELA DE ALERTAS ─────────────────────────────────────────────────────────
+app.get('/alertas', (req, res) => {
+  const nivel = String(req.query.nivel || '').trim();
+  const origem = String(req.query.origem || '').trim();
+  const busca = String(req.query.busca || '').toLowerCase().trim();
+  const n = Math.min(Number(req.query.n) || 100, ALERTAS_MAX);
+  let itens = alertas;
+  if (nivel && NIVEIS_ALERTA.includes(nivel)) itens = itens.filter(x => x.nivel === nivel);
+  if (origem) itens = itens.filter(x => x.origem === origem);
+  if (busca) itens = itens.filter(x => (x.titulo + ' ' + x.corpo).toLowerCase().includes(busca));
+  const naoLidos = { critico: 0, atencao: 0, info: 0 };
+  for (const x of alertas) if (!x.lido && naoLidos[x.nivel] != null) naoLidos[x.nivel]++;
+  res.json({
+    ok: true, total: alertas.length, naoLidos,
+    origens: [...new Set(alertas.map(x => x.origem))].sort(),
+    destinoPorNivel: DESTINO_POR_NIVEL,
+    itens: itens.slice(0, n),
+  });
+});
+
+app.post('/alertas/lido/:id', (req, res) => {
+  const alvo = alertas.find(x => String(x.id) === String(req.params.id));
+  if (!alvo) return res.status(404).json({ ok:false, erro:'alerta nao encontrado' });
+  alvo.lido = req.body?.lido === false ? false : true;
+  salvarAlertas();
+  res.json({ ok:true, alerta: alvo });
+});
+
+app.post('/alertas/lidos', (req, res) => {
+  const nivel = String(req.body?.nivel || '').trim();
+  let n = 0;
+  for (const x of alertas) {
+    if (nivel && x.nivel !== nivel) continue;
+    if (!x.lido) { x.lido = true; n++; }
+  }
+  salvarAlertas();
+  res.json({ ok:true, marcados: n });
+});
+
+// Pulso das plataformas: quando cada loja rendeu oferta pela ultima vez. E o
+// que sustenta o alerta de "plataforma parada" e serve de painel na tela.
+app.get('/alertas/pulso', (req, res) => {
+  const agora = Date.now();
+  const itens = Object.entries(pulsoLojas)
+    .map(([loja, ts]) => ({
+      loja, ultimaEm: new Date(Number(ts)).toISOString(),
+      horasParada: Math.floor((agora - Number(ts)) / 3600e3),
+      parada: (agora - Number(ts)) >= PULSO_LIMITE_MS,
+    }))
+    .sort((a, b) => b.horasParada - a.horasParada);
+  res.json({ ok:true, limiteHoras: PULSO_LIMITE_MS / 3600e3, itens });
+});
+
 app.get('/radar/capturas', (req, res) => {
   const n = Math.min(Number(req.query.n) || 20, CAPTURAS_MAX);
   const busca = String(req.query.busca || '').toLowerCase();
@@ -13537,7 +13794,8 @@ async function sondaApiAmazon() {
   _amzAvisado = true;
   console.log('[AMZ-SONDA] Creators API LIBERADA — pipeline voltou ao caminho com API.');
   try {
-    await enviarMensagem(GRUPOS['operador'], { text:
+    await registrarAlerta({ nivel:'info', origem:'amazon', chave:'amazon:api-liberada',
+      titulo:'Creators API da Amazon liberada', corpo:
       '\u2705 *Creators API da Amazon liberada*\n\n'
       + 'A conta de Associados passou a responder ao getItems. '
       + 'O radar ja voltou sozinho ao caminho com API: preco conferido, imagem, '
