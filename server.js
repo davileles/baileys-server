@@ -2885,7 +2885,7 @@ function variantesMiniatura(url) {
  * Miniatura pronta para o preview, ja dentro do limite. Ordem: o que veio na
  * captura (sem rede) -> variantes menores do CDN -> nenhuma.
  */
-async function miniaturaDoPreview(imagemBase64, imagemUrl, rotulo) {
+async function miniaturaDoPreview(imagemBase64, imagemUrl, rotulo, reservaBase64 = null) {
   if (imagemBase64) {
     const buf = Buffer.from(imagemBase64, 'base64');
     // Precisa ser JPEG de verdade: um buffer webp (padrao do Mercado Livre)
@@ -2908,6 +2908,19 @@ async function miniaturaDoPreview(imagemBase64, imagemUrl, rotulo) {
       console.log('[PREVIEW] ' + rotulo + ': usando variante de ' + Math.round(buf.length / 1024) + 'KB.');
       return buf;
     } catch (e) { /* variante indisponivel: tenta a proxima */ }
+  }
+  // Ultimo recurso: a miniatura que o PROPRIO post do grupo-fonte trazia no
+  // card. Vale quando a pagina do produto esta sob antibot e a API oficial nao
+  // devolve foto (catalogo unificado MLBU: /products/{MLBU} e 403 e /items de
+  // terceiro tambem) — sem isso a oferta sai sem card nenhum. E a foto do CDN
+  // da propria loja, ja em JPEG e ja pequena, nao imagem editada por terceiro.
+  if (reservaBase64) {
+    const buf = Buffer.from(reservaBase64, 'base64');
+    if (ehJpegBuffer(buf) && buf.length <= THUMB_MAX_BYTES) {
+      console.log('[PREVIEW] ' + rotulo + ': usando a miniatura do post de origem ('
+        + Math.round(buf.length / 1024) + 'KB).');
+      return buf;
+    }
   }
   console.log('[PREVIEW] ' + rotulo + ': nenhuma miniatura coube — card vai sem foto.');
   return null;
@@ -2945,7 +2958,7 @@ async function montarLinkPreview(oferta, mensagem) {
 
   const img = (oferta.imagens || [])[0];
   const thumb = await miniaturaDoPreview(img?.imagemBase64 || null, d.imagemUrl || null,
-    'oferta #' + (oferta.id || '?'));
+    'oferta #' + (oferta.id || '?'), oferta.miniaturaFonte || null);
   if (thumb) preview.jpegThumbnail = thumb;
   return preview;
 }
@@ -5142,6 +5155,25 @@ function enfileirarPorGrupo(jid, fn) {
 
 // Desembrulha wrappers comuns do WhatsApp (mensagens efêmeras, view-once,
 // documento com legenda, etc.) até chegar ao conteúdo real.
+// Miniatura que o post do grupo-fonte ja trazia no proprio card de link. E a
+// unica foto disponivel quando a pagina do produto esta sob antibot e a API
+// oficial nao devolve imagem — caso dos catalogos unificados (MLBU) do Mercado
+// Livre, que em 26/08 passaram a sair sem card nenhum.
+const THUMB_FONTE_MAX_BYTES = 60 * 1024;
+
+function miniaturaDaMensagem(m) {
+  const ext = m?.extendedTextMessage;
+  if (!ext?.jpegThumbnail) return null;
+  try {
+    const buf = Buffer.from(ext.jpegThumbnail);
+    if (!buf.length || buf.length > THUMB_FONTE_MAX_BYTES) return null;
+    // JPEG de verdade: buffer com outro formato rotulado como jpegThumbnail faz
+    // o cliente descartar o card inteiro (mesma regra de miniaturaDoPreview).
+    if (!(buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF)) return null;
+    return { base64: buf.toString('base64'), url: ext.matchedText || ext.canonicalUrl || null };
+  } catch (e) { return null; }
+}
+
 // ── DIARIO DE CAPTURAS BRUTAS DO RADAR ──────────────────────────────────────
 // Guarda o payload como o Baileys entregou, ANTES de qualquer interpretacao
 // nossa. Existe porque em 26/08 uma oferta saiu sem o cupom que o print do
@@ -5599,6 +5631,11 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 
   if (!resultados.length) return;
 
+  // A miniatura do post so pode virar reserva quando a mensagem trata de UM
+  // produto: com dois links no mesmo texto, o card do post e de um deles e a
+  // foto sairia trocada na outra oferta.
+  const _umProdutoSo = resultados.filter(x => x.mensagem).length === 1;
+
   for (const r of resultados) {
     if (!r.mensagem) {
       console.log('[MKT] ' + (r.produto?.asin || r.produto?.itemId || '?') + ' descartado — ' + r.descartadoPor);
@@ -5669,6 +5706,15 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     if (_divPreco) avisarPrecoDivergente(_divPreco, p, jid).catch(() => {});
 
     const imagem = await baixarImagemProduto(p.imagemUrl);
+    // Sem foto propria (antibot na pagina + API sem imagem), a miniatura do post
+    // de origem e o que salva o card. Fica FORA de oferta.imagens de proposito:
+    // ali ela viraria a foto principal de um envio como imagem, e e pequena
+    // demais para isso. So o link preview usa.
+    const _reservaThumb = (!imagem && _umProdutoSo && opcoes.thumbFonte?.base64)
+      ? opcoes.thumbFonte.base64 : null;
+    if (_reservaThumb) {
+      console.log('[MKT] ' + (p.asin || '?') + ' sem foto da loja — miniatura do post de origem vira reserva do card.');
+    }
 
     const oferta = {
       id: gerarId(),
@@ -5770,6 +5816,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     if (_cupomForaDaBase) {
       oferta.cupomForaDaBase = { codigos: _cupSemBase, anuncio: !!r.avisoCupomPagina };
     }
+    if (_reservaThumb) oferta.miniaturaFonte = _reservaThumb;
     if (_divPreco) oferta.precoDivergente = _divPreco;
     // Versao corrigida de um post que ja saiu: sempre passa pelo operador.
     if (opcoes.edicao) oferta.revisaoDeEdicao = true;
@@ -5844,9 +5891,12 @@ async function processarMensagem(msg) {
     const _ehEdicao = !!_editado;
     if (_ehEdicao) m = desembrulharMessage(_editado);
     const tipo = _TIPOS_TRATADOS.find(t => m && m[t]) || Object.keys(m || {})[0];
-    let texto = '', imagemB64 = null;
+    let texto = '', imagemB64 = null, _thumbFonte = null;
     if (tipo === 'conversation') { texto = m.conversation; }
-    else if (tipo === 'extendedTextMessage') { texto = m.extendedTextMessage.text; }
+    else if (tipo === 'extendedTextMessage') {
+      texto = m.extendedTextMessage.text;
+      _thumbFonte = miniaturaDaMensagem(m);
+    }
     else if (tipo === 'imageMessage') {
       texto = m.imageMessage.caption || '';
       try {
@@ -5888,7 +5938,7 @@ async function processarMensagem(msg) {
     // pipeline de emissoes CDV e nao sabe lidar com link de produto.
     if (_ehRadar) {
       registrarCapturaBruta(jid, msg, texto, tipo, _ehEdicao);
-      await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao });
+      await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao, thumbFonte: _thumbFonte });
       if (!GRUPOS_MONITORADOS.includes(jid)) return;
     }
 
