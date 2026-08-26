@@ -160,6 +160,28 @@ import {
 const ML_AFF_URL_TESTE = process.env.ML_AFF_URL_TESTE
   || 'https://www.mercadolivre.com.br/afiliados/linkbuilder';
 
+// ── ESPACAMENTO ENQUANTO O ANTIBOT ESTA ATIVO ────────────────────────────────
+// Cada requisicao recusada realimenta o proprio bloqueio: e exatamente o padrao
+// que o antibot mede. buscarDadosProdutoMl ja desvia para a API oficial quando
+// o bloqueio esta confirmado, mas o teste do token e o sync de cupons batiam na
+// pagina no mesmo ritmo de sempre — ~144 requisicoes/dia por fora do desvio.
+// Aqui elas ganham um segundo ritmo, usado SO enquanto o bloqueio vale. Espacar
+// em vez de suspender: cupom que envelhece na base faz o radar anunciar preco
+// que nao se aplica no checkout, o que seria pior que o bloqueio.
+const ML_ESPACO_BLOQUEADO = {
+  token:  3 * 60 * 60 * 1000,   // teste do linkbuilder (1 pagina por passada)
+  cupons: 6 * 60 * 60 * 1000,   // sync de cupons (4 paginas por passada)
+};
+const _ultimoToqueMl = { token: 0, cupons: 0 };
+function mlPodeTocarPagina(chave) {
+  if (!estadoAntibotMl().confirmadoAgora) return true;
+  if (Date.now() - (_ultimoToqueMl[chave] || 0) < (ML_ESPACO_BLOQUEADO[chave] || 0)) {
+    return false;
+  }
+  _ultimoToqueMl[chave] = Date.now();
+  return true;
+}
+
 // Aviso no grupo do operador — o token parar em silencio custaria um dia
 // inteiro de ofertas do ML sem ninguem perceber.
 async function avisarTokenMlCaiu(motivo) {
@@ -231,6 +253,10 @@ let _avisoCanalMl = 0;
 
 async function sincronizarCuponsMlAgendado() {
   if (!tokenAffOk()) return;
+  if (!mlPodeTocarPagina('cupons')) {
+    console.log('[CUPONS-ML] Sync agendado adiado — antibot ativo (proxima passada em ate 6h).');
+    return;
+  }
   // O mapa de campanhas nao depende do resultado abaixo: roda antes e em
   // separado para que uma falha do sync antigo nao deixe o mapa vazio.
   sincronizarCampanhasMlAgendado().catch(() => {});
@@ -315,16 +341,20 @@ setTimeout(sincronizarCuponsMlAgendado, 120000);   // primeira passada apos o bo
 // espera os 2 minutos do sync de cupons: sobe assim que o socket estabiliza.
 setTimeout(() => sincronizarCampanhasMlAgendado().catch(() => {}), 20000);
 
-// Verifica no boot e a cada 30 min. Frequencia alta de proposito: o custo de
-// uma chamada e irrelevante perto de descobrir tarde que o radar parou.
-setInterval(() => {
-  if (tokenAffOk()) verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
-  if (tokenAffOk()) verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
-}, 30 * 60 * 1000);
-setTimeout(() => {
-  if (tokenAffOk()) verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
-  if (tokenAffOk()) verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
-}, 45000);
+// Verifica no boot e de hora em hora. Eram 30 min: insistir no mesmo ritmo que
+// gerou o bloqueio adia a propria saida dele, e uma hora a mais para descobrir
+// que o radar parou custa menos que manter o IP marcado. A sonda da pagina e a
+// unica rotina que segue tocando a pagina mesmo bloqueada — e o que reabre o
+// caminho sozinho; o teste do token respeita o espacamento.
+function rotinaSaudeMl() {
+  if (!tokenAffOk()) return;
+  if (mlPodeTocarPagina('token')) {
+    verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
+  }
+  verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
+}
+setInterval(rotinaSaudeMl, 60 * 60 * 1000);
+setTimeout(rotinaSaudeMl, 45000);
 
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
