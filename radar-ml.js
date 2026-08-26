@@ -474,6 +474,18 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
       catch (e) { console.warn('[ML] API oficial /products/' + catalogo + ' (nome):', e.message); }
     }
 
+    // Trilha da categoria: /categories/{id} e publico e responde mesmo quando o
+    // produto nao tem nome. Vira a prova de que o titulo tirado do post fala do
+    // mesmo produto (ver tituloDoTextoMl) e alimenta o classificador de nicho.
+    let trilha = null;
+    if (venc.category_id) {
+      try {
+        const cat = await apiMl('/categories/' + encodeURIComponent(venc.category_id));
+        const cam = (cat?.path_from_root || []).map(x => x?.name).filter(Boolean);
+        if (cam.length) trilha = cam.join(' > ');
+      } catch (e) { console.warn('[ML] API oficial /categories/' + venc.category_id + ':', e.message); }
+    }
+
     const preco = Number(venc.price);
     const original = Number(venc.original_price) || null;
     const precoDe = original && original > preco ? original : null;
@@ -486,7 +498,7 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
       precoDeFonte: precoDe ? FONTE_API : null, precoDeDescartes: [], descontoDeclarado: null,
       marca: (prod?.attributes || []).find(a => a?.id === 'BRAND')?.value_name || '',
       nota: null, avaliacoes: null, vendedor: venc.seller_id ? String(venc.seller_id) : null,
-      achouLd: false, trilha: null, cuponsPagina: [], fonte: 'api',
+      achouLd: false, trilha, cuponsPagina: [], fonte: 'api',
       itemId: venc.item_id || null, catalogoId: catalogo,
       freteGratis: !!venc.shipping?.free_shipping,
     };
@@ -521,6 +533,76 @@ export async function precoCatalogoApiMl(id) {
     itemId: venc.item_id || null, catalogoId: cat,
     freteGratis: !!venc.shipping?.free_shipping, fonte: 'api',
   };
+}
+
+// ── TITULO A PARTIR DO TEXTO DO POST ────────────────────────────────────
+// Quando a leitura vem da API e o produto e catalogo unificado (/up/MLBU), nao
+// ha nome: /products/{MLBU} e /items/{id} respondem 403, /reviews aponta para
+// um product que da 404 e a descricao (/items/{id}/description) e texto de
+// marketing — comeca com "Apresentamos o...", "Distribuido por..." ou
+// "FUNCOES:", dependendo do vendedor. Sobra o texto do post.
+//
+// So que a primeira linha do post costuma ser gatilho ("CORRE QUE ACABA"),
+// preco ou nome do grupo. Publicar isso como nome do produto seria pior que
+// nao ter nome, entao aqui nenhuma linha e aceita por ser a primeira: cada
+// candidata precisa PROVAR que descreve o produto, batendo com a trilha de
+// categoria que a API devolveu. Sem prova, quem chama descarta a oferta.
+
+const RE_GATILHO = /\b(corre|corram|voando|acaba|acabou|ultim[ao]s?|imperd[ií]vel|relampago|rel[âa]mpago|aproveit|barbada|achad[oi]nh?[oa]|promo(cao|ção)?|oferta|desconto|cupom|frete|gr[áa]tis|menor pre[çc]o|pre[çc]o|so hoje|s[óo] hoje|link na|clica|clique|compre|garanta|confira|olha (isso|essa)|que isso|absurdo|barato)\b/i;
+const RE_SO_SIMBOLO = /^[\s\p{Extended_Pictographic}\p{Emoji_Presentation}\W\d]+$/u;
+
+/** Linhas do texto que sao candidatas a nome de produto, na ordem do post. */
+function candidatasTituloMl(texto) {
+  return String(texto || '')
+    .split(/\r?\n/)
+    .map(l => l
+      .replace(/https?:\/\/\S+/gi, ' ')                       // link
+      .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ' ') // emoji
+      .replace(/[*_~`]/g, ' ')                                  // markdown do WhatsApp
+      .replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .filter(l => {
+      const palavras = l.split(' ').filter(w => w.length > 1);
+      if (palavras.length < 3 || palavras.length > 20) return false;  // nome de produto tem corpo
+      if (l.length < 12 || l.length > 140) return false;
+      if (RE_SO_SIMBOLO.test(l)) return false;
+      if (/^r\$|\br\$\s*\d/i.test(l)) return false;             // linha de preco
+      if (/^(cupom|codigo|c[óo]digo|use|valor|por apenas|de:|por:)\b/i.test(l)) return false;
+      if (RE_GATILHO.test(l)) return false;                       // gatilho de venda
+      const maiusc = (l.match(/[A-ZÁÉÍÓÚÂÊÔÃÕÇ]/g) || []).length;
+      const letras = (l.match(/[a-zA-ZÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç]/g) || []).length;
+      if (letras && maiusc / letras > 0.7) return false;          // GRITO EM CAIXA ALTA
+      return true;
+    });
+}
+
+/**
+ * Escolhe do texto do post uma linha que comprovadamente nomeia o produto.
+ *
+ * A prova e o classificador (categorizador.js, sem rede): a linha tem que cair
+ * na MESMA categoria em que a trilha da API cai. "Tenis Masculino Duramo Rc2
+ * Adidas" e "Calcados, Roupas e Bolsas > Calcados > Tenis" batem em moda;
+ * "CORRE QUE ACABA" nao classifica em lugar nenhum e e recusado.
+ *
+ * @returns {{titulo:string, sinal:string}|null}  null = nao deu para provar.
+ */
+export function tituloDoTextoMl(texto, trilha) {
+  const candidatas = candidatasTituloMl(texto);
+  if (!candidatas.length) return null;
+
+  const alvo = trilha ? classificarProduto({ titulo: null, trilha }) : null;
+  const catAlvo = (alvo && categoriaConfiavel(alvo)) ? alvo.categoria : null;
+
+  for (const linha of candidatas) {
+    const cls = classificarProduto({ titulo: linha, loja: 'Mercado Livre' });
+    if (!categoriaConfiavel(cls)) continue;
+    // Sem categoria pela trilha nao ha com o que confrontar: a linha classificar
+    // sozinha nao prova que e ESTE produto, so que parece produto. Recusa.
+    if (!catAlvo) continue;
+    if (cls.categoria !== catAlvo) continue;
+    return { titulo: linha, sinal: 'categoria:' + catAlvo + ' (' + (cls.sinal || '?') + ')' };
+  }
+  return null;
 }
 
 // ── SONDA DA PAGINA DE PRODUTO ───────────────────────────────────────────
@@ -1091,6 +1173,26 @@ export async function processarTextoMl(texto, opcoes = {}) {
     catch (e) { falhaDados.set(url, e.message); }
   }
 
+  // Leitura pela API de catalogo unificado (/up/MLBU) nao tem nome — a API nao
+  // expoe titulo de anuncio de terceiro por nenhum caminho. O nome esta no
+  // texto do post, mas so vale se ele PROVAR que fala deste produto: a linha
+  // tem que cair na mesma categoria da trilha que a API devolveu. Sem prova,
+  // fica sem titulo e o produto e descartado adiante — publicar "CORRE QUE
+  // ACABA" como nome de produto seria pior que nao publicar.
+  for (const [url, d] of dadosPorUrl) {
+    if (d?.titulo || !d) continue;
+    const achado = tituloDoTextoMl(texto, d.trilha);
+    if (achado) {
+      d.titulo = achado.titulo;
+      d.tituloDoTexto = true;
+      console.log('[ML] ' + (idProdutoMl(url) || url) + ' — titulo do post aceito ('
+        + achado.sinal + '): "' + achado.titulo + '"');
+    } else {
+      console.warn('[ML] ' + (idProdutoMl(url) || url) + ' — sem titulo: a API nao devolve nome '
+        + 'e nenhuma linha do post bateu com a categoria' + (d.trilha ? ' "' + d.trilha + '"' : ''));
+    }
+  }
+
   const titulos = {};
   for (const [url, d] of dadosPorUrl) if (d?.titulo) titulos[url] = d.titulo;
 
@@ -1172,6 +1274,9 @@ export async function processarTextoMl(texto, opcoes = {}) {
       loja: 'Mercado Livre',
     };
 
+    // Sem nome nao ha oferta: a mensagem sairia comecando pelo preco, o dedup
+    // por titulo nao funciona e a etiqueta de nicho cai no balde geral.
+    if (!p.titulo)     { saida.push({ produto: p, descartadoPor: 'sem título do produto (API não expõe nome e o post não identifica)' }); continue; }
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço na página' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto pausado ou sem estoque' }); continue; }
 

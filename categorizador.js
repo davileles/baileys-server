@@ -224,11 +224,19 @@ function porTitulo(titulo) {
  * Classifica um produto. Nunca lanca e nunca faz rede.
  * @returns {{categoria: string|null, confianca: number, sinal: string, nome: string|null}}
  */
-export function classificarProduto({ titulo, asin, loja } = {}) {
+export function classificarProduto({ titulo, asin, loja, trilha } = {}) {
   const vazio = { categoria: null, confianca: 0, sinal: 'sem-taxonomia', nome: null };
   if (!_taxo.categorias || !Object.keys(_taxo.categorias).length) return vazio;
 
   try {
+    // 0. Trilha informada por quem chama (ex.: path_from_root da API do ML).
+    // Vem antes do cache porque e a trilha DESTE produto, agora — o cache e
+    // memoria de uma leitura anterior, que pode ser de outro anuncio.
+    if (trilha) {
+      const r = porTrilha(trilha);
+      if (r) return { ...r, nome: _taxo.categorias[r.categoria]?.nome || r.categoria };
+    }
+
     // 1. Trilha em cache — a fonte mais confiavel que existe hoje.
     if (asin && _cache[asin]) {
       const r = porTrilha(_cache[asin].caminho);
