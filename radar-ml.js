@@ -396,19 +396,31 @@ const RE_ANTIBOT_ML = /abuse-captcha|suspicious-traffic|\/gz\/account-verificati
 
 let _antibot = { desde: null, ultimoEm: null, ultimaUrl: null, bloqueios: 0 };
 
-// Validade do diagnostico. A sonda roda de hora em hora; se ela parar (crash,
-// tarefa nao agendada, URL de teste sumida), o estado congela em "bloqueado" e
-// o desvio da pagina viraria permanente — o sistema deixaria de ler a pagina
-// para sempre por causa de uma flag presa. Passado esse prazo sem confirmacao,
-// o bloqueio e tratado como desconhecido e a proxima leitura testa a pagina.
-// Precisa ser MAIOR que o intervalo da sonda com folga: em 60 min (o valor
-// antigo, igual ao novo intervalo) a flag vencia no exato instante da proxima
-// passada, e cada produto capturado na janela voltava a bater na pagina
-// bloqueada — o oposto do que o desvio existe para evitar.
-const VALIDADE_ANTIBOT_MS = 150 * 60 * 1000;
+// Validade do diagnostico. Se a sonda parar (crash, tarefa nao agendada, URL de
+// teste sumida), o estado congela em "bloqueado" e o desvio da pagina viraria
+// permanente — o sistema deixaria de ler a pagina para sempre por causa de uma
+// flag presa. Passado esse prazo sem confirmacao, o bloqueio e tratado como
+// desconhecido e a proxima leitura testa a pagina.
+// Precisa ser MAIOR que o intervalo da sonda com folga: se a flag vence antes
+// da proxima passada, cada produto capturado na janela volta a bater na pagina
+// bloqueada — o oposto do que o desvio existe para evitar. Por isso quem define
+// o intervalo da sonda (server.js) tambem ajusta esta validade, via
+// definirValidadeAntibotMs; o default cobre o intervalo padrao de 24 h.
+let _validadeAntibotMs = 30 * 60 * 60 * 1000;
+
+/**
+ * Ajusta a validade do diagnostico de antibot. Chamado por quem agenda a sonda,
+ * para que os dois numeros nao possam divergir num deploy futuro.
+ * @param {number} ms  janela em milissegundos; valores nao positivos sao ignorados
+ */
+export function definirValidadeAntibotMs(ms) {
+  const n = Number(ms);
+  if (Number.isFinite(n) && n > 0) _validadeAntibotMs = n;
+  return _validadeAntibotMs;
+}
 
 export function estadoAntibotMl() {
-  const fresco = !!_antibot.ultimoEm && (Date.now() - Date.parse(_antibot.ultimoEm) < VALIDADE_ANTIBOT_MS);
+  const fresco = !!_antibot.ultimoEm && (Date.now() - Date.parse(_antibot.ultimoEm) < _validadeAntibotMs);
   return { ..._antibot, ativo: !!_antibot.desde, confirmadoAgora: !!_antibot.desde && fresco };
 }
 function registrarAntibotMl(url) {
@@ -695,7 +707,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   // Bater na pagina a cada produto capturado so para descobrir o que a sonda
   // ja sabe alimenta o proprio bloqueio: sao dezenas de requisicoes recusadas
   // por dia, exatamente o padrao que o antibot mede. Enquanto o bloqueio
-  // estiver ativo, quem sonda e SO verificarPaginaProdutoMl, de 30 em 30 min,
+  // estiver ativo, quem sonda e SO verificarPaginaProdutoMl, uma vez por dia,
   // com uma requisicao. O resto vai direto para a API oficial; o que a API nao
   // cobre falha rapido, sem tocar no endereco bloqueado. Assim que a sonda
   // conseguir abrir uma pagina, o bloqueio e dado por encerrado e este desvio
