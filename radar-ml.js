@@ -437,6 +437,49 @@ function registrarPaginaMlOk() {
   _antibot.desde = null;
 }
 
+// ── ANTIBOT DAS PAGINAS LOGADAS ──────────────────────────────────────────
+// Estado separado do bloco acima, e de proposito. Em 27/08 o antibot barrava
+// toda pagina publica de produto enquanto /cupons e /afiliados/linkbuilder —
+// que vao com o cookie de sessao — seguiam abrindo normalmente: sessao logada
+// tem reputacao propria. Tratar os dois como um bloqueio so fazia o sync de
+// cupom ser espacado por um bloqueio que nao o atingia, envelhecendo a base de
+// graca. Aqui cada superficie responde pelo que de fato mede.
+let _antibotLogado = { desde: null, ultimoEm: null, ultimaUrl: null, bloqueios: 0 };
+
+// O sync de cupons roda de hora em hora; 150 min cobrem uma passada perdida sem
+// deixar a flag presa se a rotina morrer.
+const VALIDADE_LOGADA_MS = 150 * 60 * 1000;
+
+export function estadoAntibotLogadoMl() {
+  const fresco = !!_antibotLogado.ultimoEm
+    && (Date.now() - Date.parse(_antibotLogado.ultimoEm) < VALIDADE_LOGADA_MS);
+  return { ..._antibotLogado, ativo: !!_antibotLogado.desde,
+           confirmadoAgora: !!_antibotLogado.desde && fresco };
+}
+
+/** Marca que uma pagina logada caiu na tela antibot. */
+export function registrarAntibotLogadoMl(url) {
+  _antibotLogado.bloqueios++;
+  _antibotLogado.ultimoEm = new Date().toISOString();
+  _antibotLogado.ultimaUrl = url;
+  if (!_antibotLogado.desde) {
+    _antibotLogado.desde = _antibotLogado.ultimoEm;
+    console.warn('[ML] Antibot: pagina LOGADA bloqueada (' + url + ')');
+  }
+}
+
+/** Marca leitura logada bem-sucedida — encerra o bloqueio se havia um. */
+export function registrarLogadaOkMl() {
+  if (_antibotLogado.desde) console.log('[ML] Antibot: paginas logadas voltaram a abrir.');
+  _antibotLogado.desde = null;
+  _antibotLogado.ultimoEm = new Date().toISOString();
+}
+
+/** Tela antibot em pagina logada: nao ha JSON-LD para servir de contraprova. */
+export function htmlLogadoBloqueado(html) {
+  return RE_ANTIBOT_ML.test(html || '');
+}
+
 /** Pagina do ML ou URL final que caiu na tela antibot. Pagina real tem JSON-LD. */
 function paginaMlBloqueada(res, html, ld) {
   return RE_ANTIBOT_URL_ML.test(res?.url || '') || (!ld && RE_ANTIBOT_ML.test(html || ''));
@@ -1469,6 +1512,13 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
   });
   if (!res.ok) throw new Error('pagina de cupons respondeu HTTP ' + res.status);
   const html = await res.text();
+  // Sem esta checagem a tela antibot virava "0 cupons lidos": o parser nao acha
+  // nenhum card e o sync trata como se a conta nao tivesse cupom nenhum.
+  if (htmlLogadoBloqueado(html)) {
+    registrarAntibotLogadoMl(url);
+    throw new Error('pagina de cupons bloqueada (antibot)');
+  }
+  registrarLogadaOkMl();
 
   // Trabalha sobre o texto visivel aproximado: as classes do ML mudam com
   // frequencia, mas os rotulos ("Compra minima", "Limite de") sao estaveis.
@@ -2334,7 +2384,11 @@ export async function sincronizarCuponsContaMl() {
       signal: AbortSignal.timeout(25000),
     });
     const html = await res.text();
-    if (/suspicious-traffic|captcha/i.test(html)) throw new Error('pagina de cupons bloqueada (antibot)');
+    if (htmlLogadoBloqueado(html)) {
+      registrarAntibotLogadoMl(url);
+      throw new Error('pagina de cupons bloqueada (antibot)');
+    }
+    registrarLogadaOkMl();
     return html;
   };
 
