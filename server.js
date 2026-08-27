@@ -151,6 +151,7 @@ import {
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
+  definirValidadeAntibotMs,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -347,20 +348,39 @@ setTimeout(sincronizarCuponsMlAgendado, 120000);   // primeira passada apos o bo
 // espera os 2 minutos do sync de cupons: sobe assim que o socket estabiliza.
 setTimeout(() => sincronizarCampanhasMlAgendado().catch(() => {}), 20000);
 
-// Verifica no boot e de hora em hora. Eram 30 min: insistir no mesmo ritmo que
-// gerou o bloqueio adia a propria saida dele, e uma hora a mais para descobrir
-// que o radar parou custa menos que manter o IP marcado. A sonda da pagina e a
-// unica rotina que segue tocando a pagina mesmo bloqueada — e o que reabre o
-// caminho sozinho; o teste do token respeita o espacamento.
+// Saude do token: de hora em hora, respeitando o espacamento quando o antibot
+// esta ativo. Nao toca na pagina de produto — essa e a sonda separada abaixo.
 function rotinaSaudeMl() {
   if (!tokenAffOk()) return;
   if (mlPodeTocarPagina('token')) {
     verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
   }
-  verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
 }
 setInterval(rotinaSaudeMl, 60 * 60 * 1000);
 setTimeout(rotinaSaudeMl, 45000);
+
+// ── SONDA DA PAGINA DE PRODUTO ───────────────────────────────────────────────
+// Ritmo proprio, separado do teste do token, porque os dois medem coisas
+// diferentes e pagam precos diferentes: a sonda e a UNICA rotina que segue
+// tocando a pagina mesmo com o bloqueio confirmado. Cada requisicao recusada
+// realimenta o antibot — e exatamente o padrao que ele mede —, entao insistir
+// de hora em hora adia a propria saida do bloqueio. Uma vez por dia basta: com
+// a API oficial autorizada, preco e estoque seguem normalmente enquanto a
+// pagina estiver fechada, e o unico custo do espacamento e demorar mais para
+// perceber a liberacao. Configuravel por ML_SONDA_PAGINA_H para apertar o ritmo
+// sem deploy (ex.: 1 logo depois de trocar de IP, para confirmar a saida).
+const ML_SONDA_PAGINA_MS = Number(process.env.ML_SONDA_PAGINA_H || 24) * 60 * 60 * 1000;
+// A validade do diagnostico precisa cobrir o intervalo da sonda com folga: se
+// vencer antes da proxima passada, o desvio para a API oficial cai e cada
+// produto capturado volta a bater na pagina bloqueada. 25% de folga cobre
+// atraso de timer e a passada perdida no redeploy.
+definirValidadeAntibotMs(ML_SONDA_PAGINA_MS * 1.25);
+function rotinaSondaPaginaMl() {
+  if (!tokenAffOk()) return;
+  verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
+}
+setInterval(rotinaSondaPaginaMl, ML_SONDA_PAGINA_MS);
+setTimeout(rotinaSondaPaginaMl, 45000);
 
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
