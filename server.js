@@ -7556,7 +7556,15 @@ async function conectar() {
           if (!_logoutSocketTentado) {
             _logoutSocketTentado = true;
             _persistirLogout();
-            console.log('[WA] Logout — subindo socket unico para gerar QR.');
+            // Apagar as credenciais ANTES de subir o socket e obrigatorio: com
+            // creds.registered=true no disco o Baileys nao emite o evento 'qr'
+            // — ele tenta autenticar com chaves ja revogadas, leva 401 de novo
+            // e qrAtual fica null para sempre. Em 27/08/2026 o servico passou
+            // ~10h assim: o socket subia, /status mostrava sockAtivo=true com
+            // qrDisponivel=false, e /qr repetia 'Gerando QR...' sem parar. Sem
+            // esta limpeza a promessa do comentario acima nao se cumpre.
+            console.log('[WA] Logout — apagando credenciais e subindo socket unico para gerar QR.');
+            await limparCredenciaisSessao();
             _agendarReconexao(5000);
           }
         } else {
@@ -8170,7 +8178,7 @@ app.get('/qr', (req, res) => {
   // Dispara conexão se ainda não estiver conectando (modo lazy)
   if (!isConnecting && !sock) iniciarConexao();
   if (!qrAtual)  return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR...</h2></body></html>');
-  res.send('<html><head><title>QR</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Escanear QR Code</h2><img src="'+qrAtual+'" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+  res.send('<html><head><title>QR</title><meta http-equiv="refresh" content="15"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Escanear QR Code</h2><img src="'+qrAtual+'" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
 });
 
 // ── CONTAS SECUNDARIAS ───────────────────────────────────────────────────────
