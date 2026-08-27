@@ -3046,8 +3046,35 @@ const THUMB_MAX_BYTES = 60 * 1024;
 const MARCA_ATIVA = String(process.env.MARCA_DAGUA ?? '1') !== '0';
 const MARCA_BOX   = { x: 135, y: -1556, w: 14736, h: 1982 };  // caixa do path, em unidades da fonte
 const MARCA_PATH  = 'M831 -539Q831 -416 883.5 -345.0Q936 -274 1026 -274Q1115 -274 1168.0 -345.5Q1221 -417 1221 -539Q1221 -660 1167.5 -730.5Q1114 -801 1024 -801Q936 -801 883.5 -730.5Q831 -660 831 -539ZM1241 -238Q1211 -167 1144.5 -127.5Q1078 -88 989 -88Q817 -88 709.5 -212.5Q602 -337 602 -537Q602 -737 710.0 -862.0Q818 -987 989 -987Q1078 -987 1144.5 -947.0Q1211 -907 1241 -836V-967H1450V-274Q1574 -293 1645.0 -393.5Q1716 -494 1716 -651Q1716 -751 1687.0 -838.5Q1658 -926 1599 -999Q1504 -1121 1361.5 -1187.0Q1219 -1253 1053 -1253Q937 -1253 831.0 -1222.5Q725 -1192 635 -1133Q487 -1035 404.5 -879.5Q322 -724 322 -543Q322 -394 375.5 -263.5Q429 -133 530 -33Q630 65 759.5 116.5Q889 168 1036 168Q1162 168 1288.0 121.0Q1414 74 1503 -6L1610 156Q1485 253 1337.5 304.5Q1190 356 1038 356Q853 356 689.0 290.5Q525 225 397 100Q269 -25 202.0 -189.5Q135 -354 135 -543Q135 -725 203.0 -890.0Q271 -1055 397 -1180Q523 -1304 690.5 -1372.0Q858 -1440 1038 -1440Q1262 -1440 1445.0 -1354.5Q1628 -1269 1751 -1108Q1826 -1010 1864.5 -895.5Q1903 -781 1903 -655Q1903 -384 1740.0 -234.0Q1577 -84 1280 -84H1241Z M2611 -1438V-1120H2980V-864H2611V-389Q2611 -311 2642.0 -283.5Q2673 -256 2765 -256H2949V0H2642Q2430 0 2341.5 -88.5Q2253 -177 2253 -389V-864H2075V-1120H2253V-1438Z M3199 -1120H3557V0H3199ZM3199 -1556H3557V-1264H3199Z M4806 -1085V-793Q4733 -843 4659.5 -867.0Q4586 -891 4507 -891Q4357 -891 4273.5 -803.5Q4190 -716 4190 -559Q4190 -402 4273.5 -314.5Q4357 -227 4507 -227Q4591 -227 4666.5 -252.0Q4742 -277 4806 -326V-33Q4722 -2 4635.5 13.5Q4549 29 4462 29Q4159 29 3988.0 -126.5Q3817 -282 3817 -559Q3817 -836 3988.0 -991.5Q4159 -1147 4462 -1147Q4550 -1147 4635.5 -1131.5Q4721 -1116 4806 -1085Z M5617 -504Q5505 -504 5448.5 -466.0Q5392 -428 5392 -354Q5392 -286 5437.5 -247.5Q5483 -209 5564 -209Q5665 -209 5734.0 -281.5Q5803 -354 5803 -463V-504ZM6164 -639V0H5803V-166Q5731 -64 5641.0 -17.5Q5551 29 5422 29Q5248 29 5139.5 -72.5Q5031 -174 5031 -336Q5031 -533 5166.5 -625.0Q5302 -717 5592 -717H5803V-745Q5803 -830 5736.0 -869.5Q5669 -909 5527 -909Q5412 -909 5313.0 -886.0Q5214 -863 5129 -817V-1090Q5244 -1118 5360.0 -1132.5Q5476 -1147 5592 -1147Q5895 -1147 6029.5 -1027.5Q6164 -908 6164 -639Z M6855 -162V426H6497V-1120H6855V-956Q6929 -1054 7019.0 -1100.5Q7109 -1147 7226 -1147Q7433 -1147 7566.0 -982.5Q7699 -818 7699 -559Q7699 -300 7566.0 -135.5Q7433 29 7226 29Q7109 29 7019.0 -17.5Q6929 -64 6855 -162ZM7093 -887Q6978 -887 6916.5 -802.5Q6855 -718 6855 -559Q6855 -400 6916.5 -315.5Q6978 -231 7093 -231Q7208 -231 7268.5 -315.0Q7329 -399 7329 -559Q7329 -719 7268.5 -803.0Q7208 -887 7093 -887Z M8795 -815Q8748 -837 8701.5 -847.5Q8655 -858 8608 -858Q8470 -858 8395.5 -769.5Q8321 -681 8321 -516V0H7963V-1120H8321V-936Q8390 -1046 8479.5 -1096.5Q8569 -1147 8694 -1147Q8712 -1147 8733.0 -1145.5Q8754 -1144 8794 -1139Z M9506 -891Q9387 -891 9324.5 -805.5Q9262 -720 9262 -559Q9262 -398 9324.5 -312.5Q9387 -227 9506 -227Q9623 -227 9685.0 -312.5Q9747 -398 9747 -559Q9747 -720 9685.0 -805.5Q9623 -891 9506 -891ZM9506 -1147Q9795 -1147 9957.5 -991.0Q10120 -835 10120 -559Q10120 -283 9957.5 -127.0Q9795 29 9506 29Q9216 29 9052.5 -127.0Q8889 -283 8889 -559Q8889 -835 9052.5 -991.0Q9216 -1147 9506 -1147Z M11418 -934Q11486 -1038 11579.5 -1092.5Q11673 -1147 11785 -1147Q11978 -1147 12079.0 -1028.0Q12180 -909 12180 -682V0H11820V-584Q11821 -597 11821.5 -611.0Q11822 -625 11822 -651Q11822 -770 11787.0 -823.5Q11752 -877 11674 -877Q11572 -877 11516.5 -793.0Q11461 -709 11459 -550V0H11099V-584Q11099 -770 11067.0 -823.5Q11035 -877 10953 -877Q10850 -877 10794.0 -792.5Q10738 -708 10738 -551V0H10378V-1120H10738V-956Q10804 -1051 10889.5 -1099.0Q10975 -1147 11078 -1147Q11194 -1147 11283.0 -1091.0Q11372 -1035 11418 -934Z M13047 -891Q12928 -891 12865.5 -805.5Q12803 -720 12803 -559Q12803 -398 12865.5 -312.5Q12928 -227 13047 -227Q13164 -227 13226.0 -312.5Q13288 -398 13288 -559Q13288 -720 13226.0 -805.5Q13164 -891 13047 -891ZM13047 -1147Q13336 -1147 13498.5 -991.0Q13661 -835 13661 -559Q13661 -283 13498.5 -127.0Q13336 29 13047 29Q12757 29 12593.5 -127.0Q12430 -283 12430 -559Q12430 -835 12593.5 -991.0Q12757 -1147 13047 -1147Z M14796 -1085V-813Q14681 -861 14574.0 -885.0Q14467 -909 14372 -909Q14270 -909 14220.5 -883.5Q14171 -858 14171 -805Q14171 -762 14208.5 -739.0Q14246 -716 14343 -705L14406 -696Q14681 -661 14776.0 -581.0Q14871 -501 14871 -330Q14871 -151 14739.0 -61.0Q14607 29 14345 29Q14234 29 14115.5 11.5Q13997 -6 13872 -41V-313Q13979 -261 14091.5 -235.0Q14204 -209 14320 -209Q14425 -209 14478.0 -238.0Q14531 -267 14531 -324Q14531 -372 14494.5 -395.5Q14458 -419 14349 -432L14286 -440Q14047 -470 13951.0 -551.0Q13855 -632 13855 -797Q13855 -975 13977.0 -1061.0Q14099 -1147 14351 -1147Q14450 -1147 14559.0 -1132.0Q14668 -1117 14796 -1085Z';
-// Grupos do CDV ficam de fora: outra operacao, outro @.
+// Grupos do CDV ficam de fora: outra operacao, outro @. Redundante com a
+// allowlist de ehGrupoTsp — e de proposito: se um grupo do CDV for cadastrado
+// por engano como destino de trilha, este bloqueio ainda segura.
 const GRUPOS_SEM_MARCA = new Set([GRUPOS.cdv_ofertas, GRUPOS.cdv_emissao]);
+
+/**
+ * O destino e grupo do Tica Promos? ALLOWLIST, nao lista de excecoes: so leva
+ * marca o que esta declarado como grupo do TSP (destino de trilha, grupo de
+ * cupom ou o grupo do operador). Tudo o mais — CDV, concierge, conversa avulsa,
+ * grupo passado por JID direto no /enviar-imagem — sai limpo.
+ *
+ * A diferenca importa: com lista de excecoes, todo grupo novo do CDV nasceria
+ * marcado ate alguem lembrar de adiciona-lo. Aqui, grupo novo nasce sem marca,
+ * e so ganha a faixa quando for cadastrado no painel como destino do TSP.
+ */
+function ehGrupoTsp(jid) {
+  if (!jid || !jid.endsWith('@g.us')) return false;
+  try {
+    if (grupoOperadorTsp() === jid) return true;
+    if ((gruposTspCupons() || []).includes(jid)) return true;
+    if ((radarDestinos() || []).includes(jid)) return true;    // retrato das trilhas
+    // Leitura direta das trilhas: cobre destino de nicho que ainda nao entrou
+    // no retrato de papeis (trilha recem-criada, antes da sincronizacao).
+    if (trilhas().some(t => (t.destinos || []).includes(jid))) return true;
+  } catch (e) {
+    console.warn('[MARCA] Nao consegui classificar o grupo ' + jid + ':', e.message);
+  }
+  return false;   // duvida nao marca
+}
 
 let _sharp = null, _sharpTentado = false;
 async function carregarSharp() {
@@ -3123,7 +3150,9 @@ async function marcarImagem(buffer, opcoes = {}) {
  * Passagem unica antes do envio. Fica aqui, e nao em cada rotina que monta
  * imagem, porque TODO caminho (cupom, manual, agendamento, radar) desemboca em
  * enviarMensagem — marcar em cinco lugares seria cinco lugares para esquecer.
- * Conversa 1-a-1 (campanhas, concierge) e grupo do CDV passam intactos.
+ * So passa pela marca o que vai para grupo declarado do Tica Promos: conversa
+ * 1-a-1 (campanhas, concierge), grupos do CDV e qualquer grupo nao cadastrado
+ * seguem byte a byte como chegaram.
  */
 async function conteudoComMarca(destino, conteudo) {
   try {
@@ -3131,7 +3160,7 @@ async function conteudoComMarca(destino, conteudo) {
     // Operador hospedado tem o @ dele, nao o nosso.
     if ((tenantContexto() || TENANT_PADRAO) !== TENANT_PADRAO) return conteudo;
     const jid = String(destino || '');
-    if (!jid.endsWith('@g.us') || GRUPOS_SEM_MARCA.has(jid)) return conteudo;
+    if (GRUPOS_SEM_MARCA.has(jid) || !ehGrupoTsp(jid)) return conteudo;
 
     let saida = conteudo, mudou = false;
     if (Buffer.isBuffer(conteudo.image)) {
