@@ -151,7 +151,7 @@ import {
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
-  definirValidadeAntibotMs,
+  definirValidadeAntibotMs, estadoAntibotLogadoMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -163,19 +163,24 @@ const ML_AFF_URL_TESTE = process.env.ML_AFF_URL_TESTE
 
 // ── ESPACAMENTO ENQUANTO O ANTIBOT ESTA ATIVO ────────────────────────────────
 // Cada requisicao recusada realimenta o proprio bloqueio: e exatamente o padrao
-// que o antibot mede. buscarDadosProdutoMl ja desvia para a API oficial quando
-// o bloqueio esta confirmado, mas o teste do token e o sync de cupons batiam na
-// pagina no mesmo ritmo de sempre — ~144 requisicoes/dia por fora do desvio.
-// Aqui elas ganham um segundo ritmo, usado SO enquanto o bloqueio vale. Espacar
-// em vez de suspender: cupom que envelhece na base faz o radar anunciar preco
-// que nao se aplica no checkout, o que seria pior que o bloqueio.
+// que o antibot mede. Duas rotinas alem da sonda leem pagina do ML — o teste do
+// token (linkbuilder) e o sync de cupons —, e enquanto estiverem sendo barradas
+// vale espacar em vez de suspender: cupom que envelhece na base faz o radar
+// anunciar preco que nao se aplica no checkout, o que seria pior que o bloqueio.
+//
+// O gatilho e o bloqueio das paginas LOGADAS, nao o do PDP publico. Os dois sao
+// independentes: em 27/08 toda pagina de produto estava barrada com /cupons e
+// /afiliados/linkbuilder abrindo normalmente (verificado em producao — 30, 31,
+// 50 e 44 cards lidos com o antibot do PDP confirmado). Amarrado ao estado do
+// PDP, o sync caia para 4 passadas por dia por causa de um bloqueio que nao o
+// atingia: a base envelhecia de graca, sem poupar uma unica requisicao recusada.
 const ML_ESPACO_BLOQUEADO = {
   token:  3 * 60 * 60 * 1000,   // teste do linkbuilder (1 pagina por passada)
   cupons: 6 * 60 * 60 * 1000,   // sync de cupons (4 paginas por passada)
 };
 const _ultimoToqueMl = { token: 0, cupons: 0 };
 function mlPodeTocarPagina(chave) {
-  if (!estadoAntibotMl().confirmadoAgora) return true;
+  if (!estadoAntibotLogadoMl().confirmadoAgora) return true;
   if (Date.now() - (_ultimoToqueMl[chave] || 0) < (ML_ESPACO_BLOQUEADO[chave] || 0)) {
     return false;
   }
@@ -257,7 +262,7 @@ let _avisoCanalMl = 0;
 async function sincronizarCuponsMlAgendado() {
   if (!tokenAffOk()) return;
   if (!mlPodeTocarPagina('cupons')) {
-    console.log('[CUPONS-ML] Sync agendado adiado — antibot ativo (proxima passada em ate 6h).');
+    console.log('[CUPONS-ML] Sync agendado adiado — antibot nas paginas logadas (proxima passada em ate 6h).');
     return;
   }
   // O mapa de campanhas nao depende do resultado abaixo: roda antes e em
@@ -12215,7 +12220,8 @@ app.get('/ml/aff/status', async (req, res) => {
   }
   // paginaProduto e independente do token: o linkbuilder pode estar ok com
   // toda pagina de produto bloqueada pelo antibot.
-  res.json({ ok:true, urlTeste: ML_AFF_URL_TESTE, ...saudeAff(), paginaProduto: saudePaginaMl() });
+  res.json({ ok:true, urlTeste: ML_AFF_URL_TESTE, ...saudeAff(),
+             paginaProduto: saudePaginaMl(), paginasLogadas: estadoAntibotLogadoMl() });
 });
 
 app.get('/ml/aff/inspecionar', (req, res) => res.json({ ok:true, ...inspecionarTokenAff() }));
