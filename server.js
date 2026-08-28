@@ -12556,7 +12556,7 @@ app.post('/ml/testar', async (req, res) => {
 // escrever o parser contra o formato real. Nao aplica desconto nem publica nada.
 app.get('/ml/diagnostico-cupom', async (req, res) => {
   if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
-  try { res.json({ ok:true, ...await dumpCupomMl(req.query.url) }); }
+  try { res.json({ ok:true, ...await dumpCupomMl(req.query.url, { forcar: req.query.forcar === '1' }) }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
