@@ -66,6 +66,11 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // nunca chama agendarPush para ele, entao as duas pontas nunca escrevem
   // o mesmo arquivo.
   'epc-produtos.json',
+  // Carimbo da sonda diaria da pagina do ML: {em, bloqueado, bloqueadoDesde}.
+  // TEM de sobreviver a restart — o filesystem local nao dura, e sem o carimbo
+  // cada boot dispara sonda nova. Em 28/08 o Railway reiniciou sozinho no meio
+  // do dia e a "uma consulta por dia" virou duas.
+  'ml_sonda_pagina.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
