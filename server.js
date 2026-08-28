@@ -677,15 +677,45 @@ const PULSO_PATH = SESSAO_DIR + '/pulso_lojas.json';
 const PULSO_LIMITE_MS   = 12 * 3600e3;   // silencio que vira alerta
 const PULSO_ESQUECER_MS = 7 * 24 * 3600e3; // loja parada ha uma semana nao e novidade
 let pulsoLojas = {};
+// Segunda via do pulso: qualquer despacho da loja, venha do radar de grupo ou
+// nao (fila cadenciada, vitrine, lista, bot). Sem ela o alerta media so um dos
+// caminhos e gritava "loja parada" enquanto a loja faturava por outro — foi o
+// que aconteceu com a Shopee em 27/08: o radar de grupo parou as 09:37 e as
+// ofertas seguiram saindo ate as 17:45, mas o alerta contou as 8h como parada.
+let pulsoDespacho = {};
 try {
-  if (existsSync(PULSO_PATH)) pulsoLojas = JSON.parse(readFileSync(PULSO_PATH, 'utf-8')) || {};
-} catch (e) { pulsoLojas = {}; }
+  if (existsSync(PULSO_PATH)) {
+    const bruto = JSON.parse(readFileSync(PULSO_PATH, 'utf-8')) || {};
+    // Formato antigo: mapa plano loja -> timestamp. Migra sem perder historico.
+    if (bruto.radar || bruto.despacho) {
+      pulsoLojas    = bruto.radar    || {};
+      pulsoDespacho = bruto.despacho || {};
+    } else {
+      pulsoLojas = bruto;
+    }
+  }
+} catch (e) { pulsoLojas = {}; pulsoDespacho = {}; }
+
+function salvarPulso() {
+  try {
+    escreverAtomico(PULSO_PATH,
+      JSON.stringify({ radar: pulsoLojas, despacho: pulsoDespacho }), 'utf-8');
+  } catch (e) {}
+}
 
 function registrarPulsoLoja(loja) {
   const nome = String(loja || '').trim();
   if (!nome) return;
   pulsoLojas[nome] = Date.now();
-  try { escreverAtomico(PULSO_PATH, JSON.stringify(pulsoLojas), 'utf-8'); } catch (e) {}
+  salvarPulso();
+}
+
+/** Prova de vida do DESPACHO: a loja publicou, por qualquer caminho. */
+function registrarPulsoDespacho(loja) {
+  const nome = String(loja || '').trim();
+  if (!nome) return;
+  pulsoDespacho[nome] = Date.now();
+  salvarPulso();
 }
 
 async function verificarPulsoLojas() {
@@ -697,13 +727,35 @@ async function verificarPulsoLojas() {
     // ela seria ruido permanente.
     if (parado > PULSO_ESQUECER_MS) continue;
     const horas = Math.floor(parado / 3600e3);
+
+    // O radar de grupo parou — mas a loja parou mesmo? Se ela seguiu publicando
+    // por outro caminho, o problema e de CAPTURA, nao da plataforma, e o alerta
+    // nao pode ser critico: alerta critico que se repete sem a loja estar parada
+    // treina o operador a ignorar o canal justamente quando ele for verdadeiro.
+    const tsDesp     = Number(pulsoDespacho[loja] || 0);
+    const lojaViva   = tsDesp > 0 && (agora - tsDesp) < PULSO_LIMITE_MS;
+    const quando     = (t) => new Date(Number(t)).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+    if (lojaViva) {
+      await registrarAlerta({
+        nivel: 'atencao', origem: 'radar', chave: 'pulso-radar:' + loja,
+        titulo: 'Radar de grupo sem ' + loja + ' ha ' + horas + 'h',
+        corpo: '⚠️ *Radar de grupo sem ' + loja + ' ha ' + horas + 'h*\n\n'
+          + 'A loja NAO esta parada: o ultimo despacho foi ' + quando(tsDesp) + '.\n'
+          + 'O que parou foi a captura em grupo monitorado, desde ' + quando(ts) + '.\n\n'
+          + 'Vale conferir: janela de captura na aba Grupos e se os grupos-fonte '
+          + 'continuam publicando produto desta loja (cupom generico nao conta).',
+      }).catch(() => {});
+      continue;
+    }
+
     await registrarAlerta({
       nivel: 'critico', origem: 'radar', chave: 'pulso:' + loja,
       titulo: loja + ' sem oferta ha ' + horas + 'h',
       corpo: '🛑 *' + loja + ' parada ha ' + horas + 'h*\n\n'
-        + 'Nenhuma oferta desta loja saiu de grupo monitorado desde '
-        + new Date(Number(ts)).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) + '.\n\n'
-        + 'Vale conferir: janela de captura na aba Grupos, antibot/token da loja '
+        + 'Nenhuma oferta desta loja saiu de grupo monitorado desde ' + quando(ts) + '.\n'
+        + (tsDesp ? 'E nenhum despacho por qualquer caminho desde ' + quando(tsDesp) + '.\n' : '')
+        + '\nVale conferir: janela de captura na aba Grupos, antibot/token da loja '
         + 'e se os grupos-fonte continuam publicando.',
     }).catch(() => {});
   }
@@ -3669,6 +3721,11 @@ async function registrarEnvioHistorico(oferta) {
       agendarPush(local);
       return;
     }
+
+    // Prova de vida do despacho: alimenta a segunda via do pulso por loja, para
+    // que "loja parada" so vire alerta critico quando a loja de fato parou —
+    // e nao quando apenas o radar de grupo deixou de trazer produto dela.
+    if (d.loja) registrarPulsoDespacho(d.loja);
 
     regs.push({
       id:            oferta.id,
@@ -8966,13 +9023,34 @@ app.post('/alertas/lidos', (req, res) => {
 // que sustenta o alerta de "plataforma parada" e serve de painel na tela.
 app.get('/alertas/pulso', (req, res) => {
   const agora = Date.now();
-  const itens = Object.entries(pulsoLojas)
-    .map(([loja, ts]) => ({
-      loja, ultimaEm: new Date(Number(ts)).toISOString(),
-      horasParada: Math.floor((agora - Number(ts)) / 3600e3),
-      parada: (agora - Number(ts)) >= PULSO_LIMITE_MS,
-    }))
-    .sort((a, b) => b.horasParada - a.horasParada);
+  // As duas vias lado a lado: sem elas nao da para distinguir, na tela, "loja
+  // parada" de "captura em grupo parada" — que pedem acoes diferentes.
+  const lojas = new Set([...Object.keys(pulsoLojas), ...Object.keys(pulsoDespacho)]);
+  const horas = (ts) => ts ? Math.floor((agora - Number(ts)) / 3600e3) : null;
+  const itens = [...lojas]
+    .map((loja) => {
+      const tsRadar = Number(pulsoLojas[loja] || 0);
+      const tsDesp  = Number(pulsoDespacho[loja] || 0);
+      const radarParado = tsRadar > 0 && (agora - tsRadar) >= PULSO_LIMITE_MS;
+      const despParado  = tsDesp  > 0 && (agora - tsDesp)  >= PULSO_LIMITE_MS;
+      return {
+        loja,
+        ultimaEm:     tsRadar ? new Date(tsRadar).toISOString() : null,
+        horasParada:  horas(tsRadar),
+        parada:       radarParado,
+        despacho: {
+          ultimaEm:    tsDesp ? new Date(tsDesp).toISOString() : null,
+          horasParada: horas(tsDesp),
+          parada:      despParado,
+        },
+        // 'ok' = tudo fluindo | 'so-radar' = captura parou, loja viva
+        // 'parada' = nada saiu por caminho nenhum
+        situacao: !radarParado ? 'ok'
+                : (tsDesp && !despParado) ? 'so-radar'
+                : 'parada',
+      };
+    })
+    .sort((a, b) => (b.horasParada || 0) - (a.horasParada || 0));
   res.json({ ok:true, limiteHoras: PULSO_LIMITE_MS / 3600e3, itens });
 });
 
