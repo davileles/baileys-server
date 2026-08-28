@@ -230,10 +230,11 @@ async function resolverEncurtadorMl(url, tentativas = 6) {
     // entao o laco dava mais um hop e batia na propria pagina do produto —
     // requisicao inutil e, com o antibot ligado, tocando o endereco bloqueado.
     if (idProdutoMl(atual)) return atual;
-    // Caiu no perfil de afiliado: sob ML_SO_API a pagina nao sera aberta, entao
-    // seguir redirecionando so gasta requisicao para chegar num beco. Devolve
-    // como esta e deixa resolverLinkMl reportar o descarte.
-    if (ML_SO_API && RE_SOCIAL_ML.test(atual)) return atual;
+    // Caiu no perfil de afiliado. Com o leitor social de pe, quem resolve dali
+    // em diante e produtoDePerfilSocial (uma leitura, com cookie) — seguir
+    // redirect aqui so gastaria requisicao anonima. Com o leitor desligado ou
+    // pausado, devolve como esta e deixa resolverLinkMl reportar o descarte.
+    if (RE_SOCIAL_ML.test(atual)) return atual;
     const res = await fetch(atual, {
       method: 'GET', redirect: 'manual',
       headers: {
@@ -424,10 +425,12 @@ export function definirValidadeAntibotMs(ms) {
 }
 
 // ── SO API OFICIAL ────────────────────────────────────────────────────────
-// Politica da operacao: nao tocar em pagina publica do ML. Cada leitura de PDP
-// ou de perfil de afiliado alimenta o proprio antibot — e um bloqueio custa o
-// dia inteiro de ML, como em 25/08 e 27/08. A API oficial nao tem antibot, nao
-// precisa de cookie e nao gasta reputacao de IP.
+// Politica da operacao: nao tocar em pagina PUBLICA e ANONIMA do ML. Cada
+// leitura de PDP alimenta o proprio antibot — e um bloqueio custa o dia inteiro
+// de ML, como em 25/08 e 27/08. A API oficial nao tem antibot, nao precisa de
+// cookie e nao gasta reputacao de IP.
+// (O perfil de afiliado saiu deste corte em 28/08: ele e leitura logada e tem
+// politica propria, logo abaixo em ML_SOCIAL.)
 //
 // O que fica de fora desta regra, de proposito: as paginas LOGADAS (linkbuilder
 // e /cupons). Elas vao com cookie de sessao, respondem por um antibot proprio
@@ -437,6 +440,79 @@ export function definirValidadeAntibotMs(ms) {
 const ML_SO_API = String(process.env.ML_SO_API ?? '1') !== '0';
 export function modoSoApiMl() { return ML_SO_API; }
 const ERRO_SO_API = 'leitura de pagina do ML desativada (ML_SO_API)';
+
+// ── PERFIL DE AFILIADO (/social/) ─────────────────────────────────────────
+// O perfil social entrou no corte do ML_SO_API junto com o PDP anonimo, e isso
+// zerou o ML: 28/08 o radar capturou 119 links de grupo-fonte e TODOS eram
+// meli.la -> /social/<afiliado>?ref=..., o formato que os grupos usam hoje. Sem
+// abrir o perfil nao ha id de produto — o link morre antes de virar oferta, e
+// nenhuma API resolve isso (/sites/MLB/search responde 403 para este app).
+//
+// So que o perfil e lido COM cookie de sessao, igual a /cupons e ao linkbuilder:
+// pertence ao balde das paginas LOGADAS, que o proprio ML_SO_API deixa de fora
+// de proposito. Medido em producao: o antibot do PDP anonimo estava bloqueado
+// desde 27/08 enquanto as paginas logadas seguiam abrindo (0 bloqueios).
+//
+// Volta, entao, com tres freios que o desenho antigo nao tinha:
+//   1. espacamento minimo entre leituras (nao ha rajada);
+//   2. contador de bloqueios consecutivos -> pausa automatica;
+//   3. leitura boa zera tudo, entao a pausa se desfaz sozinha.
+// ML_SOCIAL=0 desliga de novo sem redeploy.
+const ML_SOCIAL = String(process.env.ML_SOCIAL ?? '1') !== '0';
+
+// Uma leitura por produto capturado; o radar nao dispara em rajada, mas dois
+// grupos-fonte publicando junto chegam quase colados. 4s ja descola.
+const ML_SOCIAL_ESPACO_MS = Number(process.env.ML_SOCIAL_ESPACO_MS || 4000);
+// Bloqueios seguidos ate desistir, e por quanto tempo. 3 e o suficiente para
+// separar soluco (1 tela antibot isolada) de bloqueio real.
+const ML_SOCIAL_BLOQUEIOS_PAUSA = 3;
+const ML_SOCIAL_PAUSA_MS = Number(process.env.ML_SOCIAL_PAUSA_MIN || 30) * 60000;
+
+let _social = { seguidos: 0, pausadoAte: 0, ultimaEm: 0, lidos: 0, bloqueados: 0 };
+
+/** Estado do leitor de perfil social, para /ml/status e diagnostico. */
+export function estadoSocialMl() {
+  return {
+    ativo: ML_SOCIAL,
+    pausado: Date.now() < _social.pausadoAte,
+    pausadoAte: _social.pausadoAte ? new Date(_social.pausadoAte).toISOString() : null,
+    bloqueiosSeguidos: _social.seguidos,
+    lidos: _social.lidos, bloqueados: _social.bloqueados,
+    espacoMs: ML_SOCIAL_ESPACO_MS,
+  };
+}
+
+/** Pode abrir perfil social agora? */
+function socialLiberado() {
+  return ML_SOCIAL && Date.now() >= _social.pausadoAte;
+}
+
+/** Espera o espacamento minimo desde a ultima leitura de perfil. */
+async function espacarSocial() {
+  const falta = _social.ultimaEm + ML_SOCIAL_ESPACO_MS - Date.now();
+  if (falta > 0) await new Promise(r => setTimeout(r, falta));
+  _social.ultimaEm = Date.now();
+}
+
+/** Tela antibot no perfil: conta, e ao terceiro seguido pausa o leitor. */
+function registrarSocialBloqueado(url) {
+  _social.bloqueados++;
+  _social.seguidos++;
+  registrarAntibotLogadoMl(url);
+  if (_social.seguidos >= ML_SOCIAL_BLOQUEIOS_PAUSA && Date.now() >= _social.pausadoAte) {
+    _social.pausadoAte = Date.now() + ML_SOCIAL_PAUSA_MS;
+    console.warn('[ML] Perfil social: ' + _social.seguidos + ' bloqueios seguidos — leitor pausado por '
+      + Math.round(ML_SOCIAL_PAUSA_MS / 60000) + ' min (ate '
+      + new Date(_social.pausadoAte).toISOString() + ').');
+  }
+}
+
+/** Leitura boa: zera o contador e levanta a pausa, sem ninguem reativar nada. */
+function registrarSocialOk() {
+  _social.lidos++;
+  _social.seguidos = 0;
+  _social.pausadoAte = 0;
+}
 
 export function estadoAntibotMl() {
   const fresco = !!_antibot.ultimoEm && (Date.now() - Date.parse(_antibot.ultimoEm) < _validadeAntibotMs);
@@ -1207,12 +1283,17 @@ export function formatarOfertaMl(p, opcoes = {}) {
  * recomendacao, e pegar qualquer um mandaria o cliente para o produto errado.
  */
 export async function produtoDePerfilSocial(urlSocial) {
-  // Perfil de afiliado e pagina publica do ML e conta para o antibot como
-  // qualquer outra. Sob ML_SO_API nao abrimos: o link de terceiro que so revela
-  // o produto por aqui e descartado, com o motivo explicito no log.
-  if (ML_SO_API) throw new Error(ERRO_SO_API + ' — perfil de afiliado nao e lido');
+  // Leitura LOGADA (vai com o cookie de afiliado), no mesmo balde de /cupons e
+  // do linkbuilder — nao no do PDP anonimo. Fora do ar so por ML_SOCIAL=0 ou
+  // pela pausa automatica do circuit breaker.
+  if (!ML_SOCIAL)
+    throw new Error('leitura de perfil de afiliado desativada (ML_SOCIAL=0)');
+  if (Date.now() < _social.pausadoAte)
+    throw new Error('leitor de perfil de afiliado pausado ate '
+      + new Date(_social.pausadoAte).toISOString() + ' (antibot em pagina logada)');
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
+  await espacarSocial();
   const res = await fetch(urlSocial, {
     headers: {
       'Cookie': cookie,
@@ -1223,8 +1304,20 @@ export async function produtoDePerfilSocial(urlSocial) {
     redirect: 'follow',
     signal: AbortSignal.timeout(25000),
   });
-  if (!res.ok) throw new Error('perfil social respondeu HTTP ' + res.status);
+  // 403/429 no perfil e a mesma coisa que a tela antibot: conta para a pausa.
+  if (!res.ok) {
+    if (res.status === 403 || res.status === 429) registrarSocialBloqueado(urlSocial);
+    throw new Error('perfil social respondeu HTTP ' + res.status);
+  }
   const html = await res.text();
+
+  // Tela antibot servida com 200: sem isso o leitor insistiria a cada produto.
+  if (htmlLogadoBloqueado(html)) {
+    registrarSocialBloqueado(urlSocial);
+    throw new Error('perfil social caiu na tela antibot');
+  }
+  registrarSocialOk();
+  registrarLogadaOkMl();
 
   // Ancora principal: o titulo declarado pelo proprio ML para a pagina.
   const tituloAlvo = (html.match(/<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']+)/i) || [])[1] || null;
