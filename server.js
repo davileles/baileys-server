@@ -5,6 +5,8 @@ import makeWASocket, {
   initAuthCreds,
   BufferJSON,
   proto,
+  signedKeyPair,
+  jidNormalizedUser,
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
@@ -1576,6 +1578,8 @@ async function conectarConta(id) {
         console.log('[CONTA:' + id + '] ✓ conectada.');
       }
       if (u.connection === 'close') {
+        if (s._closeTratado) return;                   // duplicata do mesmo socket
+        s._closeTratado = true;
         if (s !== c.sock && c.sock !== null) return;   // evento de socket antigo
         c.conectado = false; c.conectando = false; c.sock = null;
         const codigo = new Boom(u.lastDisconnect?.error)?.output?.statusCode;
@@ -6492,12 +6496,9 @@ var pingFalhas       = 0;
 
 function _reconectarPorHealth(motivo) {
   console.log('[HEALTH] ' + motivo + ' Forçando reconexão...');
-  conectado = false;
-  isConnecting = false; // evita que reconexão seja ignorada por flag travada
-  const sockRef = sock;
-  sock = null;
-  if (sockRef) { try { sockRef.end(new Error('health-ping-falhou')); } catch(e) {} }
-  conectar();
+  // Delegado a forcarReconexao: mesma limpeza (inclui healthTimer, que a
+  // versao antiga esquecia) e agendamento unico — sem caminho paralelo.
+  forcarReconexao('health: ' + motivo);
 }
 
 // A detecção PRINCIPAL de queda continua sendo por eventos: o keepAliveIntervalMs
@@ -7186,7 +7187,7 @@ const SURDEZ_SILENCIO_MS   = 20 * 60 * 1000;     // horario util: 20 min sem NEN
 // Com ~58 grupos de promo o trafego noturno nao e zero — de noite muda so o
 // LIMIAR (mais folgado) e os REAVISOS (silenciados para nao acordar ninguem).
 const SURDEZ_SILENCIO_NOITE_MS = 45 * 60 * 1000; // madrugada: 45 min de silencio = surdo
-const SURDEZ_POS_CURA_MS   = 10 * 60 * 1000;     // espera pos-reconexao antes de alertar
+const SURDEZ_POS_CURA_MS   = 6 * 60 * 1000;      // espera pos-cura antes de escalar (com o eco ativo, 6 min ja provam falha)
 const SURDEZ_REAVISO_MS    = 60 * 60 * 1000;
 // Valvula de escape: SURDEZ_EXIT=off desliga APENAS o degrau 3 (matar o
 // processo). Os degraus 1 e 2 e os alertas continuam. Serve para os casos em
@@ -7331,6 +7332,7 @@ async function _avisarOperador(texto, opcoes = {}) {
 
 function registrarUpsertHealth() {
   _health.ultimoUpsertEm = Date.now();
+  _ecoFalhas = 0; _ecoAguardando = null;   // qualquer upsert prova inbound vivo
   _salvarHealth();
   if (_surdezEstado !== 'ok') {
     const estadoAnterior = _surdezEstado;
@@ -7355,7 +7357,58 @@ function _ultimaCapturaGlobal() {
   return max || _bootEm;
 }
 
-// Ciclo da surdez (sinal primario): a cada 5 min.
+// ── ECO DE INBOUND (deteccao ativa de surdez) ────────────────────────────────
+// A deteccao passiva (20/45 min sem upsert) e lenta e depende do trafego dos
+// outros. O eco transforma isso em teste ativo: passado um silencio curto, o
+// servidor manda uma mensagem PARA O PROPRIO numero. Mensagem propria volta
+// pelo mesmo caminho servidor→device de qualquer outra: se o roteamento
+// inbound esta vivo, ela vira upsert em segundos (e o proprio eco zera o
+// relogio de silencio — correto, ja que inbound funcionando e exatamente o
+// que ele prova). Dois ecos ENVIADOS com sucesso e nao recebidos = surdez
+// confirmada em ~11 min do inicio do silencio, contra 20-45 min da regua
+// passiva — e a escada dispara na hora, sem esperar o limiar. O envio do eco
+// falhar nao conta como falha de inbound: queda de envio ja tem tratamento
+// proprio (close/ping leve).
+const ECO_APOS_MS     = 8 * 60 * 1000;   // silencio que dispara o primeiro eco
+const ECO_ESPERA_MS   = 75 * 1000;       // prazo para o eco virar upsert
+const ECO_FALHAS_CONF = 2;               // 2 ecos perdidos = surdo confirmado
+let _ecoEnviadoEm  = 0;                  // quando o ultimo eco saiu
+let _ecoAguardando = null;               // { id, em } do eco em transito
+let _ecoFalhas     = 0;                  // ecos enviados e nao recebidos, seguidos
+let _ecoUpsertRef  = 0;                  // ultimoUpsertEm no momento do envio
+
+setInterval(async () => {
+  try {
+    if (!conectado || !sock) { _ecoAguardando = null; return; }
+    const agora = Date.now();
+    if (_ecoAguardando) {
+      if ((_health.ultimoUpsertEm || 0) > _ecoUpsertRef) { _ecoAguardando = null; return; }  // chegou algo (o proprio eco conta)
+      if (agora - _ecoAguardando.em < ECO_ESPERA_MS) return;                                 // ainda no prazo
+      _ecoFalhas++;
+      _ecoAguardando = null;
+      console.warn('[ECO] Eco nao virou upsert em ' + Math.round(ECO_ESPERA_MS / 1000) + 's (' + _ecoFalhas + '/' + ECO_FALHAS_CONF + '). Inbound suspeito.');
+    }
+    if (agora - _bootEm < 5 * 60 * 1000) return;          // carencia pos-boot
+    const silencio = agora - ((_health.ultimoUpsertEm) || _bootEm);
+    if (silencio < ECO_APOS_MS) { _ecoFalhas = 0; return; }
+    if (_ecoFalhas >= ECO_FALHAS_CONF) return;            // confirmado; a escada assume
+    if (agora - _ecoEnviadoEm < 2 * 60 * 1000) return;    // espacamento entre ecos
+    const jidProprio = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+    if (!jidProprio) return;
+    _ecoEnviadoEm = agora;
+    _ecoUpsertRef = _health.ultimoUpsertEm || 0;
+    const r = await _enviarComTeto(sock.sendMessage(jidProprio, { text: '\u00b7' }));
+    _ecoAguardando = { id: r?.key?.id || null, em: Date.now() };
+    console.log('[ECO] Silencio de ' + Math.round(silencio / 60000) + ' min — eco de inbound enviado para o proprio numero.');
+    // Limpeza best-effort: apaga o eco da conversa consigo mesmo dali a pouco.
+    if (r?.key) setTimeout(() => { try { sock?.sendMessage(jidProprio, { delete: r.key }); } catch (e) {} }, 90 * 1000);
+  } catch (e) { console.warn('[ECO] Falha ao enviar eco:', e.message); }
+}, 60 * 1000).unref?.();
+
+// Ciclo da surdez (sinal primario): a cada 60s. Era 5 min; com a escada
+// dependendo dele para escalar degraus, cada ciclo largo somava ate 5 min de
+// latencia POR degrau. As checagens iniciais sao baratas — rodar por minuto
+// nao custa nada e corta a espera.
 setInterval(async () => {
   try {
     const h = horaSP();
@@ -7391,15 +7444,39 @@ setInterval(async () => {
     // O boot so serve de referencia quando nunca houve upsert nenhum.
     const ref      = _health.ultimoUpsertEm || _bootEm;
     const silencio = agora - ref;
-    if (silencio < (emHorarioUtil ? SURDEZ_SILENCIO_MS : SURDEZ_SILENCIO_NOITE_MS)) return;
+    // Surdez confirmada pelo eco dispensa a regua passiva: 2 mensagens para o
+    // proprio numero ja se perderam — nao ha por que esperar 20/45 min.
+    const surdoConfirmado = _ecoFalhas >= ECO_FALHAS_CONF;
+    if (!surdoConfirmado && silencio < (emHorarioUtil ? SURDEZ_SILENCIO_MS : SURDEZ_SILENCIO_NOITE_MS)) return;
 
-    // ── Degrau 1: socket novo ────────────────────────────────────────────
+    // ── Degrau 1: reconexao dura (websocket derrubado na marra) ──────────
+    // A reconexao "soft" que morava aqui nao curou UMA surdez sequer nos 6
+    // incidentes de ago/2026 — a dura (antigo degrau 2) foi promovida a
+    // primeiro degrau.
     if (_surdezEstado === 'ok') {
       _surdezEstado = 'cura1';
       _surdezCuraEm = agora;
       _persistirSurdez();
-      console.warn('[WATCHDOG] Socket surdo ha ' + Math.round(silencio / 60000) + ' min (zero upserts). Degrau 1: reconexao de socket...');
-      try { forcarReconexao('watchdog-surdez'); } catch (e) { console.error('[WATCHDOG] Degrau 1 falhou:', e.message); }
+      console.warn('[WATCHDOG] Socket surdo (' + (surdoConfirmado ? 'confirmado por eco; ' : '') + Math.round(silencio / 60000) + ' min sem upsert). Degrau 1: reconexao dura...');
+      try {
+        conectado = false;
+        isConnecting = false;
+        _reconectarTentativas = 0;
+        if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+        if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+        const sockRef = sock;
+        sock = null;
+        if (sockRef) {
+          try { sockRef.ws?.close?.(); } catch (e) {}
+          try { sockRef.end(new Error('watchdog-surdez-degrau1')); } catch (e) {}
+        }
+        _agendarReconexao(5000);
+      } catch (e) { console.error('[WATCHDOG] Degrau 1 falhou:', e.message); }
+      // Confirmacao zerada: o eco reenvia apos a reconexao e so uma NOVA
+      // dupla de ecos perdidos (ou a regua passiva) escala ao degrau 2 —
+      // escalar sem reconfirmar transformaria um falso positivo em cura
+      // invasiva.
+      _ecoFalhas = 0; _ecoEnviadoEm = 0; _ecoAguardando = null;
       return;
     }
 
@@ -7421,22 +7498,16 @@ setInterval(async () => {
       _surdezEstado = 'cura2';
       _surdezCuraEm = agora;
       _persistirSurdez();
-      console.warn('[WATCHDOG] Reconexao nao resolveu. Degrau 2: derrubando o websocket na marra e religando (chaves preservadas)...');
-      _avisarOperador('Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min. Reconexao nao resolveu — derrubando o websocket e religando do zero, sem tocar nas chaves (degrau 2 de 3). Sem acao necessaria por enquanto.').catch(() => {});
-      try {
-        conectado = false;
-        isConnecting = false;
-        _reconectarTentativas = 0;
-        if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
-        if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
-        const sockRef = sock;
-        sock = null;
-        if (sockRef) {
-          try { sockRef.ws?.close?.(); } catch (e) {}
-          try { sockRef.end(new Error('watchdog-surdez-degrau2')); } catch (e) {}
-        }
-        _agendarReconexao(8000);
-      } catch (e) { console.error('[WATCHDOG] Degrau 2 falhou:', e.message); }
+      // ── Degrau 2: renovacao de identidade (pareamento preservado) ──────
+      // Reproducao deliberada da UNICA cura que funcionou nos incidentes de
+      // ago/2026: creds preservado, resto da identidade zerado, signed
+      // pre-key renovado e bundle novo subido no login seguinte. Ver
+      // renovarIdentidadeSessao().
+      console.warn('[WATCHDOG] Reconexao dura nao resolveu. Degrau 2: renovacao de identidade (pareamento preservado)...');
+      _avisarOperador('Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min. Reconexao nao resolveu — renovando a identidade da sessao junto ao servidor do WhatsApp, SEM novo pareamento (degrau 2 de 3). Alguns "aguardando mensagem" transitorios sao esperados nos proximos minutos. Sem acao necessaria.').catch(() => {});
+      try { await renovarIdentidadeSessao('watchdog-surdez-degrau2'); }
+      catch (e) { console.error('[WATCHDOG] Degrau 2 falhou:', e.message); }
+      _ecoFalhas = 0; _ecoEnviadoEm = 0; _ecoAguardando = null;
       return;
     }
 
@@ -7455,13 +7526,13 @@ setInterval(async () => {
         _surdezAvisoEm = agora;
         _persistirSurdez();
       } else {
-        console.warn('[WATCHDOG] Reset de sessao nao resolveu. Degrau 3: encerrando o processo para o Railway subir um container novo.');
+        console.warn('[WATCHDOG] Renovacao de identidade nao resolveu. Degrau 3: encerrando o processo para o Railway subir um container novo.');
         _health.ultimoExitEm = agora;
         _healthGravadoEm = 0;              // forca o write, ignorando o throttle
         _salvarHealth();
         await _avisarOperador(
           'Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min.\n\n'
-          + 'Reconexao e reset de sessao nao resolveram. Reiniciando o processo '
+          + 'Reconexao e renovacao de identidade nao resolveram. Reiniciando o processo '
           + '(degrau 3 de 3) — o Railway sobe um container novo em segundos.\n\n'
           + 'Se ainda assim nao voltar, sera necessario novo pareamento (QR).',
           { critico: true }
@@ -7483,8 +7554,8 @@ setInterval(async () => {
     await _avisarOperador(
       'CRITICO — WhatsApp SURDO\n\n'
       + 'O servidor nao recebe NENHUMA mensagem ha ' + min + ' min (zero upserts crus). '
-      + 'A escada automatica ja tentou TUDO: reconexao de socket, reset de sessao '
-      + 'e restart do processo.\n\n'
+      + 'A escada automatica ja tentou TUDO: reconexao dura, renovacao de '
+      + 'identidade da sessao e restart do processo.\n\n'
       + 'O envio pode continuar funcionando, mas captura de grupos e radar estao MORTOS.\n\n'
       + 'Correcao (exige celular em maos):\n'
       + '1) No WhatsApp do celular, desconecte o dispositivo antigo em Dispositivos conectados\n'
@@ -7495,7 +7566,7 @@ setInterval(async () => {
       { critico: true }
     );
   } catch (e) { console.error('[WATCHDOG] Erro no ciclo de surdez:', e.message); }
-}, 5 * 60 * 1000);
+}, 60 * 1000);
 
 // ── WATCHDOG DE SAIDA: OFERTAS PARARAM DE SER PUBLICADAS ────────────────────
 // 22/08/2026: o servidor ficou surdo as 20h07 e passou o dia inteiro sem
@@ -7885,8 +7956,38 @@ async function conectar() {
         console.log('[WA] ✓ WhatsApp conectado!');
         // Aquece o cache de nomes: a fila mostra de qual grupo veio cada oferta.
         atualizarNomesGrupos().catch(()=>{});
+        // Pos-renovacao de identidade: sobe o bundle novo (registration +
+        // identity + pre-keys novas + signed pre-key novo — o mesmo no IQ do
+        // registro inicial). E isto que renova o cadastro do device no
+        // servidor sem novo pareamento; sem o upload, a renovacao local nao
+        // teria efeito nenhum do lado de la.
+        if (_renovacaoPendenteUpload) {
+          _renovacaoPendenteUpload = false;
+          (async () => {
+            try {
+              await Promise.race([
+                novaSock.uploadPreKeys(),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout 30s')), 30000)),
+              ]);
+              console.log('[RENOVACAO] Bundle novo enviado ao servidor (uploadPreKeys ok).');
+            } catch (e) {
+              console.error('[RENOVACAO] uploadPreKeys pos-renovacao falhou:', e.message);
+            }
+          })();
+        }
       }
       if (connection === 'close') {
+        // Um socket processa o PROPRIO close UMA unica vez. Sem esta trava, o
+        // segundo evento 'close' do mesmo socket passava pela guarda de baixo
+        // (sock ja esta null nessa hora) e era tratado como uma NOVA queda —
+        // foi assim que 2 eventos do mesmo fechamento viraram "2 401 seguidos"
+        // em 2s na noite de 28/08 e confirmaram um logout que nao existia,
+        // apagando credenciais de uma sessao viva.
+        if (novaSock._closeTratado) {
+          console.log('[WA] Evento de close duplicado do mesmo socket ignorado.');
+          return;
+        }
+        novaSock._closeTratado = true;
         // Ignora eventos de sock antigo (pode acontecer durante troca de instância)
         if (novaSock !== sock && sock !== null) {
           console.log('[WA] Evento de fechamento de sock antigo ignorado.');
@@ -7971,6 +8072,15 @@ async function conectar() {
             // qrDisponivel=false, e /qr repetia 'Gerando QR...' sem parar. Sem
             // esta limpeza a promessa do comentario acima nao se cumpre.
             console.log('[WA] Logout — apagando credenciais e subindo socket unico para gerar QR.');
+            // A cadeia de escrita da sessao morta pode regravar creds.json
+            // DEPOIS do apagao (corrida de 27-28/08: ora salvou o pareamento
+            // por sorte, ora ressuscitou credenciais revogadas e deixou /qr
+            // vazio por 10h). Drena e DESREGISTRA o flush: apagao deterministico.
+            try {
+              const _f = _flushsSessao.get(SESSAO_DIR);
+              _flushsSessao.delete(SESSAO_DIR);
+              if (_f) await _f(2000);
+            } catch (e) {}
             await limparCredenciaisSessao();
             _agendarReconexao(5000);
           }
@@ -13883,6 +13993,101 @@ async function limparCredenciaisSessao() {
     return false;
   }
 }
+
+// ── RENOVACAO DE IDENTIDADE (cura da surdez preservando o pareamento) ────────
+// Historico (13, 17, 22, 27 e 2x 28/08/2026): o socket fica surdo — conectado,
+// enviando, ping de presenca ok, ZERO upserts — e NADA da escada antiga curava:
+// nem reconexao, nem limpar sessions/sender-keys (degrau 2 antigo, falhou em
+// 28/08 de manha), nem restart de container (degrau 3, falhou 2x em 28/08).
+// A cura, em todas as ocorrencias documentadas, veio do mesmo ACIDENTE: um 401
+// transitorio caia no ramo de logout, que apagava a identidade inteira, e o
+// creds.json era ressuscitado pela corrida do flush em memoria. Efeito liquido:
+// pareamento preservado + resto da identidade zerado + reconexao = upserts de
+// volta em ~1 min. Sintoma e cura batem com o issue #2271 do Baileys ("must
+// delete the session and reconnect"): o cadastro do device vicia no servidor.
+// Esta funcao reproduz a cura de proposito, sem depender de corrida:
+//   1. drena e DESREGISTRA o flush (nada regrava por cima depois);
+//   2. guarda o creds em memoria e apaga todos os arquivos da sessao
+//      (sessions, sender keys, pre-keys, app-state), como no reset completo;
+//   3. RENOVA o signed pre-key (keyId+1) e alinha os contadores de pre-key
+//      (as one-time antigas morreram no apagao — nada fica "pendente");
+//   4. regrava o creds.json renovado, deterministicamente;
+//   5. reconecta; no 'open', uploadPreKeys() sobe o bundle novo e o servidor
+//      renova o cadastro do device sem novo pareamento.
+// Custo esperado e transitorio: sessoes 1:1 e sender keys se refazem sozinhas
+// via retry receipt (alguns "aguardando mensagem" por minutos, como os 9 stubs
+// de 28/08 a noite). App-state-sync se perde — sem efeito em mensagens, e
+// syncFullHistory ja e false.
+let _renovacaoPendenteUpload = false;
+
+async function renovarIdentidadeSessao(motivo) {
+  if (isResetting) { console.log('[RENOVACAO] Reset em andamento, ignorando.'); return false; }
+  isResetting = true;
+  console.warn('[RENOVACAO] Renovando identidade da sessao (' + motivo + ') — pareamento preservado.');
+  try {
+    if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+    conectado = false;
+    isConnecting = false;
+    _reconectarTentativas = 0;
+    if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+    const sockRef = sock;
+    sock = null;
+    if (sockRef) {
+      try { sockRef.ws?.close?.(); } catch (e) {}
+      try { sockRef.end(new Error('renovacao-identidade')); } catch (e) {}
+    }
+
+    // Flush drenado e DESREGISTRADO: a partir daqui nenhuma escrita da sessao
+    // antiga regrava arquivo apagado (a corrida de 27-28/08).
+    try {
+      const _f = _flushsSessao.get(SESSAO_DIR);
+      _flushsSessao.delete(SESSAO_DIR);
+      if (_f) await _f(3000);
+    } catch (e) {}
+
+    // creds para a memoria ANTES do apagao. Sem creds legivel e registrado,
+    // renovar viraria perder o pareamento — nesse caso aborta e so reconecta.
+    let creds = null;
+    try { creds = JSON.parse(await readFileAsync(SESSAO_DIR + '/creds.json', 'utf-8'), BufferJSON.reviver); }
+    catch (e) { creds = null; }
+    if (!creds?.registered || !creds?.signedIdentityKey) {
+      console.error('[RENOVACAO] creds.json ilegivel ou sem registro — abortando para nao perder o pareamento.');
+      isResetting = false;
+      _agendarReconexao(3000);
+      return false;
+    }
+
+    // Apagao identico ao do pareamento (preserva so os arquivos de negocio).
+    await limparCredenciaisSessao();
+
+    // Signed pre-key NOVO + contadores alinhados.
+    try {
+      creds.signedPreKey = signedKeyPair(creds.signedIdentityKey, (creds.signedPreKey?.keyId || 1) + 1);
+      creds.firstUnuploadedPreKeyId = creds.nextPreKeyId || 1;
+    } catch (e) { console.error('[RENOVACAO] Falha ao renovar signed pre-key:', e.message); }
+
+    await writeFileAsync(SESSAO_DIR + '/creds.json', JSON.stringify(creds, BufferJSON.replacer));
+    console.log('[RENOVACAO] creds.json regravado (signedPreKey keyId ' + (creds.signedPreKey?.keyId || '?') + '). Reconectando para subir o bundle novo...');
+
+    errosDescripto = 0; _indecifraveisPorGrupo.clear();
+    _renovacaoPendenteUpload = true;
+    isResetting = false;
+    _agendarReconexao(2500);
+    return true;
+  } catch (e) {
+    console.error('[RENOVACAO] Erro:', e.message);
+    isResetting = false;
+    _agendarReconexao(3000);
+    return false;
+  }
+}
+
+app.post('/renovar-identidade', async (req, res) => {
+  const ok = await renovarIdentidadeSessao('endpoint-manual');
+  res.json({ ok, mensagem: ok
+    ? 'Identidade renovada; reconectando e subindo bundle novo. Acompanhe /status.'
+    : 'Nao foi possivel renovar agora — veja os logs.' });
+});
 
 app.post('/pair', async (req, res) => {
   const bruto  = String(req.body?.numero || req.query?.numero || '');
