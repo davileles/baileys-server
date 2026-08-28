@@ -230,6 +230,10 @@ async function resolverEncurtadorMl(url, tentativas = 6) {
     // entao o laco dava mais um hop e batia na propria pagina do produto —
     // requisicao inutil e, com o antibot ligado, tocando o endereco bloqueado.
     if (idProdutoMl(atual)) return atual;
+    // Caiu no perfil de afiliado: sob ML_SO_API a pagina nao sera aberta, entao
+    // seguir redirecionando so gasta requisicao para chegar num beco. Devolve
+    // como esta e deixa resolverLinkMl reportar o descarte.
+    if (ML_SO_API && RE_SOCIAL_ML.test(atual)) return atual;
     const res = await fetch(atual, {
       method: 'GET', redirect: 'manual',
       headers: {
@@ -418,6 +422,21 @@ export function definirValidadeAntibotMs(ms) {
   if (Number.isFinite(n) && n > 0) _validadeAntibotMs = n;
   return _validadeAntibotMs;
 }
+
+// ── SO API OFICIAL ────────────────────────────────────────────────────────
+// Politica da operacao: nao tocar em pagina publica do ML. Cada leitura de PDP
+// ou de perfil de afiliado alimenta o proprio antibot — e um bloqueio custa o
+// dia inteiro de ML, como em 25/08 e 27/08. A API oficial nao tem antibot, nao
+// precisa de cookie e nao gasta reputacao de IP.
+//
+// O que fica de fora desta regra, de proposito: as paginas LOGADAS (linkbuilder
+// e /cupons). Elas vao com cookie de sessao, respondem por um antibot proprio
+// (estadoAntibotLogadoMl, hoje limpo) e sao o unico caminho para gerar link de
+// afiliado — sem elas nao ha monetizacao. Se um dia for preciso cortar tambem,
+// e ML_SO_API=2.
+const ML_SO_API = String(process.env.ML_SO_API ?? '1') !== '0';
+export function modoSoApiMl() { return ML_SO_API; }
+const ERRO_SO_API = 'leitura de pagina do ML desativada (ML_SO_API)';
 
 export function estadoAntibotMl() {
   const fresco = !!_antibot.ultimoEm && (Date.now() - Date.parse(_antibot.ultimoEm) < _validadeAntibotMs);
@@ -698,6 +717,14 @@ export function saudePaginaMl() { return { ..._saudePagina, antibot: estadoAntib
  *                               quando a pagina volta a abrir.
  */
 export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
+  // Sem leitura de pagina no pipeline, a sonda perde a funcao: ela existia para
+  // descobrir quando a PDP voltava a abrir. Manter uma requisicao diaria a uma
+  // pagina que ninguem mais le seria gastar reputacao a troco de nada.
+  if (ML_SO_API) {
+    _saudePagina = { ..._saudePagina, ok: null, verificadoEm: new Date().toISOString(),
+                     url: urlTeste, erro: null, pulada: 'ML_SO_API' };
+    return _saudePagina;
+  }
   const cookie = cookieAff();
   if (!cookie || !urlTeste) return _saudePagina;
   try {
@@ -739,33 +766,6 @@ export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
  * @param {object} [opcoes.id]  MLB do anuncio, quando quem chama ja o tem
  *   (vitrine, monitor): e o que permite o fallback pela API em URL /up/MLBU.
  */
-/**
- * Ultimo recurso com o antibot ligado: os dados que o proprio perfil social do
- * divulgador ja mostrou. Cobre exatamente o buraco que derrubou o ML em 27/08 —
- * anuncio classico (produto.mercadolivre.com.br/MLB-...), que nao tem catalogo
- * e por isso nao tem fallback pela API oficial (/items/{id} responde 403).
- * Sem cupom da pagina e sem preco em destaque (Pix/MP): e menos do que a PDP
- * daria, mas o preco e o do card que o afiliado publicou — o mesmo que o post
- * anuncia. Melhor que descartar a oferta em silencio.
- */
-function dadosViaSocialMl(alvoUrl, tituloDica) {
-  const s = lerSnapshotSocial(alvoUrl);
-  if (!s || !(s.preco > 0)) return null;
-  console.log('[ML] ' + alvoUrl.split('/').pop().slice(0, 24)
-    + ' — preco lido do card do perfil social (R$ ' + s.preco + ')');
-  return {
-    titulo: s.titulo || tituloDica || null,
-    preco: s.preco, precoDe: s.precoDe, imagem: s.imagem,
-    disponivel: true,
-    precoDeFonte: s.precoDe ? 'social' : null, precoDeDescartes: [],
-    descontoDeclarado: null, marca: '', nota: null, avaliacoes: null,
-    vendedor: s.vendedor || null, achouLd: false, trilha: null,
-    cuponsPagina: [], fonte: 'social',
-    itemId: (String(alvoUrl).match(/MLB-?(\d{6,})/i) || [])[1] || null,
-    catalogoId: null, freteGratis: !!s.freteGratis,
-  };
-}
-
 export async function buscarDadosProdutoMl(url, opcoes = {}) {
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
@@ -782,13 +782,20 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   // cobre falha rapido, sem tocar no endereco bloqueado. Assim que a sonda
   // conseguir abrir uma pagina, o bloqueio e dado por encerrado e este desvio
   // deixa de valer sozinho, sem ninguem precisar reativar nada.
-  if (estadoAntibotMl().confirmadoAgora && !opcoes.forcarPagina) {
+  // Com ML_SO_API o desvio nao depende do antibot estar confirmado: a pagina
+  // simplesmente nao e aberta, nunca. Antes o desvio so valia com bloqueio ja
+  // ativo — ou seja, so parava de bater DEPOIS de ja ter apanhado. Era essa
+  // janela que renovava o bloqueio a cada leva de produtos.
+  if (ML_SO_API || (estadoAntibotMl().confirmadoAgora && !opcoes.forcarPagina)) {
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
-    if (viaApi) return { ...viaApi, bloqueado: true, urlFinal: alvoUrl };
-    const viaSocial = dadosViaSocialMl(alvoUrl, opcoes.titulo);
-    if (viaSocial) return { ...viaSocial, bloqueado: true, urlFinal: alvoUrl };
+    if (viaApi) return { ...viaApi, bloqueado: estadoAntibotMl().confirmadoAgora, urlFinal: alvoUrl };
+    if (ML_SO_API) {
+      throw new Error(ERRO_SO_API + (apiMlAutorizada()
+        ? ' — e a API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
+        : ' — e a API oficial nao esta autorizada; conecte em /ml/conectar'));
+    }
     throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
-      ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/) e o perfil social nao trouxe preco'
+      ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
       : ' — autorize a API oficial em /ml/conectar para o fallback'));
   }
 
@@ -813,10 +820,8 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
     registrarAntibotMl(alvoUrl);
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
     if (viaApi) return { ...viaApi, bloqueado: true, urlFinal: alvoUrl };
-    const viaSocial = dadosViaSocialMl(alvoUrl, opcoes.titulo);
-    if (viaSocial) return { ...viaSocial, bloqueado: true, urlFinal: alvoUrl };
     throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
-      ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/) e o perfil social nao trouxe preco'
+      ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
       : ' — autorize a API oficial em /ml/conectar para o fallback'));
   }
   registrarPaginaMlOk();
@@ -1170,76 +1175,11 @@ export function formatarOfertaMl(p, opcoes = {}) {
  * Nao usamos o primeiro MLB do HTML: os primeiros que aparecem sao dos blocos de
  * recomendacao, e pegar qualquer um mandaria o cliente para o produto errado.
  */
-/**
- * Dados do card em destaque do perfil social ("card-featured").
- *
- * Cuidado deliberado com o escopo: a mesma pagina traz blocos de recomendacao
- * ("affiliate-profile-recommendations") com precos de OUTROS produtos. Ler o
- * primeiro "price" do HTML daria o preco errado — em 28/08 um post de R$ 39,99
- * casava com um 63,64 de recomendacao. Por isso a extracao parte do bloco do
- * CTA e caminha para tras ate o inicio do card.
- */
-function snapshotDoCardDestaque(html, tituloAlvo) {
-  const iCta = html.search(/"id"\s*:\s*"show_product"/i);
-  if (iCta < 0) return null;
-  // Janela do proprio card: o bloco de componentes que antecede o CTA.
-  const bloco = html.slice(Math.max(0, iCta - 3000), iCta);
-  const iCard = bloco.lastIndexOf('"card_type"');
-  const card  = iCard >= 0 ? bloco.slice(iCard) : bloco;
-
-  const num = (re) => {
-    const m = card.match(re);
-    const v = m ? Number(m[1]) : NaN;
-    return Number.isFinite(v) && v > 0 ? v : null;
-  };
-  const preco   = num(/"current_price"\s*:\s*\{[^{}]*?"value"\s*:\s*([0-9.]+)/i);
-  if (!preco) return null;
-  const precoDe = num(/"previous_price"\s*:\s*\{[^{}]*?"value"\s*:\s*([0-9.]+)/i);
-
-  const txt = (re) => {
-    const m = card.match(re);
-    return m ? m[1].replace(/\\u002F/gi, '/').replace(/\\"/g, '"').trim() : null;
-  };
-  const titulo   = txt(/"title"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"/i) || tituloAlvo || null;
-  const vendedor = (txt(/"seller"\s*:\s*\{\s*"text"\s*:\s*"([^"]+)"/i) || '')
-    .replace(/^Por\s+/i, '').replace(/\{[^}]*\}/g, '').trim() || null;
-  const frete    = /"shipping"\s*:\s*\{[^{}]*"text"\s*:\s*"[^"]*[Gg]r[aá]tis/.test(card);
-  const foto     = txt(/"pictures"\s*:\s*\[\s*\{\s*"id"\s*:\s*"([^"]+)"/i);
-
-  return {
-    titulo, preco,
-    precoDe: precoDe && precoDe > preco ? precoDe : null,
-    vendedor, freteGratis: frete,
-    imagem: foto ? 'https://http2.mlstatic.com/D_' + foto + '-O.jpg' : null,
-  };
-}
-
-// Cache curto do snapshot, chaveado pela URL do produto. Existe so para
-// atravessar a distancia entre resolverLinkMl (que le a pagina social) e
-// buscarDadosProdutoMl (que precisa do preco): sao chamadas separadas no mesmo
-// lote, segundos de intervalo. TTL curto de proposito — preco velho publicado
-// como novo e pior que oferta nao publicada.
-const _SNAP_SOCIAL_TTL_MS = 10 * 60 * 1000;
-const _snapSocial = new Map();
-
-function guardarSnapshotSocial(url, dados) {
-  if (!url || !dados) return;
-  _snapSocial.set(String(url).split('?')[0], { em: Date.now(), dados });
-  if (_snapSocial.size > 300) {
-    for (const [k, v] of _snapSocial) {
-      if (Date.now() - v.em > _SNAP_SOCIAL_TTL_MS) _snapSocial.delete(k);
-    }
-  }
-}
-
-function lerSnapshotSocial(url) {
-  const reg = _snapSocial.get(String(url || '').split('?')[0]);
-  if (!reg) return null;
-  if (Date.now() - reg.em > _SNAP_SOCIAL_TTL_MS) return null;
-  return reg.dados;
-}
-
 export async function produtoDePerfilSocial(urlSocial) {
+  // Perfil de afiliado e pagina publica do ML e conta para o antibot como
+  // qualquer outra. Sob ML_SO_API nao abrimos: o link de terceiro que so revela
+  // o produto por aqui e descartado, com o motivo explicito no log.
+  if (ML_SO_API) throw new Error(ERRO_SO_API + ' — perfil de afiliado nao e lido');
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
   const res = await fetch(urlSocial, {
@@ -1265,12 +1205,6 @@ export async function produtoDePerfilSocial(urlSocial) {
   if (cta) {
     const u = cta[1].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
     const abs = /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
-    // O card em destaque ja traz preco, "de", frete e vendedor. Guardar isso
-    // aqui e o que permite publicar anuncio classico com o antibot ligado: a
-    // PDP esta bloqueada e a API oficial responde 403 em /items/{id}, mas esta
-    // pagina abre normal — ela tem reputacao propria. Zero requisicao extra:
-    // o HTML ja foi baixado para descobrir a URL do produto.
-    guardarSnapshotSocial(abs, snapshotDoCardDestaque(html, tituloAlvo));
     return { url: abs, titulo: tituloAlvo };
   }
 
@@ -2083,7 +2017,12 @@ function janelasDeTexto(texto, regex, janela = JANELA_CUPOM, max = MAX_OCORRENCI
  * Retorna tambem o preco lido, para conferir se o JSON-LD ja vem com o cupom
  * abatido — se vier, subtrair de novo publicaria um preco inexistente.
  */
-export async function dumpCupomMl(url) {
+export async function dumpCupomMl(url, opcoes = {}) {
+  // Diagnostico tambem abre pagina publica. Exige ?forcar=1 para nao virar a
+  // porta dos fundos da politica num momento de pressa.
+  if (ML_SO_API && !opcoes.forcar) {
+    throw new Error(ERRO_SO_API + ' — use ?forcar=1 para abrir mesmo assim');
+  }
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
 
