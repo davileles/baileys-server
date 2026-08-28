@@ -380,46 +380,94 @@ const ML_SONDA_PAGINA_MS = Number(process.env.ML_SONDA_PAGINA_H || 24) * 60 * 60
 // produto capturado volta a bater na pagina bloqueada. 25% de folga cobre
 // atraso de timer e a passada perdida no redeploy.
 definirValidadeAntibotMs(ML_SONDA_PAGINA_MS * 1.25);
-// Trava de cadencia em DISCO. So o setInterval nao garante "uma por dia": a
-// sonda tambem dispara 45s depois de cada boot, e no Railway todo commit e um
-// boot. Em dia de varios deploys isso virava varias leituras da pagina
-// bloqueada — exatamente o padrao que o antibot mede, adiando a propria saida
-// do bloqueio que a sonda existe para detectar. O carimbo sobrevive ao restart.
-// Caminho resolvido em chamada, nao no carregamento: SESSAO_DIR e declarado
-// bem depois deste bloco e um const em TDZ derrubaria o boot inteiro. A sonda
-// so roda 45s apos subir, entao aqui e sempre seguro.
+// Trava de cadencia com memoria DURAVEL. O carimbo vive em ./sessao mas o
+// filesystem do Railway nao sobrevive a restart — a durabilidade real vem do
+// sync com o repo de dados (ml_sonda_pagina.json esta em NOMES_SINCRONIZAVEIS:
+// baixado no boot, push apos gravar). Sem isso, todo restart espontaneo do
+// Railway zerava o carimbo e a sonda do boot rodava de novo — em 28/08 a
+// "uma consulta por dia" virou duas sem nenhum deploy no meio.
+//
+// O carimbo tambem guarda o ULTIMO VEREDITO ({bloqueado, bloqueadoDesde}),
+// porque o estado do antibot em memoria zera junto com o processo: sem uma
+// memoria duravel, cada reconfirmacao parecia bloqueio NOVO e saia como alerta
+// critico de "token parou de funcionar" — tres sustos por dia para dizer a
+// mesma coisa. Com o veredito anterior em maos da para distinguir os tres
+// casos que interessam: continuou bloqueado (informativo), bloqueou agora
+// (critico) e LIBEROU (a noticia que a sonda existe para dar).
 function marcaSondaPath() { return SESSAO_DIR + '/ml_sonda_pagina.json'; }
 
-function ultimaSondaPaginaMl() {
+function lerMarcaSondaMl() {
   try {
-    const p = marcaSondaPath();
-    if (!existsSync(p)) return 0;
-    return Number(JSON.parse(readFileSync(p, 'utf-8'))?.em || 0);
-  } catch (e) { return 0; }
+    if (!existsSync(marcaSondaPath())) return null;
+    return JSON.parse(readFileSync(marcaSondaPath(), 'utf-8')) || null;
+  } catch (e) { return null; }
 }
 
-function marcarSondaPaginaMl() {
+function gravarMarcaSondaMl(m) {
   try {
-    escreverAtomico(marcaSondaPath(), JSON.stringify({ em: Date.now() }), 'utf-8');
+    escreverAtomico(marcaSondaPath(), JSON.stringify(m), 'utf-8');
+    agendarPush('ml_sonda_pagina.json');
   } catch (e) {}
 }
 
 async function rotinaSondaPaginaMl({ forcar = false } = {}) {
   if (!tokenAffOk()) return { pulada: 'sem token de afiliado' };
-  const desde = Date.now() - ultimaSondaPaginaMl();
+  const marca = lerMarcaSondaMl();
+  const desde = Date.now() - Number(marca?.em || 0);
   if (!forcar && desde < ML_SONDA_PAGINA_MS) {
     const faltamMin = Math.ceil((ML_SONDA_PAGINA_MS - desde) / 60000);
     console.log('[ML] Sonda da pagina adiada: proxima em ~' + faltamMin + ' min');
     return { pulada: 'cadencia', faltamMin };
   }
-  // Marca ANTES de sondar: se a requisicao travar ou o processo cair no meio,
-  // o proximo boot nao pode interpretar isso como "nunca sondei" e tentar de
-  // novo. Perder uma passada custa 24h de atraso; repetir custa reputacao.
-  marcarSondaPaginaMl();
+  // Carimba ANTES de sondar, preservando o veredito anterior: se a requisicao
+  // travar ou o processo cair no meio, o proximo boot nao pode ler isso como
+  // "nunca sondei". Perder uma passada custa 24h; repetir custa reputacao.
+  gravarMarcaSondaMl({ ...(marca || {}), em: Date.now() });
   console.log('[ML] Sonda da pagina de produto: 1 requisicao (cadencia '
     + (ML_SONDA_PAGINA_MS / 3600e3) + 'h)');
-  try { return await verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl); }
-  catch (e) { return { erro: e.message }; }
+
+  const quando = (t) => new Date(t).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  let r;
+  try {
+    // O aviso e decidido AQUI, com o veredito anterior em maos — nao no
+    // callback generico, que nao sabe se o bloqueio e novidade.
+    r = await verificarPaginaProdutoMl(urlSondaProdutoMl(), async (detalhe) => {
+      if (marca?.bloqueado) {
+        const d0 = marca.bloqueadoDesde || marca.em || Date.now();
+        await registrarAlerta({
+          nivel: 'atencao', origem: 'ml', chave: 'ml:antibot-sonda',
+          titulo: 'Sonda diaria: pagina do ML segue bloqueada',
+          corpo: '\u23f3 *Sonda diaria do ML: bloqueio segue ativo*\n\n'
+            + 'Bloqueado desde ' + quando(d0) + '. Nenhuma acao necessaria: '
+            + 'o pipeline nao le pagina (ML_SO_API) e a proxima verificacao e em '
+            + (ML_SONDA_PAGINA_MS / 3600e3) + 'h.\n\n'
+            + 'A API oficial segue atendendo os itens de catalogo normalmente.',
+        }).catch(() => {});
+        return;
+      }
+      await avisarAntibotMl(detalhe);
+    });
+  } catch (e) { r = { erro: e.message }; }
+
+  const bloqueadoAgora = r && r.ok === false && /antibot/i.test(String(r.erro || ''));
+  const liberouAgora   = r && r.ok === true && marca?.bloqueado;
+  if (liberouAgora) {
+    await registrarAlerta({
+      nivel: 'atencao', origem: 'ml', chave: 'ml:antibot-liberado',
+      titulo: 'ML liberou a leitura de paginas',
+      corpo: '\u2705 *A pagina de produto do ML voltou a abrir*\n\n'
+        + 'Bloqueio durou desde ' + quando(marca.bloqueadoDesde || marca.em) + '.\n'
+        + 'O pipeline continua em modo so-API (ML_SO_API) — nada volta a ler '
+        + 'pagina sozinho. Se quiser reavaliar, a decisao e sua.',
+    }).catch(() => {});
+  }
+  gravarMarcaSondaMl({
+    em: Date.now(),
+    bloqueado: !!bloqueadoAgora,
+    bloqueadoDesde: bloqueadoAgora ? (marca?.bloqueadoDesde || Date.now()) : null,
+    ultimoOk: r?.ok ?? null,
+  });
+  return r;
 }
 setInterval(() => { rotinaSondaPaginaMl().catch(()=>{}); }, ML_SONDA_PAGINA_MS);
 setTimeout(() => { rotinaSondaPaginaMl().catch(()=>{}); }, 45000);
@@ -12651,9 +12699,12 @@ app.get('/ml/aff/sonda', async (req, res) => {
 // ?forcar=1 ignora a cadencia diaria — e a unica forma de gastar leitura extra.
 app.get('/ml/sonda-pagina', async (req, res) => {
   const r = await rotinaSondaPaginaMl({ forcar: req.query.forcar === '1' });
-  const u = ultimaSondaPaginaMl();
+  const m = lerMarcaSondaMl();
   res.json({ ok:true, cadenciaHoras: ML_SONDA_PAGINA_MS / 3600e3,
-             ultimaEm: u ? new Date(u).toISOString() : null, resultado: r });
+             ultimaEm: m?.em ? new Date(m.em).toISOString() : null,
+             bloqueado: m?.bloqueado ?? null,
+             bloqueadoDesde: m?.bloqueadoDesde ? new Date(m.bloqueadoDesde).toISOString() : null,
+             resultado: r });
 });
 
 app.get('/ml/sonda', async (req, res) => {
