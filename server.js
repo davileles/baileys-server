@@ -380,12 +380,50 @@ const ML_SONDA_PAGINA_MS = Number(process.env.ML_SONDA_PAGINA_H || 24) * 60 * 60
 // produto capturado volta a bater na pagina bloqueada. 25% de folga cobre
 // atraso de timer e a passada perdida no redeploy.
 definirValidadeAntibotMs(ML_SONDA_PAGINA_MS * 1.25);
-function rotinaSondaPaginaMl() {
-  if (!tokenAffOk()) return;
-  verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
+// Trava de cadencia em DISCO. So o setInterval nao garante "uma por dia": a
+// sonda tambem dispara 45s depois de cada boot, e no Railway todo commit e um
+// boot. Em dia de varios deploys isso virava varias leituras da pagina
+// bloqueada — exatamente o padrao que o antibot mede, adiando a propria saida
+// do bloqueio que a sonda existe para detectar. O carimbo sobrevive ao restart.
+// Caminho resolvido em chamada, nao no carregamento: SESSAO_DIR e declarado
+// bem depois deste bloco e um const em TDZ derrubaria o boot inteiro. A sonda
+// so roda 45s apos subir, entao aqui e sempre seguro.
+function marcaSondaPath() { return SESSAO_DIR + '/ml_sonda_pagina.json'; }
+
+function ultimaSondaPaginaMl() {
+  try {
+    const p = marcaSondaPath();
+    if (!existsSync(p)) return 0;
+    return Number(JSON.parse(readFileSync(p, 'utf-8'))?.em || 0);
+  } catch (e) { return 0; }
 }
-setInterval(rotinaSondaPaginaMl, ML_SONDA_PAGINA_MS);
-setTimeout(rotinaSondaPaginaMl, 45000);
+
+function marcarSondaPaginaMl() {
+  try {
+    escreverAtomico(marcaSondaPath(), JSON.stringify({ em: Date.now() }), 'utf-8');
+  } catch (e) {}
+}
+
+async function rotinaSondaPaginaMl({ forcar = false } = {}) {
+  if (!tokenAffOk()) return { pulada: 'sem token de afiliado' };
+  const desde = Date.now() - ultimaSondaPaginaMl();
+  if (!forcar && desde < ML_SONDA_PAGINA_MS) {
+    const faltamMin = Math.ceil((ML_SONDA_PAGINA_MS - desde) / 60000);
+    console.log('[ML] Sonda da pagina adiada: proxima em ~' + faltamMin + ' min');
+    return { pulada: 'cadencia', faltamMin };
+  }
+  // Marca ANTES de sondar: se a requisicao travar ou o processo cair no meio,
+  // o proximo boot nao pode interpretar isso como "nunca sondei" e tentar de
+  // novo. Perder uma passada custa 24h de atraso; repetir custa reputacao.
+  marcarSondaPaginaMl();
+  console.log('[ML] Sonda da pagina de produto: 1 requisicao (cadencia '
+    + (ML_SONDA_PAGINA_MS / 3600e3) + 'h)');
+  try { return await verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl); }
+  catch (e) { return { erro: e.message }; }
+}
+setInterval(() => { rotinaSondaPaginaMl().catch(()=>{}); }, ML_SONDA_PAGINA_MS);
+setTimeout(() => { rotinaSondaPaginaMl().catch(()=>{}); }, 45000);
+
 
 // ── RADAR MAGAZINE LUIZA ──────────────────────────────────────────────────────
 import {
@@ -12534,6 +12572,15 @@ app.get('/ml/aff/sonda', async (req, res) => {
   if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
   try { res.json(await chamarAff(req.query.url)); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Sonda da pagina sob demanda, para quando o IP mudar e valer confirmar na hora.
+// ?forcar=1 ignora a cadencia diaria — e a unica forma de gastar leitura extra.
+app.get('/ml/sonda-pagina', async (req, res) => {
+  const r = await rotinaSondaPaginaMl({ forcar: req.query.forcar === '1' });
+  const u = ultimaSondaPaginaMl();
+  res.json({ ok:true, cadenciaHoras: ML_SONDA_PAGINA_MS / 3600e3,
+             ultimaEm: u ? new Date(u).toISOString() : null, resultado: r });
 });
 
 app.get('/ml/sonda', async (req, res) => {
