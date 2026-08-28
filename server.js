@@ -151,7 +151,7 @@ import {
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
-  definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl,
+  definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -12634,7 +12634,11 @@ app.get('/sonda-url', async (req, res) => {
 });
 
 // ── MERCADO LIVRE: OAuth ─────────────────────────────────────────────────────
-app.get('/ml/status', (req, res) => res.json({ ok:true, ...estadoMl(), antibot: estadoAntibotMl() }));
+app.get('/ml/status', (req, res) => res.json({ ok:true, ...estadoMl(),
+  antibot: estadoAntibotMl(), antibotLogado: estadoAntibotLogadoMl(),
+  // Leitor de perfil de afiliado: e por ele que todo link de grupo-fonte vira
+  // produto hoje, entao seu estado precisa aparecer no mesmo lugar do resto.
+  social: estadoSocialMl() }));
 
 app.get('/ml/conectar', (req, res) => {
   if (!credenciaisMlOk()) {
