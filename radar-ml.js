@@ -717,14 +717,13 @@ export function saudePaginaMl() { return { ..._saudePagina, antibot: estadoAntib
  *                               quando a pagina volta a abrir.
  */
 export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
-  // Sem leitura de pagina no pipeline, a sonda perde a funcao: ela existia para
-  // descobrir quando a PDP voltava a abrir. Manter uma requisicao diaria a uma
-  // pagina que ninguem mais le seria gastar reputacao a troco de nada.
-  if (ML_SO_API) {
-    _saudePagina = { ..._saudePagina, ok: null, verificadoEm: new Date().toISOString(),
-                     url: urlTeste, erro: null, pulada: 'ML_SO_API' };
-    return _saudePagina;
-  }
+  // UNICA leitura de pagina publica que sobrevive ao ML_SO_API, e de proposito:
+  // sem ela nao ha como saber que o bloqueio saiu — o pipeline inteiro passou a
+  // ignorar a pagina, entao ninguem mais tropecaria na liberacao. Uma requisicao
+  // por dia e ruido desprezivel perto do que o radar fazia (~4 por produto).
+  // A cadencia real e garantida por quem chama (rotinaSondaPaginaMl), que trava
+  // o intervalo em disco: so o setInterval nao bastava, porque a sonda tambem
+  // dispara no boot e o Railway reinicia a cada commit.
   const cookie = cookieAff();
   if (!cookie || !urlTeste) return _saudePagina;
   try {
