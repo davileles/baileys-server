@@ -635,6 +635,38 @@ export async function precoCatalogoApiMl(id) {
   };
 }
 
+/**
+ * Este item rende preco pela via que a operacao permite HOJE?
+ *
+ * Sob ML_SO_API a pagina do produto nao e aberta, entao so ha preco para
+ * catalogo (/p/MLB) e catalogo unificado (/up/MLBU). Anuncio classico
+ * (produto.mercadolivre.com.br/MLB-...-_JM) fica sem cobertura e vira "pulado"
+ * no meio da fila, 20 min depois de o operador ter dado o disparo.
+ *
+ * Este teste antecipa isso para a hora de MONTAR a lista, ao custo de UMA
+ * chamada por item — a mesma que a fila faria de qualquer jeito.
+ *
+ * Erro de rede/429/token NAO acusa o item: melhor deixar passar e ele falhar na
+ * hora do envio do que barrar produto bom por soluco de infra.
+ *
+ * @returns {{coberto:boolean, motivo:string|null}}
+ */
+export async function coberturaApiMl(asin, url) {
+  if (!ML_SO_API) return { coberto: true, motivo: null };
+  if (!apiMlAutorizada())
+    return { coberto: false, motivo: 'API oficial do ML nao autorizada — conecte em /ml/conectar' };
+  const candidatos = idsCatalogoMl(url, url, { id: asin });
+  if (!candidatos.length)
+    return { coberto: false, motivo: 'anuncio classico: a URL nao tem id de catalogo (/p/MLB ou /up/MLBU)' };
+  for (const cat of candidatos) {
+    try { if (await precoCatalogoApiMl(cat)) return { coberto: true, motivo: null }; }
+    catch (e) { return { coberto: true, motivo: null }; }
+  }
+  return { coberto: false,
+           motivo: 'a API oficial nao cobre este anuncio (so catalogo /p/ ou /up/) '
+                 + 'e a leitura de pagina esta desativada (ML_SO_API)' };
+}
+
 // ── TITULO A PARTIR DO TEXTO DO POST ────────────────────────────────────
 // Quando a leitura vem da API e o produto e catalogo unificado (/up/MLBU), nao
 // ha nome: /products/{MLBU} e /items/{id} respondem 403, /reviews aponta para
