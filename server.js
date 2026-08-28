@@ -5542,6 +5542,15 @@ function _jaProcessado(msg) {
 // Buffer circular de diagnostico dos ultimos upserts recebidos (ver /debug-upserts).
 const _debugUpserts = [];
 
+// Contagem de "Aguardando mensagem" RECEBIDOS (messageStubType === 2). E a
+// forma silenciosa de indecifravel: nao lanca excecao de decodificacao, entao
+// errosDescripto nunca ve — em 28/08/2026 o /status jurava errosDecodificacao=0
+// enquanto 4 de 5 stubs no buffer vinham justo de grupo monitorado/fonte do
+// radar. Distingue "nao recebo nada" (surdez de transporte) de "recebo e nao
+// leio" (chaveiro quebrado — em geral autoinfligido por reset de sessao).
+const _stub2PorGrupo = new Map();   // jid -> { n, ultimaEm }
+let _stub2Total = 0;
+
 // jid -> nome do grupo. Preenchido sob demanda para o painel mostrar de onde
 // veio cada oferta sem depender de uma chamada extra ao WhatsApp.
 const NOMES_GRUPOS = new Map();
@@ -7111,9 +7120,15 @@ const WATCHDOG_FIM_H       = 20;
 const WATCHDOG_SILENCIO_MS = 60 * 60 * 1000;     // 60 min sem captura de monitorados
 const WATCHDOG_REAVISO_MS  = 2 * 60 * 60 * 1000;
 
-const SURDEZ_INICIO_H      = 7;                  // janela do sinal de upserts crus (hora SP)
+const SURDEZ_INICIO_H      = 7;                  // horario util (hora SP): limiar curto + reavisos
 const SURDEZ_FIM_H         = 22;
-const SURDEZ_SILENCIO_MS   = 20 * 60 * 1000;     // 20 min sem NENHUM upsert = surdo
+const SURDEZ_SILENCIO_MS   = 20 * 60 * 1000;     // horario util: 20 min sem NENHUM upsert = surdo
+// 28/08/2026: a escada passou a rodar 24h. A janela 7-22h existia para nao
+// confundir madrugada quieta com surdez, mas custou caro em 27/08: a surdez
+// comecou 22h03 SP (3 min depois de a janela fechar) e ficou 9h30 sem cura.
+// Com ~58 grupos de promo o trafego noturno nao e zero — de noite muda so o
+// LIMIAR (mais folgado) e os REAVISOS (silenciados para nao acordar ninguem).
+const SURDEZ_SILENCIO_NOITE_MS = 45 * 60 * 1000; // madrugada: 45 min de silencio = surdo
 const SURDEZ_POS_CURA_MS   = 10 * 60 * 1000;     // espera pos-reconexao antes de alertar
 const SURDEZ_REAVISO_MS    = 60 * 60 * 1000;
 // Valvula de escape: SURDEZ_EXIT=off desliga APENAS o degrau 3 (matar o
@@ -7142,7 +7157,7 @@ function _salvarHealth() {
 // falharam; so o novo pareamento resolveu). Cada degrau alcanca uma camada mais
 // profunda, e so escala se o anterior nao resolveu em SURDEZ_POS_CURA_MS:
 //   ok -> cura1 (reconexao de socket)
-//      -> cura2 (limparSessaoEReconectar: apaga sessions + sender keys)
+//      -> cura2 (reconexao dura: fecha o websocket na marra; chaveiro INTACTO)
 //      -> (process.exit no proprio degrau 2+: Railway sobe container novo)
 //      -> alertado (esgotou o automatico; so novo QR resolve)
 // Voltar a receber upsert em qualquer degrau derruba o estado para 'ok'.
@@ -7176,11 +7191,13 @@ function _persistirSurdez() {
 let _logoutEm            = _health.logoutEm || 0;
 let _logoutAvisoEm       = _health.logoutAvisoEm || 0;
 let _logoutSocketTentado = !!_health.logoutSocketTentado;
+let _logout401Seguidos   = _health.logout401Seguidos || 0;   // 401 seguidos sem 'open' no meio
 
 function _persistirLogout() {
   _health.logoutEm            = _logoutEm;
   _health.logoutAvisoEm       = _logoutAvisoEm;
   _health.logoutSocketTentado = _logoutSocketTentado;
+  _health.logout401Seguidos   = _logout401Seguidos;
   _healthGravadoEm = 0;
   _salvarHealth();
 }
@@ -7285,14 +7302,14 @@ function _ultimaCapturaGlobal() {
 setInterval(async () => {
   try {
     const h = horaSP();
-    if (h < SURDEZ_INICIO_H || h >= SURDEZ_FIM_H) return;
+    const emHorarioUtil = (h >= SURDEZ_INICIO_H && h < SURDEZ_FIM_H);
 
     // ── REAVISO DE LOGOUT ────────────────────────────────────────────────
     // Precisa vir ANTES do bail de !conectado: logout e exatamente o caso em
     // que conectado=false, e era por isso que o alerta nunca se repetia.
     // Nao ha escada de autocura aqui — logout so se resolve com novo pareamento.
     if (_logoutEm && !conectado) {
-      if (Date.now() - _logoutAvisoEm >= SURDEZ_REAVISO_MS) {
+      if (emHorarioUtil && Date.now() - _logoutAvisoEm >= SURDEZ_REAVISO_MS) {
         _logoutAvisoEm = Date.now();
         _persistirLogout();
         const min = Math.round((Date.now() - _logoutEm) / 60000);
@@ -7317,7 +7334,7 @@ setInterval(async () => {
     // O boot so serve de referencia quando nunca houve upsert nenhum.
     const ref      = _health.ultimoUpsertEm || _bootEm;
     const silencio = agora - ref;
-    if (silencio < SURDEZ_SILENCIO_MS) return;
+    if (silencio < (emHorarioUtil ? SURDEZ_SILENCIO_MS : SURDEZ_SILENCIO_NOITE_MS)) return;
 
     // ── Degrau 1: socket novo ────────────────────────────────────────────
     if (_surdezEstado === 'ok') {
@@ -7329,15 +7346,40 @@ setInterval(async () => {
       return;
     }
 
-    // ── Degrau 2: sessions + sender keys ─────────────────────────────────
+    // ── Degrau 2: reconexao dura (chaveiro INTACTO) ──────────────────────
+    // 28/08/2026: este degrau chamava limparSessaoEReconectar(), que apaga
+    // TODAS as sessions e sender keys. So que o gatilho da escada e "zero
+    // upserts crus": se NADA chega, o problema e transporte/registro do device
+    // — chave de grupo nao pode ser a causa, e apagar o chaveiro inteiro so
+    // garantia tempestade de "Aguardando mensagem" (stub 2) quando a conexao
+    // voltasse. Foi a surdez pos-cura de 27-28/08 — o mesmo trauma ja
+    // documentado na cura do errosDescripto, que la virou cirurgia por grupo.
+    // Aqui a licao e mais simples: com zero upserts nao ha cirurgia a fazer.
+    // O degrau 2 agora e uma reconexao mais dura que o degrau 1 (fecha o
+    // websocket na marra, zera timers e espera mais antes de religar),
+    // preservando as chaves. Reset de sessao segue existindo, mas so manual
+    // (POST /reset-sessao).
     if (_surdezEstado === 'cura1') {
       if (agora - _surdezCuraEm < SURDEZ_POS_CURA_MS) return;
       _surdezEstado = 'cura2';
       _surdezCuraEm = agora;
       _persistirSurdez();
-      console.warn('[WATCHDOG] Reconexao nao resolveu. Degrau 2: limpando sessions e sender keys...');
-      _avisarOperador('Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min. Reconexao nao resolveu — limpando sessao (degrau 2 de 3). Sem acao necessaria por enquanto.').catch(() => {});
-      try { await limparSessaoEReconectar(); } catch (e) { console.error('[WATCHDOG] Degrau 2 falhou:', e.message); }
+      console.warn('[WATCHDOG] Reconexao nao resolveu. Degrau 2: derrubando o websocket na marra e religando (chaves preservadas)...');
+      _avisarOperador('Watchdog: socket surdo ha ' + Math.round((agora - ref) / 60000) + ' min. Reconexao nao resolveu — derrubando o websocket e religando do zero, sem tocar nas chaves (degrau 2 de 3). Sem acao necessaria por enquanto.').catch(() => {});
+      try {
+        conectado = false;
+        isConnecting = false;
+        _reconectarTentativas = 0;
+        if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+        if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+        const sockRef = sock;
+        sock = null;
+        if (sockRef) {
+          try { sockRef.ws?.close?.(); } catch (e) {}
+          try { sockRef.end(new Error('watchdog-surdez-degrau2')); } catch (e) {}
+        }
+        _agendarReconexao(8000);
+      } catch (e) { console.error('[WATCHDOG] Degrau 2 falhou:', e.message); }
       return;
     }
 
@@ -7373,7 +7415,7 @@ setInterval(async () => {
         setTimeout(() => { encerrarComFlush('watchdog-surdez-degrau3', 1); }, 1500);
         return;
       }
-    } else if (agora - _surdezAvisoEm < SURDEZ_REAVISO_MS) {
+    } else if (!emHorarioUtil || agora - _surdezAvisoEm < SURDEZ_REAVISO_MS) {
       return;
     } else {
       _surdezAvisoEm = agora;
@@ -7775,6 +7817,7 @@ async function conectar() {
         isConnecting = false;
         _reconectarTentativas = 0;
         _erros500Consecutivos = 0;
+        _logout401Seguidos = 0;
         if (_logoutEm) {
           const min = Math.round((Date.now() - _logoutEm) / 60000);
           _logoutEm = 0; _logoutAvisoEm = 0; _logoutSocketTentado = false;
@@ -7808,12 +7851,35 @@ async function conectar() {
           // ambos existem para pegar socket VIVO e surdo — queda real estava
           // delegada a este ramo, que nao avisava nada. Os tres sinais
           // concordavam em ficar quietos e /status seguia com surdezEstado 'ok'.
-          console.log('[WA] Logout detectado. Escaneie o QR novamente em /qr');
+          // 28/08/2026: um 401 sozinho NAO prova sessao morta. Em 27 e 28/08
+          // o 401 chegou ~1h depois do degrau 3 da escada e a conexao voltou
+          // SOZINHA em 1 minuto — logout real so volta com novo pareamento;
+          // era 401 transitorio pos-churn de reconexao. E este ramo apagava
+          // creds.json + pre-keys na PRIMEIRA ocorrencia: o pareamento so
+          // sobreviveu porque o flush do auth state em memoria regravou o
+          // creds.json depois do delete (corrida ganha por sorte). Agora o
+          // 1o 401 reconecta com as credenciais atuais; so o 2o 401 SEGUIDO
+          // (sem 'open' no meio) confirma a sessao revogada — e ai sim
+          // apagamos tudo e subimos o socket de QR.
           _reconectarTentativas = 0;
+          _logout401Seguidos++;
           _logoutEm = Date.now();
           _logoutAvisoEm = Date.now();
           _persistirLogout();
 
+          if (_logout401Seguidos < 2) {
+            console.log('[WA] 401 recebido (1a ocorrencia). Tentando reconectar com as credenciais atuais antes de assumir logout.');
+            _avisarOperador(
+              'Atencao — WhatsApp caiu com codigo 401 (possivel logout).\n\n'
+              + 'Pode ser transitorio (pos-instabilidade): vou reconectar com as '
+              + 'credenciais atuais. Se vier um segundo 401 em seguida, a sessao '
+              + 'morreu de verdade e o QR sera preparado automaticamente.'
+            ).catch(() => {});
+            _agendarReconexao(8000);
+            return;
+          }
+
+          console.log('[WA] Logout confirmado (2o 401 seguido). Escaneie o QR novamente em /qr');
           _avisarOperador(
             'CRITICO — WhatsApp DESCONECTADO (logout)\n\n'
             + 'A sessao foi encerrada do lado do WhatsApp. Reconexao automatica NAO '
@@ -7900,6 +7966,13 @@ async function conectar() {
             stub: mm.messageStubType ?? null,
           });
           if (_debugUpserts.length > 60) _debugUpserts.shift();
+          if (mm.messageStubType === 2) {
+            _stub2Total++;
+            const jid2 = mm.key?.remoteJid || '(sem jid)';
+            const r2 = _stub2PorGrupo.get(jid2) || { n: 0, ultimaEm: 0 };
+            r2.n++; r2.ultimaEm = Date.now();
+            _stub2PorGrupo.set(jid2, r2);
+          }
         }
       } catch (e) {}
       registrarUpsertHealth();
@@ -8756,7 +8829,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
