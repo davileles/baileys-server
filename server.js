@@ -2165,7 +2165,16 @@ const PROGRAMAS_CPM = {
 // afiliado) vive em painel-cdv/links.json e e resolvido pelo endpoint /ir do
 // proxy. Para trocar um destino NAO mexa aqui: edite links.json.
 // ATENCAO: manter os slugs iguais aos de gerador-cdv/index.html (PROGRAMAS_SLUG).
-const IR_BASE = 'https://ir.clubedoviajante.com.br/';
+//
+// TEMPORARIO (28/08/2026): ir.clubedoviajante.com.br NAO esta cadastrado como
+// custom domain no Railway -- o plano permite 2 e os slots estao ocupados por
+// grupo.tudosobrepromos.com e ir.ticapromos.com.br. Enquanto isso os links saem
+// no dominio nativo do proxy: mesmos slugs, mesmo links.json, mesmos cliques em
+// /ir-stats, mesmos params bo/bd/bi de busca. So perde a mascara. Quando
+// grupo.tudosobrepromos.com for desligado, cadastre ir.clubedoviajante.com.br no
+// Railway, ajuste o CNAME na Hostinger e reverta esta linha.
+// ESPELHAR a reversao em gerador-cdv/index.html (IR_BASE), que tem a mesma const.
+const IR_BASE = 'https://cdv-proxy-production.up.railway.app/ir/';
 const PROGRAMAS_SLUG = {
   'Smiles':'smiles',
   'Azul Fidelidade':'azul',
