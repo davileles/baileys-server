@@ -151,7 +151,7 @@ import {
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
-  definirValidadeAntibotMs, estadoAntibotLogadoMl,
+  definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -11395,6 +11395,35 @@ app.get('/listas', (req, res) => {
              agoraSP: new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()) });
 });
 
+// ── COBERTURA DE PRECO ANTES DE DISPARAR ────────────────────────────────────
+// Item do ML sem catalogo nao tem preco enquanto a leitura de pagina estiver
+// desligada: ele entra na fila, espera a vez e vira "pulado" 20 min depois. Aqui
+// o operador descobre ANTES de confirmar, quando ainda da para trocar o produto.
+// So o ML precisa do teste — Amazon e Shopee leem preco por outra via.
+const COBERTURA_MAX_ITENS = 40;   // teto: 1 requisicao por item, na hora do clique
+
+async function itensSemCoberturaMl(produtos) {
+  const fora = [];
+  for (const asin of (produtos || []).slice(0, COBERTURA_MAX_ITENS)) {
+    const it = itemVitrine(asin);
+    if (!it || String(it.loja || '') !== 'Mercado Livre') continue;
+    try {
+      const r = await coberturaApiMl(asin, it.url);
+      if (!r.coberto) fora.push({ asin, nome: it.nome || asin, motivo: r.motivo });
+    } catch (e) { /* soluco de infra nao acusa o item */ }
+  }
+  return fora;
+}
+
+// Chamado pelo painel antes do confirm() do disparo. Nao altera nada.
+app.post('/listas/checar-cobertura', async (req, res) => {
+  const produtos = Array.isArray(req.body?.produtos) ? req.body.produtos.filter(Boolean) : [];
+  if (!produtos.length) return res.json({ ok:true, semCobertura: [] });
+  try { res.json({ ok:true, conferidos: Math.min(produtos.length, COBERTURA_MAX_ITENS),
+                   semCobertura: await itensSemCoberturaMl(produtos) }); }
+  catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.post('/listas', (req, res) => {
   try { res.json({ ok:true, lista: salvarLista(req.body || {}) }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
@@ -11424,6 +11453,12 @@ app.post('/listas/:id/disparar', async (req, res) => {
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
   const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
+  // Aviso, nao bloqueio: quem dispara decide se troca o produto ou toca assim.
+  let semCobertura = [];
+  try { semCobertura = await itensSemCoberturaMl(lista.produtos); } catch (e) {}
+  if (semCobertura.length) console.warn('[LISTA] "' + lista.nome + '" — ' + semCobertura.length
+    + ' item(ns) do ML sem cobertura de preco; serao pulados: '
+    + semCobertura.map(x => x.asin).join(', '));
   const minutos  = (lista.produtos.length - 1) * lista.intervaloMin;
   const inicioTs = aguardando ? inicio : Date.now();
   const prev     = previsaoTerminoLista(lista, inicioTs, lista.produtos.length);
@@ -11431,6 +11466,7 @@ app.post('/listas/:id/disparar', async (req, res) => {
     + ' — ' + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo, termina '
     + dataHoraSP(prev.terminaEm) + ' SP' + (prev.cabeNoDia ? '' : ' (fila vira o dia)') + '.');
   res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos,
+             semCobertura,
              aguardando, iniciarEm: inicioTs,
              iniciaAs: relogioSP(inicioTs),
              janelas: janelasDaLista(lista),
@@ -11479,8 +11515,14 @@ app.post('/listas/disparo-unico', async (req, res) => {
       + ' — ' + produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
     const inicioTs = aguardando ? inicio : Date.now();
     const prev     = previsaoTerminoLista(lista, inicioTs, produtos.length);
+    let semCobertura = [];
+    try { semCobertura = await itensSemCoberturaMl(produtos); } catch (e) {}
+    if (semCobertura.length) console.warn('[LISTA] Envio unico — ' + semCobertura.length
+      + ' item(ns) do ML sem cobertura de preco; serao pulados: '
+      + semCobertura.map(x => x.asin).join(', '));
     res.json({ ok:true, lista: atualizada, produtos: produtos.length,
                duracaoMin: (produtos.length - 1) * lista.intervaloMin,
+               semCobertura,
                aguardando, iniciarEm: inicioTs,
                iniciaAs: relogioSP(inicioTs),
                janelas: janelasDaLista(lista),
