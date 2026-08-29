@@ -873,6 +873,28 @@ export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
  * @param {object} [opcoes.id]  MLB do anuncio, quando quem chama ja o tem
  *   (vitrine, monitor): e o que permite o fallback pela API em URL /up/MLBU.
  */
+/**
+ * Card do perfil social no mesmo formato que a leitura de pagina e a da API
+ * oficial devolvem. Sem trilha e sem cupom do anuncio: o card nao traz nenhum
+ * dos dois, e inventar categoria estragaria a etiqueta de nicho.
+ */
+function dadosDoCardSocial(card) {
+  return {
+    titulo: card.titulo || null,
+    preco: card.preco,
+    precoDe: card.precoDe || null,
+    imagem: card.imagem || null,
+    disponivel: true,
+    precoDeFonte: card.precoDe ? FONTE_SOCIAL : null,
+    precoDeDescartes: [], descontoDeclarado: null,
+    marca: '', nota: null, avaliacoes: null, vendedor: null,
+    achouLd: false, trilha: null, cuponsPagina: [],
+    freteGratis: !!card.freteGratis,
+    catalogoId: card.catalogoId || null,
+    fonte: 'perfil-social',
+  };
+}
+
 export async function buscarDadosProdutoMl(url, opcoes = {}) {
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
@@ -896,6 +918,15 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   if (ML_SO_API || (estadoAntibotMl().confirmadoAgora && !opcoes.forcarPagina)) {
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
     if (viaApi) return { ...viaApi, bloqueado: estadoAntibotMl().confirmadoAgora, urlFinal: alvoUrl };
+    // Anuncio classico: a API nao cobre e a pagina nao sera aberta. Sobra o card
+    // que o perfil social ja entregou na leitura anterior — preco renderizado
+    // pelo proprio ML, sem requisicao nova e sem depender do texto do post.
+    if (opcoes.card?.preco) {
+      console.log('[ML] ' + (idDeUrl(alvoUrl) || alvoUrl) + ' — preco do card do perfil social: R$ '
+        + opcoes.card.preco);
+      return { ...dadosDoCardSocial(opcoes.card), urlFinal: alvoUrl,
+               bloqueado: estadoAntibotMl().confirmadoAgora };
+    }
     if (ML_SO_API) {
       throw new Error(ERRO_SO_API + (apiMlAutorizada()
         ? ' — e a API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
@@ -1273,6 +1304,102 @@ export function formatarOfertaMl(p, opcoes = {}) {
   return renderTemplate(tpl?.corpo || '', vars);
 }
 
+// ── CARD DO PERFIL SOCIAL (polycard) ──────────────────────────────────────
+// O HTML do perfil embute o card do produto ja renderizado pelo proprio ML:
+//   metadata: { id: MLB do anuncio, product_id: MLB de catalogo,
+//               user_product_id: MLBU, url: permalink }
+//   components: [{ type:'price', price:{ previous_price:{value}, current_price:{value} } },
+//                { type:'shipping', shipping:{ text:'Frete gratis' } }, ...]
+//
+// Isto vale ouro para o anuncio classico: /items/{id} responde 403 e
+// /products/{id}/items da 404, entao sem o card o item ficava sem preco e virava
+// "pulado". Aqui o numero vem do proprio ML — nao do texto do post de terceiro,
+// que pode estar velho ou errado.
+//
+// A pagina traz VARIAS listas de polycards (o destaque e os blocos de
+// recomendacao). Pegar o card errado manda preco de outro produto para o grupo,
+// entao o casamento e sempre pelo id do item que o CTA "Ir para produto" aponta;
+// sem esse casamento, nao ha preco.
+
+/** Recorta o JSON balanceado que comeca em `inicio` ({ ou [), respeitando strings. */
+function recortarJson(texto, inicio) {
+  const abre = texto[inicio];
+  const fecha = abre === '[' ? ']' : '}';
+  let nivel = 0, emString = false, escapado = false;
+  for (let i = inicio; i < texto.length; i++) {
+    const ch = texto[i];
+    if (escapado) { escapado = false; continue; }
+    if (ch === '\\') { escapado = true; continue; }
+    if (ch === '"') { emString = !emString; continue; }
+    if (emString) continue;
+    if (ch === abre) nivel++;
+    else if (ch === fecha) { nivel--; if (!nivel) return texto.slice(inicio, i + 1); }
+  }
+  return null;
+}
+
+/** Primeiro no da arvore que satisfaz `fn`. Os componentes mudam de lugar entre
+ *  versoes do card; procurar por forma custa menos que perseguir o caminho. */
+function acharNo(no, fn, profundidade = 0) {
+  if (!no || typeof no !== 'object' || profundidade > 8) return null;
+  if (fn(no)) return no;
+  for (const v of Array.isArray(no) ? no : Object.values(no)) {
+    const achado = acharNo(v, fn, profundidade + 1);
+    if (achado) return achado;
+  }
+  return null;
+}
+
+const numeroOuNulo = (v) => (Number(v) > 0 ? Number(v) : null);
+
+// Rotulo da origem do preco "de", para o relatorio saber de onde veio o numero.
+const FONTE_SOCIAL = 'card-perfil-social';
+
+/**
+ * Preco e ids do card cujo item bate com `itemId` (MLB do anuncio) ou, na falta
+ * dele, com `catalogoId`. Devolve null quando nao ha card correspondente.
+ */
+function dadosDoPolycard(html, itemId, catalogoId) {
+  if (!itemId && !catalogoId) return null;
+  const re = /"polycards"\s*:\s*\[/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const bruto = recortarJson(html, m.index + m[0].length - 1);
+    if (!bruto) continue;
+    let cards;
+    try { cards = JSON.parse(bruto); } catch (e) { continue; }
+    if (!Array.isArray(cards)) continue;
+    const card = cards.find((k) => {
+      const md = k?.metadata || {};
+      return (itemId && String(md.id || '').toUpperCase() === itemId)
+          || (catalogoId && String(md.product_id || '').toUpperCase() === catalogoId)
+          || (catalogoId && String(md.user_product_id || '').toUpperCase() === catalogoId);
+    });
+    if (!card) continue;
+
+    const noPreco = acharNo(card, (n) => n?.type === 'price' && n?.price?.current_price);
+    const noFrete = acharNo(card, (n) => n?.type === 'shipping' && n?.shipping?.text);
+    const preco = numeroOuNulo(noPreco?.price?.current_price?.value);
+    if (!preco) return null;   // card sem preco nao serve de fonte
+    const de = numeroOuNulo(noPreco?.price?.previous_price?.value);
+    return {
+      preco,
+      precoDe: de && de > preco ? de : null,
+      freteGratis: /gr[aá]tis/i.test(noFrete?.shipping?.text || ''),
+      itemId: String(card.metadata?.id || '').toUpperCase() || null,
+      catalogoId: String(card.metadata?.product_id || card.metadata?.user_product_id || '').toUpperCase() || null,
+      fonte: 'perfil-social',
+    };
+  }
+  return null;
+}
+
+/** MLB do anuncio escondido na URL do CTA (pdp_filters=item_id%3AMLB..., wid=MLB...). */
+function itemIdDaUrlCta(u) {
+  const m = String(u || '').match(/(?:item_id(?:%3A|:)|wid=)(MLB\d{6,})/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
 /**
  * Links de afiliado de terceiros (meli.la -> /social/{tag}) nao apontam para o
  * produto: abrem o perfil social do divulgador, com o item compartilhado no topo
@@ -1329,7 +1456,13 @@ export async function produtoDePerfilSocial(urlSocial) {
   if (cta) {
     const u = cta[1].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
     const abs = /^https?:\/\//i.test(u) ? u : 'https://' + u.replace(/^\/+/, '');
-    return { url: abs, titulo: tituloAlvo };
+    // O card do destaque tem preco, frete e o id de catalogo do mesmo item que
+    // este botao aponta. Sem casamento de id nao ha preco — melhor voltar so com
+    // a URL e deixar o resto do pipeline decidir do que arriscar numero errado.
+    const card = dadosDoPolycard(html, itemIdDaUrlCta(cta[1]), idProdutoMl(abs));
+    // og:image do perfil e a foto do item em DESTAQUE — a mesma que o CTA aponta.
+    return { url: abs, titulo: tituloAlvo, imagem: metaConteudo(html, 'og:image') || null,
+             ...(card || {}) };
   }
 
   // O link do botao "Ir para produto". Aceita item, catalogo (/p/) e catalogo
@@ -1356,7 +1489,9 @@ export async function produtoDePerfilSocial(urlSocial) {
   }
 
   const url = escolhido.startsWith('http') ? escolhido : 'https://www.mercadolivre.com.br' + escolhido;
-  return { url: url.split('?')[0], titulo: tituloAlvo };
+  const limpa = url.split('?')[0];
+  const card = dadosDoPolycard(html, itemIdDaUrlCta(url) || idDeUrl(limpa), idProdutoMl(limpa));
+  return { url: limpa, titulo: tituloAlvo, ...(card || {}) };
 }
 
 /**
@@ -1395,8 +1530,10 @@ export async function processarTextoMl(texto, opcoes = {}) {
   // Encurtador precisa virar URL canonica antes de ir para o painel.
   const canonicas = [];
   const dicasMlb = new Map();   // url canonica -> MLB do anuncio, quando a URL trazia
+  const cardsSocial = new Map();// url canonica -> preco/frete lidos do card do perfil
   for (const u of urls) {
     let alvo = u;
+    let card = null;
     if (!idProdutoMl(alvo)) {
       try { alvo = await resolverLinkMl(alvo); }
       catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); continue; }
@@ -1406,8 +1543,14 @@ export async function processarTextoMl(texto, opcoes = {}) {
       try {
         const prod = await produtoDePerfilSocial(alvo);
         if (!prod) { console.warn('[ML] Perfil social sem produto identificavel:', u); continue; }
-        console.log('[ML] Perfil social -> produto: ' + prod.titulo);
+        console.log('[ML] Perfil social -> produto: ' + prod.titulo
+          + (prod.preco ? ' (card: R$ ' + prod.preco + ')' : ' (card sem preco)'));
         alvo = prod.url;
+        // Guarda o card: para anuncio classico ele e a UNICA fonte de preco.
+        if (prod.preco) card = { preco: prod.preco, precoDe: prod.precoDe || null,
+                                 titulo: prod.titulo || null, imagem: prod.imagem || null,
+                                 freteGratis: !!prod.freteGratis,
+                                 catalogoId: prod.catalogoId || null };
       } catch (e) { console.warn('[ML] Falha no perfil social:', e.message); continue; }
     }
     if (idProdutoMl(alvo)) {
@@ -1416,6 +1559,7 @@ export async function processarTextoMl(texto, opcoes = {}) {
       // wid/MLB do anuncio some na canonizacao; guardado para o fallback pela API.
       const mlb = idDeUrl(alvo) || idDeUrl(u);
       if (mlb && !dicasMlb.has(canon)) dicasMlb.set(canon, mlb);
+      if (card && !cardsSocial.has(canon)) cardsSocial.set(canon, card);
     }
     else console.warn('[ML] Sem id de produto apos resolver:', u);
   }
@@ -1446,7 +1590,8 @@ export async function processarTextoMl(texto, opcoes = {}) {
       await new Promise(r => setTimeout(r, pausaPdpMs));
     }
     primeira = false;
-    try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url, { id: dicasMlb.get(url) || null })); }
+    try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url, {
+            id: dicasMlb.get(url) || null, card: cardsSocial.get(url) || null })); }
     catch (e) { falhaDados.set(url, e.message); }
   }
 
