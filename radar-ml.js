@@ -1806,6 +1806,12 @@ export async function processarTextoMl(texto, opcoes = {}) {
       nota: dados.nota, avaliacoes: dados.avaliacoes,
       dealTermina: null, ehDeal: false,
       trilha: dados.trilha || null,
+      // De onde vieram preco e trilha: pagina, API oficial, card do perfil de
+      // terceiro ou card do nosso proprio perfil. Aparece no painel de criar
+      // oferta e no diagnostico — sem isso nao da para saber por que um item
+      // saiu sem trilha ou com preco diferente do que a API mostra.
+      fonteDados: dados.fonte || null,
+      trilhaFonte: dados.trilhaFonte || null,
       loja: 'Mercado Livre',
     };
 
