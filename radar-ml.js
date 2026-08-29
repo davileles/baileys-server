@@ -675,14 +675,7 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
     // Trilha da categoria: /categories/{id} e publico e responde mesmo quando o
     // produto nao tem nome. Vira a prova de que o titulo tirado do post fala do
     // mesmo produto (ver tituloDoTextoMl) e alimenta o classificador de nicho.
-    let trilha = null;
-    if (venc.category_id) {
-      try {
-        const cat = await apiMl('/categories/' + encodeURIComponent(venc.category_id));
-        const cam = (cat?.path_from_root || []).map(x => x?.name).filter(Boolean);
-        if (cam.length) trilha = cam.join(' > ');
-      } catch (e) { console.warn('[ML] API oficial /categories/' + venc.category_id + ':', e.message); }
-    }
+    const trilha = await trilhaDeCategoriaMl(venc.category_id);
 
     const preco = Number(venc.price);
     const original = Number(venc.original_price) || null;
@@ -702,6 +695,47 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
     };
   }
   return null;
+}
+
+// ── TRILHA DE CATEGORIA PELA API OFICIAL ──────────────────────────────────
+// A trilha e o que da confianca ao classificador de nicho: sem ela a etiqueta
+// sai so pelo titulo, e cadeirinha de bebe e esmerilhadeira caem no mesmo balde.
+// Vinha da pagina do produto; com a pagina bloqueada, vem daqui.
+//
+// O cache e por categoria, nao por produto: sao poucas dezenas de categorias
+// para milhares de produtos, e /categories nunca muda dentro de um dia.
+const _cacheTrilha = new Map();
+
+/** Trilha ('Informatica > Monitores > ...') a partir do id de categoria. */
+async function trilhaDeCategoriaMl(categoryId) {
+  if (!categoryId) return null;
+  if (_cacheTrilha.has(categoryId)) return _cacheTrilha.get(categoryId);
+  let trilha = null;
+  try {
+    const cat = await apiMl('/categories/' + encodeURIComponent(categoryId));
+    const cam = (cat?.path_from_root || []).map(x => x?.name).filter(Boolean);
+    if (cam.length) trilha = cam.join(' > ');
+  } catch (e) { console.warn('[ML] API oficial /categories/' + categoryId + ':', e.message); }
+  _cacheTrilha.set(categoryId, trilha);
+  return trilha;
+}
+
+/**
+ * Trilha de um ANUNCIO CLASSICO, pelo id de catalogo que o card do perfil
+ * social entrega em `product_id`. E o unico caminho que sobrou: /items/{id}
+ * responde 403 para anuncio de terceiro e a pagina esta bloqueada. Custa no
+ * maximo 2 chamadas a API oficial, e a segunda quase sempre vem do cache.
+ */
+async function trilhaPorCatalogoMl(catalogoId) {
+  const cat = /^MLBU?\d{5,}$/i.test(String(catalogoId || '')) ? String(catalogoId).toUpperCase() : null;
+  if (!cat || !apiMlAutorizada()) return null;
+  try {
+    const r = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=1');
+    return await trilhaDeCategoriaMl((r?.results || [])[0]?.category_id);
+  } catch (e) {
+    console.warn('[ML] trilha por catalogo ' + cat + ':', e.message);
+    return null;
+  }
 }
 
 /**
@@ -897,10 +931,13 @@ export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
  */
 /**
  * Card do perfil social no mesmo formato que a leitura de pagina e a da API
- * oficial devolvem. Sem trilha e sem cupom do anuncio: o card nao traz nenhum
- * dos dois, e inventar categoria estragaria a etiqueta de nicho.
+ * oficial devolvem. Sem cupom do anuncio — esse so a pagina declara; o cupom
+ * citado no post continua sendo casado com a base por melhorCupom().
  */
-function dadosDoCardSocial(card) {
+async function dadosDoCardSocial(card) {
+  // O card nao traz categoria, mas traz o id de catalogo — e por ele a API
+  // oficial devolve a trilha sem tocar em pagina nenhuma.
+  const trilha = await trilhaPorCatalogoMl(card.catalogoId);
   return {
     titulo: card.titulo || null,
     preco: card.preco,
@@ -910,7 +947,7 @@ function dadosDoCardSocial(card) {
     precoDeFonte: card.precoDe ? FONTE_SOCIAL : null,
     precoDeDescartes: [], descontoDeclarado: null,
     marca: '', nota: null, avaliacoes: null, vendedor: null,
-    achouLd: false, trilha: null, cuponsPagina: [],
+    achouLd: false, trilha, cuponsPagina: [],
     freteGratis: !!card.freteGratis,
     catalogoId: card.catalogoId || null,
     fonte: 'perfil-social',
@@ -946,7 +983,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
     if (opcoes.card?.preco) {
       console.log('[ML] ' + (idDeUrl(alvoUrl) || alvoUrl) + ' — preco do card do perfil social: R$ '
         + opcoes.card.preco);
-      return { ...dadosDoCardSocial(opcoes.card), urlFinal: alvoUrl,
+      return { ...(await dadosDoCardSocial(opcoes.card)), urlFinal: alvoUrl,
                bloqueado: estadoAntibotMl().confirmadoAgora };
     }
     if (ML_SO_API) {
