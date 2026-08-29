@@ -8906,7 +8906,7 @@ function forcarReconexao(motivo) {
   _agendarReconexao(1000);
 }
 
-// ── CURA POR CONFLITO (takeover) ─────────────────────────────────────────────
+// ── CURA POR CONFLITO (takeover) ───────────────────────────────────────────── (redeploy 00:16Z)
 // 28/08/2026, terceiro incidente do dia: a renovacao de identidade reconecta
 // mas NAO cura a surdez — nem o eco para o proprio numero chega. Isso isolou o
 // ingrediente ativo da unica cura ja observada: nao era o apagao local de
