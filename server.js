@@ -12923,8 +12923,13 @@ app.get('/ml/item', async (req, res) => {
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// leitura=1 para aqui antes do createLink: da para conferir preco e titulo de um
+// link de grupo sem gerar link de afiliado — o que grudaria a etiqueta de nicho
+// num produto que talvez nem seja divulgado.
 app.post('/ml/testar', async (req, res) => {
-  try { res.json({ ok:true, resultados: await processarTextoMl(req.body?.texto || '') }); }
+  const leitura = req.body?.leitura === true || String(req.query.leitura || '') === '1';
+  try { res.json({ ok:true, leitura,
+                   resultados: await processarTextoMl(req.body?.texto || '', { leitura }) }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
