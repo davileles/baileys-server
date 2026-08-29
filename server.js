@@ -13002,7 +13002,10 @@ function chaveLojaSimples(s) {
 }
 
 function pipelineDoLink(texto) {
-  if (ehLinkMl(texto))     return { loja: 'Mercado Livre',  run: t => processarTextoMl(t) };
+  // viaNossoLink: link colado a mao pode ser anuncio classico, que hoje so tem
+  // preco pelo card do nosso proprio perfil social. Vale aqui e nao no radar
+  // porque o operador ja decidiu divulgar este item.
+  if (ehLinkMl(texto))     return { loja: 'Mercado Livre',  run: t => processarTextoMl(t, { viaNossoLink: true }) };
   if (ehLinkShopee(texto)) return { loja: 'Shopee',         run: t => processarTextoShopee(t) };
   if (ehLinkMagalu(texto)) return { loja: 'Magazine Luiza', run: t => processarTextoMagalu(t) };
   // Rede Awin: cobre os 80+ anunciantes afiliados, cada um com sua propria
