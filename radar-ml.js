@@ -2212,6 +2212,33 @@ export async function resolverLinhaVitrineMl(linha) {
 const NOME_PROVISORIO_ML = /^Produto MLB\d+$/;
 
 /**
+ * Ultima fonte de preco para anuncio classico colado a mao no painel.
+ *
+ * O caminho: gera o NOSSO link de afiliado para a URL e le o card no NOSSO
+ * perfil social. O createLink nao devolve dado nenhum de produto — mas o
+ * short_url que ele cria aponta para /social/{nossa-conta}?ref=..., e essa
+ * pagina renderiza o card do item compartilhado, com preco, preco-de e frete.
+ * Verificado em producao: o nosso perfil traz o card igual ao de terceiro.
+ *
+ * So vale para o fluxo da vitrine, onde o link de afiliado seria gerado logo
+ * em seguida de qualquer forma. No radar isso NAO se aplica: la o link ja chega
+ * como perfil social e o card e colhido na resolucao, sem gerar nada.
+ *
+ * A geracao usa o mesmo titulo que o fluxo usaria adiante, entao a etiqueta de
+ * nicho sai igual e a segunda chamada ao painel e idempotente.
+ */
+export async function dadosPeloNossoLinkMl(url, titulo = '') {
+  const mapa = await gerarLinksAfiliadoMl([url], { titulos: { [url]: titulo || '' } });
+  const info = mapa.get(url) || mapa.get(idDeUrl(url)) || {};
+  if (!info.link) throw new Error(info.erro || 'painel de afiliados nao devolveu link para esta URL');
+  const r = await resolverLinkMlComCard(info.link);
+  if (!r.card?.preco) throw new Error('o card do nosso perfil social nao trouxe preco para este anuncio');
+  const card = { ...r.card, titulo: r.card.titulo || r.titulo || titulo || null };
+  return { dados: { ...(await dadosDoCardSocial(card)), urlFinal: r.url, fonte: 'nosso-perfil-social' },
+           link: info.link, linkLongo: info.linkLongo, codigoBusca: info.codigoBusca };
+}
+
+/**
  * Monta as mensagens da vitrine para itens do ML no momento do disparo: gera o
  * link de afiliado, le preco e estoque da pagina agora, aplica o cupom (o
  * informado no disparo vence o vinculado ao produto) e renderiza o template.
@@ -2231,8 +2258,17 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
     let dados;
     try { dados = await buscarDadosProdutoMl(bruta, { id: salvo.asin }); }
     catch (e) {
-      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'dados do produto: ' + e.message });
-      continue;
+      // Anuncio classico colado a mao: sem perfil de terceiro para ler, sem
+      // catalogo na API e sem pagina. Sobra passar pelo nosso proprio link.
+      try {
+        const viaNosso = await dadosPeloNossoLinkMl(url, salvo.nome || '');
+        dados = viaNosso.dados;
+        console.log('[ML] ' + salvo.asin + ' — preco pelo card do NOSSO perfil social: R$ ' + dados.preco);
+      } catch (e2) {
+        descartados.push({ asin: salvo.asin, nome: salvo.nome,
+          motivo: 'dados do produto: ' + e.message + ' — e pelo nosso link: ' + e2.message });
+        continue;
+      }
     }
 
     // Link curto (meli.la, /sec/) nao entra no createLink: o painel responde
