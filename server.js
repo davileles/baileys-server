@@ -13080,6 +13080,11 @@ app.post('/mkt/montar', async (req, res) => {
       desconto: p.desconto || 0, disponivel: p.disponivel !== false,
       vendedor: p.vendedor || null, nota: p.nota || null, avaliacoes: p.avaliacoes || null,
       asin: p.asin || null, codigoBusca: p.codigoBusca || null,
+      // Procedencia: de onde saiu o preco e a categoria. Com a pagina do ML
+      // bloqueada ha varias fontes possiveis, e o operador precisa saber se
+      // esta olhando dado da API oficial ou de card de perfil.
+      trilha: p.trilha || null, fonteDados: p.fonteDados || null,
+      trilhaFonte: p.trilhaFonte || null, precoDeFonte: p.precoDeFonte || null,
     },
     cupom: cupom ? { codigo: cupom.reg.codigo, tipo: cupom.reg.tipo, valor: cupom.reg.valor,
                      minimo: cupom.reg.minimo, maximo: cupom.reg.maximo, limite: cupom.reg.limite,
