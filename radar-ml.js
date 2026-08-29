@@ -1685,7 +1685,27 @@ export async function processarTextoMl(texto, opcoes = {}) {
     primeira = false;
     try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url, {
             id: dicasMlb.get(url) || null, card: cardsSocial.get(url) || null })); }
-    catch (e) { falhaDados.set(url, e.message); }
+    catch (e) {
+      // Link colado a mao no painel (/mkt/montar): nao passou por perfil de
+      // terceiro, entao nao ha card — e anuncio classico nao tem catalogo na
+      // API nem pagina para ler. Sobra passar pelo NOSSO proprio link, cujo
+      // perfil social renderiza o card do item.
+      //
+      // Fica atras de opcao porque gera link de afiliado antes da hora: no radar
+      // automatico isso queimaria a etiqueta de nicho de produtos que talvez nem
+      // sejam divulgados. O titulo vem do slug da URL justamente para a etiqueta
+      // sair certa mesmo sem ter lido o produto ainda.
+      if (opcoes.viaNossoLink) {
+        try {
+          const viaNosso = await dadosPeloNossoLinkMl(url, nomeDoSlugMl(url));
+          dadosPorUrl.set(url, viaNosso.dados);
+          console.log('[ML] ' + (idProdutoMl(url) || url) + ' — preco pelo card do NOSSO perfil social: R$ '
+            + viaNosso.dados.preco);
+          continue;
+        } catch (e2) { falhaDados.set(url, e.message + ' — e pelo nosso link: ' + e2.message); continue; }
+      }
+      falhaDados.set(url, e.message);
+    }
   }
 
   // Leitura pela API de catalogo unificado (/up/MLBU) nao tem nome — a API nao
