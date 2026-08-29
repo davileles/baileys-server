@@ -1356,11 +1356,20 @@ const numeroOuNulo = (v) => (Number(v) > 0 ? Number(v) : null);
 const FONTE_SOCIAL = 'card-perfil-social';
 
 /**
- * Preco e ids do card cujo item bate com `itemId` (MLB do anuncio) ou, na falta
- * dele, com `catalogoId`. Devolve null quando nao ha card correspondente.
+ * Preco e ids do card cujo produto bate com QUALQUER um dos ids informados.
+ *
+ * O casamento e cruzado de proposito: no anuncio classico o id que a URL entrega
+ * (MLB-3652376861) aparece no card como `metadata.id`, enquanto no catalogo o
+ * mesmo lugar da URL entrega o `product_id`. Comparar cada id so com o campo
+ * "equivalente" fazia o anuncio classico — justamente o caso que este card veio
+ * resolver — nao casar com nada e voltar sem preco.
+ *
+ * Devolve null quando nao ha card correspondente: preco de outro produto no
+ * grupo e pior que produto sem preco.
  */
-function dadosDoPolycard(html, itemId, catalogoId) {
-  if (!itemId && !catalogoId) return null;
+function dadosDoPolycard(html, ...ids) {
+  const alvos = new Set(ids.filter(Boolean).map(x => String(x).toUpperCase()));
+  if (!alvos.size) return null;
   const re = /"polycards"\s*:\s*\[/g;
   let m;
   while ((m = re.exec(html))) {
@@ -1371,9 +1380,8 @@ function dadosDoPolycard(html, itemId, catalogoId) {
     if (!Array.isArray(cards)) continue;
     const card = cards.find((k) => {
       const md = k?.metadata || {};
-      return (itemId && String(md.id || '').toUpperCase() === itemId)
-          || (catalogoId && String(md.product_id || '').toUpperCase() === catalogoId)
-          || (catalogoId && String(md.user_product_id || '').toUpperCase() === catalogoId);
+      return [md.id, md.product_id, md.user_product_id]
+        .some(v => v && alvos.has(String(v).toUpperCase()));
     });
     if (!card) continue;
 
@@ -1459,7 +1467,7 @@ export async function produtoDePerfilSocial(urlSocial) {
     // O card do destaque tem preco, frete e o id de catalogo do mesmo item que
     // este botao aponta. Sem casamento de id nao ha preco — melhor voltar so com
     // a URL e deixar o resto do pipeline decidir do que arriscar numero errado.
-    const card = dadosDoPolycard(html, itemIdDaUrlCta(cta[1]), idProdutoMl(abs));
+    const card = dadosDoPolycard(html, itemIdDaUrlCta(cta[1]), idProdutoMl(abs), idDeUrl(abs));
     // og:image do perfil e a foto do item em DESTAQUE — a mesma que o CTA aponta.
     return { url: abs, titulo: tituloAlvo, imagem: metaConteudo(html, 'og:image') || null,
              ...(card || {}) };
@@ -1490,7 +1498,7 @@ export async function produtoDePerfilSocial(urlSocial) {
 
   const url = escolhido.startsWith('http') ? escolhido : 'https://www.mercadolivre.com.br' + escolhido;
   const limpa = url.split('?')[0];
-  const card = dadosDoPolycard(html, itemIdDaUrlCta(url) || idDeUrl(limpa), idProdutoMl(limpa));
+  const card = dadosDoPolycard(html, itemIdDaUrlCta(url), idProdutoMl(limpa), idDeUrl(limpa));
   return { url: limpa, titulo: tituloAlvo, ...(card || {}) };
 }
 
