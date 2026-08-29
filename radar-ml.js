@@ -210,17 +210,39 @@ export function idProdutoMl(url) {
  * o codigo achava que era link curto e disparava a cascata.
  */
 export async function resolverLinkMl(url) {
+  return (await resolverLinkMlComCard(url)).url;
+}
+
+/**
+ * Mesma resolucao, mas devolvendo TAMBEM o card do perfil social.
+ *
+ * Existe porque o card morria aqui dentro: quem chamava resolverLinkMl recebia
+ * so a URL, e o preco lido do perfil — unica fonte para anuncio classico — era
+ * jogado fora junto com o resto do retorno. Quem precisa do preco chama esta;
+ * quem so quer a URL continua chamando a de cima.
+ *
+ * @returns {{url:string, card:object|null, titulo:string|null}}
+ */
+export async function resolverLinkMlComCard(url) {
   let alvo = String(url || '').trim();
-  if (!alvo) return alvo;
+  if (!alvo) return { url: alvo, card: null, titulo: null };
 
   if (RE_ENCURTADOR_ML.test(alvo)) alvo = await resolverEncurtadorMl(alvo);
 
   if (RE_SOCIAL_ML.test(alvo)) {
     const prod = await produtoDePerfilSocial(alvo);
-    if (prod?.url) return prod.url;
-    throw new Error('link de perfil de afiliado sem produto identificavel');
+    if (!prod?.url) throw new Error('link de perfil de afiliado sem produto identificavel');
+    return {
+      url: prod.url,
+      titulo: prod.titulo || null,
+      card: prod.preco
+        ? { preco: prod.preco, precoDe: prod.precoDe || null, titulo: prod.titulo || null,
+            imagem: prod.imagem || null, freteGratis: !!prod.freteGratis,
+            catalogoId: prod.catalogoId || null }
+        : null,
+    };
   }
-  return alvo;
+  return { url: alvo, card: null, titulo: null };
 }
 
 async function resolverEncurtadorMl(url, tentativas = 6) {
@@ -1543,23 +1565,15 @@ export async function processarTextoMl(texto, opcoes = {}) {
     let alvo = u;
     let card = null;
     if (!idProdutoMl(alvo)) {
-      try { alvo = await resolverLinkMl(alvo); }
-      catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); continue; }
-    }
-    // Caiu num perfil social de outro afiliado: extrai o produto do topo.
-    if (/\/social\//i.test(alvo)) {
       try {
-        const prod = await produtoDePerfilSocial(alvo);
-        if (!prod) { console.warn('[ML] Perfil social sem produto identificavel:', u); continue; }
-        console.log('[ML] Perfil social -> produto: ' + prod.titulo
-          + (prod.preco ? ' (card: R$ ' + prod.preco + ')' : ' (card sem preco)'));
-        alvo = prod.url;
-        // Guarda o card: para anuncio classico ele e a UNICA fonte de preco.
-        if (prod.preco) card = { preco: prod.preco, precoDe: prod.precoDe || null,
-                                 titulo: prod.titulo || null, imagem: prod.imagem || null,
-                                 freteGratis: !!prod.freteGratis,
-                                 catalogoId: prod.catalogoId || null };
-      } catch (e) { console.warn('[ML] Falha no perfil social:', e.message); continue; }
+        // Com card: o perfil social e lido UMA vez e entrega URL e preco juntos.
+        const r = await resolverLinkMlComCard(alvo);
+        alvo = r.url;
+        card = r.card;   // null quando nao veio de perfil ou o card nao casou
+        if (r.titulo) console.log('[ML] Perfil social -> produto: ' + r.titulo
+          + (card ? ' (card: R$ ' + card.preco + ')' : ' (card sem preco)'));
+      }
+      catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); continue; }
     }
     if (idProdutoMl(alvo)) {
       const canon = urlCanonicaMl(alvo);
