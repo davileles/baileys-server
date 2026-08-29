@@ -739,6 +739,30 @@ async function trilhaPorCatalogoMl(catalogoId) {
 }
 
 /**
+ * Ultimo degrau da trilha: anuncio classico que nao pertence a catalogo nenhum
+ * (o card vem sem `product_id`). Aqui a categoria e PREDITA pelo proprio ML a
+ * partir do titulo, pelo domain_discovery — o mesmo servico que sugere
+ * categoria a quem esta anunciando.
+ *
+ * E predicao, nao a categoria declarada do anuncio, e vai marcada como tal.
+ * Um cuidado importante: so vale para titulo vindo do og:title do perfil, que e
+ * texto do ML. Predizer a partir de titulo tirado do POST e depois usar essa
+ * trilha para validar o mesmo post seria circular — a prova sairia do que ela
+ * deveria provar.
+ */
+async function trilhaPreditaMl(titulo) {
+  const t = String(titulo || '').trim();
+  if (t.length < 8 || !apiMlAutorizada()) return null;
+  try {
+    const r = await apiMl('/sites/MLB/domain_discovery/search?limit=1&q=' + encodeURIComponent(t));
+    return await trilhaDeCategoriaMl((Array.isArray(r) ? r[0] : null)?.category_id);
+  } catch (e) {
+    console.warn('[ML] predicao de categoria:', e.message);
+    return null;
+  }
+}
+
+/**
  * Leitura LEVE pela API oficial: so o preco de tabela do catalogo, 1 chamada.
  * E o leitor do monitor de precos — canal oficial, sem antibot, sem cookie.
  * Nao serve para divulgar: nao tem preco em destaque (Pix/saldo MP) nem cupom
@@ -936,9 +960,19 @@ export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
  */
 async function dadosDoCardSocial(card) {
   // O card nao traz categoria, mas traz o id de catalogo — e por ele a API
-  // oficial devolve a trilha sem tocar em pagina nenhuma.
-  const trilha = await trilhaPorCatalogoMl(card.catalogoId);
+  // oficial devolve a trilha sem tocar em pagina nenhuma. Anuncio fora de
+  // catalogo nao tem esse id: sobra a predicao pelo titulo.
+  let trilha = await trilhaPorCatalogoMl(card.catalogoId);
+  let trilhaFonte = trilha ? 'catalogo' : null;
+  if (!trilha && card.titulo) {
+    trilha = await trilhaPreditaMl(card.titulo);
+    if (trilha) {
+      trilhaFonte = 'predicao';
+      console.log('[ML] trilha predita pelo titulo: ' + trilha);
+    }
+  }
   return {
+    trilhaFonte,
     titulo: card.titulo || null,
     preco: card.preco,
     precoDe: card.precoDe || null,
