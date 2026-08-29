@@ -792,18 +792,21 @@ export async function precoCatalogoApiMl(id) {
 }
 
 /**
- * Este item rende preco pela via que a operacao permite HOJE?
+ * Este item tem preco pela API OFICIAL, ou vai depender do card do perfil?
  *
- * Sob ML_SO_API a pagina do produto nao e aberta, entao so ha preco para
- * catalogo (/p/MLB) e catalogo unificado (/up/MLBU). Anuncio classico
- * (produto.mercadolivre.com.br/MLB-...-_JM) fica sem cobertura e vira "pulado"
- * no meio da fila, 20 min depois de o operador ter dado o disparo.
+ * Sob ML_SO_API a pagina nao e aberta, entao a API so cobre catalogo (/p/MLB e
+ * /up/MLBU). Anuncio classico fica fora dela — mas desde 29/08 isso deixou de
+ * significar "pulado": montarOfertasMlVitrine gera o nosso link de afiliado e
+ * le o preco no card do NOSSO perfil social.
  *
- * Este teste antecipa isso para a hora de MONTAR a lista, ao custo de UMA
- * chamada por item — a mesma que a fila faria de qualquer jeito.
+ * Ou seja, este teste virou um aviso de PROCEDENCIA, nao de descarte: diz quais
+ * itens vao pelo caminho mais longo (uma requisicao a mais, e dependente de o
+ * produto ser elegivel ao programa de afiliados). Nao ha como confirmar o
+ * caminho longo aqui sem gerar link de afiliado — e gerar link para um item que
+ * talvez nem seja disparado queimaria a etiqueta de nicho dele.
  *
- * Erro de rede/429/token NAO acusa o item: melhor deixar passar e ele falhar na
- * hora do envio do que barrar produto bom por soluco de infra.
+ * Erro de rede/429/token NAO acusa o item: melhor deixar passar do que assustar
+ * o operador por soluco de infra.
  *
  * @returns {{coberto:boolean, motivo:string|null}}
  */
@@ -813,14 +816,15 @@ export async function coberturaApiMl(asin, url) {
     return { coberto: false, motivo: 'API oficial do ML nao autorizada — conecte em /ml/conectar' };
   const candidatos = idsCatalogoMl(url, url, { id: asin });
   if (!candidatos.length)
-    return { coberto: false, motivo: 'anuncio classico: a URL nao tem id de catalogo (/p/MLB ou /up/MLBU)' };
+    return { coberto: false, motivo: 'anuncio classico: a URL nao tem id de catalogo (/p/MLB ou /up/MLBU). '
+                                   + 'O preco vai ser lido do card do nosso perfil social no disparo' };
   for (const cat of candidatos) {
     try { if (await precoCatalogoApiMl(cat)) return { coberto: true, motivo: null }; }
     catch (e) { return { coberto: true, motivo: null }; }
   }
   return { coberto: false,
-           motivo: 'a API oficial nao cobre este anuncio (so catalogo /p/ ou /up/) '
-                 + 'e a leitura de pagina esta desativada (ML_SO_API)' };
+           motivo: 'anuncio classico: a API oficial nao cobre (so catalogo /p/ ou /up/). '
+                 + 'O preco vai ser lido do card do nosso perfil social no disparo' };
 }
 
 // ── TITULO A PARTIR DO TEXTO DO POST ────────────────────────────────────
