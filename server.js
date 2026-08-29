@@ -8906,6 +8906,46 @@ function forcarReconexao(motivo) {
   _agendarReconexao(1000);
 }
 
+// ── CURA POR CONFLITO (takeover) ─────────────────────────────────────────────
+// 28/08/2026, terceiro incidente do dia: a renovacao de identidade reconecta
+// mas NAO cura a surdez — nem o eco para o proprio numero chega. Isso isolou o
+// ingrediente ativo da unica cura ja observada: nao era o apagao local de
+// chaves, era o 401 VINDO DO SERVIDOR imediatamente antes. Quando o servidor
+// encerra a sessao do lado dele, a reconexao seguinte monta um estado de
+// entrega NOVO; uma reconexao comum faz resume do estado viciado — por isso
+// socket novo, reset de chaves e ate restart de container nunca resolveram.
+//
+// Nao ha como pedir um 401 sem perder o pareamento, mas o protocolo tem um
+// takeover nativo: conectar um SEGUNDO socket com as mesmas credenciais faz o
+// servidor derrubar o antigo com stream conflict (440 replaced) e religar a
+// entrega na conexao nova — mesmo efeito de desmonte server-side, pareamento
+// intacto. E o que acontece num restart rapido; aqui e feito de proposito:
+// abrir o novo SEM fechar o velho.
+function curarPorConflito(motivo) {
+  const sockVelho = sock;
+  if (!sockVelho) { forcarReconexao(motivo || 'curar-conflito-sem-sock'); return; }
+  console.warn('[CONFLITO] Cura por takeover (' + (motivo || 'manual') + '): abrindo socket novo SEM fechar o atual; o servidor derruba o antigo com replaced.');
+  // Listeners do velho removidos JA: evita corrida de creds.update entre os
+  // dois sockets e processamento fantasma de eventos duplicados. O close 440
+  // que o servidor mandar para ele seria ignorado pela guarda de sock antigo
+  // de qualquer forma.
+  try { sockVelho.ev.removeAllListeners('creds.update'); } catch (e) {}
+  try { sockVelho.ev.removeAllListeners('connection.update'); } catch (e) {}
+  try { sockVelho.ev.removeAllListeners('messages.upsert'); } catch (e) {}
+  conectado = false;
+  isConnecting = false;
+  _reconectarTentativas = 0;
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+  // NAO fazer sockVelho.end() aqui — o desmonte precisa vir do SERVIDOR.
+  conectar();
+  // Teto de seguranca: se em 60s o servidor tolerou as duas conexoes (nao
+  // deveria), encerra o velho localmente para nao vazar socket.
+  setTimeout(() => {
+    try { if (sockVelho && sockVelho !== sock) sockVelho.end(new Error('conflito-teto-60s')); } catch (e) {}
+  }, 60000);
+}
+
 // ── SUPERVISOR DE ESTADO DO WEBSOCKET (socket-zumbi) ─────────────────────────
 // A escada de surdez detecta o zumbi so pela AUSENCIA de upsert (20 min). Este
 // supervisor e um sinal ORTOGONAL e mais rapido, baseado no estado REAL do
@@ -14081,6 +14121,13 @@ async function renovarIdentidadeSessao(motivo) {
     return false;
   }
 }
+
+app.post('/curar-conflito', (req, res) => {
+  try {
+    curarPorConflito('endpoint-manual');
+    res.json({ ok: true, mensagem: 'Takeover disparado: socket novo subindo por cima do atual. Acompanhe /status.' });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
 
 app.post('/renovar-identidade', async (req, res) => {
   const ok = await renovarIdentidadeSessao('endpoint-manual');
