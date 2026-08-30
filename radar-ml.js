@@ -225,7 +225,7 @@ export async function resolverLinkMl(url) {
  */
 export async function resolverLinkMlComCard(url) {
   let alvo = String(url || '').trim();
-  if (!alvo) return { url: alvo, card: null, titulo: null };
+  if (!alvo) return { url: alvo, card: null, titulo: null, origemProduto: null };
 
   if (RE_ENCURTADOR_ML.test(alvo)) alvo = await resolverEncurtadorMl(alvo);
 
@@ -235,6 +235,7 @@ export async function resolverLinkMlComCard(url) {
     return {
       url: prod.url,
       titulo: prod.titulo || null,
+      origemProduto: prod.origemProduto || null,
       card: prod.preco
         ? { preco: prod.preco, precoDe: prod.precoDe || null, titulo: prod.titulo || null,
             imagem: prod.imagem || null, freteGratis: !!prod.freteGratis,
@@ -242,7 +243,7 @@ export async function resolverLinkMlComCard(url) {
         : null,
     };
   }
-  return { url: alvo, card: null, titulo: null };
+  return { url: alvo, card: null, titulo: null, origemProduto: null };
 }
 
 async function resolverEncurtadorMl(url, tentativas = 6) {
@@ -492,6 +493,34 @@ const ML_SOCIAL_PAUSA_MS = Number(process.env.ML_SOCIAL_PAUSA_MIN || 30) * 60000
 
 let _social = { seguidos: 0, pausadoAte: 0, ultimaEm: 0, lidos: 0, bloqueados: 0 };
 
+// ── PROCEDENCIA DO PRODUTO NO PERFIL SOCIAL (medicao, fase 1) ─────────────
+// Link de LISTA de cupons e link de PRODUTO chegam no MESMO formato
+// (/social/<tag>?ref=...): a URL nao distingue os dois. O que distingue e o
+// bloco CTA "show_product", que so existe quando o ref aponta para um item
+// unico. Sem ele a pagina e uma vitrine, e o fallback por og:title casa com o
+// PRIMEIRO card da grade — foi assim que uma lista de cupons virou oferta de
+// Smart TV com cupom de moda em 30/08.
+//
+// Nesta fase nada e descartado: so marcamos de onde o produto veio e contamos.
+// O numero em /ml/status diz quanto do radar ML depende hoje do fallback; com
+// ele na mao se decide se o gate pode ser ligado sem derrubar volume.
+let _origemSocial = { destaque: 0, vitrine: 0, ultimaVitrineEm: null, ultimaVitrineUrl: null };
+
+function registrarOrigemSocial(origem, url) {
+  if (origem === 'vitrine') {
+    _origemSocial.vitrine++;
+    _origemSocial.ultimaVitrineEm = new Date().toISOString();
+    _origemSocial.ultimaVitrineUrl = String(url || '').slice(0, 160);
+  } else _origemSocial.destaque++;
+}
+
+/** Contadores de procedencia do produto lido em perfil social. */
+export function estadoOrigemSocialMl() {
+  const t = _origemSocial.destaque + _origemSocial.vitrine;
+  return { ..._origemSocial, total: t,
+           pctVitrine: t ? Math.round(1000 * _origemSocial.vitrine / t) / 10 : 0 };
+}
+
 /** Estado do leitor de perfil social, para /ml/status e diagnostico. */
 export function estadoSocialMl() {
   return {
@@ -501,6 +530,7 @@ export function estadoSocialMl() {
     bloqueiosSeguidos: _social.seguidos,
     lidos: _social.lidos, bloqueados: _social.bloqueados,
     espacoMs: ML_SOCIAL_ESPACO_MS,
+    origemProduto: estadoOrigemSocialMl(),
   };
 }
 
@@ -1386,7 +1416,7 @@ export function normalizarMl(it) {
 
 // ── PIPELINE ──────────────────────────────────────────────────────────────
 
-import { melhorCupom, melhorCupomAplicavel, cupomPorCodigo, cupomVigente,
+import { melhorCupom, melhorCupomAplicavel, codigosDaBaseCitados, cupomPorCodigo, cupomVigente,
          calcularDesconto, templateDaLoja, renderTemplate, varsDoProduto,
          casarCupomDaPagina, registrarCupomBase, comRastreio } from './radar-amazon.js';
 
@@ -1566,8 +1596,9 @@ export async function produtoDePerfilSocial(urlSocial) {
     // a URL e deixar o resto do pipeline decidir do que arriscar numero errado.
     const card = dadosDoPolycard(html, itemIdDaUrlCta(cta[1]), idProdutoMl(abs), idDeUrl(abs));
     // og:image do perfil e a foto do item em DESTAQUE — a mesma que o CTA aponta.
+    registrarOrigemSocial('destaque', urlSocial);
     return { url: abs, titulo: tituloAlvo, imagem: metaConteudo(html, 'og:image') || null,
-             ...(card || {}) };
+             origemProduto: 'destaque', ...(card || {}) };
   }
 
   // O link do botao "Ir para produto". Aceita item, catalogo (/p/) e catalogo
@@ -1596,7 +1627,13 @@ export async function produtoDePerfilSocial(urlSocial) {
   const url = escolhido.startsWith('http') ? escolhido : 'https://www.mercadolivre.com.br' + escolhido;
   const limpa = url.split('?')[0];
   const card = dadosDoPolycard(html, itemIdDaUrlCta(url), idProdutoMl(limpa), idDeUrl(limpa));
-  return { url: limpa, titulo: tituloAlvo, ...(card || {}) };
+  // Sem CTA: o produto saiu do casamento com o og:title, que numa pagina de
+  // vitrine e o primeiro card da grade e nao "o produto do link". Nao e
+  // descartado nesta fase — so marcado, para o volume aparecer no contador.
+  registrarOrigemSocial('vitrine', urlSocial);
+  console.warn('[ML] Perfil social SEM CTA de produto — item veio da grade (procedencia: vitrine): '
+    + String(urlSocial).slice(0, 120));
+  return { url: limpa, titulo: tituloAlvo, origemProduto: 'vitrine', ...(card || {}) };
 }
 
 /**
@@ -1636,17 +1673,24 @@ export async function processarTextoMl(texto, opcoes = {}) {
   const canonicas = [];
   const dicasMlb = new Map();   // url canonica -> MLB do anuncio, quando a URL trazia
   const cardsSocial = new Map();// url canonica -> preco/frete lidos do card do perfil
+  const origemSocial = new Map();// url canonica -> 'destaque' | 'vitrine'
+  // url canonica -> link como ele aparece NO POST. O casamento de cupom por
+  // bloco precisa saber onde, no texto, este link estava escrito.
+  const urlNoPost = new Map();
   for (const u of urls) {
     let alvo = u;
     let card = null;
+    let origem = null;
     if (!idProdutoMl(alvo)) {
       try {
         // Com card: o perfil social e lido UMA vez e entrega URL e preco juntos.
         const r = await resolverLinkMlComCard(alvo);
         alvo = r.url;
         card = r.card;   // null quando nao veio de perfil ou o card nao casou
+        origem = r.origemProduto || null;
         if (r.titulo) console.log('[ML] Perfil social -> produto: ' + r.titulo
-          + (card ? ' (card: R$ ' + card.preco + ')' : ' (card sem preco)'));
+          + (card ? ' (card: R$ ' + card.preco + ')' : ' (card sem preco)')
+          + (origem ? ' [' + origem + ']' : ''));
       }
       catch (e) { console.warn('[ML] Falha ao resolver', u, '-', e.message); continue; }
     }
@@ -1657,6 +1701,8 @@ export async function processarTextoMl(texto, opcoes = {}) {
       const mlb = idDeUrl(alvo) || idDeUrl(u);
       if (mlb && !dicasMlb.has(canon)) dicasMlb.set(canon, mlb);
       if (card && !cardsSocial.has(canon)) cardsSocial.set(canon, card);
+      if (origem && !origemSocial.has(canon)) origemSocial.set(canon, origem);
+      if (!urlNoPost.has(canon)) urlNoPost.set(canon, u);
     }
     else console.warn('[ML] Sem id de produto apos resolver:', u);
   }
@@ -1816,6 +1862,10 @@ export async function processarTextoMl(texto, opcoes = {}) {
       // saiu sem trilha ou com preco diferente do que a API mostra.
       fonteDados: dados.fonte || null,
       trilhaFonte: dados.trilhaFonte || null,
+      // 'destaque' = veio do CTA do perfil (o link aponta para ESTE item).
+      // 'vitrine'  = veio do casamento por og:title numa pagina sem CTA, isto e,
+      // possivelmente um card qualquer de uma lista. null = link direto de PDP.
+      origemProduto: origemSocial.get(url) || null,
       loja: 'Mercado Livre',
     };
 
@@ -1835,7 +1885,22 @@ export async function processarTextoMl(texto, opcoes = {}) {
     // checkout realmente entrega.
     const daPagina = resolverCupomPaginaMl(dados.cuponsPagina, p.preco);
     let cupom = daPagina.cupom;
-    if (!cupom) cupom = melhorCupom('Mercado Livre', p.preco, texto);
+    // urlOrigem: o link como ele aparece NO POST. Post que cita varios cupons
+    // (um por categoria) so pode casar o codigo escrito no mesmo bloco deste
+    // link — ver melhorCupom(). Com um cupom so citado, nada muda.
+    if (!cupom) cupom = melhorCupom('Mercado Livre', p.preco, texto,
+                                    { urlOrigem: urlNoPost.get(url) || null });
+
+    // Varios cupons citados e nenhum casou com o bloco deste link: a oferta sai
+    // pelo preco cheio enquanto o post promete desconto. Nao e erro, mas nao
+    // pode auto-enviar — o server usa este campo para segurar na fila.
+    const _multiCupom = codigosDaBaseCitados('Mercado Livre', texto);
+    const _cupomAmbiguo = (!cupom && _multiCupom.length >= 2)
+      ? { codigos: _multiCupom, link: urlNoPost.get(url) || url } : null;
+    if (_cupomAmbiguo) {
+      console.warn('[ML] ' + p.id + ' — post cita ' + _multiCupom.length
+        + ' cupons (' + _multiCupom.join(', ') + ') e nenhum e do bloco deste link; vai sem cupom.');
+    }
 
     if (cupom?.daPagina) {
       console.log('[ML] ' + p.id + ' + cupom do anúncio ' + cupom.codigo +
@@ -1861,6 +1926,7 @@ export async function processarTextoMl(texto, opcoes = {}) {
         : null,
       // Cupom no anuncio sem correspondente na base: o server avisa o operador.
       avisoCupomPagina: daPagina.aviso,
+      cupomAmbiguo: _cupomAmbiguo,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaMl(p, { cupom }),
     });
