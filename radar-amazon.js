@@ -1326,16 +1326,89 @@ export function ultimoCupomDaLoja(loja) {
  * Fora esses dois casos nao aplica nada: cruzar um cupom qualquer com um produto
  * que nunca falou em cupom anunciaria um preco que nao existe no checkout.
  */
-export function melhorCupom(loja, preco, textoOriginal = '') {
+/**
+ * Codigos QUE ESTAO NA BASE desta loja e aparecem citados no texto.
+ * Diferente de cupomCitadoDesconhecido(), que devolve os que NAO estao.
+ */
+export function codigosDaBaseCitados(loja, textoOriginal) {
+  const lojaKey = normalizarTexto(loja);
+  const texto = normalizarTexto(textoOriginal);
+  if (!texto) return [];
+  const achados = new Set();
+  for (const reg of Object.values(E().cupons)) {
+    if (!cupomVigente(reg)) continue;
+    if (normalizarTexto(reg.loja) !== lojaKey) continue;
+    if (!reg.codigo) continue;
+    if (texto.includes(normalizarTexto(reg.codigo))) achados.add(reg.codigo.toUpperCase());
+  }
+  return [...achados];
+}
+
+/**
+ * Trecho do post que se refere a UM link especifico.
+ *
+ * Segmentacao por POSICAO do link, nao por linha em branco: o post de cupom
+ * chega do WhatsApp com quebras simples, com quebras duplas ou numa linha unica,
+ * dependendo de quem escreveu, e um split por paragrafo devolveria o texto
+ * inteiro justamente nos casos em que ele nao serve.
+ *
+ * O segmento de um link vai do FIM do link anterior ate o fim dele proprio —
+ * ou seja, o texto que o antecede e o descreve. E o formato universal desses
+ * posts: cabecalho da categoria, cupom, e entao o link.
+ *
+ * Com um unico link no texto nao ha o que atribuir: o post inteiro fala dele, e
+ * a funcao devolve o texto todo (comportamento antigo, de proposito).
+ */
+export function blocoDoLink(textoOriginal, urlOrigem) {
+  const texto = String(textoOriginal || '');
+  if (!texto) return null;
+  const pos = [];
+  for (const m of texto.matchAll(/https?:\/\/\S+/g)) {
+    pos.push({ ini: m.index, fim: m.index + m[0].length, url: m[0] });
+  }
+  if (pos.length <= 1) return texto;
+  if (!urlOrigem) return null;
+  const alvo = String(urlOrigem).trim().replace(/[)\]}.,;!]+$/, '');
+  const k = pos.findIndex(x => x.url.includes(alvo) || alvo.includes(x.url.replace(/[)\]}.,;!]+$/, '')));
+  if (k < 0) return null;
+  return texto.slice(k === 0 ? 0 : pos[k - 1].fim, pos[k].fim);
+}
+
+export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
   const lojaKey = normalizarTexto(loja);
   const texto = normalizarTexto(textoOriginal);
   if (!texto) return null;
   let melhor = null;
 
+  // ── POST COM VARIOS CUPONS: casamento por BLOCO ──────────────────────────
+  // Post de cupom distribui um codigo POR CATEGORIA ("EM MODA E BELEZA: X /
+  // EM CELL E TECH: Y"), cada um com sua propria lista. A varredura abaixo le o
+  // texto inteiro e escolhe pelo MAIOR desconto, sem olhar a qual link o codigo
+  // pertence: em 30/08 isso colou um cupom de moda (10%, teto R$ 25) numa Smart
+  // TV, porque o cupom de tech exigia minimo de R$ 1.599 e zerou no calculo.
+  //
+  // Com UM codigo citado nada muda — e a esmagadora maioria dos posts, e o
+  // comportamento antigo segue intacto. Com DOIS OU MAIS, so vale o codigo
+  // escrito no mesmo bloco que o link de origem deste produto. Sem bloco
+  // identificavel, nenhum codigo passa e a oferta sai sem cupom (ou vai para
+  // aprovacao, quem decide isso e o chamador).
+  const _citados = codigosDaBaseCitados(loja, textoOriginal);
+  let escopo = texto;
+  if (_citados.length >= 2) {
+    const bloco = blocoDoLink(textoOriginal, opcoes.urlOrigem);
+    if (!bloco) {
+      console.warn('[CUPOM] ' + loja + ': ' + _citados.length + ' cupons citados no post e o link '
+        + (opcoes.urlOrigem ? String(opcoes.urlOrigem).slice(0, 60) : '(sem url)')
+        + ' nao caiu em nenhum bloco — nenhum cupom aplicado.');
+      return null;
+    }
+    escopo = normalizarTexto(bloco);
+  }
+
   for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== lojaKey) continue;
-    if (!reg.codigo || !texto.includes(normalizarTexto(reg.codigo))) continue;
+    if (!reg.codigo || !escopo.includes(normalizarTexto(reg.codigo))) continue;
 
     const desconto = calcularDesconto(reg, preco);
     if (desconto <= 0) continue;
@@ -1343,6 +1416,16 @@ export function melhorCupom(loja, preco, textoOriginal = '') {
     if (!melhor || desconto > melhor.desconto) melhor = { reg, desconto, citado: true };
   }
   if (melhor) return melhor;
+
+  // Varios cupons citados e nenhum era do bloco deste link: parar aqui. A etapa
+  // generica abaixo escolhe pela base inteira, ignorando o texto — seria a mesma
+  // atribuicao as cegas que este bloco existe para impedir, entrando pela porta
+  // dos fundos.
+  if (_citados.length >= 2) {
+    console.warn('[CUPOM] ' + loja + ': nenhum dos ' + _citados.length
+      + ' cupons citados se aplica ao bloco deste link — oferta sai sem cupom.');
+    return null;
+  }
 
   // Etapa 2: mencao generica ao cupom, sem codigo.
   // Usa o MELHOR cupom aplicavel a este preco, nao o mais recente capturado. O
