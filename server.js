@@ -3770,6 +3770,15 @@ async function _registrosDoShard(local) {
   return regs;
 }
 
+// Dos grupos que de fato receberam, quais sao destino de trilha de NICHO.
+// Devolve null quando nao ha lista de enviados (registro sem rastro de grupo)
+// para nao confundir "nenhum nicho" com "nao sei".
+function jidsDeNicho(gruposEnviados) {
+  if (!Array.isArray(gruposEnviados)) return null;
+  try { return gruposEnviados.filter(j => ehDestinoDeNicho(j)); }
+  catch { return null; }
+}
+
 async function registrarEnvioHistorico(oferta) {
   try {
     if (!oferta || oferta.status !== 'enviado') return;
@@ -3809,6 +3818,8 @@ async function registrarEnvioHistorico(oferta) {
           link:          null,
           origem:        oferta.grupoOrigem || oferta.origem || null,
           gruposDestino: Array.isArray(oferta.gruposEnviados) ? oferta.gruposEnviados.length : null,
+          gruposNicho:   jidsDeNicho(oferta.gruposEnviados),
+          categoria:     c.categoria || null,
           autoEnviado:   !!oferta.autoEnviado,
           temImagem:     Array.isArray(oferta.imagens) && oferta.imagens.length > 0,
         });
@@ -3860,6 +3871,15 @@ async function registrarEnvioHistorico(oferta) {
       origem:        oferta.grupoOrigem || oferta.origem || null,
       gruposDestino: Array.isArray(oferta.gruposEnviados) ? oferta.gruposEnviados.length
                    : Array.isArray(oferta.destinos)       ? oferta.destinos.length : null,
+      // Contar quantos grupos receberam nao diz QUAIS. Sem isto, medir volume
+      // por grupo de nicho so era possivel por inferencia (reclassificar o
+      // titulo e comparar contagens), e falha parcial de envio ja bastava para
+      // errar o numero. Guardamos so os JIDs de nicho, nao a lista inteira: 30
+      // JIDs por registro somariam ~750 KB no shard do mes e estourariam o
+      // ~1 MB que a Contents API devolve na leitura.
+      gruposNicho:   jidsDeNicho(oferta.gruposEnviados),
+      categoria:     d.categoria || null,
+      categoriaConfianca: d.categoriaConfianca ?? null,
       autoEnviado:   !!oferta.autoEnviado,
       temImagem:     Array.isArray(oferta.imagens) && oferta.imagens.length > 0,
       mensagens:     1,
