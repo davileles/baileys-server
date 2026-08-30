@@ -153,6 +153,7 @@ import {
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
+  estadoOrigemSocialMl,
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
 } from './radar-ml.js';
 
@@ -6444,6 +6445,15 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     if (_cupomForaDaBase) {
       oferta.cupomForaDaBase = { codigos: _cupSemBase, anuncio: !!r.avisoCupomPagina };
     }
+    // Post com varios cupons de categoria e nenhum casando com o bloco deste
+    // link: sai pelo preco cheio enquanto o post promete desconto. Segura na
+    // fila, como cupomForaDaBase.
+    if (r.cupomAmbiguo) oferta.cupomAmbiguo = r.cupomAmbiguo;
+    // Procedencia do produto quando o link veio de perfil de afiliado.
+    // 'vitrine' = o item saiu do casamento por og:title numa pagina SEM CTA de
+    // produto, isto e, pode ser um card qualquer de uma lista de cupons. Nesta
+    // fase e so marcacao para medir volume — nao segura nada.
+    if (p.origemProduto) oferta.dadosExtraidos.origemProduto = p.origemProduto;
     // Prova de vida da plataforma: chegou a virar oferta de grupo monitorado.
     registrarPulsoLoja(p.loja);
     if (_reservaThumb) oferta.miniaturaFonte = _reservaThumb;
@@ -6476,6 +6486,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     const _seguraPorPreco = oferta.dadosExtraidos.precoDeReferencia
                          && !oferta.dadosExtraidos.autoEnvioMesmoSemVerificar;
     if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
+        && !oferta.cupomAmbiguo
         && !oferta.precoDivergente && !oferta.revisaoDeEdicao) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
@@ -6500,6 +6511,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     salvarFila();
     const _motivoFila = autoEnvioModoOferta() !== 'on' ? ''
       : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
+      : oferta.cupomAmbiguo ? ' — post cita ' + oferta.cupomAmbiguo.codigos.length
+          + ' cupons e nenhum e do bloco deste link, exige aprovacao manual'
       : oferta.precoDivergente ? ' — post anuncia R$ ' + oferta.precoDivergente.declarado
           + ' e calculamos R$ ' + oferta.precoDivergente.calculado + ', exige aprovacao manual'
       : oferta.revisaoDeEdicao ? ' — versao editada do post, exige aprovacao manual'
@@ -9165,7 +9178,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
