@@ -4518,6 +4518,23 @@ function TG_CANAIS_IGNORADOS_RAW() {
 let tgClient = null;
 let tgConectado = false;
 
+// ── CANAIS DO TELEGRAM COMO FONTE DO RADAR ───────────────────────────────────
+// A aba Grupos do painel grava a fonte como 'tg:<channelId>' na trilha. O cache
+// de entidades evita resolver o mesmo canal a cada polling; o de dialogos poupa
+// o getDialogs (lento) a cada abertura da aba no painel.
+const _tgEntidadesPorId = new Map();          // channelId (string) -> entity
+let _tgCanaisCache = { ts: 0, canais: [] };   // resposta do GET /tg/canais
+function tgFontesRadar() { return radarFontes().filter(j => j.startsWith('tg:')); }
+async function _tgEntityPorId(cid) {
+  if (_tgEntidadesPorId.has(cid)) return _tgEntidadesPorId.get(cid);
+  if (!tgClient) return null;
+  try {
+    const ent = await tgClient.getInputEntity(Number(cid));
+    _tgEntidadesPorId.set(cid, ent);
+    return ent;
+  } catch (e) { return null; }
+}
+
 let tgAuthState = null;
 let tgConta = null;
 let tgAuthResolve = null;
@@ -4590,6 +4607,18 @@ async function iniciarTelegram() {
     } catch(e) { console.warn(`[TG] Falha ao ativar canal monitorado @${canal}: ${e.message}`); }
   }
 
+  // Canais marcados como FONTE do radar no painel: mesma ativacao explicita,
+  // resolvendo pelo channelId (a trilha grava 'tg:<id>', nao username).
+  for (const tgFonte of tgFontesRadar()) {
+    const cid = tgFonte.slice(3);
+    try {
+      const ent = await _tgEntityPorId(cid);
+      if (!ent) { console.warn(`[TG] Fonte do radar ${tgFonte} nao resolvida — a conta segue este canal?`); continue; }
+      await tgClient.getMessages(ent, { limit: 1 });
+      console.log(`[TG] Canal fonte do radar ativo: ${tgFonte}`);
+    } catch(e) { console.warn(`[TG] Falha ao ativar fonte do radar ${tgFonte}: ${e.message}`); }
+  }
+
   // Resolver blacklist para channelIds numéricos
   const _ignoradosIds = new Set();
   for (const termo of TG_CANAIS_IGNORADOS_RAW()) {
@@ -4647,6 +4676,31 @@ async function iniciarTelegram() {
         }
       } catch(e) { /* silencioso — canal pode estar temporariamente inacessível */ }
     }
+
+    // Backstop das FONTES do radar no Telegram: mesmo corte por _ultimosMsgIds
+    // e mesma deduplicacao do NewMessage, mas roteado direto para o radar de
+    // marketplace — cupom destes canais ja e coberto pela captura geral.
+    for (const tgFonte of tgFontesRadar()) {
+      const cid = tgFonte.slice(3);
+      try {
+        const ent = await _tgEntityPorId(cid);
+        if (!ent) continue;
+        const msgs = await tgClient.getMessages(ent, { limit: 20 });
+        for (const msg of msgs.reverse()) {
+          if (!msg.message?.trim()) continue;
+          const ultimoId = _ultimosMsgIds[cid] || 0;
+          if (msg.id <= ultimoId) continue;
+          _ultimosMsgIds[cid] = msg.id;
+          salvarUltimosMsgIds(_ultimosMsgIds);
+          const dedupKeyRadar = `${cid}:${msg.id}`;
+          if (_msgProcessadas.has(dedupKeyRadar)) continue;
+          _msgProcessadas.set(dedupKeyRadar, Date.now());
+          console.log(`[TG-RADAR] Polling ACEITA ${tgFonte} msgId=${msg.id}: ${msg.message.slice(0,60)}`);
+          ultimaCapturaPorGrupo.set(tgFonte, Date.now());
+          await processarRadarMarketplace(tgFonte, msg.message, {});
+        }
+      } catch(e) { /* silencioso — canal pode estar temporariamente inacessivel */ }
+    }
   }, 60 * 1000); // a cada 1 minuto
 
   // Handler principal: NewMessage captura UpdateNewMessage + UpdateNewChannelMessage de forma normalizada
@@ -4684,6 +4738,17 @@ async function iniciarTelegram() {
 
       const texto = msg.message || '';
       if (!texto.trim()) return;
+
+      // Canal marcado como FONTE na aba Grupos do painel: alimenta o radar de
+      // marketplace pela mesma esteira das fontes de WhatsApp — so muda a
+      // origem. O pipeline de cupons abaixo segue valendo para o mesmo canal.
+      const tgFonte = peerChannelId ? ('tg:' + peerChannelId) : null;
+      if (tgFonte && ehFonteRadar(tgFonte)) {
+        if (entity?.title) NOMES_GRUPOS.set(tgFonte, entity.title);
+        ultimaCapturaPorGrupo.set(tgFonte, Date.now());
+        processarRadarMarketplace(tgFonte, texto, {})
+          .catch(e => console.error('[TG-RADAR] Falha no pipeline:', e.message));
+      }
 
       // Tentar baixar mídia se existir
       let imagemBase64 = null;
@@ -8587,6 +8652,36 @@ app.post(BOT_TSP_PATH, (req, res) => {
   tratarUpdateBotTsp(req.body).catch(e => console.error('[BOT-TSP] Erro:', e.message));
 });
 
+// ── CANAIS DO TELEGRAM (aba Grupos do painel) ────────────────────────────────
+// Lista os canais/grupos que a conta conectada segue, no formato que a trilha
+// grava como fonte ('tg:<channelId>'). getDialogs e lento, entao a resposta sai
+// de cache por 10 min — ?refresh=1 forca a leitura.
+app.get('/tg/canais', async (req, res) => {
+  if (!tgConectado || !tgClient) return res.status(503).json({ ok:false, erro:'Telegram nao conectado.' });
+  const TTL = 10 * 60 * 1000;
+  if (_tgCanaisCache.canais.length && req.query.refresh !== '1' && Date.now() - _tgCanaisCache.ts < TTL) {
+    return res.json({ ok:true, total:_tgCanaisCache.canais.length, canais:_tgCanaisCache.canais, doCache:true });
+  }
+  try {
+    const dialogs = await tgClient.getDialogs({ limit: 500 });
+    const canais = [];
+    for (const d of dialogs) {
+      const ent = d.entity;
+      if (!ent) continue;
+      if (!(d.isChannel || d.isGroup)) continue;   // conversa privada nao e fonte
+      const cid = ent.id?.toString();
+      if (!cid) continue;
+      const nome = ent.title || ent.username || ('canal ' + cid);
+      canais.push({ id: 'tg:' + cid, nome, username: ent.username || null });
+      _tgEntidadesPorId.set(cid, ent);
+      NOMES_GRUPOS.set('tg:' + cid, nome);
+    }
+    canais.sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+    _tgCanaisCache = { ts: Date.now(), canais };
+    res.json({ ok:true, total:canais.length, canais });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.get('/tg/estado', (req, res) => {
   if (req.tenantId === TENANT_PADRAO) {
     return res.json({ ok:true, tenant:'tsp', conectado: tgConectado, authState: tgAuthState, conta: tgConta });
@@ -9056,7 +9151,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
