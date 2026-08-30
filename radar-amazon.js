@@ -189,6 +189,9 @@ export function ehFonteRadar(jid) {
 // ── TRILHAS ───────────────────────────────────────────────────────────────
 
 const RE_JID_GRUPO_MKT = /^[\d-]{5,}@g\.us$/;
+// Canal do Telegram como fonte do radar: 'tg:<channelId>'. So FONTE — destino
+// e sempre grupo de WhatsApp, porque e la que a oferta e publicada.
+const RE_FONTE_TELEGRAM_MKT = /^tg:\d{5,}$/;
 
 export function trilhas() {
   return (E().cfg.trilhas || []).map(t => ({
@@ -291,7 +294,13 @@ export function salvarTrilhas(lista, categoriaExiste) {
 
     const norm = (arr, papel) => [...new Set((Array.isArray(arr) ? arr : []).map(x => String(x || '').trim()).filter(Boolean))]
       .map(j => {
-        if (!RE_JID_GRUPO_MKT.test(j)) throw new Error('Trilha "' + nome + '": "' + j + '" nao e um JID de grupo.');
+        if (!RE_JID_GRUPO_MKT.test(j)) {
+          if (RE_FONTE_TELEGRAM_MKT.test(j)) {
+            if (papel !== 'fonte') throw new Error('Trilha "' + nome + '": canal do Telegram (' + j + ') so pode ser fonte, nunca destino.');
+          } else {
+            throw new Error('Trilha "' + nome + '": "' + j + '" nao e um JID de grupo.');
+          }
+        }
         const outro = papelDe.get(j);
         // Um grupo que le E publica realimenta o proprio radar: a oferta que ele
         // recebe volta como captura na rodada seguinte.
