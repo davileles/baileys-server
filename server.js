@@ -6292,9 +6292,23 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       continue;
     }
     const _pisoDesc = descontoMinimoRadar();
-    if (!p.ehDeal && Number(p.desconto || 0) < _pisoDesc) {
+    // O piso media so a etiqueta da loja (precoDe -> p.desconto). Sob ML_SO_API
+    // a pagina do ML nao e aberta e a API oficial quase nunca traz
+    // original_price: precoDe vem null, p.desconto vem 0 e TODA oferta do ML era
+    // descartada aqui — inclusive as que tinham 10-15% de cupom vigente na base.
+    // Foi o que zerou o ML em 30/08 (antibot na pagina desde 27/08 16:18).
+    // O desconto do cupom so existe em r.precoFinal, calculado ANTES deste gate
+    // mas nunca lido por ele. Agora as duas medidas sao comparadas e vence a
+    // maior: etiqueta da loja OU preco final com cupom. O piso continua o mesmo,
+    // e teto de cupom (calcularDesconto) entra no calculo — item caro com cupom
+    // de teto baixo segue barrado, como deve.
+    const _descEfetivo = (Number(p.preco) > 0 && Number(r.precoFinal) > 0 && r.precoFinal < p.preco)
+      ? Math.round((1 - r.precoFinal / p.preco) * 100) : 0;
+    const _descGate = Math.max(Number(p.desconto || 0), _descEfetivo);
+    if (!p.ehDeal && _descGate < _pisoDesc) {
       console.log('[MKT] ' + (p.asin || '?') + ' descartado — desconto '
-        + Number(p.desconto || 0) + '% abaixo do piso de ' + _pisoDesc + '%');
+        + _descGate + '% (etiqueta ' + Number(p.desconto || 0) + '%, com cupom '
+        + _descEfetivo + '%) abaixo do piso de ' + _pisoDesc + '%');
       continue;
     }
 
