@@ -4698,6 +4698,9 @@ async function iniciarTelegram() {
           _msgProcessadas.set(dedupKeyRadar, Date.now());
           console.log(`[TG-RADAR] Polling ACEITA ${tgFonte} msgId=${msg.id}: ${msg.message.slice(0,60)}`);
           ultimaCapturaPorGrupo.set(tgFonte, Date.now());
+          registrarCapturaBruta(tgFonte, { key: { id: 'tg-' + msg.id },
+            message: { telegram: { msgId: msg.id, temMidia: !!msg.media } } },
+            msg.message, 'telegram-polling', false);
           await processarRadarMarketplace(tgFonte, msg.message, {});
         }
       } catch(e) { /* silencioso — canal pode estar temporariamente inacessivel */ }
@@ -4747,6 +4750,9 @@ async function iniciarTelegram() {
       if (tgFonte && ehFonteRadar(tgFonte)) {
         if (entity?.title) NOMES_GRUPOS.set(tgFonte, entity.title);
         ultimaCapturaPorGrupo.set(tgFonte, Date.now());
+        registrarCapturaBruta(tgFonte, { key: { id: 'tg-' + msg.id },
+          message: { telegram: { msgId: msg.id, temMidia: !!msg.media } } },
+          texto, 'telegram', false);
         processarRadarMarketplace(tgFonte, texto, {})
           .catch(e => console.error('[TG-RADAR] Falha no pipeline:', e.message));
       }
@@ -6145,8 +6151,74 @@ async function lerPrecosParaSerie(produtos, jid, motivo) {
   return { gravados, freados };
 }
 
+// ── ENCURTADORES GENERICOS ────────────────────────────────────────────────────
+// Canal de oferta costuma mascarar o destino num encurtador proprio (cutt.ly,
+// bit.ly...). Nenhum ehLink*() casa com esse dominio, entao a mensagem inteira
+// morria em silencio no radar: sem pipeline, sem log, sem motivo. Um canal do
+// Telegram usado como fonte chegou a perder ~45% dos posts assim. Aqui a URL
+// curta e resolvida ANTES do roteamento e o texto segue para os gates de loja
+// ja com o destino no lugar dela.
+//
+// Encurtador DE LOJA (meli.la, amzn.to, s.shopee) NAO entra nesta lista: cada
+// pipeline ja sabe resolver o seu, com pausa e cuidado de antibot proprios.
+const ENCURTADORES_GENERICOS = /^(?:www\.)?(cutt\.ly|bit\.ly|tinyurl\.com|is\.gd|t\.ly|rebrand\.ly|ow\.ly|shorturl\.at|encurtador\.com\.br|l1nq\.com|acesse\.one|shre\.ink|encr\.pw|goo\.su|abrir\.link)$/i;
+const _cacheEncurtador = new Map();          // url curta -> { destino, em }
+const ENCURTADOR_TTL_MS = 24 * 60 * 60 * 1000;
+const ENCURTADOR_CACHE_MAX = 500;
+
+function _hostSemWww(u) {
+  try { return new URL(u).hostname.replace(/^www\./i, '').toLowerCase(); }
+  catch (e) { return ''; }
+}
+
+async function resolverEncurtadorGenerico(url) {
+  const emCache = _cacheEncurtador.get(url);
+  if (emCache && Date.now() - emCache.em < ENCURTADOR_TTL_MS) return emCache.destino;
+  let destino = null;
+  try {
+    const res = await fetch(url, {
+      redirect: 'follow',
+      headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      signal: AbortSignal.timeout(8000),
+    });
+    destino = res.url || null;
+    // Encurtador que entrega HTML com meta refresh ou JS nao move res.url — o
+    // destino real esta no corpo.
+    if (destino && _hostSemWww(destino) === _hostSemWww(url)) {
+      const corpo = await res.text().catch(() => '');
+      const m = corpo.match(/(?:url=|location(?:\.href)?\s*=\s*)["']?(https?:\/\/[^"'\s>]+)/i);
+      destino = m ? m[1] : null;
+    }
+    if (destino && (!/^https?:\/\//i.test(destino) || _hostSemWww(destino) === _hostSemWww(url))) destino = null;
+  } catch (e) {
+    console.warn('[ENCURTADOR] Nao resolveu ' + url + ': ' + e.message);
+  }
+  if (_cacheEncurtador.size >= ENCURTADOR_CACHE_MAX) {
+    _cacheEncurtador.delete(_cacheEncurtador.keys().next().value);
+  }
+  _cacheEncurtador.set(url, { destino, em: Date.now() });
+  return destino;
+}
+
+async function expandirEncurtadores(texto) {
+  const urls = String(texto || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
+  const alvos = [...new Set(urls.filter(u => ENCURTADORES_GENERICOS.test(_hostSemWww(u))))];
+  if (!alvos.length) return texto;
+  let saida = texto;
+  for (const curta of alvos) {
+    const destino = await resolverEncurtadorGenerico(curta);
+    if (!destino) continue;
+    console.log('[ENCURTADOR] ' + curta + ' -> ' + destino.slice(0, 140));
+    saida = saida.split(curta).join(destino);
+  }
+  return saida;
+}
+
 async function processarRadarMarketplace(jid, texto, opcoes = {}) {
   if (!texto) return;
+
+  // Encurtador generico esconde a loja de destino de todos os gates abaixo.
+  texto = await expandirEncurtadores(texto);
 
   // Uma mensagem pode trazer link de mais de uma loja; cada pipeline cuida dos
   // links que reconhece e ignora o resto.
@@ -6244,7 +6316,17 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     }
   }
 
-  if (!resultados.length) return;
+  if (!resultados.length) {
+    // Ate aqui o descarte era mudo. Sem o dominio no log nao da para saber se a
+    // mensagem nao tinha link, se a loja e desconhecida ou se um encurtador
+    // novo entrou em cena.
+    const _doms = [...new Set((String(texto).match(/https?:\/\/[^\/\s]+/g) || [])
+      .map(u => u.replace(/^https?:\/\//i, '')))];
+    if (_doms.length) {
+      console.log('[MKT] ' + String(jid).split('@')[0] + ' — nenhum pipeline reconheceu o link: ' + _doms.join(', '));
+    }
+    return;
+  }
 
   // A miniatura do post so pode virar reserva quando a mensagem trata de UM
   // produto: com dois links no mesmo texto, o card do post e de um deles e a
