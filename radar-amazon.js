@@ -134,6 +134,15 @@ const CFG_PADRAO = {
   // conta principal (comportamento historico). Fora de qualquer turno tambem
   // cai na principal: a mensagem nunca deixa de sair por causa da escala.
   turnosTsp: { ativo: false, turnos: [] },
+  // Qual numero dispara em CADA grupo de destino. Complementa a escala de
+  // turnos em vez de substituir: grupo COM atribuicao sai sempre pelo numero
+  // dele, grupo SEM atribuicao cai no turno vigente (e, na falta de turno, na
+  // principal). Existe porque a carga que o WhatsApp enxerga e por numero e por
+  // grupo — nao por horario: espalhar 40 grupos entre tres numeros so funciona
+  // se cada grupo tiver dono fixo. Dono fixo tambem deixa o remetente coerente
+  // dentro do grupo, que e o que o membro percebe.
+  //   { ativo: bool, mapa: { '<jid>@g.us': '<apelido da conta>' } }
+  numerosGrupo: { ativo: false, mapa: {} },
   // Pausa entre um grupo e outro quando a MESMA mensagem e replicada para
   // varios destinos. Era 3-5s fixo no server.js: virou config porque o ritmo
   // seguro muda conforme o numero de grupos e a idade da conta, e ajustar isso
@@ -732,6 +741,93 @@ export function contaDoTurno(quando = new Date()) {
     if (dentro) return t.conta;
   }
   return 'principal';
+}
+
+// ── NUMERO FIXO POR GRUPO DE DESTINO ──────────────────────────────────────
+// A escala de turnos acima resolve "quem dispara AGORA". Isto resolve "quem
+// dispara NESTE GRUPO", que e a pergunta que importa para dividir carga: o
+// limite pratico de um numero e quantos grupos ele alimenta, nao quantas horas
+// ele fica de plantao. Os dois convivem — a atribuicao por grupo tem
+// precedencia, e o que nao estiver atribuido continua seguindo o turno.
+
+export function numerosGrupo() {
+  const n = E().cfg.numerosGrupo || {};
+  const mapa = (n.mapa && typeof n.mapa === 'object' && !Array.isArray(n.mapa)) ? n.mapa : {};
+  return { ativo: !!n.ativo, mapa };
+}
+
+/**
+ * Grava o mapa inteiro (substitui, nao mescla): a tela manda o estado completo,
+ * e mesclar impediria de DESATRIBUIR um grupo. Entrada com jid invalido ou
+ * conta vazia e descartada em silencio — conta vazia e justamente como a tela
+ * diz "este grupo volta a seguir o turno".
+ */
+export function salvarNumerosGrupo(dados = {}) {
+  const atual = numerosGrupo();
+  let mapa = atual.mapa;
+  if (dados.mapa && typeof dados.mapa === 'object' && !Array.isArray(dados.mapa)) {
+    mapa = {};
+    for (const [jid, conta] of Object.entries(dados.mapa)) {
+      if (!RE_JID_GRUPO_MKT.test(String(jid || ''))) continue;
+      const c = String(conta || '').trim();
+      if (!c) continue;
+      if (!/^[a-z0-9_-]{2,24}$/i.test(c)) throw new Error('apelido de conta invalido: ' + c);
+      mapa[jid] = c;
+    }
+  }
+  const nova = { ativo: dados.ativo !== undefined ? !!dados.ativo : atual.ativo, mapa };
+  salvarRadarConfig({ numerosGrupo: nova });
+  return nova;
+}
+
+/** Tira uma conta do mapa inteiro. Usado quando a conta e excluida no painel. */
+export function removerContaDosGrupos(apelido) {
+  const alvo = String(apelido || '').trim();
+  if (!alvo) return 0;
+  const { ativo, mapa } = numerosGrupo();
+  const limpo = {}; let removidos = 0;
+  for (const [jid, c] of Object.entries(mapa)) {
+    if (c === alvo) { removidos++; continue; }
+    limpo[jid] = c;
+  }
+  if (removidos) salvarRadarConfig({ numerosGrupo: { ativo, mapa: limpo } });
+  return removidos;
+}
+
+/**
+ * Quem dispara neste grupo. Ordem: atribuicao fixa -> turno -> 'principal'.
+ * Sempre devolve algo: a mensagem nunca deixa de sair por causa desta camada.
+ */
+export function contaDoGrupo(jid, quando = new Date()) {
+  const { ativo, mapa } = numerosGrupo();
+  if (ativo) {
+    const c = mapa[String(jid || '')];
+    if (c) return c;
+  }
+  return contaDoTurno(quando);
+}
+
+/**
+ * Grupos de destino sem numero atribuido — os "orfaos". Com a atribuicao
+ * desligada nao existe orfao: todo mundo segue o turno, que e o comportamento
+ * historico e nao tem buraco.
+ */
+export function gruposOrfaos(destinos = []) {
+  const { ativo, mapa } = numerosGrupo();
+  if (!ativo) return [];
+  return [...new Set(destinos)].filter(j => !mapa[j]);
+}
+
+/** Quantos grupos cada numero carrega. Chave null = sem atribuicao. */
+export function cargaPorNumero(destinos = []) {
+  const { mapa } = numerosGrupo();
+  const carga = new Map();
+  for (const j of [...new Set(destinos)]) {
+    const c = mapa[j] || null;
+    carga.set(c, (carga.get(c) || 0) + 1);
+  }
+  return [...carga.entries()].map(([conta, grupos]) => ({ conta, grupos }))
+    .sort((a, b) => b.grupos - a.grupos);
 }
 
 export function listarMonitor() { return E().cfg.monitor || {}; }
