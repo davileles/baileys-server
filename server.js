@@ -95,6 +95,16 @@ import {
   modoAutoEnvioCupom, modoAutoEnvioOferta, origemAutoEnvio,
 } from './config-tsp.js';
 
+// ── CONFIG DA OPERACAO CDV (editavel pela aba Config do gerador) ──────────────
+// Irmao do config-tsp para o outro lado da casa. Ate esta versao os grupos do
+// CDV eram hardcode aqui embaixo; agora sao cadastro em tela, como no TSP.
+import {
+  carregarConfigCdv, configCdv, salvarConfigCdv, PAPEIS_CDV,
+  grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv,
+  gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv,
+  contaEnvioCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
+} from './config-cdv.js';
+
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
   carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant, tenantContexto,
@@ -577,40 +587,32 @@ process.on('SIGINT',  () => encerrarComFlush('SIGINT'));
 // ── GRUPOS DE DESTINO ─────────────────────────────────────────────────────────
 // Os grupos do TSP (padrao, so-cupons e operador) vem da config editavel pelo
 // painel (aba Configuracoes) — getters para toda leitura ver o valor atual.
-// Os grupos do CDV seguem fixos: pertencem a outra operacao, fora deste painel.
+// Os grupos do CDV vinham fixos aqui — pertenciam a outra operacao, fora deste
+// painel. Passaram a sair de config-cdv.js, editavel na aba Config do gerador:
+// mesmos getters, mesma razao (gravar em tela vale na proxima leitura, sem
+// restart e sem deploy).
 const GRUPOS = {
   // Grupos exclusivos de cupons — recebem copia de todo cupom_tsp com rodape
   // convidando para o grupo de ofertas (convite cruzado). Nunca recebem oferta
   // de produto. Podem ser varios.
   get tsp_cupons() { return gruposTspCupons(); },
-  cdv_ofertas: '120363170138704529@g.us',
-  cdv_emissao: '120363172490263905@g.us',
+  get cdv_ofertas() { return grupoOfertasCdv(); },
+  get cdv_emissao() { return grupoEmissaoCdv(); },
   // Grupo interno do operador — avisos operacionais que NAO vao para clientes
   // (novo cupom capturado, falha de coleta, etc).
   get operador()   { return grupoOperadorTsp(); },
 };
-const GRUPOS_MONITORADOS      = [
-  '120363430801699326@g.us',
-  '120363409136599326@g.us',
-  '120363410708080270@g.us',
-  '120363229600818869@g.us',
-  '120363298361885116@g.us',
-  '120363301488379027@g.us',
-  '120363230402728347@g.us',
-  '120363229682219999@g.us',
-  '120363212151306916@g.us',
-  '120363211235070904@g.us',
-  '120363230586056001@g.us',
-  '120363211276624072@g.us',
-  '120363416996630307@g.us',
-  '120363427410900900@g.us',
-  '120363423603571989@g.us',
-  '120363428018752970@g.us', // TSM - ALERTAS CAMPO GRANDE #2 (grupo antigo 120363280292009756 foi recriado pelo TSM)
-  '120363281681293673@g.us', // TSM - ALERTAS ARACAJU
-  '120363231330746034@g.us', // TSM - ALERTAS BELÉM
-  '120363428522283420@g.us', // TSM - ALERTAS JOÃO PESSOA/CAMPINA GRANDE
-  '120363284038160631@g.us', // TSM - ALERTAS SÃO LUÍS
-];
+// Os 20 grupos que ficavam listados aqui viraram cadastro em config-cdv.js
+// (./sessao/config_cdv.json), ligaveis e desligaveis na aba Config do gerador.
+// A lista de partida e identica a que estava neste ponto — quem nao mexer em
+// nada continua monitorando exatamente os mesmos grupos.
+//
+// As regras de EXTRACAO por grupo continuam logo abaixo, no codigo:
+// GRUPOS_FILTRO_DATAS_MIN, GRUPO_APENAS_IMAGEM, GRUPO_EXECUTIVA e
+// GRUPOS_TEXTO_ESTRUTURADO. Sao decisao de parsing, nao de operacao — um valor
+// torto ali nao desliga o grupo, faz o grupo capturar errado em silencio.
+// Grupo cadastrado pela tela e que nao aparece em nenhuma dessas regras e
+// tratado no fluxo padrao.
 const GRUPO_DESTINO_PASSAGENS = 'cdv_emissao';
 const JANELA_AGRUPAMENTO_MS   = 3 * 60 * 1000;
 
@@ -1664,10 +1666,18 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
     return enviarPelaConta(alvo, destino, conteudo);
   }
 
+  // Destino do CDV sem conta explicita usa a conta configurada na aba Config do
+  // gerador. Quem chamou pedindo uma conta especifica (a escala de turnos do
+  // TSP) continua mandando — este default so preenche o que estava vazio.
+  let contaId = opcoes.conta;
+  if (!contaId && ehGrupoCdv(destino)) {
+    const apelidoCdv = contaEnvioCdv();
+    if (apelidoCdv) contaId = contaIdDe(TENANT_PADRAO, apelidoCdv);
+  }
+
   // Conta escolhida pela escala de turnos. Falha ou indisponibilidade cai na
   // principal em vez de abortar: a mensagem sair pelo numero "errado" e menos
   // grave do que nao sair.
-  const contaId = opcoes.conta;
   if (contaId && contaId !== 'principal' && tentativa === 0) {
     if (contaDisponivel(contaId)) {
       try {
@@ -1708,6 +1718,32 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
     }
     throw err;
   }
+}
+
+/**
+ * Aviso operacional do CDV: vai para o grupo de avisos (se cadastrado) e para
+ * o WhatsApp de cada admin com o papel 'avisos'. Nunca lanca — um aviso que
+ * falha nao pode derrubar o fluxo que o gerou.
+ */
+async function avisarAdminsCdv(texto) {
+  const alvos = [];
+  const grupo = grupoAvisosCdv();
+  if (grupo) alvos.push(grupo);
+  for (const tel of telefonesAvisoCdv()) {
+    try {
+      // Nunca montar o JID somando '@s.whatsapp.net' ao telefone — ver
+      // resolverJidWhatsApp logo abaixo (conversa fantasma).
+      const { jid } = await resolverJidWhatsApp(tel);
+      if (jid) alvos.push(jid);
+    } catch (e) { console.warn('[CDV] Nao resolvi o JID do admin ' + tel + ': ' + e.message); }
+  }
+  if (!alvos.length) return 0;
+  let ok = 0;
+  for (const jid of alvos) {
+    try { await enviarMensagem(jid, { text: texto }); ok++; }
+    catch (e) { console.warn('[CDV] Falha ao avisar ' + jid + ': ' + e.message); }
+  }
+  return ok;
 }
 
 // ── JID CANONICO ─────────────────────────────────────────────────────────────
@@ -1836,6 +1872,9 @@ async function workerFila() {
           salvarFila();
         }
         console.error('[FILA] Oferta #' + item.ofertaId + ' removida da fila e devolvida para aprovação manual.');
+        avisarAdminsCdv('⚠️ CDV — a oferta #' + item.ofertaId + ' falhou ' + item.tentativas
+          + ' vez(es) e voltou para aprovação manual no gerador.\n\nÚltimo erro: ' + e.message)
+          .catch(() => {});
       }
       await new Promise(r => setTimeout(r, 10000));
       continue;
@@ -3201,7 +3240,7 @@ const MARCA_PATH  = 'M831 -539Q831 -416 883.5 -345.0Q936 -274 1026 -274Q1115 -27
 // Grupos do CDV ficam de fora: outra operacao, outro @. Redundante com a
 // allowlist de ehGrupoTsp — e de proposito: se um grupo do CDV for cadastrado
 // por engano como destino de trilha, este bloqueio ainda segura.
-const GRUPOS_SEM_MARCA = new Set([GRUPOS.cdv_ofertas, GRUPOS.cdv_emissao]);
+// (era um Set montado no boot; virou ehGrupoCdv(), lido a cada envio)
 
 /**
  * O destino e grupo do Tica Promos? ALLOWLIST, nao lista de excecoes: so leva
@@ -3315,7 +3354,7 @@ async function conteudoComMarca(destino, conteudo) {
     // Operador hospedado tem o @ dele, nao o nosso.
     if ((tenantContexto() || TENANT_PADRAO) !== TENANT_PADRAO) return conteudo;
     const jid = String(destino || '');
-    if (GRUPOS_SEM_MARCA.has(jid) || !ehGrupoTsp(jid)) return conteudo;
+    if (ehGrupoCdv(jid) || !ehGrupoTsp(jid)) return conteudo;
 
     let saida = conteudo, mudou = false;
     if (Buffer.isBuffer(conteudo.image)) {
@@ -5732,6 +5771,7 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_base.json',       // base de cupons — cadastro manual/capturado
   'radar_config.json',      // papeis fonte/destino dos grupos do radar
   'config_tsp.json',        // config da operacao (afiliados, rodapes, grupos)
+  'config_cdv.json',        // config do CDV (destinos, monitorados, admins, conta)
   'tenants.json',           // registro dos operadores do modelo hospedado
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
@@ -6607,11 +6647,11 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 async function processarMensagem(msg) {
   try {
     const jid    = msg.key.remoteJid;
-    // Dois monitoramentos convivem: GRUPOS_MONITORADOS alimenta o pipeline de
+    // Dois monitoramentos convivem: os monitorados do CDV alimentam o pipeline de
     // emissoes CDV; os grupos marcados como 'fonte' no painel alimentam o radar
     // de marketplace. Um grupo pode estar so em um dos dois.
     const _ehRadar = ehFonteRadar(jid);
-    if (!GRUPOS_MONITORADOS.includes(jid) && !_ehRadar) return;
+    if (!ehMonitoradoCdv(jid) && !_ehRadar) return;
     // Edicao de mensagem no grupo-fonte: o WhatsApp entrega a versao nova
     // dentro de protocolMessage.editedMessage. Sem este desembrulho o tipo caia
     // em 'protocolMessage', que esta em _TIPOS_IGNORADOS, e a correcao sumia sem
@@ -6669,7 +6709,7 @@ async function processarMensagem(msg) {
     if (_ehRadar) {
       registrarCapturaBruta(jid, msg, texto, tipo, _ehEdicao);
       await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao, thumbFonte: _thumbFonte });
-      if (!GRUPOS_MONITORADOS.includes(jid)) return;
+      if (!ehMonitoradoCdv(jid)) return;
     }
 
     if (!bufferAgrupamento.has(jid)) bufferAgrupamento.set(jid, { itens:[], timer:null });
@@ -6973,7 +7013,7 @@ async function limparSenderKeysDoGrupo(jid, cura) {
       // de DESTINO o bot nao le nada: indecifravel ali e conversa de membro que
       // nunca seria processada — avisar gera alarme falso e induz o operador a
       // "sair e entrar" de um grupo saudavel (perdendo admin e a base de membros).
-      if (!(ehFonteRadar(jid) || GRUPOS_MONITORADOS.includes(jid))) {
+      if (!(ehFonteRadar(jid) || ehMonitoradoCdv(jid))) {
         console.log('[WA] ' + (NOMES_GRUPOS.get(jid) || jid) + ' segue indecifravel apos ' + cura
           + ' cura(s), mas e grupo de DESTINO (nao lemos dele) — nenhuma captacao afetada, sem aviso ao operador.');
         return;
@@ -8321,7 +8361,7 @@ async function conectar() {
             type,
             jid: mm.key?.remoteJid || null,
             fromMe: !!mm.key?.fromMe,
-            monitorado: GRUPOS_MONITORADOS.includes(mm.key?.remoteJid),
+            monitorado: ehMonitoradoCdv(mm.key?.remoteJid),
             fonteRadar: ehFonteRadar(mm.key?.remoteJid),
             chaves: mm.message ? Object.keys(mm.message) : null,
             stub: mm.messageStubType ?? null,
@@ -8348,7 +8388,7 @@ async function conectar() {
         //      o pipeline mandando mensagem a mao (incidente de 17/08/2026).
         // Agora processamos os de grupos monitorados; o dedup por key.id evita
         // processar de novo se a mesma mensagem voltar como 'notify'.
-        const dosMonitorados = (messages || []).filter(mm => GRUPOS_MONITORADOS.includes(mm.key?.remoteJid));
+        const dosMonitorados = (messages || []).filter(mm => ehMonitoradoCdv(mm.key?.remoteJid));
         if (dosMonitorados.length > 0) {
           const comConteudo = dosMonitorados.filter(mm => mm.message);
           console.log('[WA] Upsert tipo "' + type + '" com ' + dosMonitorados.length + ' msg(s) de grupos monitorados: ' + comConteudo.length + ' processada(s), ' + (dosMonitorados.length - comConteudo.length) + ' sem conteudo.');
@@ -9051,8 +9091,8 @@ app.get('/contas/:id/grupos', async (req, res) => {
       const fontes = radarFontes();
       resposta.leitura = {
         monitorados: {
-          conferidos: GRUPOS_MONITORADOS.length,
-          faltando: ausentes(GRUPOS_MONITORADOS),
+          conferidos: gruposMonitoradosCdv().length,
+          faltando: ausentes(gruposMonitoradosCdv()),
         },
         fontesRadar: {
           conferidos: [...new Set(fontes)].length,
@@ -9260,7 +9300,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:GRUPOS_MONITORADOS, radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
@@ -10699,6 +10739,51 @@ app.get('/config-tsp/rodape-preview', (req, res) => {
 // ── REGISTRO DE OPERADORES ───────────────────────────────────────────────────
 // Leitura publica MASCARADA: sem e-mails (endpoints do painel sao abertos; a
 // gestao completa do registro entra junto do login por operador, na fase 2.5).
+// ── CONFIG DO CDV ────────────────────────────────────────────────────────────
+// Espelho de /config-tsp para o gerador. GET devolve a config inteira mais o
+// que a tela precisa para montar os seletores: nomes dos grupos conhecidos e
+// contas conectadas (para escolher quem dispara).
+app.get('/config-cdv', (req, res) => {
+  if (!NOMES_GRUPOS.size) atualizarNomesGrupos().catch(() => {});
+  const cfg = configCdv();
+  const contas = [...contasExtras.values()]
+    .filter(c => tenantDaConta(c.id) === TENANT_PADRAO)
+    .map(c => ({ id: apelidoDaConta(c.id), conectado: c.conectado }));
+  res.json({
+    ok: true,
+    config: cfg,
+    papeis: PAPEIS_CDV,
+    // Nome atual de cada grupo monitorado, direto do WhatsApp: o cadastro
+    // guarda o nome do dia em que foi salvo, e grupo renomeado ficaria com um
+    // rotulo velho na tela para sempre.
+    nomes: Object.fromEntries(NOMES_GRUPOS),
+    contas,
+    contaEmUso: contaEnvioCdv() || 'principal',
+  });
+});
+
+app.post('/config-cdv', (req, res) => {
+  try {
+    const novo = salvarConfigCdv(req.body || {});
+    const ativos = novo.monitorados.filter(m => m.ativo).length;
+    console.log('[CFG-CDV] Config gravada pelo painel — ofertas=' + novo.grupos.ofertas
+      + ' emissao=' + novo.grupos.emissao + ' monitorados=' + ativos + '/' + novo.monitorados.length
+      + ' admins=' + novo.admins.length + ' conta=' + (novo.envio.conta || 'principal') + '.');
+    res.json({ ok: true, config: novo });
+  } catch (e) {
+    res.status(400).json({ ok: false, erro: e.message });
+  }
+});
+
+// Papeis de um e-mail. O gerador ainda NAO tem login, entao isto responde
+// "o que esta cadastrado para este e-mail", nao "quem e voce" — organiza a
+// operacao, nao autentica. Vira cadeado de verdade quando o gerador ganhar o
+// OTP que o painel-cdv ja tem.
+app.get('/config-cdv/permissoes', (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  res.json({ ok: true, email, papeis: papeisDoEmailCdv(email), autenticado: false });
+});
+
 app.get('/tenants', (req, res) => {
   res.json({
     ok: true,
