@@ -9455,12 +9455,21 @@ app.delete('/contas/:id', async (req, res) => {
 // falha o envio na hora do turno dele — melhor descobrir antes.
 app.get('/contas/:id/grupos', async (req, res) => {
   const id = contaIdReq(req);
-  const c = contasExtras.get(id);
-  if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
+  // A principal tambem precisa ser auditavel: desde que ela virou leitora do
+  // TSP e dona de metade dos grupos de destino, "conta nao conectada" aqui era
+  // um ponto cego bem no numero mais critico do sistema.
+  const ehPrincipal = apelidoDaConta(id) === 'principal';
+  const s = ehPrincipal ? (conectado ? sock : null) : contasExtras.get(id)?.sock;
+  if (!s || (!ehPrincipal && !contasExtras.get(id)?.conectado)) {
+    return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
+  }
   try {
-    const daConta = Object.keys(await c.sock.groupFetchAllParticipating());
+    const daConta = Object.keys(await s.groupFetchAllParticipating());
     const alvos = [...new Set([...radarDestinos(), ...GRUPOS['tsp_cupons']])];
+    // Fonte de Telegram (tg:...) nunca sera grupo de WhatsApp: contar como
+    // "faltando" so gerava falso negativo em aptaAPrincipal.
     const ausentes = (lista) => [...new Set(lista)]
+      .filter(j => !String(j).startsWith('tg:'))
       .filter(j => !daConta.includes(j))
       .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
 
@@ -9489,6 +9498,11 @@ app.get('/contas/:id/grupos', async (req, res) => {
           faltando: ausentes(fontes),
         },
       };
+      // Destinos do CDV: quem dispara oferta/emissao precisa estar nesses tres
+      // grupos, e ate agora nada conferia isso em lugar nenhum.
+      const gc = configCdv().grupos || {};
+      const destinosCdv = [gc.ofertas, gc.emissao, gc.operador].filter(Boolean);
+      resposta.destinosCdv = { conferidos: destinosCdv.length, faltando: ausentes(destinosCdv) };
       resposta.leitura.aptaAPrincipal =
         resposta.leitura.monitorados.faltando.length === 0 &&
         resposta.leitura.fontesRadar.faltando.length === 0;
