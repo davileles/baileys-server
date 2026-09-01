@@ -9356,10 +9356,23 @@ app.delete('/contas/:id', async (req, res) => {
   // exatamente o que a aba de balanceamento existe para denunciar.
   const gruposLiberados = removerContaDosGrupos(apelidoDaConta(id));
 
+  // Mesma razao para os papeis de leitura e de disparo do CDV: apontados para
+  // uma conta que nao existe mais, contaLeitoraDe() devolve a principal e o
+  // envio cai no fallback — tudo continua funcionando, e o operador nunca
+  // entende por que a separacao que ele configurou "parou de valer".
+  const apel = apelidoDaConta(id);
+  const papeisLimpos = [];
+  try {
+    if (contaLeitoraCdv() === apel) { salvarConfigCdv({ leitura: { conta: '' } }); papeisLimpos.push('leitura do CDV'); }
+    if (contaEnvioCdv()   === apel) { salvarConfigCdv({ envio:   { conta: '' } }); papeisLimpos.push('disparo do CDV'); }
+    if (contaLeitoraTsp() === apel) { salvarConfigTsp({ leitura: { conta: '' } }); papeisLimpos.push('leitura do TSP'); }
+  } catch (e) { console.warn('[CONTA:' + id + '] Falha ao limpar papeis:', e.message); }
+
   console.log('[CONTA:' + id + '] removida' + (desvinculou ? ' (dispositivo desvinculado)' : '')
     + (turnosRemovidos ? ' — ' + turnosRemovidos + ' turno(s) descartado(s)' : '')
-    + (gruposLiberados ? ' — ' + gruposLiberados + ' grupo(s) sem numero atribuido' : '') + '.');
-  res.json({ ok:true, desvinculou, turnosRemovidos, gruposLiberados });
+    + (gruposLiberados ? ' — ' + gruposLiberados + ' grupo(s) sem numero atribuido' : '')
+    + (papeisLimpos.length ? ' — devolvido(s) para a principal: ' + papeisLimpos.join(', ') : '') + '.');
+  res.json({ ok:true, desvinculou, turnosRemovidos, gruposLiberados, papeisLimpos });
 });
 
 // Compara os grupos das duas contas. Um numero que nao esta num grupo de destino
@@ -10912,6 +10925,11 @@ app.get('/mkt/config', (req, res) => {
     espacamentoGrupos: espacamentoGrupos(),
     turnosTsp: turnosTsp(),
     contaAgora: contaDoTurno(),
+    // Quem le o que, para o painel do TSP nao continuar afirmando que a
+    // principal "le e envia" e as demais "so enviam" — deixou de ser verdade
+    // quando a leitura passou a ser escolhida por operacao.
+    leitores: estadoLeitores(),
+    envioCdv: contaEnvioCdv() || 'principal',
   });
 });
 
