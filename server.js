@@ -2448,6 +2448,38 @@ function appendHistoricoMensagem(msg, hist180) {
   return msg.slice(0, linkIdx) + bloco + msg.slice(linkIdx);
 }
 
+// ── DESCARTES SILENCIOSOS DO PIPELINE DE ALERTAS ─────────────────────────────
+// Todo descarte daqui até a fila só existia como linha de log no Railway. Na
+// prática isso significa que "esse alerta não foi pego" vira investigação: sem
+// registro consultável não dá para distinguir mensagem que não chegou, extração
+// que falhou e emissão que o filtro cortou de propósito.
+//
+// Ring buffer em memória, não arquivo: é material de diagnóstico das últimas
+// horas, e persistir traria sync, crescimento e uma decisão de retenção que o
+// caso não justifica. Reinício limpa, e tudo bem.
+const DESCARTES_MAX = 200;
+const _descartesCdv = [];
+
+function registrarDescarteCdv({ jid, motivo, detalhe, dados, texto }) {
+  const de = dados || {};
+  _descartesCdv.unshift({
+    em: new Date().toISOString(),
+    jid: jid || null,
+    grupo: (jid && NOMES_GRUPOS.get(jid)) || null,
+    motivo,                                  // categoria curta, para filtrar
+    detalhe: detalhe || '',                  // números que explicam a decisão
+    origem: de.origem || de.origemCodigo || null,
+    destino: de.destino || de.destinoCodigo || null,
+    programa: de.programa || null,
+    cabine: de.cabine || null,
+    pontos: Number(de.pontos) || null,
+    // Só o começo do texto: o suficiente para você reconhecer a mensagem no
+    // grupo sem transformar o ring buffer num arquivo de conversas.
+    trecho: String(texto || '').replace(/\s+/g, ' ').trim().slice(0, 220),
+  });
+  if (_descartesCdv.length > DESCARTES_MAX) _descartesCdv.length = DESCARTES_MAX;
+}
+
 // ── FILTRO: preço fora da curva vs média 180 dias ────────────────────────────
 // Descarta emissões cujo valor supera a média dos últimos 180 dias da MESMA
 // chave (origem|destino|programa|cabine|cia — a mesma usada pelo proxy no
@@ -2464,7 +2496,13 @@ function precoForaDaCurva(pontos, hist180, tipoVoo) {
   const fator  = nacional ? 1.50 : 1.30;
   const limite = Math.round(hist180.mediaPts * fator);
   if (pts > limite) {
-    console.log('[FILTRO-180D] Fora da curva: ' + pts.toLocaleString('pt-BR') + ' pts > limite ' + limite.toLocaleString('pt-BR') + ' (média ' + hist180.mediaPts.toLocaleString('pt-BR') + ' × ' + fator + ', ' + hist180.count + ' amostra(s), ' + (nacional ? 'nacional' : 'internacional') + ')');
+    const det = pts.toLocaleString('pt-BR') + ' pts > limite ' + limite.toLocaleString('pt-BR')
+      + ' (média ' + hist180.mediaPts.toLocaleString('pt-BR') + ' × ' + fator + ', '
+      + hist180.count + ' amostra(s), ' + (nacional ? 'nacional' : 'internacional') + ')';
+    console.log('[FILTRO-180D] Fora da curva: ' + det);
+    // Guardado para quem chamou anexar ao registro do descarte: recalcular o
+    // texto no chamador duplicaria a regra dos fatores em cinco lugares.
+    precoForaDaCurva.ultimoDetalhe = det;
     return true;
   }
   return false;
@@ -5245,6 +5283,8 @@ function filtrarProgramasBloqueados(resultados) {
   return resultados.map(r => {
     if (r?.valido && PROGRAMAS_BLOQUEADOS_ALERTA.test(String(r.programa || ''))) {
       console.log('   [FILTRO] Descartada por programa bloqueado: ' + r.programa + ' (' + (r.origemCodigo || r.origem || '?') + '->' + (r.destinoCodigo || r.destino || '?') + ')');
+      registrarDescarteCdv({ motivo: 'programa bloqueado',
+        detalhe: r.programa + ' não alimenta a aba Alertas', dados: r });
       return { ...r, valido: false };
     }
     return r;
@@ -5668,6 +5708,9 @@ async function aguardarParIdaVolta(oferta, grupoId) {
     const hist180Par = await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
     if (precoForaDaCurva(mesclada.dadosExtraidos?.pontos, hist180Par, mesclada.dadosExtraidos?.tipoVoo)) {
       console.log('[PAR-BUFFER] Par mesclado descartado pelo filtro 180d: ' + (mesclada.dadosExtraidos?.origemCodigo) + '↔' + (mesclada.dadosExtraidos?.destinoCodigo));
+      registrarDescarteCdv({ jid: mesclada.grupoOrigem, motivo: 'preço fora da curva',
+        detalhe: precoForaDaCurva.ultimoDetalhe, dados: mesclada.dadosExtraidos,
+        texto: mesclada.conteudoOriginal });
       return true; // consumido (descartado)
     }
     mesclada.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV({ ...mesclada.dadosExtraidos }), hist180Par);
@@ -5686,6 +5729,9 @@ async function aguardarParIdaVolta(oferta, grupoId) {
         .then(hist180 => {
           if (precoForaDaCurva(oferta.dadosExtraidos?.pontos, hist180, oferta.dadosExtraidos?.tipoVoo)) {
             console.log('[PAR-BUFFER] Somente-ida descartada pelo filtro 180d: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
+            registrarDescarteCdv({ jid: oferta.grupoOrigem, motivo: 'preço fora da curva',
+              detalhe: precoForaDaCurva.ultimoDetalhe, dados: oferta.dadosExtraidos,
+              texto: oferta.conteudoOriginal });
             return;
           }
           if (hist180) oferta.mensagemFormatada = appendHistoricoMensagem(oferta.mensagemFormatada, hist180);
@@ -5710,7 +5756,16 @@ async function processarBuffer(grupoId) {
   try {
     const classificacoes = await classificarItens(itens, grupoId);
     let validas = classificacoes.filter(c => c?.valido);
-    if (validas.length === 0) { console.log('Nenhuma oferta encontrada.'); return; }
+    if (validas.length === 0) {
+      console.log('Nenhuma oferta encontrada.');
+      // O caso mais confuso de todos: a mensagem chegou, passou pela IA e não
+      // virou nada. Sem este registro o alerta simplesmente some.
+      for (const it of itens) {
+        registrarDescarteCdv({ jid: grupoId, motivo: 'não reconhecido como emissão',
+          detalhe: 'a extração não identificou rota/milhas neste conteúdo', texto: it.texto });
+      }
+      return;
+    }
 
     const gruposMesclagem = new Set([GRUPO_APENAS_IMAGEM, GRUPO_EXECUTIVA, ...GRUPOS_TEXTO_ESTRUTURADO]);
     if (gruposMesclagem.has(grupoId)) {
@@ -5721,7 +5776,12 @@ async function processarBuffer(grupoId) {
     if (minDatas) {
       const validasFiltradas = validas.filter(v => {
         const total = contarDatas(v.datasIda) + contarDatas(v.datasVolta);
-        if (total <= minDatas) { console.log('   [FILTRO] Descartada por poucas datas ('+total+'): '+v.origemCodigo+'->'+v.destinoCodigo); return false; }
+        if (total <= minDatas) {
+          console.log('   [FILTRO] Descartada por poucas datas ('+total+'): '+v.origemCodigo+'->'+v.destinoCodigo);
+          registrarDescarteCdv({ jid: grupoId, motivo: 'poucas datas',
+            detalhe: total + ' data(s), mínimo do grupo é ' + (minDatas + 1), dados: v });
+          return false;
+        }
         return true;
       });
       if (validasFiltradas.length === 0) { console.log('   [FILTRO] Todas descartadas.'); return; }
@@ -5737,6 +5797,8 @@ async function processarBuffer(grupoId) {
         const hist180Bypass = await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta_pendente', apenasConsulta:true });
         if (precoForaDaCurva(dados.pontos, hist180Bypass, dados.tipoVoo)) {
           console.log('[BYPASS] Emissão descartada pelo filtro 180d: ' + v.origemCodigo + '->' + v.destinoCodigo + ' (' + v.programa + ')');
+          registrarDescarteCdv({ jid: grupoId, motivo: 'preço fora da curva',
+            detalhe: precoForaDaCurva.ultimoDetalhe, dados, texto: textos });
           continue;
         }
         const mensagem = appendHistoricoMensagem(formatarMensagemCDV(dados), hist180Bypass);
@@ -5786,6 +5848,8 @@ async function processarBuffer(grupoId) {
       const hist180Normal = await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
       if (precoForaDaCurva(emissao.pontos, hist180Normal, emissao.tipoVoo)) {
         console.log('[FILTRO-180D] Emissão descartada: ' + emissao.origem + '->' + emissao.destino + ' (' + emissao.programa + ')');
+        registrarDescarteCdv({ jid: grupoId, motivo: 'preço fora da curva',
+          detalhe: precoForaDaCurva.ultimoDetalhe, dados: emissao, texto: textosFinal });
         continue;
       }
       const mensagemComHist = appendHistoricoMensagem(emissao.mensagem, hist180Normal);
@@ -6923,6 +6987,12 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
     const entrada = bufferAgrupamento.get(jid);
     if (entrada.timer) clearTimeout(entrada.timer);
     entrada.timer = setTimeout(() => processarBuffer(jid), JANELA_AGRUPAMENTO_MS);
+    // A janela e um DEBOUNCE: cada mensagem nova reinicia a contagem, entao em
+    // grupo que posta em rajada o alerta espera a rajada acabar. Guardar o
+    // horario previsto de fechamento e o que permite a tela explicar a espera
+    // em vez de o operador achar que a mensagem se perdeu.
+    entrada.fechaEm = Date.now() + JANELA_AGRUPAMENTO_MS;
+    if (!entrada.desdeEm) entrada.desdeEm = Date.now();
     entrada.itens.push({ texto, imagemBase64:imagemB64, timestamp:Date.now() });
   } catch(err) { console.error('Erro ao processar mensagem WA:', err.message); }
 }
@@ -10031,8 +10101,32 @@ app.get('/painel-json', (req, res) => {
       // autoAgendado e ele volta a aparecer aqui para aprovacao manual.
       .filter(o => !(o.autoAgendado && (o.status === 'pendente' || o.status === 'enviando')))
       .slice(0,50).map(o => ({ ...o, conteudoOriginal: typeof o.conteudoOriginal==='string'?o.conteudoOriginal:(Array.isArray(o.conteudoOriginal)?o.conteudoOriginal.join('\n'):''), imagens:Array.isArray(o.imagens)?o.imagens:[] }));
-    res.json({ ok:true, bufferAtivo:emBuffer, ofertas });
+    // Detalhe do buffer por grupo: sem isto a aba Alertas so sabe que existem N
+    // itens em algum lugar, que e quase tao opaco quanto nao saber nada.
+    const buffer = [...bufferAgrupamento.entries()].map(([jid, e]) => ({
+      jid,
+      grupo: NOMES_GRUPOS.get(jid) || null,
+      itens: e.itens.length,
+      desdeEm: e.desdeEm ? new Date(e.desdeEm).toISOString() : null,
+      fechaEm: e.fechaEm ? new Date(e.fechaEm).toISOString() : null,
+    })).sort((a, b) => String(a.fechaEm).localeCompare(String(b.fechaEm)));
+    res.json({ ok:true, bufferAtivo:emBuffer, janelaMin: JANELA_AGRUPAMENTO_MS / 60000, buffer, ofertas });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Descartes do pipeline de alertas: o que chegou, foi processado e nao virou
+// item na fila. Serve para responder "por que esse alerta nao apareceu?" sem
+// abrir o log do Railway.
+app.get('/cdv/descartes', (req, res) => {
+  const limite = Math.min(Number(req.query.limite) || 60, DESCARTES_MAX);
+  const motivo = String(req.query.motivo || '').trim().toLowerCase();
+  const jid    = String(req.query.jid || '').trim();
+  let lista = _descartesCdv;
+  if (motivo) lista = lista.filter(d => d.motivo.toLowerCase().includes(motivo));
+  if (jid)    lista = lista.filter(d => d.jid === jid);
+  const porMotivo = {};
+  for (const d of _descartesCdv) porMotivo[d.motivo] = (porMotivo[d.motivo] || 0) + 1;
+  res.json({ ok: true, total: _descartesCdv.length, porMotivo, itens: lista.slice(0, limite) });
 });
 
 // Resumo da campanha ativa para a aba Fila. Cache de 60s porque a aba recarrega
