@@ -162,6 +162,18 @@ const CFG_TSP_PADRAO = {
     // captura. Complementa (nao substitui) a env TG_CANAIS_IGNORADOS.
     canaisIgnorados: ['bugmundodasmilhas'],
   },
+  // Conta que LE os grupos-fonte do radar. Vazio = conta principal, que era o
+  // unico socket com handler de mensagens ate esta versao.
+  //
+  // Existe para o TSP e o CDV poderem ser lidos por NUMEROS DIFERENTES, cada um
+  // no seu conjunto de grupos. Enquanto as duas operacoes apontarem para a
+  // mesma conta, o comportamento e identico ao anterior: um socket le tudo.
+  //
+  // Conta caida devolve a leitura para a principal — ver contaLeitoraDe() no
+  // server.js. Grupo cego e pior do que grupo lido pelo numero errado.
+  leitura: {
+    conta: '',
+  },
   // Modo de disparo automatico. Decisao de OPERACAO, nao de infraestrutura:
   // mora aqui para o operador mudar em tela, sem mexer no Railway e sem
   // redeploy. String vazia = herda a env de mesmo nome (AUTO_ENVIO_CUPOM /
@@ -454,6 +466,7 @@ export function salvarConfigTsp(parcial = {}, tenantId) {
     grupos:   { ...atual.grupos,    ...(parcial.grupos    || {}) },
     telegram: { ...atual.telegram,  ...(parcial.telegram  || {}) },
     autoEnvio:{ ...atual.autoEnvio, ...(parcial.autoEnvio || {}) },
+    leitura:  { ...atual.leitura,  ...(parcial.leitura  || {}) },
     credenciais: { ...atual.credenciais, ...(parcial.credenciais || {}) },
   }, tenantId);
 
@@ -467,6 +480,13 @@ export function salvarConfigTsp(parcial = {}, tenantId) {
   }
   if (!MODOS_OFERTA.includes(novo.autoEnvio.oferta)) {
     throw new Error('Auto-envio de oferta invalido: use off ou on.');
+  }
+  // Apelido de conta fora do formato aceito por /contas/:id seria uma leitora
+  // que nunca existe — e o grupo ficaria sendo lido pela principal para sempre,
+  // sem ninguem entender por que a troca "nao pegou".
+  novo.leitura.conta = String(novo.leitura.conta || '').trim();
+  if (novo.leitura.conta && !/^[a-z0-9_-]{2,24}$/i.test(novo.leitura.conta)) {
+    throw new Error('Conta de leitura invalida: use o apelido da conta (2 a 24 caracteres).');
   }
   // Um JID invalido quebra avisos do operador em silencio — melhor recusar.
   // Tenant novo pode ficar sem grupo do operador ate conectar o WhatsApp.
@@ -607,6 +627,9 @@ export function trocasDeLinkDoGrupo(jid, tenantId) {
 export function tagsAmazonPorGrupo(tenantId) {
   try { return { ...obter(tenantId).afiliados.tagsPorGrupo }; } catch (e) { return {}; }
 }
+
+/** Apelido da conta que LE os grupos-fonte do radar. Vazio -> principal. */
+export function contaLeitoraTsp(tenantId) { return (obter(tenantId).leitura || {}).conta || ''; }
 
 export function gruposTspCupons(tenantId)   { return (obter(tenantId).grupos.cupons || []).slice(); }
 export function grupoOperadorTsp(tenantId)  { return obter(tenantId).grupos.operador; }
