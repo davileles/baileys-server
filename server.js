@@ -9464,7 +9464,8 @@ app.get('/contas/:id/grupos', async (req, res) => {
     return res.status(503).json({ ok:false, erro:'conta ' + id + ' nao conectada' });
   }
   try {
-    const daConta = Object.keys(await s.groupFetchAllParticipating());
+    const chatsDaConta = await s.groupFetchAllParticipating();
+    const daConta = Object.keys(chatsDaConta);
     const alvos = [...new Set([...radarDestinos(), ...GRUPOS['tsp_cupons']])];
     // Fonte de Telegram (tg:...) nunca sera grupo de WhatsApp: contar como
     // "faltando" so gerava falso negativo em aptaAPrincipal.
@@ -9506,6 +9507,19 @@ app.get('/contas/:id/grupos', async (req, res) => {
       resposta.leitura.aptaAPrincipal =
         resposta.leitura.monitorados.faltando.length === 0 &&
         resposta.leitura.fontesRadar.faltando.length === 0;
+    }
+
+    // Lista nominal dos grupos da conta (?lista=1). As conferencias acima so
+    // respondem sim/nao para JIDs ja cadastrados; nao dizem se a conta esta em
+    // OUTRO grupo da mesma cidade, com JID diferente. Com varios grupos por
+    // praca (BH, BH #2, BH NOVO) essa e a diferenca entre "cidade descoberta" e
+    // "cidade coberta por outro grupo". O nome vem do proprio fetch, nao do
+    // cache global: o cache so e alimentado pelas contas LEITORAS, e uma conta
+    // de disparo apareceria com nome nulo em todo grupo exclusivo dela.
+    if (String(req.query.lista || '') === '1') {
+      resposta.grupos = daConta
+        .map(j => ({ jid: j, nome: chatsDaConta[j]?.subject || NOMES_GRUPOS.get(j) || null }))
+        .sort((a, b) => String(a.nome || a.jid).localeCompare(String(b.nome || b.jid), 'pt-BR'));
     }
 
     res.json(resposta);
