@@ -39,6 +39,10 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   'listas.json',
   'radar_config.json',
   'config_tsp.json',
+  // Config da operacao CDV: destinos, grupos monitorados, admins e conta de
+  // disparo. Mesmo peso do config_tsp — perdido, o CDV volta aos valores de
+  // fabrica e para de monitorar o que o operador cadastrou em tela.
+  'config_cdv.json',
   'awin_config.json',
   'tenants.json',            // global: registro de operadores (so na raiz)
   'grupos_censo_hist.json',
