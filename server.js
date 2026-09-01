@@ -10880,6 +10880,53 @@ app.post('/config-cdv', (req, res) => {
   }
 });
 
+// A conta escolhida para disparar o CDV esta nos grupos que precisa?
+//
+// Estar PAREADA nao basta: um numero fora do grupo de destino falha o envio na
+// hora — e como o fallback manda pela principal, a mensagem sai pelo numero
+// errado e ninguem percebe. Melhor descobrir aqui.
+//
+// Separa deliberadamente as duas listas, porque as exigencias sao diferentes:
+//   destinos    — a conta de disparo PRECISA estar neles (ofertas, emissao e,
+//                 se cadastrado, o grupo de avisos).
+//   monitorados — quem LE e sempre a conta principal. Faltar aqui nao afeta o
+//                 disparo; so importa para responder "posso promover esta conta
+//                 a principal sem cegar o radar de milhas?".
+app.get('/config-cdv/conta/:id/grupos', async (req, res) => {
+  const apelido = String(req.params.id || '').trim();
+  const ehPrincipal = !apelido || apelido === 'principal';
+
+  let daConta;
+  try {
+    if (ehPrincipal) {
+      if (!conectado || !sock) return res.status(503).json({ ok:false, erro:'conta principal nao conectada' });
+      daConta = Object.keys(await sock.groupFetchAllParticipating());
+    } else {
+      const id = contaIdDe(TENANT_PADRAO, apelido);
+      const ct = contasExtras.get(id);
+      if (!ct?.conectado || !ct.sock) {
+        return res.status(503).json({ ok:false, erro:'conta "' + apelido + '" nao esta conectada — pareie o QR antes de conferir' });
+      }
+      daConta = Object.keys(await ct.sock.groupFetchAllParticipating());
+    }
+  } catch (e) { return res.status(500).json({ ok:false, erro:e.message }); }
+
+  const noGrupo = new Set(daConta);
+  const ausentes = (lista) => [...new Set(lista.filter(Boolean))]
+    .filter(j => !noGrupo.has(j))
+    .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
+
+  const destinos = [grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv()].filter(Boolean);
+  const monitorados = gruposMonitoradosCdv();
+  res.json({
+    ok: true,
+    conta: ehPrincipal ? 'principal' : apelido,
+    total: daConta.length,
+    destinos:    { conferidos: destinos.length,    faltando: ausentes(destinos) },
+    monitorados: { conferidos: monitorados.length, faltando: ausentes(monitorados) },
+  });
+});
+
 // Papeis de um e-mail. O gerador ainda NAO tem login, entao isto responde
 // "o que esta cadastrado para este e-mail", nao "quem e voce" — organiza a
 // operacao, nao autentica. Vira cadeado de verdade quando o gerador ganhar o
