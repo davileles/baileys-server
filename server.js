@@ -11077,6 +11077,11 @@ app.get('/config-cdv', (req, res) => {
     // rotulo velho na tela para sempre.
     nomes: Object.fromEntries(NOMES_GRUPOS),
     contas,
+    // A conta principal entra na MESMA lista da tela: para quem opera, ela e
+    // so mais um numero com papeis. A diferenca (ser o socket que sustenta
+    // resolucao de JID, bot, campanha e autocura) e interna e nao deveria
+    // aparecer como hierarquia no seletor.
+    principal: { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual },
     contaEmUso: contaEnvioCdv() || 'principal',
     // As DUAS leitoras na mesma resposta: a escolha so faz sentido vendo as
     // duas juntas (apontar as duas para a mesma conta e o comportamento
