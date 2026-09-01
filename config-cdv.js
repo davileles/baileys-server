@@ -82,6 +82,19 @@ const CFG_CDV_PADRAO = {
     // menos grave do que nao sair.
     conta: '',
   },
+  leitura: {
+    // Apelido da conta que LE os grupos monitorados do CDV. Vazio = principal.
+    //
+    // Envio e leitura sao escolhas separadas de proposito: e comum querer que o
+    // CDV seja lido pelo numero que ja esta nos grupos de passagem e enviado
+    // por outro, ou o contrario. Apontar as duas para a mesma conta e so um
+    // caso particular.
+    //
+    // Se esta conta cair, a principal reassume a leitura — grupo cego e pior
+    // que grupo lido pelo numero "errado", e a leitura nao muda nada do que o
+    // assinante ve.
+    conta: '',
+  },
 };
 
 let _cfg = null;
@@ -105,6 +118,7 @@ function estruturar(bruto) {
   out.grupos.emissao  = String(out.grupos.emissao  || '').trim();
   out.grupos.operador = String(out.grupos.operador || '').trim();
   out.envio.conta     = String(out.envio.conta     || '').trim();
+  out.leitura.conta   = String(out.leitura.conta   || '').trim();
   return out;
 }
 
@@ -188,8 +202,9 @@ export function configCdv() {
 export function salvarConfigCdv(parcial = {}) {
   const atual = configCdv();
   const novo = estruturar({
-    grupos:      { ...atual.grupos, ...(parcial.grupos || {}) },
-    envio:       { ...atual.envio,  ...(parcial.envio  || {}) },
+    grupos:      { ...atual.grupos,  ...(parcial.grupos  || {}) },
+    envio:       { ...atual.envio,   ...(parcial.envio   || {}) },
+    leitura:     { ...atual.leitura, ...(parcial.leitura || {}) },
     monitorados: parcial.monitorados !== undefined ? parcial.monitorados : atual.monitorados,
     admins:      parcial.admins      !== undefined ? parcial.admins      : atual.admins,
   });
@@ -208,6 +223,9 @@ export function salvarConfigCdv(parcial = {}) {
   }
   if (novo.envio.conta && !RE_CONTA.test(novo.envio.conta)) {
     throw new Error('Conta de envio invalida: use o apelido da conta (2 a 24 caracteres).');
+  }
+  if (novo.leitura.conta && !RE_CONTA.test(novo.leitura.conta)) {
+    throw new Error('Conta de leitura invalida: use o apelido da conta (2 a 24 caracteres).');
   }
   // Admin com papel 'avisos' e sem telefone e um aviso que nunca chega.
   for (const a of novo.admins) {
@@ -251,6 +269,9 @@ export function ehMonitoradoCdv(jid) {
 
 /** Apelido da conta que dispara o CDV. Vazio -> principal. */
 export function contaEnvioCdv() { return configCdv().envio.conta; }
+
+/** Apelido da conta que LE os grupos monitorados do CDV. Vazio -> principal. */
+export function contaLeitoraCdv() { return configCdv().leitura.conta; }
 
 /** Os dois destinos, para "este JID pertence ao CDV?". */
 export function ehGrupoCdv(jid) {
