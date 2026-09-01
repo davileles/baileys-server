@@ -9558,6 +9558,239 @@ app.get('/contas/:id/admin', async (req, res) => {
   });
 });
 
+// ── PARTICIPACAO DE UMA CONTA NOS GRUPOS DE DESTINO (acoes) ──────────────────
+// Os dois endpoints acima so DIAGNOSTICAM ("nao esta em 4 grupos", "nao e admin
+// em 7"). Corrigir era trabalho manual no celular, grupo por grupo. Aqui o
+// operador age: entrar, virar admin, deixar de ser admin, sair.
+//
+// Tres regras que moldam o desenho:
+//  1. Quem executa nao pode ser a propria conta alvo — o WhatsApp exige que a
+//     ordem venha de um ADMIN do grupo. Por isso montamos um mapa de executores
+//     (principal + demais contas do operador) e escolhemos, por grupo, alguem
+//     que ja seja admin ali. Sem executor, o grupo e reportado como bloqueado.
+//  2. 'add' pode voltar 403 quando a privacidade do alvo proibe adicao direta.
+//     Como o alvo e uma conta NOSSA (conectada aqui), da para contornar: o
+//     executor gera o convite e o socket do alvo aceita sozinho.
+//  3. 'remove' usa groupLeave pelo proprio alvo. Sair nao exige admin nenhum e
+//     e o que o operador realmente quer ("tirar o numero do grupo"); expulsar
+//     via admin daria o mesmo fim com mais pre-requisitos.
+//
+// Tudo em serie e com pausa entre grupos: uma rajada de alteracoes de
+// participante e o caminho mais curto para o numero levar bloqueio.
+const GA_ACOES = new Set(['add', 'remove', 'promote', 'demote']);
+
+// Uma unica chamada por conta devolve TODOS os grupos dela com participantes.
+// Alternativa seria um groupMetadata por grupo por conta — dezenas de chamadas
+// e risco de rate-overlimit so para montar a tela.
+async function _gaMapaParticipacao(s) {
+  const mapa = new Map();
+  const todos = await s.groupFetchAllParticipating();
+  const meus = new Set();
+  for (const v of [s?.user?.id, s?.user?.lid]) {
+    const n = String(v || '').split(':')[0].split('@')[0].trim();
+    if (n) meus.add(n);
+  }
+  for (const [jid, md] of Object.entries(todos || {})) {
+    const eu = (md.participants || []).find(p => _ggIdsDoParticipante(p).some(n => meus.has(n)));
+    mapa.set(jid, { membro: !!eu, admin: !!(eu && eu.admin), nome: md.subject || null });
+    if (md.subject) NOMES_GRUPOS.set(jid, md.subject);
+  }
+  return mapa;
+}
+
+// Contas que PODEM mandar na acao: principal (quando o operador e o padrao) e
+// as secundarias conectadas do mesmo operador. A conta alvo fica de fora — nao
+// se promove sozinha.
+function _gaCandidatosExecutor(tenantId, idAlvo) {
+  const lista = [];
+  if (tenantId === TENANT_PADRAO && conectado && sock && idAlvo !== 'principal') {
+    lista.push({ id: 'principal', sock });
+  }
+  for (const c of contasExtras.values()) {
+    if (tenantDaConta(c.id) !== tenantId) continue;
+    if (c.id === idAlvo || !c.conectado || !c.sock) continue;
+    lista.push({ id: apelidoDaConta(c.id), sock: c.sock });
+  }
+  return lista;
+}
+
+// Telefone da conta no formato que o groupParticipantsUpdate espera.
+function _gaJidDoAlvo(s) {
+  const n = String(s?.user?.id || '').split(':')[0].split('@')[0].trim();
+  return n ? n + '@s.whatsapp.net' : null;
+}
+
+function _gaDestinos() {
+  return [...new Set([...(radarDestinos() || []), ...(GRUPOS['tsp_cupons'] || [])])]
+    .filter(j => String(j).endsWith('@g.us'));
+}
+
+// Retrato rapido para a tela: cada grupo de destino com o estado do alvo e se
+// existe alguem apto a executar ali. E o que alimenta a selecao por checkbox.
+app.get('/contas/:id/grupos-estado', async (req, res) => {
+  const id = contaIdReq(req);
+  const apel = apelidoDaConta(id);
+  const c = contasExtras.get(id);
+  if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + apel + ' nao conectada' });
+
+  try {
+    const alvoMapa = await _gaMapaParticipacao(c.sock);
+    const executores = _gaCandidatosExecutor(req.tenantId, apel);
+    const execMapas = [];
+    for (const e of executores) {
+      try { execMapas.push({ id: e.id, mapa: await _gaMapaParticipacao(e.sock) }); }
+      catch (err) { console.warn('[GA] executor ' + e.id + ' falhou no retrato: ' + err.message); }
+    }
+
+    const grupos = _gaDestinos().map(jid => {
+      const a = alvoMapa.get(jid);
+      const aptos = execMapas.filter(e => e.mapa.get(jid)?.admin).map(e => e.id);
+      return {
+        jid,
+        nome: a?.nome || NOMES_GRUPOS.get(jid) || null,
+        membro: !!a?.membro,
+        admin: !!a?.admin,
+        executores: aptos,           // quem pode agir neste grupo
+        bloqueado: aptos.length === 0,
+      };
+    });
+
+    res.json({
+      ok: true,
+      conta: apel,
+      total: grupos.length,
+      foraDoGrupo: grupos.filter(g => !g.membro).length,
+      semAdmin: grupos.filter(g => g.membro && !g.admin).length,
+      bloqueados: grupos.filter(g => g.bloqueado).length,
+      grupos,
+    });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Acao em lote. Body: { acao, jids?, pausaMs? }. Sem 'jids', roda em todos os
+// grupos de destino. Grupos que ja estao no estado desejado sao PULADOS — sem
+// isso, um "entrar em todos" viraria dezenas de chamadas inuteis ao WhatsApp.
+app.post('/contas/:id/grupos-acao', async (req, res) => {
+  const id = contaIdReq(req);
+  const apel = apelidoDaConta(id);
+  const c = contasExtras.get(id);
+  if (!c?.conectado || !c.sock) return res.status(503).json({ ok:false, erro:'conta ' + apel + ' nao conectada' });
+
+  const acao = String(req.body?.acao || '').trim();
+  if (!GA_ACOES.has(acao)) {
+    return res.status(400).json({ ok:false, erro:'acao invalida — use add, remove, promote ou demote' });
+  }
+  const alvoJid = _gaJidDoAlvo(c.sock);
+  if (!alvoJid) return res.status(503).json({ ok:false, erro:'nao consegui ler o telefone da conta ' + apel });
+
+  // Piso de 1s: abaixo disso o ganho de tempo nao paga o risco de bloqueio.
+  const pausaMs = Math.min(Math.max(parseInt(req.body?.pausaMs ?? 5000, 10) || 5000, 1000), 60000);
+
+  const destinos = _gaDestinos();
+  const pedidos = Array.isArray(req.body?.jids) && req.body.jids.length
+    ? req.body.jids.map(j => String(j).trim()).filter(j => destinos.includes(j))
+    : destinos;
+  if (!pedidos.length) return res.status(400).json({ ok:false, erro:'nenhum grupo de destino valido na lista' });
+
+  let alvoMapa, execMapas = [];
+  try {
+    alvoMapa = await _gaMapaParticipacao(c.sock);
+    for (const e of _gaCandidatosExecutor(req.tenantId, apel)) {
+      try { execMapas.push({ id: e.id, sock: e.sock, mapa: await _gaMapaParticipacao(e.sock) }); }
+      catch (err) { console.warn('[GA] executor ' + e.id + ' fora: ' + err.message); }
+    }
+  } catch (e) { return res.status(500).json({ ok:false, erro:'falha ao ler participacao: ' + e.message }); }
+
+  // Estado desejado por acao — a base do "pular o que ja esta certo".
+  const jaEsta = (est) => {
+    if (acao === 'add')     return !!est?.membro;
+    if (acao === 'remove')  return !est?.membro;
+    if (acao === 'promote') return !!est?.admin;
+    return est?.membro && !est?.admin;   // demote
+  };
+
+  const resultados = [];
+  let feitos = 0, pulados = 0, falhas = 0;
+
+  for (let i = 0; i < pedidos.length; i++) {
+    const jid = pedidos[i];
+    const nome = alvoMapa.get(jid)?.nome || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+    const est = alvoMapa.get(jid);
+
+    if (jaEsta(est)) {
+      pulados++;
+      resultados.push({ jid, nome, estado:'pulado', detalhe:'ja estava no estado desejado' });
+      continue;
+    }
+    // promote/demote em quem nem esta no grupo nao tem como dar certo.
+    if ((acao === 'promote' || acao === 'demote') && !est?.membro) {
+      falhas++;
+      resultados.push({ jid, nome, estado:'falha', detalhe:'a conta nao esta neste grupo — entre primeiro' });
+      continue;
+    }
+
+    try {
+      if (acao === 'remove') {
+        // Sai por conta propria: nao depende de admin nenhum.
+        await c.sock.groupLeave(jid);
+        feitos++;
+        resultados.push({ jid, nome, estado:'ok', detalhe:'saiu do grupo' });
+      } else {
+        const exec = execMapas.find(e => e.mapa.get(jid)?.admin);
+        if (!exec) {
+          falhas++;
+          resultados.push({ jid, nome, estado:'bloqueado',
+            detalhe:'nenhum numero conectado e admin deste grupo — promova alguem pelo celular' });
+        } else {
+          const r = await exec.sock.groupParticipantsUpdate(jid, [alvoJid], acao);
+          const st = String(r?.[0]?.status || '');
+          if (st === '200') {
+            feitos++;
+            resultados.push({ jid, nome, estado:'ok', por: exec.id,
+              detalhe: acao === 'add' ? 'adicionada' : acao === 'promote' ? 'promovida a admin' : 'rebaixada' });
+          } else if (acao === 'add' && st === '403') {
+            // Privacidade do alvo barra a adicao direta. Como o socket do alvo
+            // e nosso, ele mesmo aceita o convite gerado pelo executor.
+            try {
+              const code = await exec.sock.groupInviteCode(jid);
+              await c.sock.groupAcceptInvite(code);
+              feitos++;
+              resultados.push({ jid, nome, estado:'ok', por: exec.id, detalhe:'entrou por convite (privacidade bloqueou a adicao direta)' });
+            } catch (e2) {
+              falhas++;
+              resultados.push({ jid, nome, estado:'falha', por: exec.id, detalhe:'403 e o convite tambem falhou: ' + e2.message });
+            }
+          } else if (st === '409') {
+            pulados++;
+            resultados.push({ jid, nome, estado:'pulado', detalhe:'o WhatsApp respondeu que ja estava assim' });
+          } else {
+            falhas++;
+            resultados.push({ jid, nome, estado:'falha', por: exec.id, detalhe:'WhatsApp retornou status ' + (st || '?') });
+          }
+        }
+      }
+    } catch (e) {
+      falhas++;
+      resultados.push({ jid, nome, estado:'falha', detalhe:e.message });
+    }
+
+    // Pausa so ENTRE operacoes de verdade: pular grupo ja correto nao consumiu
+    // cota nenhuma, entao esperar ali seria so tempo de tela perdido.
+    const ultimo = i === pedidos.length - 1;
+    const agiu = resultados[resultados.length - 1].estado === 'ok';
+    if (agiu && !ultimo) {
+      // Jitter: rajada com intervalo exato tem cara de robo.
+      const jitter = Math.round(pausaMs * (0.8 + Math.random() * 0.4));
+      await new Promise(r => setTimeout(r, jitter));
+    }
+  }
+
+  console.log('[GA] ' + apel + ' / ' + acao + ' — ' + feitos + ' feito(s), '
+    + pulados + ' pulado(s), ' + falhas + ' falha(s) em ' + pedidos.length + ' grupo(s).');
+
+  res.json({ ok:true, conta:apel, acao, pausaMs, total:pedidos.length, feitos, pulados, falhas, resultados });
+});
+
 // Nucleo da reconexao soft: usado pelo endpoint manual e pela autocura do
 // watchdog de surdez. Declarada como function para valer por hoisting no
 // watchdog, que fica acima neste arquivo.
