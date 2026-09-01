@@ -92,7 +92,7 @@ import {
   carregarConfigTsp, configTsp, salvarConfigTsp,
   linksTsp,
   registrarResolvedorDeNome,
-  gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig,
+  gruposTspCupons, grupoOperadorTsp, tgIgnoradosConfig, contaLeitoraTsp,
   estadoCredenciais, aplicarCredenciais,
   modoAutoEnvioCupom, modoAutoEnvioOferta, origemAutoEnvio,
 } from './config-tsp.js';
@@ -104,7 +104,7 @@ import {
   carregarConfigCdv, configCdv, salvarConfigCdv, PAPEIS_CDV,
   grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv,
   gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv,
-  contaEnvioCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
+  contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
 } from './config-cdv.js';
 
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
@@ -1602,7 +1602,21 @@ async function conectarConta(id) {
         c.timer = setTimeout(() => conectarConta(id).catch(()=>{}), espera);
       }
     });
-    // De proposito sem handler de 'messages.upsert': quem le e a conta principal.
+    // Handler de leitura da conta secundaria. ENXUTO de proposito: nada de
+    // reset de sessao, contagem global de erros de decifracao, health timer ou
+    // resposta de campanha — tudo isso pertence ao socket principal, e disparar
+    // a partir daqui derrubaria a sessao da principal por um evento que nao e
+    // dela. Aqui so entra o que a operacao dona precisa: pulso e pipeline.
+    c.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify' && type !== 'append') return;
+      registrarPulsoLeitor(id);
+      const ctx = { contaId: id, sock: c.sock };
+      for (const msg of (messages || [])) {
+        if (!msg.message) continue;
+        try { await despacharParaPipeline(msg, ctx); }
+        catch (e) { console.error('[CONTA:' + id + '] Falha ao processar mensagem:', e.message); }
+      }
+    });
   } catch (e) {
     c.conectando = false;
     c.ultimoErro = e.message;
@@ -3105,6 +3119,63 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
 
   return { auto:true, motivo:'aprovado' };
 }
+
+// ── SENTINELA: leitora secundaria surda ─────────────────────────────────────
+// O watchdog principal so enxerga _health.ultimoUpsertEm, que e da principal.
+// Uma leitora secundaria pode parar de receber sem que nada dispare: os grupos
+// dela ficam cegos e a operacao inteira parece saudavel. Esta sentinela existe
+// exatamente para esse buraco.
+//
+// Nao escala para restart: derrubar o processo por causa de uma secundaria
+// tiraria a principal do ar junto. Reconecta a conta (degrau 1) e alerta —
+// a decisao de trocar a leitora volta a ser de quem opera.
+const LEITOR_SILENCIO_MS   = 6 * 3600e3;   // 6h sem inbound
+const LEITOR_CHECAGEM_MS   = 30 * 60e3;
+setInterval(async () => {
+  const hora = horaSP();
+  // Fora de 8h-22h SP o silencio e esperado: alertar de madrugada so ensina a
+  // ignorar alerta.
+  if (hora < 8 || hora >= 22) return;
+  const agora = Date.now();
+  for (const id of contasLeitorasAtivas()) {
+    if (id === 'principal') continue;
+    const ct = contasExtras.get(id);
+    const apelido = apelidoDaConta(id);
+    const grupos = (contaLeitoraCdv() && _idDaConta(contaLeitoraCdv()) === id) ? 'do CDV' : 'do radar';
+
+    if (!ct || !ct.conectado) {
+      await registrarAlerta({
+        nivel: 'critico', origem: 'whatsapp', chave: 'leitor-caido:' + apelido,
+        titulo: 'Conta leitora "' + apelido + '" desconectada',
+        corpo: 'A conta que le os grupos ' + grupos + ' esta fora do ar. A principal '
+             + 'assumiu a leitura, entao nada foi perdido — mas os dois conjuntos voltaram '
+             + 'a ser lidos pelo mesmo numero. Pareie o QR de "' + apelido + '" para restaurar a separacao.',
+      });
+      if (ct && !ct.conectando) conectarConta(id).catch(() => {});
+      continue;
+    }
+
+    const ultimo = _pulsoLeitores.get(id) || _bootEm;
+    const silencio = agora - ultimo;
+    if (silencio < LEITOR_SILENCIO_MS) continue;
+    const horas = Math.round(silencio / 3600e3);
+    await registrarAlerta({
+      nivel: 'critico', origem: 'whatsapp', chave: 'leitor-surdo:' + apelido,
+      titulo: 'Conta leitora "' + apelido + '" sem receber ha ' + horas + 'h',
+      corpo: 'A conta esta conectada mas nao recebe mensagem ha ' + horas + 'h em horario '
+           + 'comercial. Os grupos ' + grupos + ' podem estar cegos: a principal NAO assume '
+           + 'enquanto a conta se declara conectada. Confira se o numero continua nos grupos '
+           + 'e, se preciso, aponte a leitura de volta para a principal na aba Config.',
+    });
+    // Aviso tambem no canal do CDV quando a leitora surda e a dele: o alerta
+    // padrao vai para o grupo do operador do TSP, que e outro publico.
+    if (contaLeitoraCdv() && _idDaConta(contaLeitoraCdv()) === id) {
+      avisarAdminsCdv('⚠️ CDV — o número que lê os grupos de passagem ("' + apelido
+        + '") está há ' + horas + 'h sem receber nada. Os alertas de milhas podem não estar chegando.')
+        .catch(() => {});
+    }
+  }
+}, LEITOR_CHECAGEM_MS);
 
 // ── SENTINELA: grupo so-admins sem a conta do turno como admin ───────────────
 // O WhatsApp descarta EM SILENCIO mensagem de nao-admin em grupo "somente
@@ -5789,14 +5860,108 @@ const NOMES_GRUPOS = new Map();
 // mutavel, entao a config sempre le o cache mais recente.
 registrarResolvedorDeNome((jid) => NOMES_GRUPOS.get(jid) || '');
 
+// Cache alimentado por TODAS as contas leitoras, nao so pela principal: com
+// leitura separada, um grupo pode ser visto apenas pela secundaria, e sem isto
+// ele apareceria sem nome em toda tela do ecossistema.
 async function atualizarNomesGrupos() {
-  if (!sock || !conectado) return;
-  try {
-    const chats = await sock.groupFetchAllParticipating();
-    for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
-    console.log('[GRUPOS] Cache de nomes atualizado — ' + NOMES_GRUPOS.size + ' grupo(s).');
-  } catch (e) { console.warn('[GRUPOS] Falha ao atualizar cache de nomes:', e.message); }
+  const fontes = [];
+  if (sock && conectado) fontes.push({ id: 'principal', sock });
+  for (const id of contasLeitorasAtivas()) {
+    if (id === 'principal') continue;
+    const ct = contasExtras.get(id);
+    if (ct?.conectado && ct.sock) fontes.push({ id, sock: ct.sock });
+  }
+  if (!fontes.length) return;
+  let lidas = 0;
+  for (const f of fontes) {
+    try {
+      const chats = await f.sock.groupFetchAllParticipating();
+      for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
+      lidas++;
+    } catch (e) {
+      console.warn('[GRUPOS] Falha ao ler grupos de ' + f.id + ':', e.message);
+    }
+  }
+  console.log('[GRUPOS] Cache de nomes atualizado — ' + NOMES_GRUPOS.size
+    + ' grupo(s), de ' + lidas + '/' + fontes.length + ' conta(s) leitora(s).');
 }
+
+// ── LEITURA POR OPERACAO ─────────────────────────────────────────────────────
+// Ate esta versao havia UM socket com handler de mensagens: a conta principal
+// lia tudo — grupos monitorados do CDV e grupos-fonte do radar do TSP. As
+// secundarias subiam de proposito sem handler, porque estavam nos MESMOS
+// grupos e processar em duas dobraria o pipeline inteiro (inclusive as
+// chamadas de IA) para publicar a mesma coisa.
+//
+// Agora cada operacao declara sua conta leitora, escolhida do mesmo pool de
+// contas pareadas. O motivo do bloqueio deixa de valer porque existe DONO: a
+// conta que recebeu a mensagem so a processa se for a leitora daquele grupo.
+// Duas contas no mesmo grupo continuam sem duplicar — uma ignora.
+//
+// Fora dos dois conjuntos (conversa direta, bot, resposta de campanha) a
+// principal segue sendo a unica leitora. Nao ha operacao dona dessas mensagens
+// e mudar isso quebraria a campanha e o bot sem nenhum ganho.
+
+function _idDaConta(apelido) {
+  const a = String(apelido || '').trim();
+  if (!a || a === 'principal') return 'principal';
+  return contaIdDe(TENANT_PADRAO, a);
+}
+
+function _leitorVivo(id) {
+  if (id === 'principal') return !!(conectado && sock);
+  const ct = contasExtras.get(id);
+  return !!(ct?.conectado && ct.sock);
+}
+
+/**
+ * Qual conta deve processar mensagens deste grupo AGORA.
+ *
+ * A leitora configurada que estiver fora do ar devolve a leitura para a
+ * principal: um grupo cego perde ofertas para sempre, enquanto ser lido pelo
+ * numero "errado" nao muda nada do que chega ao assinante — a leitura nao
+ * aparece para ninguem.
+ */
+function contaLeitoraDe(jid) {
+  const j = String(jid || '');
+  let desejada = null;
+  if (ehMonitoradoCdv(j))      desejada = _idDaConta(contaLeitoraCdv());
+  else if (ehFonteRadar(j))    desejada = _idDaConta(contaLeitoraTsp());
+  else                         return 'principal';
+  if (desejada !== 'principal' && !_leitorVivo(desejada)) return 'principal';
+  return desejada;
+}
+
+/** Contas configuradas como leitoras (independente de estarem vivas). */
+function contasLeitorasAtivas() {
+  return [...new Set([_idDaConta(contaLeitoraCdv()), _idDaConta(contaLeitoraTsp())])];
+}
+
+// Pulso de inbound POR conta leitora. O watchdog historico vigia um unico
+// _health.ultimoUpsertEm: com leitura separada, o numero do CDV poderia ficar
+// surdo por horas enquanto o do TSP recebe normalmente — e a escada de
+// autocura nunca dispararia, porque o pulso global continuaria vivo. Silencio
+// que parece saude e a pior falha possivel aqui.
+const _pulsoLeitores = new Map();   // contaId -> timestamp do ultimo inbound
+function registrarPulsoLeitor(id) { _pulsoLeitores.set(id, Date.now()); }
+
+// Ponto unico de entrada no pipeline, para principal e secundarias. A guarda de
+// dono fica AQUI e nao dentro de processarMensagem, porque o dedup por key.id e
+// global: se as duas contas estiverem no mesmo grupo, a que nao e dona precisa
+// desistir ANTES de marcar o id como visto, senao ela consumiria a mensagem da
+// outra e o grupo ficaria sem processamento nenhum.
+async function despacharParaPipeline(msg, ctx) {
+  const jid = msg.key?.remoteJid;
+  if (contaLeitoraDe(jid) !== ctx.contaId) return false;
+  if (_jaProcessado(msg)) return false;
+  if (jid) enfileirarPorGrupo(jid, () => processarMensagem(msg, ctx));
+  else await processarMensagem(msg, ctx);
+  return true;
+}
+
+// Contexto da principal: `sock` e reatribuido a cada reconexao, entao precisa
+// ser getter — guardar a referencia congelaria um socket morto.
+const CTX_PRINCIPAL = { contaId: 'principal', get sock() { return sock; } };
 
 // Arquivos de ./sessao que sobrevivem a um reset completo: nao sao credenciais
 // do WhatsApp e nao se regeneram sozinhos. Ao criar um arquivo novo nessa pasta,
@@ -6682,7 +6847,10 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
   }
 }
 
-async function processarMensagem(msg) {
+// ctx = { contaId, sock } da conta que RECEBEU a mensagem. Importa para a
+// midia: o reupload precisa do socket que tem a sessao daquela mensagem —
+// pedir pelo principal uma imagem que chegou na secundaria falha.
+async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
   try {
     const jid    = msg.key.remoteJid;
     // Dois monitoramentos convivem: os monitorados do CDV alimentam o pipeline de
@@ -6708,7 +6876,8 @@ async function processarMensagem(msg) {
     else if (tipo === 'imageMessage') {
       texto = m.imageMessage.caption || '';
       try {
-        const buffer = await downloadMediaMessage(msg,'buffer',{},{ logger:pino({level:'silent'}), reuploadRequest:sock.updateMediaMessage });
+        const sockMidia = ctx?.sock || sock;
+        const buffer = await downloadMediaMessage(msg,'buffer',{},{ logger:pino({level:'silent'}), reuploadRequest:sockMidia.updateMediaMessage });
         imagemB64 = buffer.toString('base64');
       } catch(e) { console.error('[IMG] Erro ao baixar imagem:', e.message); if (!texto) texto = '[imagem sem legenda]'; }
     } else {
@@ -8415,6 +8584,7 @@ async function conectar() {
         }
       } catch (e) {}
       registrarUpsertHealth();
+      registrarPulsoLeitor('principal');
       if (conectado) resetarHealthTimer();
       if (type !== 'notify') {
         // Upserts 'append' (sync/reconexao) eram DESCARTADOS — e com eles:
@@ -8431,10 +8601,8 @@ async function conectar() {
           const comConteudo = dosMonitorados.filter(mm => mm.message);
           console.log('[WA] Upsert tipo "' + type + '" com ' + dosMonitorados.length + ' msg(s) de grupos monitorados: ' + comConteudo.length + ' processada(s), ' + (dosMonitorados.length - comConteudo.length) + ' sem conteudo.');
           for (const msg of comConteudo) {
-            if (_jaProcessado(msg)) continue;
-            const jid = msg.key?.remoteJid;
-            if (jid) enfileirarPorGrupo(jid, () => processarMensagem(msg));
-            else await processarMensagem(msg);
+            // Grupo cuja leitora e outra conta sai aqui, sem consumir o dedup.
+            await despacharParaPipeline(msg, CTX_PRINCIPAL);
           }
         }
         return;
@@ -8471,14 +8639,10 @@ async function conectar() {
         // Sem isto o sistema cobra quem ja respondeu — o pior erro possivel
         // numa campanha de recuperacao.
         campanhaMarcarResposta(msg).catch(() => {});
-        // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos = paralelo
-        const jid = msg.key?.remoteJid;
-        if (_jaProcessado(msg)) continue;   // ja veio via 'append'
-        if (jid) {
-          enfileirarPorGrupo(jid, () => processarMensagem(msg));
-        } else {
-          await processarMensagem(msg);
-        }
+        // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos =
+        // paralelo. Dedup por key.id (pode ja ter vindo via 'append') e guarda
+        // de dono vivem dentro do despacho.
+        await despacharParaPipeline(msg, CTX_PRINCIPAL);
       }
     });
     resetarHealthTimer();
@@ -9437,7 +9601,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
@@ -10880,6 +11044,24 @@ app.get('/config-tsp/rodape-preview', (req, res) => {
 // Espelho de /config-tsp para o gerador. GET devolve a config inteira mais o
 // que a tela precisa para montar os seletores: nomes dos grupos conhecidos e
 // contas conectadas (para escolher quem dispara).
+// Quem le o que, agora. Inclui o efetivo (contaLeitoraDe devolve a principal
+// quando a configurada esta fora do ar), porque a diferenca entre configurado
+// e efetivo e justamente o que explica "troquei a conta e nada mudou".
+function estadoLeitores() {
+  const montar = (apelidoCfg, rotulo) => {
+    const id = _idDaConta(apelidoCfg);
+    const vivo = _leitorVivo(id);
+    return {
+      operacao: rotulo,
+      configurada: apelidoCfg || 'principal',
+      efetiva: (id === 'principal' || vivo) ? apelidoDaConta(id) : 'principal',
+      conectada: vivo,
+      ultimoInboundEm: _pulsoLeitores.get(id) ? new Date(_pulsoLeitores.get(id)).toISOString() : null,
+    };
+  };
+  return [montar(contaLeitoraCdv(), 'cdv'), montar(contaLeitoraTsp(), 'tsp')];
+}
+
 app.get('/config-cdv', (req, res) => {
   if (!NOMES_GRUPOS.size) atualizarNomesGrupos().catch(() => {});
   const cfg = configCdv();
@@ -10896,13 +11078,26 @@ app.get('/config-cdv', (req, res) => {
     nomes: Object.fromEntries(NOMES_GRUPOS),
     contas,
     contaEmUso: contaEnvioCdv() || 'principal',
+    // As DUAS leitoras na mesma resposta: a escolha so faz sentido vendo as
+    // duas juntas (apontar as duas para a mesma conta e o comportamento
+    // historico, e a tela precisa deixar isso obvio).
+    leituraTsp: contaLeitoraTsp(),
+    leitores: estadoLeitores(),
   });
 });
 
 app.post('/config-cdv', (req, res) => {
   try {
+    // A leitora do TSP mora no config_tsp (e dona daquela operacao), mas e
+    // escolhida NESTA tela: decidir quem le o que exige ver os dois lados. O
+    // acoplamento e proposital e fica restrito a este campo.
+    if (req.body && req.body.leituraTsp !== undefined) {
+      salvarConfigTsp({ leitura: { conta: String(req.body.leituraTsp || '').trim() } });
+    }
     const novo = salvarConfigCdv(req.body || {});
     const ativos = novo.monitorados.filter(m => m.ativo).length;
+    console.log('[CFG-CDV] Leitura — cdv=' + (novo.leitura.conta || 'principal')
+      + ' tsp=' + (contaLeitoraTsp() || 'principal') + '.');
     console.log('[CFG-CDV] Config gravada pelo painel — ofertas=' + novo.grupos.ofertas
       + ' emissao=' + novo.grupos.emissao + ' monitorados=' + ativos + '/' + novo.monitorados.length
       + ' admins=' + novo.admins.length + ' conta=' + (novo.envio.conta || 'principal') + '.');
