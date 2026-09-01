@@ -9190,6 +9190,12 @@ app.get('/contas', (req, res) => {
     turnosTsp: turnosTsp(),
     contaAgora: contaDoTurno(),
     numerosGrupo: numerosGrupo(),
+    // A aba Conexao monta os papeis de cada numero a partir DESTE endpoint. Sem
+    // os dois campos abaixo ela nao tinha como saber quem le e quem dispara o
+    // CDV: o seletor de leitor voltava para "principal" a cada refresh (mesmo
+    // com a config gravada) e todo numero fora da escala aparecia "sem papel".
+    leitores: estadoLeitores(),
+    envioCdv: contaEnvioCdv() || 'principal',
   });
 });
 
