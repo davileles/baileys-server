@@ -34,6 +34,8 @@ import {
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
+  numerosGrupo, salvarNumerosGrupo, contaDoGrupo, removerContaDosGrupos,
+  gruposOrfaos, cargaPorNumero,
   listarTemplates, templateDaLoja, salvarTemplate, removerTemplate,
   templateCupom, templateCupomLote, templateCupomLoteItem, templateCupomLoteItemExcecao,
   templateAwin, templateProprioDaLoja,
@@ -3092,15 +3094,18 @@ function _idsDaContaSock(s) {
   return ids;
 }
 
-async function verificarAdminGruposCupons(contaId) {
+async function verificarAdminGruposCupons() {
   const grupos = GRUPOS['tsp_cupons'] || [];
   if (!grupos.length) return;
-  const s = (contaId && contaId !== 'principal')
-    ? contasExtras.get(contaId)?.sock
-    : sock;
-  if (!s) return;
-  const meus = _idsDaContaSock(s);
   for (const jid of grupos) {
+    // Com numero fixo por grupo, quem precisa ser admin muda de grupo para
+    // grupo: checar uma conta so daria falso negativo em metade da lista.
+    const contaId = contaDoGrupo(jid);
+    const s = (contaId && contaId !== 'principal')
+      ? contasExtras.get(contaId)?.sock
+      : sock;
+    if (!s) continue;
+    const meus = _idsDaContaSock(s);
     try {
       const md = await s.groupMetadata(jid);
       if (!md?.announce) continue;   // grupo aberto: qualquer membro posta
@@ -3138,12 +3143,13 @@ async function verificarAdminGruposCupons(contaId) {
 // esse rastro que permite retomar sem mandar o mesmo cupom duas vezes para quem
 // ja recebeu.
 async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
-  // Mesma conta em todos os grupos: o cupom e as copias dele saem juntos, e
-  // alternar no meio deixaria o mesmo conteudo com dois remetentes no mesmo minuto.
-  const op = { conta: contaDoTurno() };
+  // A conta e decidida POR GRUPO (contaDoGrupo): grupo com numero atribuido sai
+  // sempre pelo mesmo remetente, e o resto segue o turno. O que nao pode variar
+  // e o remetente DENTRO de um grupo — entre grupos diferentes, variar e o
+  // proprio objetivo de dividir a carga.
   const _execId = oferta?.id ? String(oferta.id) : ('c_' + Date.now());
   // Sentinela do modo so-admins: detecta o descarte silencioso antes do despacho.
-  await verificarAdminGruposCupons(op.conta);
+  await verificarAdminGruposCupons();
   // Cupom e de LOJA, nao de produto: nao tem categoria para casar com nicho.
   // Vai para os destinos gerais mais os so-cupons — mandar cupom generico no
   // grupo de bebidas descaracterizaria o nicho.
@@ -3155,6 +3161,7 @@ async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
 
   for (const jid of alvos) {
     if (jaRecebeu.has(jid)) { pulados.push(jid); continue; }
+    const op = { conta: contaDoGrupo(jid) };
     // Rodape extra por grupo: cupom nao tem categoria, entao so casam regras
     // sem filtro de categoria. Sem regra aplicavel, `texto` e a mensagem original.
     // Tag de afiliado do destino: grupo com tag propria recebe o link com ela,
@@ -3598,13 +3605,14 @@ async function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   const soCupons = new Set(GRUPOS['tsp_cupons']);
   const enviados = [], falhas = [];
   const preview = oferta ? await montarLinkPreview(oferta, mensagem) : null;
-  const op = { conta: contaDoTurno() };
   // Um id por despacho: todos os destinos desta execucao compartilham a chave
   // de idempotencia da outbox (id, jid).
   const _execId = oferta?.id ? String(oferta.id) : ('o_' + Date.now());
 
   for (const jid of alvos) {
     if (soCupons.has(jid)) continue;
+    // Numero fixo do grupo quando houver; senao, o turno vigente.
+    const op = { conta: contaDoGrupo(jid) };
     // Rodape extra decidido AQUI, ja sabendo o destino: e o que permite a mesma
     // oferta de bebida sair no grupo geral com o convite para o grupo de bebidas
     // e sair sem ele dentro do proprio grupo de bebidas.
@@ -3673,10 +3681,6 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
       : 'Nenhum grupo marcado como destino na aba Grupos.');
   }
 
-  // Mesma conta em todos os grupos: alternar no meio deixaria a mesma mensagem
-  // com dois remetentes no mesmo minuto.
-  const op = { conta: contaDoTurno() };
-
   // Card de link so vale quando nao ha imagem — o WhatsApp mostra um ou outro.
   let lp = null;
   if (!imagem?.imagemBase64 && preview?.link) {
@@ -3690,6 +3694,8 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
   // rodape que nao filtram por categoria.
   const catManual = String(categoria || '').trim();
   for (const jid of alvos) {
+    // Remetente do grupo: fixo se atribuido, senao o do turno.
+    const op = { conta: contaDoGrupo(jid) };
     const texto = comTagDoGrupo(comRodapeExtra(mensagem, {
       jid,
       tipo: ehCupom ? 'cupom' : 'manual',
@@ -8987,7 +8993,100 @@ app.get('/contas', (req, res) => {
     extras,
     turnosTsp: turnosTsp(),
     contaAgora: contaDoTurno(),
+    numerosGrupo: numerosGrupo(),
   });
+});
+
+// ── NUMERO FIXO POR GRUPO DE DESTINO ─────────────────────────────────────────
+// Responde as duas perguntas da tela de balanceamento: "quantos grupos cada
+// numero carrega" e "que grupo ficou sem dono". Com ?conferir=1 tambem checa se
+// o numero atribuido esta DENTRO do grupo — atribuicao para um numero que nao
+// participa e um orfao disfarcado: nao aparece na lista de faltantes e so falha
+// na hora do disparo, caindo no principal em silencio.
+//
+// A checagem custa UMA chamada por conta conectada (groupFetchAllParticipating),
+// nao uma por grupo: por isso e opcional e nao roda no carregamento da aba.
+app.get('/contas/grupos-numeros', async (req, res) => {
+  if (!NOMES_GRUPOS.size) atualizarNomesGrupos().catch(() => {});
+  const { ativo, mapa } = numerosGrupo();
+  const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
+  const destinos = [...new Set([...radarDestinos(), ...soCupons])];
+
+  const disponiveis = ['principal', ...[...contasExtras.values()]
+    .filter(c => tenantDaConta(c.id) === req.tenantId)
+    .map(c => apelidoDaConta(c.id))];
+  const conectadas = new Set(
+    (conectado ? ['principal'] : []).concat([...contasExtras.values()]
+      .filter(c => tenantDaConta(c.id) === req.tenantId && c.conectado)
+      .map(c => apelidoDaConta(c.id))));
+
+  // Participacao por conta, so quando pedido.
+  let participacao = null;
+  if (String(req.query.conferir || '') === '1') {
+    participacao = {};
+    const usadas = [...new Set(Object.values(mapa))].filter(a => conectadas.has(a));
+    if (conectadas.has('principal') && !usadas.includes('principal')) usadas.push('principal');
+    for (const apelido of usadas) {
+      try {
+        const s = apelido === 'principal' ? sock
+          : contasExtras.get(contaIdDe(req.tenantId, apelido))?.sock;
+        if (!s) continue;
+        participacao[apelido] = new Set(Object.keys(await s.groupFetchAllParticipating()));
+      } catch (e) {
+        console.warn('[NUM-GRUPO] Nao deu para listar grupos de ' + apelido + ': ' + e.message);
+      }
+    }
+  }
+
+  const grupos = destinos.map(jid => {
+    const conta = mapa[jid] || null;
+    const contaViva = conta ? conectadas.has(conta) : null;
+    const contaExiste = conta ? disponiveis.includes(conta) : null;
+    let participa = null;
+    if (participacao && conta && participacao[conta]) participa = participacao[conta].has(jid);
+    return {
+      jid,
+      nome: NOMES_GRUPOS.get(jid) || null,
+      soCupons: soCupons.has(jid),
+      conta,
+      contaExiste,
+      contaConectada: contaViva,
+      participa,
+      // Orfao = ninguem responde por ele. Sem atribuicao com o modo ligado,
+      // atribuicao para conta que nao existe mais, ou conta que nao esta no
+      // grupo: nos tres casos o disparo cai no fallback sem ninguem saber.
+      orfao: ativo && (!conta || contaExiste === false || participa === false),
+    };
+  }).sort((a, b) => (a.nome || a.jid).localeCompare(b.nome || b.jid, 'pt-BR'));
+
+  res.json({
+    ok: true,
+    ativo,
+    contas: disponiveis,
+    conectadas: [...conectadas],
+    contaAgora: contaDoTurno(),
+    turnoAtivo: turnosTsp().ativo,
+    grupos,
+    carga: cargaPorNumero(destinos),
+    orfaos: grupos.filter(g => g.orfao).map(g => g.jid),
+    semAtribuicao: gruposOrfaos(destinos),
+    conferido: !!participacao,
+  });
+});
+
+app.post('/contas/grupos-numeros', (req, res) => {
+  try {
+    const nova = salvarNumerosGrupo(req.body || {});
+    const destinos = [...new Set([...radarDestinos(), ...(GRUPOS['tsp_cupons'] || [])])];
+    const carga = cargaPorNumero(destinos);
+    console.log('[NUM-GRUPO] Mapa gravado — ' + (nova.ativo ? 'ATIVO' : 'desligado') + ', '
+      + Object.keys(nova.mapa).length + ' grupo(s) atribuido(s), '
+      + gruposOrfaos(destinos).length + ' sem numero. '
+      + carga.map(x => (x.conta || 'sem numero') + '=' + x.grupos).join(' '));
+    res.json({ ok: true, numerosGrupo: nova, carga, semAtribuicao: gruposOrfaos(destinos) });
+  } catch (e) {
+    res.status(400).json({ ok: false, erro: e.message });
+  }
 });
 
 app.post('/contas/:id/conectar', async (req, res) => {
@@ -9056,9 +9155,15 @@ app.delete('/contas/:id', async (req, res) => {
   let turnosRemovidos = escala.turnos.length - restantes.length;
   if (turnosRemovidos) salvarTurnosTsp({ ativo: escala.ativo, turnos: restantes });
 
+  // Grupos atribuidos a ela viram orfaos EXPLICITOS: sem isto o mapa apontaria
+  // para uma conta inexistente e o disparo cairia no fallback em silencio —
+  // exatamente o que a aba de balanceamento existe para denunciar.
+  const gruposLiberados = removerContaDosGrupos(apelidoDaConta(id));
+
   console.log('[CONTA:' + id + '] removida' + (desvinculou ? ' (dispositivo desvinculado)' : '')
-    + (turnosRemovidos ? ' — ' + turnosRemovidos + ' turno(s) descartado(s)' : '') + '.');
-  res.json({ ok:true, desvinculou, turnosRemovidos });
+    + (turnosRemovidos ? ' — ' + turnosRemovidos + ' turno(s) descartado(s)' : '')
+    + (gruposLiberados ? ' — ' + gruposLiberados + ' grupo(s) sem numero atribuido' : '') + '.');
+  res.json({ ok:true, desvinculou, turnosRemovidos, gruposLiberados });
 });
 
 // Compara os grupos das duas contas. Um numero que nao esta num grupo de destino
