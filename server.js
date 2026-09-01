@@ -11101,22 +11101,19 @@ app.get('/config-cdv', (req, res) => {
     // aparecer como hierarquia no seletor.
     principal: { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual },
     contaEmUso: contaEnvioCdv() || 'principal',
-    // As DUAS leitoras na mesma resposta: a escolha so faz sentido vendo as
-    // duas juntas (apontar as duas para a mesma conta e o comportamento
-    // historico, e a tela precisa deixar isso obvio).
-    leituraTsp: contaLeitoraTsp(),
+    // As duas leituras vao juntas, mas so como INFORMACAO: a tela do CDV usa
+    // para etiquetar os numeros ("lê fontes do Tica") e nao deixar um numero
+    // ocupado parecer livre. Quem ESCOLHE a leitora do TSP e o painel do TSP —
+    // cada operacao manda na propria leitura.
     leitores: estadoLeitores(),
   });
 });
 
 app.post('/config-cdv', (req, res) => {
   try {
-    // A leitora do TSP mora no config_tsp (e dona daquela operacao), mas e
-    // escolhida NESTA tela: decidir quem le o que exige ver os dois lados. O
-    // acoplamento e proposital e fica restrito a este campo.
-    if (req.body && req.body.leituraTsp !== undefined) {
-      salvarConfigTsp({ leitura: { conta: String(req.body.leituraTsp || '').trim() } });
-    }
+    // Este endpoint grava SO a config do CDV. A leitora do TSP mora no
+    // config_tsp e e escolhida na aba Conexao do painel do TSP: uma tela que
+    // muda a operacao vizinha e um lugar a mais para quebrar o Tica sem querer.
     const novo = salvarConfigCdv(req.body || {});
     const ativos = novo.monitorados.filter(m => m.ativo).length;
     console.log('[CFG-CDV] Leitura — cdv=' + (novo.leitura.conta || 'principal')
