@@ -2466,6 +2466,12 @@ function precoForaDaCurva(pontos, hist180, tipoVoo) {
 // continua rodando ANTES: muito acima da média nem chega aqui.
 const AUTO_ENVIO_ALERTA_MODO = (process.env.AUTO_ENVIO_ALERTA || 'on').toLowerCase();
 
+// GATE_ASSIMETRICO: 'off' (padrão — teto pela média cheia, como sempre) |
+// 'sombra' (decide como hoje e só loga quando o critério novo divergiria) |
+// 'on' (teto pela referência assimétrica calculada no proxy). Ver
+// refGateAssimetrica() em painel-cdv/index.js para a regra de elegibilidade.
+const GATE_ASSIMETRICO_MODO = (process.env.GATE_ASSIMETRICO || 'off').toLowerCase();
+
 // ── PROCEDENCIA DA CAPTURA ───────────────────────────────────────────────────
 // 'coleta' = achado da varredura seats.aero (Cowork) injetado em /injetar.
 // Ausencia do campo = captura em grupo/canal monitorado (comportamento antigo).
@@ -2503,10 +2509,36 @@ function avaliarAutoEnvioAlerta(oferta, hist180) {
   if (!hist180 || !hist180.mediaPts || hist180.count < 1) return { auto: false, motivo: 'sem histórico' };
   const cab = String(de.cabine || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
   const tol  = cab === 'executiva' ? 0.05 : 0.10;
-  const teto = Math.round(hist180.mediaPts * (1 + tol));
-  const det  = pts.toLocaleString('pt-BR') + ' pts vs teto ' + teto.toLocaleString('pt-BR')
-    + ' (média ' + hist180.mediaPts.toLocaleString('pt-BR') + ' +' + Math.round(tol * 100) + '%, ' + hist180.count + ' reg(s))';
-  return pts <= teto ? { auto: true, motivo: det } : { auto: false, motivo: 'acima do teto — ' + det };
+  // GATE_ASSIMETRICO=on usa a referência calculada pelo proxy (refGate), que
+  // ignora no cálculo do teto os auto-envios que passaram só por estarem abaixo
+  // do teto vigente. Sem o flag, ou sem refGate no payload, mantém a média
+  // cheia — comportamento idêntico ao anterior.
+  const usaGate = GATE_ASSIMETRICO_MODO === 'on' && hist180.refGate > 0;
+  const ref     = usaGate ? hist180.refGate : hist180.mediaPts;
+  const rotulo  = usaGate
+    ? (hist180.baseGate === 'assimetrica' ? 'mediana elegível' : 'média')
+    : 'média';
+  const nRef  = usaGate ? (hist180.countGate || hist180.count) : hist180.count;
+  const teto  = Math.round(ref * (1 + tol));
+  const det   = pts.toLocaleString('pt-BR') + ' pts vs teto ' + teto.toLocaleString('pt-BR')
+    + ' (' + rotulo + ' ' + ref.toLocaleString('pt-BR') + ' +' + Math.round(tol * 100) + '%, ' + nRef + ' reg(s))';
+  const vered = pts <= teto ? { auto: true, motivo: det } : { auto: false, motivo: 'acima do teto — ' + det };
+
+  // Modo sombra do gate: decide pelo critério ANTIGO e só registra no log
+  // quando o novo teria decidido diferente. Serve para medir o impacto real
+  // antes de ligar GATE_ASSIMETRICO=on, sem alterar nenhum envio.
+  if (GATE_ASSIMETRICO_MODO === 'sombra' && hist180.refGate > 0) {
+    const tetoNovo  = Math.round(hist180.refGate * (1 + tol));
+    const autoNovo  = pts <= tetoNovo;
+    if (autoNovo !== vered.auto) {
+      console.log('[GATE-ASSIM][SOMBRA] divergência: ' + pts.toLocaleString('pt-BR') + ' pts — '
+        + 'hoje ' + (vered.auto ? 'ENVIA' : 'FILA') + ' (teto ' + teto.toLocaleString('pt-BR') + ')'
+        + ' / assimétrico ' + (autoNovo ? 'ENVIARIA' : 'FILA') + ' (teto ' + tetoNovo.toLocaleString('pt-BR')
+        + ', base ' + (hist180.baseGate || '?') + ', ' + (hist180.countGate || 0) + ' elegíveis, '
+        + (hist180.descartadosGate || 0) + ' descartado(s))');
+    }
+  }
+  return vered;
 }
 
 // Ponto único de entrega de oferta de alerta de passagem. A oferta SEMPRE
