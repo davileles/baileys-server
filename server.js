@@ -14362,10 +14362,21 @@ app.get('/grupos/convite', async (req, res) => {
   // esta nos grupos dele, e um convite gerado pelo numero errado seria de outro
   // grupo homonimo ou simplesmente falharia.
   let sockConvite = null;
+  const apelConvite = String(req.query.conta || '').trim();
   if (req.tenantId !== TENANT_PADRAO) {
     const idConta = contaConectadaDoTenant(req.tenantId);
     if (!idConta) return res.status(503).json({ ok:false, erro:'WhatsApp do operador nao conectado.' });
     sockConvite = contasExtras.get(idConta).sock;
+  } else if (apelConvite && apelConvite !== 'principal') {
+    // Conta explicita (?conta=apelido). groupInviteCode so funciona a partir de
+    // um numero que esteja DENTRO do grupo; com a leitura migrada para a
+    // principal, sobraram grupos onde apenas uma conta secundaria esta, e nao
+    // havia como tirar o link deles — nem para fazer a propria principal entrar.
+    const ct = contasExtras.get(contaIdDe(TENANT_PADRAO, apelConvite));
+    if (!ct?.conectado || !ct.sock) {
+      return res.status(503).json({ ok:false, erro:'conta ' + apelConvite + ' nao conectada.' });
+    }
+    sockConvite = ct.sock;
   } else {
     if (!sock || !conectado) {
       const ok = await aguardarSock(15000);
@@ -14374,7 +14385,10 @@ app.get('/grupos/convite', async (req, res) => {
     sockConvite = sock;
   }
   const forcar = req.query.refresh === '1';
-  const chaveCache = req.tenantId + '|' + jid;   // cache por operador: mesmo jid, contas diferentes
+  // A conta entra na chave: o mesmo jid gerado por numeros diferentes devolve
+  // codigos diferentes, e servir o de outra conta do cache mandaria o operador
+  // para um link que ele nao pediu.
+  const chaveCache = req.tenantId + '|' + (apelConvite || 'principal') + '|' + jid;
   const c = _ggConviteCache.get(chaveCache);
   if (!forcar && c && (Date.now() - c.ts) < GG_CONVITE_TTL_MS) {
     return res.json({ ok:true, jid, url:c.url, doCache:true });
