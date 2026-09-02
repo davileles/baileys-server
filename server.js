@@ -1549,6 +1549,30 @@ function contaDisponivel(id) {
   return !!(c && c.conectado && c.sock);
 }
 
+// Uma conta deslogada pelo WhatsApp (401) fica com creds.json marcado como
+// "registered" mas invalido do lado de la. O Baileys so emite o evento 'qr'
+// quando NAO ha registro — entao um conectarConta() novo sobe o socket, toma
+// 401 na hora e nunca emite QR nenhum: /contas/<id>/qr fica eternamente em
+// "Gerando QR de <id>...". Apagar as credenciais e o unico caminho de volta ao
+// pareamento. Drena e DESREGISTRA o flush antes, senao uma escrita atrasada da
+// sessao antiga regrava o arquivo recem-apagado (a mesma corrida que a
+// renovacao de identidade da principal ja trata).
+async function limparCredenciaisConta(id) {
+  const dir = CONTAS_DIR + '/' + id;
+  try {
+    const f = _flushsSessao.get(dir);
+    _flushsSessao.delete(dir);
+    if (f) await f(3000);
+  } catch (e) {}
+  try {
+    await rmAsync(dir, { recursive: true, force: true });
+    return true;
+  } catch (e) {
+    console.error('[CONTA:' + id + '] falha ao apagar credenciais: ' + e.message);
+    return false;
+  }
+}
+
 async function conectarConta(id) {
   const c = estadoConta(id);
   if (c.removida) return c;
@@ -1556,6 +1580,9 @@ async function conectarConta(id) {
   c.conectando = true;
   try {
     const dir = CONTAS_DIR + '/' + id;
+    // Logout detectado nesta instancia (ou repareamento pedido): o que esta no
+    // disco so serve para bloquear o QR.
+    if (c.precisaPareamento) { await limparCredenciaisConta(id); c.precisaPareamento = false; }
     await mkdirAsync(dir, { recursive: true });
     const { state, saveCreds, flush: flushSessao } = await useAuthStateAtomico(dir);
     _flushsSessao.set(dir, flushSessao);
@@ -1591,6 +1618,10 @@ async function conectarConta(id) {
         console.log('[CONTA:' + id + '] conexao fechada. Codigo: ' + codigo);
         if (codigo === DisconnectReason.loggedOut) {
           c.ultimoErro = 'deslogada — escaneie o QR de novo';
+          c.precisaPareamento = true;
+          // Sem apagar aqui, o proximo pedido de QR nunca gera QR: as creds
+          // invalidas fazem o Baileys pular direto para o 401.
+          await limparCredenciaisConta(id);
           return;   // logout nao reconecta sozinho
         }
         // Backoff ate 5 min: a conta secundaria nao e critica, entao insistir
@@ -9407,6 +9438,39 @@ app.get('/contas/:id/qr', async (req, res) => {
   if (c.conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Conta ' + id + ' ja conectada!</h2></body></html>');
   if (!c.qr) return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR de ' + id + '...</h2></body></html>');
   res.send('<html><head><title>QR ' + id + '</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Parear conta: ' + id + '</h2><img src="' + c.qr + '" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+});
+
+// Repareamento de conta existente SEM perder o que ela carrega. Excluir e
+// recriar tambem destrava o QR, mas leva junto os grupos atribuidos, os turnos
+// e os papeis de leitura/disparo — perda desproporcional para uma sessao que so
+// caiu. Aqui apaga so as credenciais e reabre o pareamento.
+app.post('/contas/:id/reparear', async (req, res) => {
+  const apelido = String(req.params.id || '').trim();
+  if (!/^[a-z0-9_-]{2,24}$/i.test(apelido)) return res.status(400).json({ ok:false, erro:'apelido invalido' });
+  const id = contaIdDe(req.tenantId, apelido);
+  if (!id || id === 'principal') return res.status(400).json({ ok:false, erro:'use /reset-sessao-completo para a conta principal' });
+
+  const c = contasExtras.get(id);
+  if (!c) return res.status(404).json({ ok:false, erro:'conexao "' + apelido + '" nao existe — use Gerar QR para criar' });
+
+  clearTimeout(c.timer);
+  const sockRef = c.sock;
+  c.sock = null; c.conectado = false; c.conectando = false; c.qr = null; c.tentativas = 0;
+  if (sockRef) {
+    // _closeTratado antes de encerrar: sem isso o close deste socket cai no
+    // handler com c.sock ja nulo, agenda um backoff e disputa com a reconexao
+    // que iniciamos logo abaixo.
+    sockRef._closeTratado = true;
+    try { sockRef.ws?.close?.(); } catch (e) {}
+    try { sockRef.end(new Error('repareamento')); } catch (e) {}
+  }
+
+  await limparCredenciaisConta(id);
+  c.precisaPareamento = false;
+  c.ultimoErro = null;
+  console.warn('[CONTA:' + id + '] credenciais apagadas a pedido — aguardando novo pareamento.');
+  conectarConta(id).catch(()=>{});
+  res.json({ ok:true, mensagem:'Credenciais apagadas. Abra /contas/' + apelido + '/qr para parear.' });
 });
 
 // Remove uma conta secundaria: desvincula o dispositivo no WhatsApp, apaga as
