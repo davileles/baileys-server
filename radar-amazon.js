@@ -1501,15 +1501,43 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
     escopo = normalizarTexto(bloco);
   }
 
+  // Bloco do link deste produto, calculado uma unica vez e so quando um cupom
+  // restrito aparece citado. Serve de guarda extra para o restrito: se o post
+  // traz varios links e sabemos qual e o nosso, o codigo tem de estar escrito
+  // AO LADO dele, nao em outro canto do post.
+  let _blocoCache;
+  const blocoDesteLink = () => {
+    if (_blocoCache === undefined) {
+      const b = blocoDoLink(textoOriginal, opcoes.urlOrigem);
+      _blocoCache = b ? normalizarTexto(b) : null;
+    }
+    return _blocoCache;
+  };
+
   for (const reg of Object.values(E().cupons)) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== lojaKey) continue;
-    if (!reg.codigo || !escopo.includes(normalizarTexto(reg.codigo))) continue;
+    if (!reg.codigo) continue;
+    const cod = normalizarTexto(reg.codigo);
+    if (!escopo.includes(cod)) continue;
+
+    // Restrito entra SO por citacao — nunca por escolha do sistema — e, quando
+    // conhecemos o link de origem, so se o codigo estiver no bloco dele. Foi a
+    // fonte que mandou usar aquele codigo naquele produto; e disso que vem a
+    // autorizacao, e ela nao se estende ao post inteiro.
+    if (cupomRestrito(reg) && opcoes.urlOrigem) {
+      const bloco = blocoDesteLink();
+      if (!bloco || !bloco.includes(cod)) {
+        console.warn('[CUPOM] ' + loja + ': ' + reg.codigo + ' e restrito e nao aparece no bloco '
+          + 'deste link — ignorado.');
+        continue;
+      }
+    }
 
     const desconto = calcularDesconto(reg, preco);
     if (desconto <= 0) continue;
 
-    if (!melhor || desconto > melhor.desconto) melhor = { reg, desconto, citado: true };
+    if (!melhor || desconto > melhor.desconto) melhor = { reg, desconto, citado: true, restrito: cupomRestrito(reg) };
   }
   if (melhor) return melhor;
 
@@ -3283,6 +3311,15 @@ export function casarCupomDaPagina(loja, cupomPagina) {
     // elegivel: e exatamente assim que a via 2 aprende o vinculo.
     const campanhaDivergente = !!(cupomPagina.idCampanhaLoja && reg.idCampanhaLoja) && !mesmaCampanha;
     if (campanhaDivergente) continue;
+
+    // Cupom restrito NAO entra no casamento por (tipo, valor). Bater percentual
+    // nao e prova de que ele vale para este produto — e restrito e exatamente o
+    // cupom que so vale numa selecao fechada de itens. Sem esta guarda, um cupom
+    // que nos criamos para tres produtos especificos era anunciado em qualquer
+    // anuncio do ML que exibisse o mesmo percentual, e o codigo nao funcionava
+    // no checkout. Pela via 1 (idCampanhaLoja) ele continua entrando: ali quem
+    // declara a campanha e a pagina do proprio produto, o que e prova.
+    if (cupomRestrito(reg)) continue;
 
     if (reg.tipo === cupomPagina.tipo && Number(reg.valor) === Number(cupomPagina.valor)) porValor.push(reg);
   }
