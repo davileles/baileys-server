@@ -1960,6 +1960,10 @@ carregarAgendamentos();
 // o link preview e assincrono (baixa a thumbnail) e o loop nao pode esperar.
 // Falha ao montar o card nao cancela o envio: a mensagem sai sem preview.
 async function despacharAgendamento(ag, grupoId) {
+  // A conta escolhida no momento do agendamento viaja junto: se o disparo
+  // agendado saisse pela principal, a mensagem trocaria de numero so por ter
+  // sido programada em vez de enviada na hora.
+  const op = { conta: contaPedida(ag.conta) };
   // Tag de afiliado do destino, pelo mesmo motivo do envio imediato: agendamento
   // para um grupo com tag propria precisa sair com ela. Grupo fora do mapa
   // recebe a mensagem original. O caminho multi-grupo nao passa por aqui — ele
@@ -1977,11 +1981,11 @@ async function despacharAgendamento(ag, grupoId) {
     if (!mt || mt.indexOf('image/') === 0) {
       const conteudo = { image: buffer, caption: msg };
       if (mt) conteudo.mimetype = mt;
-      return enviarMensagem(grupoId, conteudo);
+      return enviarMensagem(grupoId, conteudo, 0, op);
     }
     const conteudo = { document: buffer, mimetype: mt, fileName: ag.anexo.nomeArquivo || 'arquivo' };
     if (msg && msg.trim()) conteudo.caption = msg;
-    return enviarMensagem(grupoId, conteudo);
+    return enviarMensagem(grupoId, conteudo, 0, op);
   }
 
   let lp = null;
@@ -1989,7 +1993,7 @@ async function despacharAgendamento(ag, grupoId) {
     try { lp = previewComTagDoGrupo(await montarLinkPreviewManual(ag.preview, msg), grupoId); }
     catch (e) { console.warn('[AGEND] Nao montou o preview de #' + ag.id + ':', e.message); }
   }
-  return enviarMensagem(grupoId, lp ? { text: msg, linkPreview: lp } : { text: msg });
+  return enviarMensagem(grupoId, lp ? { text: msg, linkPreview: lp } : { text: msg }, 0, op);
 }
 
 // Versao multi-grupo do despacho agendado. Anexo so vale se for imagem: enviar
@@ -2070,6 +2074,21 @@ setInterval(() => {
 
 function resolverGrupo(chave) {
   return GRUPOS[chave] ?? (chave?.includes('@g.us') ? chave : null);
+}
+
+// Conta de disparo pedida pelo cliente HTTP (a aba Configuracao do concierge
+// manda o apelido escolhido no corpo do POST). Apelido torto e IGNORADO em vez
+// de derrubar o envio: cair na conta principal e menos grave do que a mensagem
+// nao sair. 'principal' explicito tambem vale — significa "nao use secundaria",
+// e por isso tem precedencia sobre o default de grupo do CDV.
+function contaPedida(v) {
+  const c = String(v || '').trim();
+  if (!c) return null;
+  if (!/^[a-z0-9_-]{2,24}$/i.test(c)) {
+    console.warn('[WA] Apelido de conta invalido no pedido de envio: ' + c + ' — seguindo com o padrao.');
+    return null;
+  }
+  return c;
 }
 
 // Apelidos que NAO sao um JID: significam "todos os grupos configurados na aba
@@ -11022,7 +11041,11 @@ app.post('/enviar', async (req, res) => {
   // Enviado pela aba Emissao do gerador para (a) a fila de envio conseguir
   // exibir a rota na programacao e (b) o agendamento registrar a passagem no
   // disparo — antes, emissao agendada nunca entrava em passagens.json.
-  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio } = req.body;
+  // conta: apelido da conta secundaria que deve disparar (aba Conexao). Vazio =
+  // comportamento historico (conta do turno/CDV ou principal). O concierge usa
+  // este campo para fixar o numero da operacao dele.
+  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio, conta } = req.body;
+  const contaEnvio = contaPedida(conta);
 
   // Se sock nulo mas server está tentando reconectar, aguarda até 15s
   if (!conectado || !sock) {
@@ -11056,6 +11079,7 @@ app.post('/enviar', async (req, res) => {
     }
     const id = gerarId();
     agendamentos.push({ id, grupo, mensagem, dispararEm, status:'aguardando', direto: !!direto,
+                        conta: contaEnvio,
                         tipo: tipo || null,
                         dados: dados || null,
                         fonteRegistro: dados ? 'emissao' : null,
@@ -11100,7 +11124,7 @@ app.post('/enviar', async (req, res) => {
   } else {
     try {
       const lp = preview?.link ? await montarLinkPreviewManual(preview, mensagem) : null;
-      await enviarMensagem(grupoId, lp ? { text:mensagem, linkPreview:lp } : { text:mensagem });
+      await enviarMensagem(grupoId, lp ? { text:mensagem, linkPreview:lp } : { text:mensagem }, 0, { conta: contaEnvio });
       res.json({ ok:true, comPreview: !!lp });
     }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
@@ -11130,7 +11154,7 @@ const EXT_POR_MIME = {
 
 async function enviarAnexoHandler(req, res, padraoImagem) {
   // tipoEnvio (nao 'tipo': o nome ja e usado mais abaixo para imagem/documento)
-  const { grupo, legenda, base64, mimetype, nomeArquivo, tipo: tipoEnvio } = req.body;
+  const { grupo, legenda, base64, mimetype, nomeArquivo, tipo: tipoEnvio, conta } = req.body;
   const file = req.file;
   const limpar = () => { try { if (file && existsSync(file.path)) unlinkSync(file.path); } catch(e) {} };
 
@@ -11199,7 +11223,7 @@ async function enviarAnexoHandler(req, res, padraoImagem) {
       if (legenda && String(legenda).trim()) conteudo.caption = legenda;
     }
 
-    await enviarMensagem(grupoId, conteudo);
+    await enviarMensagem(grupoId, conteudo, 0, { conta: contaPedida(conta) });
     console.log('[ANEXO] ' + tipo + ' enviado para ' + grupoId + ' (' + buffer.length + ' bytes' + (nome ? ', ' + nome : '') + ')');
     res.json({ ok:true, tipo });
   } catch(err) {
