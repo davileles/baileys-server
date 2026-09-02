@@ -8407,6 +8407,26 @@ async function conectarSeNecessario() {
 let _reconectarTentativas = 0;
 let _erros500Consecutivos = 0;
 
+// ── GUARDA CONTRA O LOOP CEGO DE RECONEXAO ───────────────────────────────────
+// 02/09/2026: o servico passou a tarde inteira assim — socket sobe, o WhatsApp
+// derruba, socket sobe de novo, 145 tentativas e subindo, e /qr eternamente em
+// "Gerando QR...". O motivo: o Baileys so emite o evento 'qr' quando as
+// credenciais NAO estao registradas. Com creds.registered=true no disco e a
+// sessao ja invalidada do lado do WhatsApp, ele tenta autenticar para sempre e
+// QR nenhum nasce. O operador fica sem NENHUM caminho de volta pela tela.
+//
+// Ja existia protecao equivalente no ramo de logout — mas so dispara quando o
+// codigo do fechamento e 401. Quando a sessao morre sem 401 (foi o caso de
+// hoje), aquele ramo nunca roda e o loop fica cego indefinidamente.
+//
+// Aqui a saida e por contagem: N fechamentos SEGUIDOS sem um unico 'open'
+// significa que reconectar com estas credenciais nao vai funcionar. Apagar as
+// credenciais e o que faz o proximo socket emitir 'qr'.
+const RECONEXOES_CEGAS_MAX = 12;          // ~12+ min no teto do backoff
+const CEGUEIRA_MIN_MS      = 15 * 60000;  // e pelo menos 15 min sem nenhum 'open'
+let _reconexoesCegas  = 0;
+let _limpezaCegaFeita = false;            // uma limpeza por ciclo, nunca em loop
+
 function _delayReconexao(codigo) {
   if (codigo === 440) {
     _reconectarTentativas++;
@@ -8514,6 +8534,10 @@ async function conectar() {
         _reconectarTentativas = 0;
         _erros500Consecutivos = 0;
         _logout401Seguidos = 0;
+        // Abriu: as credenciais servem. Zera o guarda de cegueira para que uma
+        // instabilidade futura comece a contar do inicio.
+        _reconexoesCegas  = 0;
+        _limpezaCegaFeita = false;
         if (_logoutEm) {
           const min = Math.round((Date.now() - _logoutEm) / 60000);
           _logoutEm = 0; _logoutAvisoEm = 0; _logoutSocketTentado = false;
@@ -8653,6 +8677,44 @@ async function conectar() {
             _agendarReconexao(5000);
           }
         } else {
+          // ── Loop cego: fechou de novo sem nunca ter aberto ────────────────
+          _reconexoesCegas++;
+          const semAbrirMs = Date.now() - (_abertoEm || _bootEm);
+          const registrado = !!novaSock.authState?.creds?.registered;
+          if (_reconexoesCegas >= RECONEXOES_CEGAS_MAX
+              && semAbrirMs >= CEGUEIRA_MIN_MS
+              && registrado
+              && !_limpezaCegaFeita) {
+            _limpezaCegaFeita = true;
+            console.log('[WA] ' + _reconexoesCegas + ' fechamentos seguidos sem abrir ha '
+              + Math.round(semAbrirMs / 60000) + ' min. Apagando credenciais para liberar o QR.');
+            _avisarOperador(
+              'CRITICO — WhatsApp preso em loop de reconexao\n\n'
+              + 'O socket subiu e caiu ' + _reconexoesCegas + ' vezes seguidas sem conectar, '
+              + 'ha ' + Math.round(semAbrirMs / 60000) + ' min. A sessao morreu sem devolver 401, '
+              + 'entao o tratamento de logout nao se aplicava.\n\n'
+              + 'Com credenciais registradas no disco o Baileys NAO emite QR — era por isso '
+              + 'que /qr ficava em "Gerando QR..." sem parar. Apaguei as credenciais: o '
+              + 'proximo socket ja nasce com QR.\n\n'
+              + 'Para reconectar:\n'
+              + '• So com o celular: /pair, informar o numero com DDI e digitar o codigo de 8 digitos\n'
+              + '• Com tela e Wi-Fi: /qr\n\n'
+              + 'Captura, radar e envio seguem parados ate o pareamento.',
+              { critico: true }
+            ).catch(() => {});
+            // Mesma corrida do ramo de logout: a cadeia de escrita da sessao
+            // morta pode regravar creds.json DEPOIS do apagao e ressuscitar
+            // credenciais revogadas. Drena e desregistra o flush primeiro.
+            try {
+              const _f = _flushsSessao.get(SESSAO_DIR);
+              _flushsSessao.delete(SESSAO_DIR);
+              if (_f) await _f(2000);
+            } catch (e) {}
+            await limparCredenciaisSessao();
+            _reconectarTentativas = 0;
+            _agendarReconexao(5000);
+            return;
+          }
           const delay = _delayReconexao(codigo);
           if (delay >= 0) _agendarReconexao(delay);
         }
@@ -10041,7 +10103,7 @@ app.get('/debug-fila', (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
@@ -15198,6 +15260,8 @@ app.post('/reset-sessao-completo', async (req, res) => {
   } catch(e) { console.error('[RESET] Erro ao apagar sessão:', e.message); }
   errosDescripto = 0; _indecifraveisPorGrupo.clear();
   _reconectarTentativas = 0;
+  // Sessao zerada = ciclo novo: o guarda de loop cego volta a valer daqui.
+  _reconexoesCegas = 0; _limpezaCegaFeita = false;
   isResetting = false;
 
   _agendarReconexao(2000);
@@ -15353,6 +15417,8 @@ app.post('/pair', async (req, res) => {
   pairPedidoEm = Date.now();
   errosDescripto = 0; _indecifraveisPorGrupo.clear();
   _reconectarTentativas = 0;
+  // Pareamento novo = ciclo novo: o guarda de loop cego volta a valer daqui.
+  _reconexoesCegas = 0; _limpezaCegaFeita = false;
   isResetting = false;
 
   _agendarReconexao(1500);
