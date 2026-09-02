@@ -107,6 +107,13 @@ import {
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
 } from './config-cdv.js';
 
+// ── AGENDA DE WORKFLOWS DO GITHUB ACTIONS ────────────────────────────────────
+// O cron do Actions degradou na conta (de 15 disparos/dia para 2-5, em horarios
+// aleatorios). Este processo, que ja roda 24/7, passa a ser o relogio: dispara
+// os workflows por workflow_dispatch na hora certa de SP. Detalhes e medicoes
+// no cabecalho de agenda-actions.js.
+import { iniciarAgendaActions, estadoAgenda, dispararAgora, agendaAtiva } from './agenda-actions.js';
+
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
   carregarTenants, listarTenants, resolverTenant, TENANT_PADRAO, comContextoTenant, tenantContexto,
@@ -15695,6 +15702,21 @@ app.get('/historico-seats/rotas', (req, res) => {
   res.json({ ok: true, total: rotas.length, totalRegistros: historicoSeats.length, rotas });
 });
 
+// ── AGENDA DE WORKFLOWS ───────────────────────────────────────────────────────
+// Retrato do relogio que dispara os workflows do painel-cdv. Serve para
+// responder "a coleta das 15h saiu?" sem abrir a aba Actions do GitHub.
+app.get('/agenda-actions', (req, res) => {
+  res.json({ ok: true, ...estadoAgenda() });
+});
+
+// Disparo manual de um job da agenda, sem esperar o slot. `?forcar=1` ignora a
+// checagem de run recente — util quando a coleta rodou e falhou no meio.
+app.post('/agenda-actions/disparar/:id', async (req, res) => {
+  if (!agendaAtiva()) return res.status(400).json({ ok: false, erro: 'Agenda desligada (AGENDA_ACTIONS=0 ou GITHUB_TOKEN ausente).' });
+  const r = await dispararAgora(req.params.id, { ignorarRunRecente: req.query.forcar === '1' });
+  res.status(r.ok ? 200 : 500).json(r);
+});
+
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
 });
@@ -15806,6 +15828,11 @@ iniciarMonitorPrecos({
   gerarId,
   whatsappPronto: () => !!(conectado && sock),
 });
+
+// Relogio dos workflows do painel-cdv. Sobe cedo e independente do WhatsApp: a
+// coleta de pontuacao nao depende do socket, e nao pode ficar refem de um
+// pareamento pendente.
+iniciarAgendaActions({ onAlerta: registrarAlerta });
 
 // Conecta ao WhatsApp imediatamente no startup.
 // Garante que mensagens dos grupos monitorados não sejam perdidas após deploy.
