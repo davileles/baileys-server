@@ -1840,6 +1840,48 @@ function saidaSerializada(fn) {
   return proxima;
 }
 
+// ── ESPERA PELA CONTA DE ENVIO DO CDV ────────────────────────────────────────
+// Depois de um restart do Railway as contas secundarias so COMECAM a reconectar
+// 20s apos o boot (ver o setTimeout no fim deste arquivo) e ainda levam alguns
+// segundos para autenticar. A fila e persistida: ela volta a despachar antes
+// disso, e enviarMensagem() cai na principal por desenho ("melhor pelo numero
+// errado do que nao sair"). Para um cupom isso e invisivel; para uma EMISSAO,
+// nao: a mensagem aparece no grupo assinado por um numero que nao e o da
+// operacao, e o assinante ve.
+//
+// Aqui a fila espera. Ela ja guarda 10 min entre itens (INTERVALO_ENVIO_MS),
+// entao segurar alguns minutos pelo numero certo nao atrasa a operacao na
+// pratica. Passado o teto, segue com o fallback antigo — nao sair continua
+// sendo pior do que sair pelo numero errado.
+const ESPERA_CONTA_ENVIO_MS  = 5 * 60 * 1000;
+const ESPERA_CONTA_PASSO_MS  = 5 * 1000;
+
+async function aguardarContaDeEnvio(destino) {
+  // So vale para os destinos do CDV: quem escolhe a conta no TSP e a escala de
+  // turnos, que passa `opcoes.conta` explicito e nao depende deste default.
+  if (!ehGrupoCdv(destino)) return;
+  const apelido = contaEnvioCdv();
+  if (!apelido) return;                       // vazio = principal, nada a esperar
+  const contaId = contaIdDe(TENANT_PADRAO, apelido);
+  if (contaDisponivel(contaId)) return;
+
+  const limite = Date.now() + ESPERA_CONTA_ENVIO_MS;
+  console.log('[FILA] Conta de envio do CDV (' + apelido + ') ainda nao esta conectada — aguardando ate '
+    + Math.round(ESPERA_CONTA_ENVIO_MS / 60000) + ' min antes de cair na principal.');
+  while (Date.now() < limite) {
+    await new Promise(r => setTimeout(r, ESPERA_CONTA_PASSO_MS));
+    if (contaDisponivel(contaId)) {
+      console.log('[FILA] Conta ' + apelido + ' conectada — o envio sai por ela.');
+      return;
+    }
+  }
+  console.warn('[FILA] Conta ' + apelido + ' nao conectou em '
+    + Math.round(ESPERA_CONTA_ENVIO_MS / 60000) + ' min — o envio seguira pela principal.');
+  avisarAdminsCdv('⚠️ CDV — a conta de disparo (' + apelido + ') nao subiu em '
+    + Math.round(ESPERA_CONTA_ENVIO_MS / 60000) + ' min. O envio saiu pela conta principal.')
+    .catch(() => {});
+}
+
 async function workerFila() {
   if (workerRodando) return;
   workerRodando = true;
@@ -1873,6 +1915,8 @@ async function workerFila() {
     if (!item) break;
     try {
       console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
+      // Conta certa antes de mensagem rapida: ver aguardarContaDeEnvio acima.
+      await aguardarContaDeEnvio(item.destino);
       await saidaSerializada(() => enviarMensagem(item.destino, { text: item.mensagem }));
       filaEnvio.shift();
       ultimoEnvioMs = Date.now(); // registra timestamp do envio
