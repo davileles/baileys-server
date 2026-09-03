@@ -15402,11 +15402,41 @@ app.post('/renovar-identidade', async (req, res) => {
     : 'Nao foi possivel renovar agora — veja os logs.' });
 });
 
+// DDDs em uso no Brasil. Serve para reconhecer numero nacional digitado sem o
+// DDI — ver o comentario dentro de POST /pair.
+const DDD_BR = new Set([
+  '11','12','13','14','15','16','17','18','19',
+  '21','22','24','27','28',
+  '31','32','33','34','35','37','38',
+  '41','42','43','44','45','46','47','48','49',
+  '51','53','54','55',
+  '61','62','63','64','65','66','67','68','69',
+  '71','73','74','75','77','79',
+  '81','82','83','84','85','86','87','88','89',
+  '91','92','93','94','95','96','97','98','99',
+]);
+function dddBrasileiro(dd) { return DDD_BR.has(String(dd)); }
+
 app.post('/pair', async (req, res) => {
   const bruto  = String(req.body?.numero || req.query?.numero || '');
   const numero = bruto.replace(/\D/g, '');
   if (numero.length < 10 || numero.length > 15) {
     return res.status(400).json({ ok:false, erro:'numero invalido: use DDI + DDD + numero, so digitos (ex 5511999999999)' });
+  }
+  // DDI faltando e a falha mais cara aqui: o comprimento passa (celular BR sem
+  // o 55 tem 11 digitos), o codigo e gerado normalmente e SO o WhatsApp reclama
+  // — com um "Nao foi possivel conectar o dispositivo" que nao diz o motivo. Em
+  // 03/09/2026 isso custou uma manha inteira de sessao caida, com o operador
+  // convencido de que a sessao estava presa. Se os dois primeiros digitos sao
+  // um DDD valido e o numero tem cara de nacional, recusa e devolve a sugestao
+  // pronta. ?forcar=1 libera, para o caso raro de numero estrangeiro colidir.
+  const forcarPair = req.body?.forcar === true || String(req.query?.forcar || '') === '1';
+  if (!forcarPair && (numero.length === 10 || numero.length === 11) && dddBrasileiro(numero.slice(0, 2))) {
+    return res.status(400).json({
+      ok: false,
+      erro: 'numero sem DDI: ' + numero + ' parece brasileiro sem o 55 na frente. Use ' + '55' + numero + '.',
+      sugestao: '55' + numero,
+    });
   }
   if (isResetting) return res.status(409).json({ ok:false, erro:'reset em andamento, tente em alguns segundos' });
 
@@ -15483,10 +15513,12 @@ ol{color:#ccc;font-size:.9rem;line-height:1.6;padding-left:18px}
 </div>
 <script>
 var t=null;
+var DDDS='11,12,13,14,15,16,17,18,19,21,22,24,27,28,31,32,33,34,35,37,38,41,42,43,44,45,46,47,48,49,51,53,54,55,61,62,63,64,65,66,67,68,69,71,73,74,75,77,79,81,82,83,84,85,86,87,88,89,91,92,93,94,95,96,97,98,99'.split(',');
 function msg(txt,cls){var m=document.getElementById('msg');m.textContent=txt;m.className='msg '+(cls||'');}
 document.getElementById('btn').onclick=async function(){
   var n=document.getElementById('num').value.replace(/\D/g,'');
   if(n.length<10){msg('Numero invalido.','err');return;}
+  if((n.length===10||n.length===11)&&DDDS.indexOf(n.slice(0,2))>=0){msg('Faltou o DDI. Use 55'+n+'.','err');document.getElementById('num').value='55'+n;return;}
   this.disabled=true;document.getElementById('codigo').textContent='';
   msg('Reiniciando a sessao e pedindo o codigo...');
   try{
