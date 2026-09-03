@@ -9361,6 +9361,15 @@ app.get('/qr', (req, res) => {
 });
 
 // ── CONTAS SECUNDARIAS ───────────────────────────────────────────────────────
+// Telefone realmente pareado na sessao, lido do proprio socket. Sem isto a aba
+// Conexao afirmava "conectado" sem dizer QUEM: conferir a sessao no celular
+// virava adivinhacao sobre em qual aparelho abrir "Dispositivos conectados", e
+// olhar o numero errado passa a impressao de que a conta caiu.
+function telefoneDaConta(s) {
+  const n = String(s?.user?.id || '').split(':')[0].split('@')[0].trim();
+  return n || null;
+}
+
 app.get('/contas', (req, res) => {
   // Cada operador ve SO as proprias contas (pelo apelido, sem o prefixo
   // interno). O socket principal e da operacao padrao — operador novo nao o ve.
@@ -9369,11 +9378,13 @@ app.get('/contas', (req, res) => {
     .map(c => ({
       id: apelidoDaConta(c.id), conectado: c.conectado, conectando: c.conectando,
       qrDisponivel: !!c.qr, ultimoEnvio: c.ultimoEnvio, ultimoErro: c.ultimoErro,
+      numero: telefoneDaConta(c.sock),
     }));
   res.json({
     ok: true,
     principal: req.tenantId === TENANT_PADRAO
-      ? { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual }
+      ? { id:'principal', conectado, conectando: isConnecting, qrDisponivel: !!qrAtual,
+          numero: telefoneDaConta(sock) }
       : null,
     extras,
     turnosTsp: turnosTsp(),
