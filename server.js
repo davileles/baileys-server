@@ -2532,10 +2532,31 @@ async function registrarPassagemProxy(dados) {
   }
 }
 
+// Marca que entra no título quando a emissão bate o mínimo dos últimos 180 dias.
+const TITULO_MIN_SUFIXO = ' - bateu o mínimo histórico!';
+
+// Destaca a primeira linha (o título em negrito) da mensagem: 🔥 na frente e a
+// chamada no fim. Idempotente — mensagem já marcada (reprocessada, editada no
+// painel ou remontada pelo gerador) volta intacta, sem 🔥 duplicado.
+function destacarTituloMinimo(msg) {
+  const linhas = String(msg == null ? '' : msg).split('\n');
+  let i = 0;
+  while (i < linhas.length && !linhas[i].trim()) i++;
+  if (i >= linhas.length) return msg;
+  const t = linhas[i];
+  if (t.indexOf('🔥') !== -1 || t.indexOf(TITULO_MIN_SUFIXO) !== -1) return msg;
+  const m = t.match(/^\*(.+)\*\s*$/);
+  linhas[i] = m ? '*🔥 ' + m[1] + TITULO_MIN_SUFIXO + '*'
+                : '🔥 ' + t + TITULO_MIN_SUFIXO;
+  return linhas.join('\n');
+}
+
 function appendHistoricoMensagem(msg, hist180) {
   // Insere bloco de histórico ANTES do 🔗 *LINK* na mensagem WhatsApp.
   // Só inclui se hist180 tiver ao menos 1 entrada prévia (count >= 1).
   if (!hist180 || hist180.count < 1) return msg;
+  // Bateu o mínimo da janela: o título ganha destaque antes de qualquer insercao.
+  if (hist180.isMin) msg = destacarTituloMinimo(msg);
   const min   = hist180.minPts.toLocaleString('pt-BR');
   const media = hist180.mediaPts.toLocaleString('pt-BR');
   const minLinha = hist180.isMin
