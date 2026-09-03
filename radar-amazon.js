@@ -1394,10 +1394,7 @@ export function cupomPorCodigo(loja, codigo) {
   return k ? (E().cupons[k] || null) : null;
 }
 
-// Mensagens que falam de cupom sem dar o codigo: "resgate cupom do anuncio",
-// "com cupom", "aplique o cupom". Exige a palavra cupom — nao inferimos cupom a
-// partir de "desconto" ou "promocao", que aparecem em qualquer oferta.
-const REGEX_CUPOM_GENERICO = /\bcupom\b|\bcupons\b|\bcoupon\b/i;
+// (removida a REGEX_CUPOM_GENERICO — ver o fim de melhorCupom())
 
 /** Cupom vigente mais recente de uma loja, pela data de captura. */
 export function ultimoCupomDaLoja(loja) {
@@ -1470,6 +1467,13 @@ export function blocoDoLink(textoOriginal, urlOrigem) {
   return texto.slice(k === 0 ? 0 : pos[k - 1].fim, pos[k].fim);
 }
 
+/**
+ * Cupom a aplicar numa oferta capturada de grupo/canal monitorado.
+ *
+ * Regra unica: o codigo tem de estar ESCRITO no post e cadastrado na base.
+ * Post que so fala em "cupom" sem dar codigo sai sem cupom, pelo preco cheio.
+ * Ver a nota no fim da funcao.
+ */
 export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
   const lojaKey = normalizarTexto(loja);
   const texto = normalizarTexto(textoOriginal);
@@ -1551,16 +1555,25 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
     return null;
   }
 
-  // Etapa 2: mencao generica ao cupom, sem codigo.
-  // Usa o MELHOR cupom aplicavel a este preco, nao o mais recente capturado. O
-  // ML publica varios cupons por dia com minimo alto (R$ 299, R$ 399, R$ 899):
-  // o mais novo quase nunca vale para produto de ticket baixo, e a etapa antes
-  // desistia ali mesmo, deixando a oferta sair sem cupom nenhum apesar de haver
-  // outro vigente que servia.
-  if (!REGEX_CUPOM_GENERICO.test(String(textoOriginal))) return null;
-  const m = melhorCupomAplicavel(loja, preco);
-  if (!m) return null;
-  return { reg: m.reg, desconto: m.desconto, citado: false, generico: true };
+  // ── CUPOM SO POR CITACAO EXPLICITA ──────────────────────────────────────
+  // Existia aqui uma etapa 2: se o post falasse "cupom" sem dar codigo, o
+  // sistema escolhia sozinho o melhor cupom vigente da loja. A escolha era pelo
+  // MAIOR desconto em reais, entao em produto caro sempre ganhava o cupom
+  // percentual sem teto — em 03/09 um SHOPEE50AF cadastrado como 50% sem
+  // 'limite' entrou num iPhone de R$ 5.561 e anunciou R$ 2.780, metade do
+  // preco, com base em um "resgate os cupons na Live" que nao prometia nada
+  // daquilo. A inferencia nunca teve como saber se o item era elegivel: quem
+  // paga o erro e o membro que chega no checkout com outro valor.
+  //
+  // A regra passa a ser uma so: cupom entra quando o post escreve o CODIGO e
+  // esse codigo esta na base. Nada de deduzir a partir da palavra "cupom".
+  //
+  // Isto NAO afeta os outros dois caminhos, que continuam valendo:
+  //   - vitrine no modo 'auto' e monitor de precos — chamam
+  //     melhorCupomAplicavel() direto; ali quem mandou aplicar foi o operador;
+  //   - cupom lido da pagina do anuncio no ML (daPagina) — nao e inferencia,
+  //     e o proprio ML declarando o desconto daquele item.
+  return null;
 }
 
 // Codigos que aparecem depois da palavra "cupom" no texto do grupo-fonte.
