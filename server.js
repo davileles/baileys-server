@@ -10633,98 +10633,6 @@ app.get('/radar/fila', (req, res) => {
   });
 });
 
-// POST /radar/link — le UM link e devolve o produto, sem enfileirar nada.
-//
-// Existe para a criacao manual de oferta no painel: ate aqui, so WhatsApp e
-// Telegram entravam em processarRadarMarketplace(), entao quem colava um link
-// na mao tinha de digitar titulo e preco. Passa pelo mesmo expandirEncurtadores
-// (portanto tambem aceita dominio proprio de afiliado) e chama cada pipeline em
-// MODO LEITURA: sem gerar link de afiliado, sem rastreio, sem fila. O que sai
-// daqui e material para preencher formulario, nao para publicar.
-app.post('/radar/link', async (req, res) => {
-  const bruto = String(req.body?.link || req.body?.texto || '').trim();
-  if (!bruto) return res.status(400).json({ ok: false, erro: 'link obrigatório' });
-
-  try {
-    const texto = await expandirEncurtadores(bruto);
-    const expandido = (texto.match(/https?:\/\/[^\s<>"')]+/) || [bruto])[0];
-
-    const achados = [];
-    const lojas = [];
-
-    if (/amazon|amzn|a\.co/i.test(texto)) {
-      lojas.push('Amazon');
-      try { achados.push(...await processarTextoAmazon(texto)); }
-      catch (e) { console.warn('[RADAR/LINK] Amazon:', e.message); }
-    }
-    if (ehLinkMl(texto)) {
-      lojas.push('Mercado Livre');
-      if (credenciaisMlOk()) {
-        try { achados.push(...await processarTextoMl(texto, { leitura: true })); }
-        catch (e) { console.warn('[RADAR/LINK] ML:', e.message); }
-      } else {
-        achados.push({ produto: { loja: 'Mercado Livre', link: expandido },
-                       descartadoPor: 'credenciais do Mercado Livre indisponíveis' });
-      }
-    }
-    if (ehLinkShopee(texto)) {
-      lojas.push('Shopee');
-      if (credenciaisShopeeOk()) {
-        try { achados.push(...await processarTextoShopee(texto, { leitura: true })); }
-        catch (e) { console.warn('[RADAR/LINK] Shopee:', e.message); }
-      } else {
-        achados.push({ produto: { loja: 'Shopee', link: expandido },
-                       descartadoPor: 'credenciais da Shopee indisponíveis' });
-      }
-    }
-    if (ehLinkMagalu(texto)) {
-      lojas.push('Magazine Luiza');
-      try { achados.push(...await processarTextoMagalu(texto)); }
-      catch (e) { console.warn('[RADAR/LINK] Magalu:', e.message); }
-    }
-
-    const normalizar = (r) => {
-      const p = r.produto || {};
-      return {
-        loja: p.loja || null,
-        id: p.asin || p.id || p.codigo || null,
-        titulo: p.titulo || '',
-        preco: Number.isFinite(p.preco) ? p.preco : null,
-        precoDe: Number.isFinite(p.precoDe) ? p.precoDe : null,
-        imagem: p.imagemUrl || p.imagem || null,
-        link: p.link || expandido,
-        disponivel: p.disponivel !== false,
-        trilha: p.trilha || null,
-      };
-    };
-
-    const produtos = achados.filter(r => !r.descartadoPor).map(normalizar);
-    const descartes = achados.filter(r => r.descartadoPor)
-      .map(r => ({ ...normalizar(r), motivo: r.descartadoPor }));
-
-    console.log('[RADAR/LINK] ' + bruto.slice(0, 80)
-      + (expandido !== bruto ? ' -> ' + expandido.slice(0, 100) : '')
-      + ' — ' + produtos.length + ' produto(s), ' + descartes.length + ' descarte(s)');
-
-    res.json({
-      ok: true,
-      linkOriginal: bruto,
-      linkExpandido: expandido,
-      expandiu: expandido !== bruto,
-      lojas,
-      produtos,
-      descartes,
-      erro: (!produtos.length && !descartes.length)
-        ? (lojas.length ? 'loja reconhecida, mas nenhum produto identificado no link'
-                        : 'nenhuma loja reconhecida neste link')
-        : null,
-    });
-  } catch (e) {
-    console.error('[RADAR/LINK] Falha:', e.message);
-    res.status(500).json({ ok: false, erro: e.message });
-  }
-});
-
 // Diario cru das capturas do radar. Serve para responder "o que o WhatsApp
 // realmente entregou?" sem depender do texto ja interpretado.
 // ── TELA DE ALERTAS ─────────────────────────────────────────────────────────
@@ -14608,8 +14516,26 @@ function pipelineDoLink(texto) {
 }
 
 app.post('/mkt/montar', async (req, res) => {
-  const link = String(req.body?.link || '').trim();
-  if (!link) return res.status(400).json({ ok:false, erro:'informe { link }' });
+  const bruto = String(req.body?.link || '').trim();
+  if (!bruto) return res.status(400).json({ ok:false, erro:'informe { link }' });
+
+  // Link mascarado (encurtador generico ou dominio proprio de afiliado) nao casa
+  // em nenhum ehLink*(), e pipelineDoLink cai no fallback da Amazon — que nao
+  // acha ASIN nenhum e devolve "nenhum produto reconhecido". Expandir aqui e o
+  // que faz o link.dominio.com.br/XYZ do concorrente virar produto preenchido.
+  // Mesmo resolvedor do radar: cache de 24h, para no primeiro host de loja
+  // conhecida e nao baixa a pagina final anonima.
+  let link = bruto;
+  try {
+    const expandido = await expandirEncurtadores(bruto);
+    const primeira = (expandido.match(/https?:\/\/[^\s<>"')]+/) || [])[0];
+    if (primeira && primeira !== bruto) {
+      link = primeira;
+      console.log('[MKT/MONTAR] Link expandido: ' + bruto + ' -> ' + link.slice(0, 140));
+    }
+  } catch (e) {
+    console.warn('[MKT/MONTAR] Expansao falhou (segue com o link original): ' + e.message);
+  }
 
   const pipe = pipelineDoLink(link);
   let resultados;
@@ -14662,6 +14588,9 @@ app.post('/mkt/montar', async (req, res) => {
   res.json({
     ok: true,
     loja,
+    linkOriginal: bruto,
+    linkExpandido: link,
+    expandiu: link !== bruto,
     produto: {
       titulo: p.titulo || '', marca: p.marca || '', link: p.link || link,
       imagemUrl: p.imagemUrl || null, preco: p.preco, precoDe: p.precoDe || null,
