@@ -6739,15 +6739,99 @@ async function resolverEncurtadorGenerico(url) {
   return destino;
 }
 
+// ── ENCURTADOR DE DOMINIO PROPRIO ─────────────────────────────────────────────
+// Concorrente serio nao usa bit.ly: registra dominio proprio e serve o link por
+// ele (link.igoroda.com.br/YN360III -> meli.la -> /social/<afiliado>?ref=...).
+// Como a allowlist acima e fixa, esse formato nao casava em nenhum gate de loja
+// e a mensagem morria em silencio, sem log e sem motivo — o mesmo buraco que o
+// encurtador generico tapou, so que para o formato que mais cresce.
+//
+// A diferenca esta em COMO resolver. O generico faz GET com redirect: 'follow',
+// o que aqui significaria baixar a pagina final do ML inteira (~350 KB) numa
+// requisicao ANONIMA — exatamente o que resolverEncurtadorMl() evita, porque e
+// isso que alimenta o antibot. Aqui a cadeia e seguida salto a salto, com
+// redirect manual e sem corpo, e PARA no primeiro host de loja conhecida. Dali
+// em diante quem resolve e o pipeline da loja, com cookie de sessao.
+const HOSTS_LOJA_CONHECIDA = /(?:^|\.)(?:amazon\.com\.br|amazon\.com|amzn\.to|a\.co|mercadolivre\.com\.br|mercadolibre\.com|meli\.la|shopee\.com\.br|shope\.ee|magazineluiza\.com\.br|magazinevoce\.com\.br|magalu\.com|ofertou\.ai|onelink\.me|tidd\.ly|awin1\.com)$/i;
+
+// Dominio que nunca deve ser tratado como encurtador, por mais que o caminho
+// pareca um: perfil de rede social e convite de grupo casam a heuristica.
+const HOSTS_NAO_ENCURTADOR = /(?:^|\.)(?:whatsapp\.com|wa\.me|t\.me|telegram\.me|instagram\.com|facebook\.com|fb\.com|youtube\.com|youtu\.be|tiktok\.com|twitter\.com|x\.com|linktr\.ee|github\.com|githubusercontent\.com|clubedoviajante\.com\.br|ticapromos\.com\.br)$/i;
+
+// Sinal 1: subdominio dedicado a redirecionamento.
+const SUB_ENCURTADOR = /^(?:link|links|go|ir|vai|promo|promos|oferta|ofertas|cupom|cupons|acesse|abre|l|s|to)\./i;
+// Sinal 2: caminho no formato de hash gerado (letra + digito, sem separador).
+const SLUG_HASH = /^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9]{5,14}$/;
+
+function ehEncurtadorCustom(url) {
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  if (!/^https?:$/.test(u.protocol)) return false;
+  const host = u.hostname.toLowerCase();
+  const semWww = host.replace(/^www\./i, '');
+  if (HOSTS_LOJA_CONHECIDA.test(semWww)) return false;   // a loja resolve sozinha
+  if (HOSTS_NAO_ENCURTADOR.test(semWww)) return false;
+  if (ENCURTADORES_GENERICOS.test(semWww)) return false; // ja coberto acima
+  if (u.search || u.hash) return false;                  // link curto nao leva query
+  const partes = u.pathname.split('/').filter(Boolean);
+  if (partes.length !== 1) return false;
+  const slug = partes[0];
+  if (!/^[A-Za-z0-9_-]{4,24}$/.test(slug)) return false; // sem ponto: nao e arquivo
+  // Um dos dois sinais basta. Exigir os dois deixaria de fora tanto o
+  // link.dominio.com.br/promocao quanto o dominio-curto.com/aB3xK9.
+  return SUB_ENCURTADOR.test(host) || SLUG_HASH.test(slug);
+}
+
+async function resolverEncurtadorCustom(url, saltos = 4) {
+  const emCache = _cacheEncurtador.get(url);
+  if (emCache && Date.now() - emCache.em < ENCURTADOR_TTL_MS) return emCache.destino;
+
+  let destino = null;
+  let atual = url;
+  try {
+    for (let i = 0; i < saltos; i++) {
+      const res = await fetch(atual, {
+        method: 'GET', redirect: 'manual',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+          'Accept-Language': 'pt-BR,pt;q=0.9',
+          'Range': 'bytes=0-0',   // so o cabecalho: o corpo nao interessa aqui
+        },
+        signal: AbortSignal.timeout(8000),
+      });
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      atual = new URL(loc, atual).href;
+      if (HOSTS_LOJA_CONHECIDA.test(_hostSemWww(atual))) { destino = atual; break; }
+    }
+    // Cadeia que terminou fora de loja conhecida ainda vale: o destino pode ser
+    // uma pagina de produto de loja que o radar le por outro caminho.
+    if (!destino && atual !== url && /^https?:\/\//i.test(atual)) destino = atual;
+  } catch (e) {
+    console.warn('[ENCURTADOR] Dominio proprio nao resolveu ' + url + ': ' + e.message);
+  }
+
+  if (_cacheEncurtador.size >= ENCURTADOR_CACHE_MAX) {
+    _cacheEncurtador.delete(_cacheEncurtador.keys().next().value);
+  }
+  _cacheEncurtador.set(url, { destino, em: Date.now() });
+  return destino;
+}
+
 async function expandirEncurtadores(texto) {
   const urls = String(texto || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
-  const alvos = [...new Set(urls.filter(u => ENCURTADORES_GENERICOS.test(_hostSemWww(u))))];
+  const alvos = [...new Set(urls.filter(u =>
+    ENCURTADORES_GENERICOS.test(_hostSemWww(u)) || ehEncurtadorCustom(u)))];
   if (!alvos.length) return texto;
   let saida = texto;
   for (const curta of alvos) {
-    const destino = await resolverEncurtadorGenerico(curta);
+    const generico = ENCURTADORES_GENERICOS.test(_hostSemWww(curta));
+    const destino = generico
+      ? await resolverEncurtadorGenerico(curta)
+      : await resolverEncurtadorCustom(curta);
     if (!destino) continue;
-    console.log('[ENCURTADOR] ' + curta + ' -> ' + destino.slice(0, 140));
+    console.log('[ENCURTADOR] ' + (generico ? '' : '(dominio proprio) ')
+      + curta + ' -> ' + destino.slice(0, 140));
     saida = saida.split(curta).join(destino);
   }
   return saida;
@@ -10547,6 +10631,98 @@ app.get('/radar/fila', (req, res) => {
       preview: item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
     })),
   });
+});
+
+// POST /radar/link — le UM link e devolve o produto, sem enfileirar nada.
+//
+// Existe para a criacao manual de oferta no painel: ate aqui, so WhatsApp e
+// Telegram entravam em processarRadarMarketplace(), entao quem colava um link
+// na mao tinha de digitar titulo e preco. Passa pelo mesmo expandirEncurtadores
+// (portanto tambem aceita dominio proprio de afiliado) e chama cada pipeline em
+// MODO LEITURA: sem gerar link de afiliado, sem rastreio, sem fila. O que sai
+// daqui e material para preencher formulario, nao para publicar.
+app.post('/radar/link', async (req, res) => {
+  const bruto = String(req.body?.link || req.body?.texto || '').trim();
+  if (!bruto) return res.status(400).json({ ok: false, erro: 'link obrigatório' });
+
+  try {
+    const texto = await expandirEncurtadores(bruto);
+    const expandido = (texto.match(/https?:\/\/[^\s<>"')]+/) || [bruto])[0];
+
+    const achados = [];
+    const lojas = [];
+
+    if (/amazon|amzn|a\.co/i.test(texto)) {
+      lojas.push('Amazon');
+      try { achados.push(...await processarTextoAmazon(texto)); }
+      catch (e) { console.warn('[RADAR/LINK] Amazon:', e.message); }
+    }
+    if (ehLinkMl(texto)) {
+      lojas.push('Mercado Livre');
+      if (credenciaisMlOk()) {
+        try { achados.push(...await processarTextoMl(texto, { leitura: true })); }
+        catch (e) { console.warn('[RADAR/LINK] ML:', e.message); }
+      } else {
+        achados.push({ produto: { loja: 'Mercado Livre', link: expandido },
+                       descartadoPor: 'credenciais do Mercado Livre indisponíveis' });
+      }
+    }
+    if (ehLinkShopee(texto)) {
+      lojas.push('Shopee');
+      if (credenciaisShopeeOk()) {
+        try { achados.push(...await processarTextoShopee(texto, { leitura: true })); }
+        catch (e) { console.warn('[RADAR/LINK] Shopee:', e.message); }
+      } else {
+        achados.push({ produto: { loja: 'Shopee', link: expandido },
+                       descartadoPor: 'credenciais da Shopee indisponíveis' });
+      }
+    }
+    if (ehLinkMagalu(texto)) {
+      lojas.push('Magazine Luiza');
+      try { achados.push(...await processarTextoMagalu(texto)); }
+      catch (e) { console.warn('[RADAR/LINK] Magalu:', e.message); }
+    }
+
+    const normalizar = (r) => {
+      const p = r.produto || {};
+      return {
+        loja: p.loja || null,
+        id: p.asin || p.id || p.codigo || null,
+        titulo: p.titulo || '',
+        preco: Number.isFinite(p.preco) ? p.preco : null,
+        precoDe: Number.isFinite(p.precoDe) ? p.precoDe : null,
+        imagem: p.imagemUrl || p.imagem || null,
+        link: p.link || expandido,
+        disponivel: p.disponivel !== false,
+        trilha: p.trilha || null,
+      };
+    };
+
+    const produtos = achados.filter(r => !r.descartadoPor).map(normalizar);
+    const descartes = achados.filter(r => r.descartadoPor)
+      .map(r => ({ ...normalizar(r), motivo: r.descartadoPor }));
+
+    console.log('[RADAR/LINK] ' + bruto.slice(0, 80)
+      + (expandido !== bruto ? ' -> ' + expandido.slice(0, 100) : '')
+      + ' — ' + produtos.length + ' produto(s), ' + descartes.length + ' descarte(s)');
+
+    res.json({
+      ok: true,
+      linkOriginal: bruto,
+      linkExpandido: expandido,
+      expandiu: expandido !== bruto,
+      lojas,
+      produtos,
+      descartes,
+      erro: (!produtos.length && !descartes.length)
+        ? (lojas.length ? 'loja reconhecida, mas nenhum produto identificado no link'
+                        : 'nenhuma loja reconhecida neste link')
+        : null,
+    });
+  } catch (e) {
+    console.error('[RADAR/LINK] Falha:', e.message);
+    res.status(500).json({ ok: false, erro: e.message });
+  }
 });
 
 // Diario cru das capturas do radar. Serve para responder "o que o WhatsApp
