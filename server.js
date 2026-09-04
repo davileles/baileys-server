@@ -5245,7 +5245,13 @@ const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade,
   + '\n- "SAA" ou "South African Airways" deve ser sempre gravado como "South African".'
   + '\n- Voo NACIONAL dentro do Brasil (origem E destino brasileiros): a cia segue o programa — Smiles = "GOL"; Azul Fidelidade/TudoAzul = "Azul"; LATAM Pass = "LATAM". Nunca use outra cia nesses casos.'
   + '\n- Voo INTERNACIONAL: identifique a companhia aerea OPERADORA ("cia") lendo o texto e principalmente a IMAGEM quando houver — screenshots da Smiles mostram o nome da cia (ex: "AIR FRANCE"). Preencha "cia" apenas com o que estiver visivel na fonte; NUNCA deduza a cia a partir do programa (Smiles NAO implica GOL em voo internacional). Se nao estiver visivel, deixe "cia" vazia.'
-  + '\n- Defina tipoVoo="nacional" sempre que origem e destino forem cidades brasileiras.';
+  + '\n- Defina tipoVoo="nacional" sempre que origem e destino forem cidades brasileiras.'
+  + '\n\nREGRAS DE PROGRAMA (campo "programa") — NAO CONFUNDA COM A CIA:'
+  + '\n- O "programa" e o programa de fidelidade que EMITE o resgate, ou seja, de quem sao as milhas gastas. A "cia" e quem OPERA o voo. Frequentemente sao empresas diferentes.'
+  + '\n- Em um screenshot, o programa e o DONO DO SITE/APP onde a busca foi feita: logo, cores, menus e rodape identificam o emissor. Textos como "A experiencia a bordo em outras companhias aereas pode ser diferente da Qatar Airways" indicam que o site e da Qatar (programa Privilege Club).'
+  + '\n- Frases do tipo "voos operados por X", "operado por X", "esta viagem inclui voos operados por X", "voando pela X" identificam APENAS a cia operadora. NUNCA transforme esse X em programa. Exemplo real: um print do site da Qatar mostrando "Esta viagem inclui voos operados por Latam Airlines Group" e um resgate de 22.000 e programa "Privilege Club" com cia "LATAM" — NAO e "LATAM Pass".'
+  + '\n- Um mesmo trecho custa quantidades MUITO diferentes de milhas em cada programa. Errar o programa e mais grave que deixa-lo vazio.'
+  + '\n- Se o programa nao estiver identificado com clareza na fonte, deixe "programa" VAZIO. Nunca deduza o programa a partir da cia operadora.';
 
 // ── DE-PARA: programa → CIA operadora (para voos nacionais BR e fallback) ─────
 const CIA_POR_PROGRAMA = {
@@ -5912,6 +5918,64 @@ async function aguardarParIdaVolta(oferta, grupoId) {
   return true; // segurado
 }
 
+// ── SCREENSHOT REDUNDANTE NO MESMO BUFFER ────────────────────────────────────
+// Uma emissao costuma chegar como DUAS mensagens seguidas: o texto estruturado
+// e um print de confirmacao. Como cada item do buffer e classificado
+// isoladamente, o print virava uma emissao independente — e, quando a IA lia
+// mal o print, uma emissao independente ERRADA.
+//
+// Caso real (04/09/2026, TSM - ALERTAS SP #5): print do site da Qatar
+// (GRU-SCL, 22.000 Avios, Executiva) chegou 1s antes do texto que dizia
+// "Qatar Airways (Privilege Club)". O print virou "LATAM Pass" — porque
+// mostrava "voos operados por Latam Airlines Group" — e, comparado com a base
+// LATAM Pass (media ~68.757), passou por minimo historico e foi ao ar.
+//
+// Aqui, quando uma classificacao vinda de item SEM TEXTO (so imagem) tem a
+// mesma rota, os mesmos pontos e a mesma cabine de outra classificacao vinda
+// de TEXTO no mesmo buffer, a versao-imagem e descartada: o texto e sempre a
+// fonte mais confiavel e ja traz a lista de datas completa.
+function chaveRotaClassificacao(v) {
+  const par = [String(v.origemCodigo || v.origem || '').trim().toUpperCase(),
+               String(v.destinoCodigo || v.destino || '').trim().toUpperCase()].sort().join('-');
+  const cab = String(v.cabine || 'Economica').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  return par + '|' + cab + '|' + (Number(v.pontos) || 0);
+}
+
+function itemSoImagem(item) {
+  if (!item || !item.imagemBase64) return false;
+  const t = String(item.texto || '').trim();
+  return !t || t === '[imagem sem legenda]';
+}
+
+function descartarScreenshotsRedundantes(validas, itens, grupoId) {
+  if (!Array.isArray(validas) || validas.length < 2) return validas;
+  const daImagem = [];
+  const doTexto  = new Map();
+  for (const v of validas) {
+    const idxs = v.indices || [v.indice];
+    const soImagem = idxs.length > 0 && idxs.every(i => itemSoImagem(itens[i]));
+    if (soImagem) daImagem.push(v);
+    else if (!doTexto.has(chaveRotaClassificacao(v))) doTexto.set(chaveRotaClassificacao(v), v);
+  }
+  if (!daImagem.length || !doTexto.size) return validas;
+
+  const descartar = new Set();
+  for (const v of daImagem) {
+    const gemeo = doTexto.get(chaveRotaClassificacao(v));
+    if (!gemeo) continue;
+    descartar.add(v);
+    const divergencia = String(v.programa || '') !== String(gemeo.programa || '')
+      ? ' — programa divergente: imagem dizia "' + (v.programa || '(vazio)') + '", texto diz "' + (gemeo.programa || '(vazio)') + '"'
+      : '';
+    console.log('[REDUNDANTE] Screenshot descartado: ' + (v.origemCodigo || v.origem) + '->'
+      + (v.destinoCodigo || v.destino) + ' ' + (Number(v.pontos) || 0) + ' pts' + divergencia);
+    registrarDescarteCdv({ jid: grupoId, motivo: 'screenshot de confirmação',
+      detalhe: 'mesma rota, pontos e cabine de uma emissão em texto no mesmo lote' + divergencia,
+      dados: v });
+  }
+  return descartar.size ? validas.filter(v => !descartar.has(v)) : validas;
+}
+
 async function processarBuffer(grupoId) {
   const entrada = bufferAgrupamento.get(grupoId);
   if (!entrada) return;
@@ -5936,6 +6000,9 @@ async function processarBuffer(grupoId) {
     if (gruposMesclagem.has(grupoId)) {
       validas = mesclarParesIdaVolta(validas);
     }
+
+    validas = descartarScreenshotsRedundantes(validas, itens, grupoId);
+    if (validas.length === 0) { console.log('   [REDUNDANTE] Todas descartadas.'); return; }
 
     const minDatas = minDatasDoGrupo(grupoId);
     if (minDatas) {
