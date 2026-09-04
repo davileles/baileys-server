@@ -645,6 +645,24 @@ const GRUPOS_FILTRO_DATAS_MIN = {
   '120363284038160631@g.us': 5, // TSM - ALERTAS SÃO LUÍS
 };
 
+// Piso padrao para qualquer grupo cujo NOME comece com "TSM". A tabela acima e
+// hardcoded, mas os grupos monitorados passaram a sair de config-cdv.js (aba
+// Config do gerador): todo TSM cadastrado pela tela nascia SEM filtro de datas,
+// em silencio. Em 04/09/2026 eram 17 grupos TSM ativos sem entrada aqui — entre
+// eles o "TSM - ALERTAS SP #5 (NOVO)", que deixou passar uma emissao com UMA
+// data. O nome resolve o padrao; a tabela continua valendo como EXCECAO, e um
+// 0 explicito ali desliga o filtro num grupo especifico.
+const DATAS_MIN_PADRAO_TSM = 5;
+
+function minDatasDoGrupo(grupoId) {
+  if (Object.prototype.hasOwnProperty.call(GRUPOS_FILTRO_DATAS_MIN, grupoId)) {
+    return GRUPOS_FILTRO_DATAS_MIN[grupoId];
+  }
+  const nome = (typeof NOMES_GRUPOS !== 'undefined' && NOMES_GRUPOS.get(grupoId)) || '';
+  if (/^\s*TSM\b/i.test(nome)) return DATAS_MIN_PADRAO_TSM;
+  return null;
+}
+
 const PORT          = process.env.PORT || 3001;
 // Funcao, nao const: a chave pode ser gravada pelo painel depois do boot e
 // precisa valer na proxima chamada, sem restart.
@@ -2646,6 +2664,14 @@ const AUTO_ENVIO_ALERTA_MODO = (process.env.AUTO_ENVIO_ALERTA || 'on').toLowerCa
 // refGateAssimetrica() em painel-cdv/index.js para a regra de elegibilidade.
 const GATE_ASSIMETRICO_MODO = (process.env.GATE_ASSIMETRICO || 'off').toLowerCase();
 
+// PISO_AUTO_ALERTA: fracao da referencia 180d abaixo da qual o auto-envio e
+// negado e a emissao cai na fila de aprovacao. Padrao 0.40 (40%). Vale para
+// qualquer cabine. 0 desliga o piso.
+const PISO_AUTO_ALERTA = (() => {
+  const v = Number(process.env.PISO_AUTO_ALERTA);
+  return Number.isFinite(v) && v >= 0 && v < 1 ? v : 0.40;
+})();
+
 // ── PROCEDENCIA DA CAPTURA ───────────────────────────────────────────────────
 // 'coleta' = achado da varredura seats.aero (Cowork) injetado em /injetar.
 // Ausencia do campo = captura em grupo/canal monitorado (comportamento antigo).
@@ -2696,6 +2722,23 @@ function avaliarAutoEnvioAlerta(oferta, hist180) {
   const teto  = Math.round(ref * (1 + tol));
   const det   = pts.toLocaleString('pt-BR') + ' pts vs teto ' + teto.toLocaleString('pt-BR')
     + ' (' + rotulo + ' ' + ref.toLocaleString('pt-BR') + ' +' + Math.round(tol * 100) + '%, ' + nRef + ' reg(s))';
+
+  // PISO DE SANIDADE — desvio para BAIXO tambem e suspeito.
+  // O teto acima so barra valor alto. Um valor absurdamente baixo passava como
+  // "menor valor historico" e auto-enviava. Caso real (04/09/2026): print da
+  // Qatar/Privilege Club GRU-SCL 22.000 Avios foi extraido como LATAM Pass
+  // (a IA leu "voos operados por Latam Airlines Group" como se fosse o
+  // programa) e comparado com a base LATAM Pass, cuja media 180d era ~68.757 —
+  // 32% da referencia. Passou no teto e foi ao ar com programa errado.
+  // Abaixo do piso NAO descarta: manda para aprovacao manual. Erro de extracao
+  // e achado excepcional parecem a mesma coisa aqui, e so o olho humano separa.
+  if (pts < Math.round(ref * PISO_AUTO_ALERTA)) {
+    const pct = Math.round((pts / ref) * 100);
+    return { auto: false, motivo: 'abaixo do piso de sanidade — ' + pts.toLocaleString('pt-BR')
+      + ' pts e ' + pct + '% da ' + rotulo + ' (' + ref.toLocaleString('pt-BR') + ', ' + nRef
+      + ' reg(s)); minimo para auto-envio e ' + Math.round(PISO_AUTO_ALERTA * 100) + '%' };
+  }
+
   const vered = pts <= teto ? { auto: true, motivo: det } : { auto: false, motivo: 'acima do teto — ' + det };
 
   // Modo sombra do gate: decide pelo critério ANTIGO e só registra no log
@@ -5894,7 +5937,7 @@ async function processarBuffer(grupoId) {
       validas = mesclarParesIdaVolta(validas);
     }
 
-    const minDatas = GRUPOS_FILTRO_DATAS_MIN[grupoId];
+    const minDatas = minDatasDoGrupo(grupoId);
     if (minDatas) {
       const validasFiltradas = validas.filter(v => {
         const total = contarDatas(v.datasIda) + contarDatas(v.datasVolta);
