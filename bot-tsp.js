@@ -300,6 +300,156 @@ async function confirmarEnvio(chatId, s, acao, editar) {
   return falar(chatId, `✅ Enviado em *${res.ok}/${res.total}* grupo(s).`, null, editar);
 }
 
+// ── CARD DE REVISAO DE OFERTA DO RADAR ───────────────────────────────────────
+// Oferta capturada de grupo monitorado chega aqui com a mensagem EXATA que
+// sairia. Os botoes editam o ITEM DA FILA (persistido em disco pelo servidor),
+// nunca a sessao: um redeploy do Railway no meio da revisao nao pode perder o
+// ajuste, e o mesmo item continua valendo no painel web. A sessao so guarda
+// "estou esperando o texto do campo X da oferta #N".
+
+async function apiLocal(metodo, caminho, body) {
+  const r = await fetch('http://127.0.0.1:' + dep.PORT + caminho, {
+    method: metodo,
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  return { ...d, http: r.status };
+}
+
+// Sem parse_mode: titulo de produto vem com *, _, [ e ~ escritos pelo vendedor,
+// e Markdown malformado faz o Telegram RECUSAR a mensagem inteira — o card
+// simplesmente nao apareceria, que e pior do que aparecer sem negrito.
+async function falarPlano(chatId, texto, kb, editarMsgId) {
+  const base = { chat_id: chatId, text: texto, disable_web_page_preview: true };
+  if (kb) base.reply_markup = kb;
+  if (editarMsgId) {
+    const d = await tg('editMessageText', { ...base, message_id: editarMsgId });
+    if (d.ok) return d.result;
+  }
+  const d = await tg('sendMessage', base);
+  return d.result || null;
+}
+
+const LIMITE_PREVIA = 3000;   // sendMessage corta em 4096; sobra para cabecalho
+
+function cabecalhoCard(o) {
+  const d = o.dados || {};
+  const linha = ['🛍️ #' + o.id, d.loja || '?'];
+  if (o.grupoOrigemNome) linha.push('via ' + o.grupoOrigemNome);
+
+  // Os mesmos motivos que seguram a oferta na fila aparecem no card: sem eles o
+  // operador aprovaria pelo celular sem saber por que ela nao auto-enviou.
+  const avisos = [];
+  if (o.cupomForaDaBase)   avisos.push('⚠️ o post cita cupom que nao esta na base');
+  if (o.cupomAmbiguo)      avisos.push('⚠️ o post cita cupons de outro bloco');
+  if (o.precoDivergente)   avisos.push('⚠️ o post anuncia R$ ' + o.precoDivergente.declarado
+                                     + ' e calculamos R$ ' + o.precoDivergente.calculado);
+  if (d.precoDeReferencia) avisos.push('⚠️ preco veio do TEXTO do grupo, nao da loja');
+  if (o.ajustes)           avisos.push('✏️ ajustado: ' + Object.keys(o.ajustes).join(', '));
+  return linha.join(' · ') + (avisos.length ? '\n' + avisos.join('\n') : '');
+}
+
+function corpoCard(o, extra) {
+  const msg = String(o.mensagemFormatada || '');
+  const previa = msg.length > LIMITE_PREVIA ? msg.slice(0, LIMITE_PREVIA) + '\n[...]' : msg;
+  return cabecalhoCard(o) + '\n\n- - - - - - - - - -\n' + previa + '\n- - - - - - - - - -'
+    + (extra ? '\n\n' + extra : '');
+}
+
+function tecladoCard(id) {
+  return teclado([
+    [['🚀 Enviar agora', 'r:enviar:' + id]],
+    [['💲 Preço', 'r:preco:' + id], ['✏️ Título', 'r:titulo:' + id]],
+    [['🏷️ Cupom', 'r:cupom:' + id], ['🔝 Topo', 'r:topo:' + id]],
+    [['🔄 Atualizar', 'r:ver:' + id], ['🗑️ Descartar', 'r:descartar:' + id]],
+  ]);
+}
+
+/** Chamado pelo server.js quando uma oferta de produto entra na fila. */
+export async function enviarCardRevisaoTelegram(oferta) {
+  if (!TOKEN || !ADMINS.size || !dep) return;
+  const r = await apiLocal('GET', '/mkt/oferta/' + oferta.id);
+  if (!r.ok) { console.warn('[BOT-TSP] Oferta #' + oferta.id + ' sem card: ' + (r.erro || r.http)); return; }
+  for (const chatId of ADMINS) {
+    try { await falarPlano(chatId, corpoCard(r.oferta), tecladoCard(r.oferta.id)); }
+    catch (e) { console.warn('[BOT-TSP] Card #' + oferta.id + ' nao chegou em ' + chatId + ': ' + e.message); }
+  }
+}
+
+async function aplicarAjuste(chatId, msgId, id, ov) {
+  const r = await apiLocal('POST', '/mkt/remontar/' + id, ov);
+  if (!r.ok) {
+    const atual = await apiLocal('GET', '/mkt/oferta/' + id);
+    return falarPlano(chatId,
+      (atual.ok ? corpoCard(atual.oferta) + '\n\n' : '') + '❌ ' + (r.erro || 'falha ao remontar'),
+      atual.ok ? tecladoCard(id) : null, msgId);
+  }
+  return falarPlano(chatId, corpoCard(r.oferta, r.aviso ? '⚠️ ' + r.aviso : ''), tecladoCard(id), msgId);
+}
+
+async function tratarRevisao(chatId, msgId, partes) {
+  const acao = partes[1];
+  const id   = partes[2];
+
+  // Sempre reler antes de agir: o item pode ter sido aprovado no painel web ou
+  // varrido pela limpeza da fila desde que o card foi desenhado.
+  const rr = await apiLocal('GET', '/mkt/oferta/' + id);
+  if (!rr.ok) return falarPlano(chatId, '⚠️ Oferta #' + id + ' saiu da fila (aprovada em outro lugar, rejeitada ou expirada).', null, msgId);
+  const o = rr.oferta;
+  if (o.status !== 'pendente') {
+    return falarPlano(chatId, corpoCard(o, 'Status: ' + o.status + ' — este item ja foi resolvido.'), null, msgId);
+  }
+
+  if (acao === 'ver') return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId);
+
+  if (acao === 'enviar') {
+    // Tira os botoes ANTES do await: o envio com espacamento entre grupos leva
+    // segundos, e um segundo toque duplicaria a mensagem nos grupos.
+    await falarPlano(chatId, corpoCard(o, '⏳ Enviando...'), null, msgId);
+    const env = await apiLocal('POST', '/painel/aprovar/' + id, {});
+    if (!env.ok) return falarPlano(chatId, corpoCard(o, '❌ Falha no envio: ' + (env.erro || env.http)), tecladoCard(id), msgId);
+    return falarPlano(chatId, corpoCard(o, '✅ Enviado em ' + (env.enviados ?? '?') + ' grupo(s).'), null, msgId);
+  }
+
+  if (acao === 'descartar') {
+    const d = await apiLocal('POST', '/painel/rejeitar/' + id, {});
+    return falarPlano(chatId, cabecalhoCard(o) + '\n\n'
+      + (d.ok ? '🗑️ Descartada.' : '❌ Falha ao descartar: ' + (d.erro || d.http)), null, msgId);
+  }
+
+  if (acao === 'preco' || acao === 'titulo' || acao === 'topo') {
+    const s = abrir(chatId, 'revisao');
+    s.passo = acao; s.ofertaId = id; s.msgId = msgId;
+    const pergunta = acao === 'preco'  ? 'Digite o novo PREÇO (só o número, ex: 149,90).'
+                   : acao === 'titulo' ? 'Digite o novo TÍTULO do produto.'
+                   : 'Digite a MENSAGEM DE TOPO (a chamada que abre a oferta).';
+    const linhas = [];
+    if (acao === 'topo') linhas.push([['Sem topo', 'r:semtopo:' + id]]);
+    linhas.push([['⬅️ Voltar', 'r:ver:' + id]]);
+    return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + pergunta, teclado(linhas), msgId);
+  }
+
+  if (acao === 'semtopo') {
+    sessoes.delete(String(chatId));
+    return aplicarAjuste(chatId, msgId, id, { gatilho: '' });
+  }
+
+  if (acao === 'cupom') {
+    const cupons = rr.cupons || [];
+    const linhas = cupons.map(cp => [['🏷️ ' + cp.codigo + ' (-R$ ' + cp.descontoAplicado + ')', 'r:cup:' + id + ':' + cp.codigo]]);
+    linhas.push([['Sem cupom', 'r:cup:' + id + ':'], ['⬅️ Voltar', 'r:ver:' + id]]);
+    return falarPlano(chatId, cabecalhoCard(o) + '\n\n'
+      + (cupons.length ? 'Cupons da base que abatem neste preço:' : 'Nenhum cupom da base abate neste preço.'),
+      teclado(linhas), msgId);
+  }
+
+  if (acao === 'cup') {
+    // Codigo com ':' e improvavel, mas o join evita truncar em silencio.
+    return aplicarAjuste(chatId, msgId, id, { cupom: partes.slice(3).join(':') });
+  }
+}
+
 // ── STATUS PARA O TELEGRAM ───────────────────────────────────────────────────
 // Le o retrato injetado por dep.status() e monta uma mensagem curta e legivel
 // para o operador conferir a saude do servidor do celular, sem abrir /status.
@@ -365,6 +515,20 @@ async function tratarTexto(chatId, texto) {
   if (!s) return falar(chatId, MENU, MENU_KB());
 
   // ── entrada de texto por passo ──
+  if (s.fluxo === 'revisao') {
+    let ov = null;
+    if (s.passo === 'preco') {
+      const v = num(t);
+      if (v === null || v <= 0) return falar(chatId, 'Preço inválido. Digite só o número (ex: `149,90`).');
+      ov = { preco: v };
+    } else if (s.passo === 'titulo') ov = { titulo: t };
+    else if (s.passo === 'topo')     ov = { gatilho: t };
+    if (!ov) return;
+    const { ofertaId, msgId } = s;
+    sessoes.delete(String(chatId));
+    return aplicarAjuste(chatId, msgId, ofertaId, ov);
+  }
+
   if (s.fluxo === 'msg' && s.passo === 'texto') { s.dados.mensagem = t; return previewMsg(chatId, s); }
 
   if (s.fluxo === 'oferta') {
@@ -397,8 +561,13 @@ async function tratarTexto(chatId, texto) {
 }
 
 async function tratarBotao(chatId, msgId, data) {
+  const partes = data.split(':');
+  // Revisao de oferta da fila: ancorada no id do item, nao na sessao — o card
+  // continua funcionando depois de um redeploy ou dias depois.
+  if (partes[0] === 'r') return tratarRevisao(chatId, msgId, partes);
+
   const s = sessao(chatId);
-  const [ns, chave, valor] = data.split(':');
+  const [ns, chave, valor] = partes;
 
   if (ns === 'a') {
     if (chave === 'novo') {
