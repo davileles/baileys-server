@@ -54,7 +54,7 @@ import {
   carregarCuponsBase, carregarTemplates, carregarVitrine, sondarRecursos,
   recarregarRadarTenants, refDeterministico,
   sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
-  contasAmazonSeparadas,
+  contasAmazonSeparadas, formatarOfertaAmazon,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -142,7 +142,8 @@ import {
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
-import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram } from './bot-tsp.js';
+import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram,
+         enviarCardRevisaoTelegram } from './bot-tsp.js';
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
@@ -159,7 +160,7 @@ function aplicarTtlsAwin() {
 import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
   normalizarShopee, credenciaisShopeeOk, montarOfertasShopeeVitrine,
-  validarAtribuicao, resolverEncurtadorShopee, chamarShopee,
+  validarAtribuicao, resolverEncurtadorShopee, chamarShopee, formatarOfertaShopee,
 } from './radar-shopee.js';
 
 // ── RADAR MERCADO LIVRE ───────────────────────────────────────────────────────
@@ -174,6 +175,7 @@ import {
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
   estadoOrigemSocialMl,
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
+  formatarOfertaMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -499,6 +501,7 @@ setTimeout(() => { rotinaSondaPaginaMl().catch(()=>{}); }, 45000);
 import {
   processarTextoMagalu, ehLinkMagalu, converterLinkMagalu, lojaMagalu,
   resolverLinhaVitrineMagalu, montarOfertasMagaluVitrine, ttlPrecoMagalu,
+  formatarOfertaMagalu,
 } from './radar-magalu.js';
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -7071,6 +7074,15 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         imagemUrl: p.imagemUrl || null,
         vendedor: p.vendedor,
         ehDeal: p.ehDeal,
+        // Campos que so o FORMATADOR usa. Sem eles guardados aqui, remontar a
+        // mensagem depois de um ajuste no card do Telegram sairia sem nota,
+        // marca, selo de relampago ou (no ML) vendas e codigo de busca.
+        nota: p.nota ?? null,
+        avaliacoes: p.avaliacoes ?? null,
+        marca: p.marca || '',
+        dealTermina: p.dealTermina || null,
+        vendas: p.vendas || '',
+        codigoBusca: p.codigoBusca || null,
         cupom: r.cupom || null,
         precoFinal: r.precoFinal ?? p.preco,
         // Magalu nao tem fonte verificavel de preco: o painel precisa avisar
@@ -7214,6 +7226,11 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 
     filaPendentes.unshift(oferta);
     salvarFila();
+    // Card de revisao no Telegram: a MESMA oferta que espera no painel web,
+    // agora com botoes de ajuste no celular. Fire-and-forget de proposito —
+    // bot fora do ar ou webhook errado nunca pode segurar o radar.
+    enviarCardRevisaoTelegram(oferta).catch(e =>
+      console.warn('[BOT-TSP] Card da oferta #' + oferta.id + ' falhou: ' + e.message));
     const _motivoFila = autoEnvioModoOferta() !== 'on' ? ''
       : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
       : oferta.cupomAmbiguo ? ' — post cita ' + oferta.cupomAmbiguo.codigos.length
@@ -14614,6 +14631,194 @@ app.post('/mkt/montar', async (req, res) => {
     mensagem: renderTemplate(templateDaLoja(loja)?.corpo || '', vars),
     avisos: resultados.filter(r => r.descartadoPor).map(r => r.descartadoPor),
   });
+});
+
+// ── REVISAO DE OFERTA PELO CARD DO TELEGRAM ─────────────────────────────────
+// O card do bot precisa refazer a mensagem depois de cada ajuste do operador.
+// Refazer aqui e REMONTAR pelo formatador da propria loja — nunca dar replace
+// no texto pronto, que perderia blocos condicionais do template, rodape e o
+// link ja rastreado. E o mesmo caminho que o radar usou para montar a original,
+// entao o que o operador aprova sai identico ao que ele leu no card.
+
+function produtoDaOfertaFila(o) {
+  const d = o.dadosExtraidos || {};
+  return {
+    titulo: d.titulo || '', marca: d.marca || '', link: d.link || '',
+    imagemUrl: d.imagemUrl || null,
+    preco: Number(d.preco) || 0,
+    precoDe: d.precoDe != null ? Number(d.precoDe) : null,
+    desconto: Number(d.desconto) || 0,
+    loja: d.loja || '', vendedor: d.vendedor || null,
+    nota: d.nota ?? null, avaliacoes: d.avaliacoes ?? null,
+    asin: d.asin || null, codigoBusca: d.codigoBusca || null, vendas: d.vendas || '',
+    dealTermina: d.dealTermina || null,
+    precoDeReferencia: !!d.precoDeReferencia,
+    // O ref de rastreio do ML sai da CATEGORIA; sem ela a remontagem trocaria a
+    // etiqueta do produto e o coletor de comissoes perderia o casamento.
+    categoria: d.categoria || null,
+    disponivel: true,
+  };
+}
+
+function formatarOfertaDaLoja(tipo, p, opcoes) {
+  switch (String(tipo || '')) {
+    case 'oferta_ml':     return formatarOfertaMl(p, opcoes);
+    case 'oferta_shopee': return formatarOfertaShopee(p, opcoes);
+    case 'oferta_magalu': return formatarOfertaMagalu(p, opcoes);
+    case 'oferta_awin':   return formatarOfertaAwin(p, opcoes);
+    default:              return formatarOfertaAmazon(p, opcoes);
+  }
+}
+
+// Cupons da base que abatem algo NESTE preco — e o que vira botao no card.
+function cuponsAplicaveisNoPreco(loja, preco) {
+  if (!loja || !(preco > 0)) return [];
+  return listarCuponsBase()
+    .filter(cp => cp.codigo && cupomVigente(cp) && chaveLojaSimples(cp.loja) === chaveLojaSimples(loja))
+    .map(cp => ({ codigo: cp.codigo, descontoAplicado: calcularDesconto(cp, preco) }))
+    .filter(cp => cp.descontoAplicado > 0)
+    .sort((a, b) => b.descontoAplicado - a.descontoAplicado)
+    .slice(0, 4);
+}
+
+// Cupom que ja estava na oferta. Com o codigo na base o desconto e RECALCULADO
+// (cupom percentual muda de valor quando o preco muda). Cupom lido do anuncio,
+// que nao tem registro, e preservado inteiro: as flags semCodigo/segmentado
+// mudam a frase do template e nao da para reconstruir a partir do codigo.
+function cupomVigenteDaOferta(o, p) {
+  const c = o.dadosExtraidos?.cupom;
+  if (!c) return null;
+  const codigo = c.codigo || c.reg?.codigo || '';
+  if (codigo) {
+    const reg = cupomPorCodigo(p.loja, codigo);
+    if (reg && cupomVigente(reg)) {
+      const desconto = calcularDesconto(reg, p.preco);
+      return desconto > 0 ? { reg, desconto, citado: true } : null;
+    }
+  }
+  return { ...c, desconto: Number(c.desconto) || 0 };
+}
+
+function remontarOfertaFila(oferta, ov = {}) {
+  const p   = produtoDaOfertaFila(oferta);
+  const tem = k => Object.prototype.hasOwnProperty.call(ov, k);
+
+  if (tem('preco')) {
+    p.preco = Number(ov.preco);
+    // Preco digitado a mao invalida o % que veio da loja: com 'de' o desconto e
+    // recalculado; sem 'de' nao ha base para afirmar desconto nenhum.
+    p.desconto = (p.precoDe && p.precoDe > p.preco)
+      ? Math.round((1 - p.preco / p.precoDe) * 100) : 0;
+  }
+  if (tem('titulo')) p.titulo = String(ov.titulo || '').trim();
+
+  let cupom = null, aviso = null;
+  if (tem('cupom')) {
+    const cod = String(ov.cupom || '').trim();
+    if (cod) {
+      const reg = cupomPorCodigo(p.loja, cod);
+      if (!reg)                    aviso = 'cupom ' + cod + ' nao esta na base de ' + p.loja;
+      else if (!cupomVigente(reg)) aviso = 'cupom ' + cod + ' expirado ou inativo';
+      else {
+        const desconto = calcularDesconto(reg, p.preco);
+        if (desconto > 0) cupom = { reg, desconto, citado: true };
+        else aviso = 'cupom ' + cod + ' nao abate nada neste preco';
+      }
+    }
+  } else {
+    cupom = cupomVigenteDaOferta(oferta, p);
+  }
+
+  const gatilho = tem('gatilho') ? String(ov.gatilho || '').trim() : (oferta.gatilhoTopo || '');
+  // A chave so entra em opcoes quando ha texto: passar '' suprimiria o
+  // gatilhoPadrao da configuracao, que a oferta original teria usado.
+  const opcoes = { cupom };
+  if (gatilho) opcoes.gatilho = gatilho;
+  let mensagem = formatarOfertaDaLoja(oferta.tipoConteudo, p, opcoes);
+  // Loja cujo template nao tem a variavel: o topo entra como prefixo, para o
+  // botao valer em todas e nao so nas que suportam {{gatilho}}.
+  if (gatilho && mensagem.indexOf(gatilho) === -1) mensagem = gatilho + '\n\n' + mensagem;
+
+  oferta.mensagemFormatada = mensagem;
+  oferta.gatilhoTopo = gatilho || null;
+  const d = oferta.dadosExtraidos || (oferta.dadosExtraidos = {});
+  d.titulo   = p.titulo;
+  d.preco    = p.preco;
+  d.desconto = p.desconto;
+  d.cupom      = cupom ? { codigo: cupom.codigo || cupom.reg?.codigo || '', desconto: cupom.desconto } : null;
+  d.precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
+  oferta.ajustes = { ...(oferta.ajustes || {}) };
+  for (const k of Object.keys(ov)) oferta.ajustes[k] = true;
+  oferta.ajustadoEm = new Date().toISOString();
+  salvarFila();
+  return { mensagem, aviso };
+}
+
+// Retrato enxuto para o card: sem imagens base64 nem texto original, que
+// estouram o payload e nao aparecem no Telegram.
+function resumoOfertaFila(o) {
+  const d = o.dadosExtraidos || {};
+  return {
+    id: o.id, status: o.status, tipoConteudo: o.tipoConteudo,
+    mensagemFormatada: o.mensagemFormatada,
+    grupoOrigemNome: o.grupoOrigemNome || null,
+    ajustes: o.ajustes || null, gatilhoTopo: o.gatilhoTopo || null,
+    cupomForaDaBase: o.cupomForaDaBase || null,
+    cupomAmbiguo: o.cupomAmbiguo || null,
+    precoDivergente: o.precoDivergente || null,
+    dados: {
+      loja: d.loja || '', titulo: d.titulo || '',
+      preco: d.preco ?? null, precoDe: d.precoDe ?? null,
+      desconto: d.desconto ?? null, precoFinal: d.precoFinal ?? null,
+      cupom: d.cupom || null, precoDeReferencia: !!d.precoDeReferencia,
+    },
+  };
+}
+
+function ofertaDaFilaPara(req, id) {
+  const o = filaPendentes.find(x => String(x.id) === String(id));
+  if (!o) return null;
+  // Dono: mesma defesa das rotas do painel.
+  if ((o.tenant || TENANT_PADRAO) !== req.tenantId) return null;
+  return o;
+}
+
+app.get('/mkt/oferta/:id', (req, res) => {
+  const o = ofertaDaFilaPara(req, req.params.id);
+  if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  res.json({ ok:true, oferta: resumoOfertaFila(o),
+    cupons: cuponsAplicaveisNoPreco(o.dadosExtraidos?.loja || '', Number(o.dadosExtraidos?.preco) || 0) });
+});
+
+app.post('/mkt/remontar/:id', (req, res) => {
+  const o = ofertaDaFilaPara(req, req.params.id);
+  if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  if (!ehOfertaMarketplace(o.tipoConteudo)) {
+    return res.status(400).json({ ok:false, erro:'So oferta de marketplace remonta por aqui.' });
+  }
+  // Item ja enviado ou saindo nao volta atras: a mensagem que foi para os grupos
+  // deixaria de bater com a que fica registrada no historico.
+  if (o.status !== 'pendente') {
+    return res.status(409).json({ ok:false, erro:'Oferta com status ' + o.status + ' — nao da para editar.' });
+  }
+
+  const b = req.body || {};
+  const ov = {};
+  if (b.preco !== undefined && b.preco !== null && b.preco !== '') {
+    const v = Number(b.preco);
+    if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok:false, erro:'preco invalido' });
+    ov.preco = v;
+  }
+  if (typeof b.titulo  === 'string') ov.titulo  = b.titulo;
+  if (typeof b.cupom   === 'string') ov.cupom   = b.cupom;
+  if (typeof b.gatilho === 'string') ov.gatilho = b.gatilho;
+  if (!Object.keys(ov).length) return res.status(400).json({ ok:false, erro:'nada para ajustar' });
+
+  try {
+    const r = remontarOfertaFila(o, ov);
+    res.json({ ok:true, mensagem:r.mensagem, aviso:r.aviso, oferta: resumoOfertaFila(o),
+      cupons: cuponsAplicaveisNoPreco(o.dadosExtraidos?.loja || '', Number(o.dadosExtraidos?.preco) || 0) });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // Cola um link Shopee e ve a mensagem que sairia, sem enfileirar nem publicar.
