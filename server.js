@@ -7415,21 +7415,29 @@ function _agendarReconexao(delay) {
 // `session-*` e `sender-key-*` sao seguros (o remetente redistribui via retry
 // receipt); `pre-key-*`, `creds.json` e `app-state-sync-*` NUNCA sao tocados,
 // sob pena de "Bad MAC" permanente ate novo QR.
-const FAXINA_DIAS   = Number(process.env.FAXINA_DIAS || 21);
+// 21 dias nunca colhia nada: a emergencia zerava o mtime de todo mundo antes.
+// Com o corte em 7 dias a faxina por idade volta a ser o mecanismo principal —
+// remove aos poucos, a cada 6h, so a chave de quem esta parado. Sender key
+// apagada e recriada pelo remetente no primeiro retry receipt.
+const FAXINA_DIAS   = Number(process.env.FAXINA_DIAS || 7);
 const FAXINA_INTERV = 6 * 60 * 60 * 1000;   // 6h
+const FAXINA_FEED_HORAS = Number(process.env.FAXINA_FEED_HORAS || 12);
 // Piso de espaco livre que dispara a emergencia, e quantos arquivos ela deixa.
 // O alvo antigo (500) foi escolhido durante o ENOSPC de agosto, quando derrubar
 // tudo era o mal menor. Em operacao normal 38 grupos sustentam dezenas de
 // milhares de chaves em ~60 MB: cortar para 500 apaga o chaveiro inteiro e o
 // Baileys o reconstroi em minutos, sem liberar espaco que fizesse diferenca.
-const FAXINA_LIVRE_MIN_MB = Number(process.env.FAXINA_LIVRE_MIN_MB || 150);
+const FAXINA_LIVRE_MIN_MB = Number(process.env.FAXINA_LIVRE_MIN_MB || 80);
 const FAXINA_EMERG_ALVO   = Number(process.env.FAXINA_EMERG_ALVO || 20000);
 // Teto do que a pasta de sessao pode ocupar. Segunda rede: num bind-mount o
 // statfs pode responder pelo disco do HOST, e ai o espaco livre pareceria
 // infinito e a protecao contra o ENOSPC de 21/08/2026 sumiria. Em operacao
 // normal a pasta gasta ~300 MB reais (62 MB de dados + o bloco minimo de cada
 // um dos ~48 mil arquivos), entao o teto precisa ficar acima disso.
-const FAXINA_OCUPADO_MAX_MB = Number(process.env.FAXINA_OCUPADO_MAX_MB || 700);
+// Medido em 07/09/2026: cota de 500 MB rende 433 MB uteis, a pasta gasta 248 MB
+// reais. O teto tem de caber DENTRO da cota — 700 era maior que o volume
+// inteiro e portanto nunca dispararia.
+const FAXINA_OCUPADO_MAX_MB = Number(process.env.FAXINA_OCUPADO_MAX_MB || 330);
 
 async function ocupacaoSessaoMB() {
   const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0, blocos: 0 };
@@ -7469,7 +7477,9 @@ async function faxinaAuxiliar() {
   const agora = Date.now();
   const alvos = [
     { dir: SESSAO_DIR,            filtro: a => a.endsWith('.tmp'), idadeH: 1  },
-    { dir: SESSAO_DIR + '/feeds', filtro: a => a.endsWith('.csv.gz'), idadeH: 48 },
+    // Feeds da Awin sao os unicos arquivos GRANDES do volume (47 MB entre os
+    // 15 maiores). Cache puro: o proximo /awin/feeds/atualizar rebaixa tudo.
+    { dir: SESSAO_DIR + '/feeds', filtro: a => a.endsWith('.csv.gz'), idadeH: FAXINA_FEED_HORAS },
     { dir: UPLOAD_DIR,            filtro: () => true,              idadeH: 6  },
   ];
   for (const alvo of alvos) {
@@ -7493,8 +7503,8 @@ async function faxinaAuxiliar() {
   return { apagados: n, bytes };
 }
 
-async function faxinaDisco(motivo = 'periodica') {
-  const corte = Date.now() - FAXINA_DIAS * 24 * 60 * 60 * 1000;
+async function faxinaDisco(motivo = 'periodica', dias = FAXINA_DIAS) {
+  const corte = Date.now() - dias * 24 * 60 * 60 * 1000;
   let apagados = 0, mantidos = 0, bytes = 0;
   await faxinaAuxiliar();
   try {
@@ -7518,7 +7528,7 @@ async function faxinaDisco(motivo = 'periodica') {
       } catch (e) { /* arquivo sumiu no meio da varredura */ }
     }
     console.log('[FAXINA] ' + motivo + ': ' + apagados + ' arquivo(s) com mais de ' +
-      FAXINA_DIAS + ' dia(s) apagado(s) (' + Math.round(bytes / 1024) + ' KB), ' +
+      dias + ' dia(s) apagado(s) (' + Math.round(bytes / 1024) + ' KB), ' +
       mantidos + ' mantido(s).');
   } catch (e) {
     console.error('[FAXINA] Erro:', e.message);
@@ -16394,6 +16404,44 @@ app.listen(PORT, () => {
 
 // Faxina do volume: uma no arranque (antes que o disco aperte de novo) e uma a
 // cada 6h. Roda solta de proposito — nada no boot deve esperar por ela.
+// Diagnostico unico do volume, usado pelo arranque e pelo ciclo de 6h.
+async function volumeApertado() {
+  const esp = await espacoVolume();
+  const ocu = await ocupacaoSessaoMB();
+  const semEspaco = esp ? esp.livreMB < FAXINA_LIVRE_MIN_MB : false;
+  const inchada   = ocu ? ocu.mb   > FAXINA_OCUPADO_MAX_MB : false;
+  return { esp, ocu, apertado: semEspaco || inchada, semEspaco, inchada };
+}
+
+function descreverVolume({ esp, ocu }) {
+  return (esp ? esp.livreMB + ' MB livres de ' + esp.totalMB + ' (' + esp.usoPct + '% em uso)' : 'espaco nao medido')
+       + (ocu ? ', sessao gasta ' + ocu.mb + ' MB reais em ' + ocu.arquivos + ' arquivo(s)' : '');
+}
+
+// Aperto detectado COM O SOCKET VIVO. Aqui a emergencia esta proibida: em
+// 17/08/2026 apagar 72 sender keys com a conexao ativa derrubou o stream e o
+// socket ficou surdo por 2h — e a emergencia hoje cortaria dezenas de milhares.
+// A saida e um corte por idade mais curto, que sai de fininho, mais um aviso ao
+// operador. Se nem isso resolver, o proximo restart aciona a emergencia com o
+// socket ainda desligado, que e quando ela e segura.
+async function faxinaSobPressao() {
+  const v = await volumeApertado();
+  if (!v.apertado) return;
+  console.warn('[FAXINA] Aperto com o servico no ar — ' + descreverVolume(v));
+  const r = await faxinaDisco('aperto', 3);
+  const depois = await volumeApertado();
+  if (!depois.apertado) {
+    console.log('[FAXINA] Aperto resolvido pelo corte de 3 dias — ' + descreverVolume(depois));
+    return;
+  }
+  const aviso = '⚠️ Volume do baileys-server apertado\n'
+    + descreverVolume(depois) + '\n'
+    + 'O corte de 3 dias liberou ' + r.apagados + ' arquivo(s) e nao foi suficiente.\n'
+    + 'A limpeza pesada so roda com o socket desligado: um restart resolve.';
+  console.warn('[FAXINA] ' + aviso.replace(/\n/g, ' | '));
+  notificarAdminsTelegram(aviso).catch(() => {});
+}
+
 faxinaDisco('arranque').then(async () => {
   // Gatilho por ESPACO LIVRE, nunca por contagem de arquivos. O criterio antigo
   // ('nada apagado por idade' + '>2000 arquivos') se auto-alimentava: a propria
@@ -16404,25 +16452,20 @@ faxinaDisco('arranque').then(async () => {
   // janela dessa renegociacao que a mensagem de grupo monitorado vira stub
   // indecifravel. Sem leitura do volume nao ha emergencia: apagar o chaveiro no
   // escuro ja custou 2h de socket surdo em 17/08/2026.
-  const esp = await espacoVolume();
-  const ocu = await ocupacaoSessaoMB();
-  const semEspaco = esp ? esp.livreMB < FAXINA_LIVRE_MIN_MB : false;
-  const inchada   = ocu ? ocu.mb   > FAXINA_OCUPADO_MAX_MB : false;
-
-  if (!semEspaco && !inchada) {
-    console.log('[FAXINA] Volume ok — '
-      + (esp ? esp.livreMB + ' MB livres de ' + esp.totalMB + ' (' + esp.usoPct + '% em uso)' : 'espaco nao medido')
-      + (ocu ? ', sessao ocupa ' + ocu.mb + ' MB em ' + ocu.arquivos + ' arquivo(s)' : '')
-      + '. Emergencia dispensada.');
+  const v = await volumeApertado();
+  if (!v.apertado) {
+    console.log('[FAXINA] Volume ok — ' + descreverVolume(v) + '. Emergencia dispensada.');
     return;
   }
   console.warn('[FAXINA] Acionando emergencia — '
-    + (semEspaco ? 'so ' + esp.livreMB + ' MB livres (piso ' + FAXINA_LIVRE_MIN_MB + ' MB)' : '')
-    + (semEspaco && inchada ? ' e ' : '')
-    + (inchada ? 'sessao com ' + ocu.mb + ' MB (teto ' + FAXINA_OCUPADO_MAX_MB + ' MB)' : '') + '.');
+    + (v.semEspaco ? 'so ' + v.esp.livreMB + ' MB livres (piso ' + FAXINA_LIVRE_MIN_MB + ' MB)' : '')
+    + (v.semEspaco && v.inchada ? ' e ' : '')
+    + (v.inchada ? 'sessao com ' + v.ocu.mb + ' MB reais (teto ' + FAXINA_OCUPADO_MAX_MB + ' MB)' : '') + '.');
   return faxinaEmergencia();
 }).catch(() => {});
-setInterval(() => { faxinaDisco('periodica').catch(() => {}); }, FAXINA_INTERV);
+setInterval(() => {
+  faxinaDisco('periodica').then(() => faxinaSobPressao()).catch(() => {});
+}, FAXINA_INTERV);
 
 // ── SONDA DE LIBERACAO DA CREATORS API (AMAZON) ──────────────────────────────
 // A conta de Associados esta sem elegibilidade e o getItems devolve 403. Em vez
