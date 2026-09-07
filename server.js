@@ -14,7 +14,7 @@ import pino from 'pino';
 import multer from 'multer';
 import { Boom } from '@hapi/boom';
 import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, mkdirSync } from 'fs';
-import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync, stat as statAsync } from 'fs/promises';
+import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync, stat as statAsync, statfs as statfsAsync } from 'fs/promises';
 import { join } from 'path';
 import QRCode from 'qrcode';
 
@@ -7417,6 +7417,43 @@ function _agendarReconexao(delay) {
 // sob pena de "Bad MAC" permanente ate novo QR.
 const FAXINA_DIAS   = Number(process.env.FAXINA_DIAS || 21);
 const FAXINA_INTERV = 6 * 60 * 60 * 1000;   // 6h
+// Piso de espaco livre que dispara a emergencia, e quantos arquivos ela deixa.
+// O alvo antigo (500) foi escolhido durante o ENOSPC de agosto, quando derrubar
+// tudo era o mal menor. Em operacao normal 38 grupos sustentam dezenas de
+// milhares de chaves em ~60 MB: cortar para 500 apaga o chaveiro inteiro e o
+// Baileys o reconstroi em minutos, sem liberar espaco que fizesse diferenca.
+const FAXINA_LIVRE_MIN_MB = Number(process.env.FAXINA_LIVRE_MIN_MB || 150);
+const FAXINA_EMERG_ALVO   = Number(process.env.FAXINA_EMERG_ALVO || 20000);
+// Teto do que a pasta de sessao pode ocupar. Segunda rede: num bind-mount o
+// statfs pode responder pelo disco do HOST, e ai o espaco livre pareceria
+// infinito e a protecao contra o ENOSPC de 21/08/2026 sumiria. Em operacao
+// normal a pasta vive em ~60 MB.
+const FAXINA_OCUPADO_MAX_MB = Number(process.env.FAXINA_OCUPADO_MAX_MB || 400);
+
+async function ocupacaoSessaoMB() {
+  const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0 };
+  try { await _varrer(SESSAO_DIR, '', acc); } catch (e) { return null; }
+  return { mb: +(acc.total / 1048576).toFixed(1), arquivos: acc.arquivos };
+}
+
+// Espaco REAL do volume. O gatilho da emergencia usava contagem de arquivos, que
+// nao diz nada sobre disco: em 07/09/2026 ela apagou 14.784 chaves com o volume
+// em 62 MB de uso. Sem leitura possivel devolve null, e quem chama decide.
+async function espacoVolume(dir = SESSAO_DIR) {
+  try {
+    const s = await statfsAsync(dir);
+    const livre = s.bavail * s.bsize;
+    const total = s.blocks * s.bsize;
+    return {
+      livreMB: +(livre / 1048576).toFixed(1),
+      totalMB: +(total / 1048576).toFixed(1),
+      usoPct: total > 0 ? Math.round(100 * (total - livre) / total) : null,
+    };
+  } catch (e) {
+    console.warn('[FAXINA] Nao consegui medir o volume:', e.message);
+    return null;
+  }
+}
 
 // Sobra de escrita atomica: `writeFile(tmp)` + `rename` deixa .tmp para tras
 // se o processo morre no meio — foi o caso do enviadas.json.tmp de 117 MB que
@@ -7487,7 +7524,7 @@ async function faxinaDisco(motivo = 'periodica') {
 // Faxina de emergencia: ignora a idade e apaga do mais antigo para o mais novo
 // ate sobrar `alvo` arquivos. So e chamada quando o disco ja estourou — nesse
 // ponto perder segmentacao de sessao e barato perto de ficar fora do ar.
-async function faxinaEmergencia(alvo = 500) {
+async function faxinaEmergencia(alvo = FAXINA_EMERG_ALVO) {
   try {
     const lista = [];
     const pastas = [SESSAO_DIR];
@@ -7554,7 +7591,8 @@ app.get('/manutencao/disco', async (_req, res) => {
     .map(([nome, v]) => ({ nome, arquivos: v.arquivos, mb: +(v.bytes / 1048576).toFixed(2) }))
     .sort((a, b) => b.mb - a.mb).slice(0, 25);
   const maiores = acc.maiores.sort((a, b) => b.kb - a.kb).slice(0, 15);
-  res.json({ ok: true, totalMB: +(acc.total / 1048576).toFixed(2), arquivos: acc.arquivos, familias, maiores });
+  res.json({ ok: true, totalMB: +(acc.total / 1048576).toFixed(2), arquivos: acc.arquivos,
+    volume: await espacoVolume(), pisoLivreMB: FAXINA_LIVRE_MIN_MB, familias, maiores });
 });
 
 app.post('/manutencao/faxina', async (req, res) => {
@@ -16343,10 +16381,33 @@ app.listen(PORT, () => {
 
 // Faxina do volume: uma no arranque (antes que o disco aperte de novo) e uma a
 // cada 6h. Roda solta de proposito — nada no boot deve esperar por ela.
-faxinaDisco('arranque').then(r => {
-  // Volume ja estourado no arranque: o corte por idade nao adiantou, entao
-  // apara pelo excedente. Sem isso o processo volta a ENOSPC em minutos.
-  if (r.apagados === 0 && r.mantidos > 2000) return faxinaEmergencia(500);
+faxinaDisco('arranque').then(async () => {
+  // Gatilho por ESPACO LIVRE, nunca por contagem de arquivos. O criterio antigo
+  // ('nada apagado por idade' + '>2000 arquivos') se auto-alimentava: a propria
+  // emergencia deixava tudo recente, entao nada chegava aos 21 dias, o corte por
+  // idade travava em zero e a emergencia voltava a rodar em TODO restart —
+  // 14.784 chaves apagadas com o disco em 62 MB. Quem paga isso e a captura:
+  // cada boot forcava renegociacao de dezenas de milhares de sender keys, e e na
+  // janela dessa renegociacao que a mensagem de grupo monitorado vira stub
+  // indecifravel. Sem leitura do volume nao ha emergencia: apagar o chaveiro no
+  // escuro ja custou 2h de socket surdo em 17/08/2026.
+  const esp = await espacoVolume();
+  const ocu = await ocupacaoSessaoMB();
+  const semEspaco = esp ? esp.livreMB < FAXINA_LIVRE_MIN_MB : false;
+  const inchada   = ocu ? ocu.mb   > FAXINA_OCUPADO_MAX_MB : false;
+
+  if (!semEspaco && !inchada) {
+    console.log('[FAXINA] Volume ok — '
+      + (esp ? esp.livreMB + ' MB livres de ' + esp.totalMB + ' (' + esp.usoPct + '% em uso)' : 'espaco nao medido')
+      + (ocu ? ', sessao ocupa ' + ocu.mb + ' MB em ' + ocu.arquivos + ' arquivo(s)' : '')
+      + '. Emergencia dispensada.');
+    return;
+  }
+  console.warn('[FAXINA] Acionando emergencia — '
+    + (semEspaco ? 'so ' + esp.livreMB + ' MB livres (piso ' + FAXINA_LIVRE_MIN_MB + ' MB)' : '')
+    + (semEspaco && inchada ? ' e ' : '')
+    + (inchada ? 'sessao com ' + ocu.mb + ' MB (teto ' + FAXINA_OCUPADO_MAX_MB + ' MB)' : '') + '.');
+  return faxinaEmergencia();
 }).catch(() => {});
 setInterval(() => { faxinaDisco('periodica').catch(() => {}); }, FAXINA_INTERV);
 
