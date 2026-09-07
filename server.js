@@ -14783,6 +14783,32 @@ function ofertaDaFilaPara(req, id) {
   return o;
 }
 
+// Pendentes de marketplace para o comando /fila do bot. So o resumo: a lista
+// vira teclado no Telegram e nao aguenta mensagem inteira por item.
+app.get('/mkt/fila', (req, res) => {
+  const n = Math.min(Math.max(parseInt(req.query.n) || 8, 1), 20);
+  const pendentes = filaPendentes.filter(o =>
+       o.status === 'pendente'
+    && ehOfertaMarketplace(o.tipoConteudo)
+    && (o.tenant || TENANT_PADRAO) === req.tenantId);
+  // filaPendentes recebe por unshift: a ordem ja e da mais recente para a mais
+  // antiga, que e a que interessa quando so cabem 8 botoes.
+  const itens = pendentes.slice(0, n).map(o => {
+    const d = o.dadosExtraidos || {};
+    return {
+      id: o.id, loja: d.loja || '', titulo: d.titulo || '',
+      preco: d.preco ?? null,
+      precoFinal: d.precoFinal ?? d.preco ?? null,
+      cupom: d.cupom?.codigo || null,
+      ajustado: !!o.ajustes,
+      // Um unico sinal para o rotulo do botao: o motivo detalhado esta no card.
+      aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.precoDivergente || d.precoDeReferencia),
+      timestamp: o.timestamp || null,
+    };
+  });
+  res.json({ ok:true, total: pendentes.length, itens });
+});
+
 app.get('/mkt/oferta/:id', (req, res) => {
   const o = ofertaDaFilaPara(req, req.params.id);
   if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
