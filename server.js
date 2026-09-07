@@ -7618,6 +7618,97 @@ app.get('/manutencao/disco', async (_req, res) => {
     tetoOcupadoMB: FAXINA_OCUPADO_MAX_MB, familias, maiores });
 });
 
+// Censo das sender keys por GRUPO. Existe para responder a uma pergunta de
+// decisao: o volume esta cheio de chave de grupo que a gente LE (fonte/CDV, onde
+// apagar custa captura) ou de grupo onde a gente so PUBLICA (onde a chave dos
+// membros nao serve para nada)?
+//
+// Nome do arquivo: sender-key-<grupo>--<remetente>--<device>.json — o '::' do
+// SenderKeyName vira '--' no fixFileName do auth state.
+//
+// ATENCAO ao usar isto para apagar: a SUA PROPRIA chave de saida do grupo mora
+// no mesmo namespace (sender-key-<grupo>--<seu jid>--0) e o Baileys so a
+// redistribui aos membros quando 'sender-key-memory-<grupo>' NAO diz que eles ja
+// receberam. Apagar a chave e manter a memoria faz o servidor cifrar com chave
+// nova sem avisar ninguem: todo membro ve "Aguardando esta mensagem". Os dois
+// arquivos andam juntos, sempre.
+function classeDoGrupo(jid) {
+  if (ehFonteRadar(jid))    return 'fonte';
+  if (ehMonitoradoCdv(jid)) return 'monitorado_cdv';
+  try { if (radarDestinos().includes(jid)) return 'destino'; } catch (e) {}
+  return 'desconhecido';
+}
+
+app.get('/manutencao/sender-keys', async (_req, res) => {
+  try {
+    const pastas = [SESSAO_DIR];
+    try {
+      for (const cn of await readdir(CONTAS_DIR)) pastas.push(CONTAS_DIR + '/' + cn);
+    } catch (e) {}
+
+    const porGrupo = new Map();   // jid -> { arquivos, blocos, memoria }
+    let orfaos = 0, memorias = 0;
+
+    for (const pasta of pastas) {
+      let arquivos = [];
+      try { arquivos = await readdir(pasta); } catch (e) { continue; }
+      for (const arq of arquivos) {
+        if (!arq.startsWith('sender-key')) continue;
+
+        // A memoria de distribuicao e por grupo, nao por remetente.
+        if (arq.startsWith('sender-key-memory-')) {
+          const jid = arq.slice('sender-key-memory-'.length).replace(/\.json$/, '');
+          const cur = porGrupo.get(jid) || { arquivos: 0, blocos: 0, memoria: false };
+          cur.memoria = true;
+          porGrupo.set(jid, cur);
+          memorias++;
+          continue;
+        }
+
+        const resto = arq.slice('sender-key-'.length).replace(/\.json$/, '');
+        const corte = resto.indexOf('--');
+        if (corte <= 0) { orfaos++; continue; }
+        const jid = resto.slice(0, corte);
+        const cur = porGrupo.get(jid) || { arquivos: 0, blocos: 0, memoria: false };
+        cur.arquivos++;
+        try {
+          const st = await statAsync(pasta + '/' + arq);
+          cur.blocos += (st.blocks || 0);
+        } catch (e) {}
+        porGrupo.set(jid, cur);
+      }
+    }
+
+    const grupos = [...porGrupo.entries()].map(([jid, v]) => ({
+      jid,
+      nome: NOMES_GRUPOS.get(jid) || null,
+      classe: classeDoGrupo(jid),
+      arquivos: v.arquivos,
+      mb: +(v.blocos * 512 / 1048576).toFixed(2),
+      memoriaDistribuicao: v.memoria,
+    })).sort((a, b) => b.arquivos - a.arquivos);
+
+    const porClasse = {};
+    for (const g of grupos) {
+      const k = g.classe;
+      porClasse[k] = porClasse[k] || { grupos: 0, arquivos: 0, mb: 0 };
+      porClasse[k].grupos++;
+      porClasse[k].arquivos += g.arquivos;
+      porClasse[k].mb = +(porClasse[k].mb + g.mb).toFixed(2);
+    }
+
+    res.json({ ok: true,
+      totalArquivos: grupos.reduce((s, g) => s + g.arquivos, 0),
+      totalMB: +grupos.reduce((s, g) => s + g.mb, 0).toFixed(2),
+      memorias, orfaos,
+      porClasse,
+      grupos: grupos.slice(0, 60),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
+  }
+});
+
 app.post('/manutencao/faxina', async (req, res) => {
   const emergencia = req.body?.emergencia === true;
   const alvo = Number(req.body?.alvo || 500);
