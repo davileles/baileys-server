@@ -7219,10 +7219,29 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
           + ' R$ ' + p.preco + ' -> ' + r.enviados.length + ' grupo(s)');
         continue;
       } catch (e) {
-        // Falhou o envio: cai para a fila em vez de perder a oferta.
+        // Falhou o envio: cai para a fila em vez de perder a oferta. A causa fica
+        // GRAVADA na oferta — sem isso o operador ve o item parado no painel e no
+        // card sem nenhuma pista de que houve uma tentativa e do que a barrou
+        // (foi assim com a #15393: sem trilha que a entregasse).
+        oferta.falhaAutoEnvio = e.message;
         console.error('[MKT] Auto-envio falhou (' + e.message + ') — indo para a fila.');
       }
     }
+
+    // Por que esta oferta parou aqui. Calculado ANTES do card, porque e a
+    // primeira coisa que o operador precisa ler no celular: sem o motivo, o card
+    // e so uma oferta parada sem explicacao, e a decisao de aprovar vira chute.
+    oferta.motivoFila =
+        autoEnvioModoOferta() !== 'on' ? 'auto-envio desligado — tudo passa por aprovacao'
+      : oferta.falhaAutoEnvio  ? 'auto-envio tentou e falhou: ' + oferta.falhaAutoEnvio
+      : oferta.cupomForaDaBase ? 'cupom fora da base'
+      : oferta.cupomAmbiguo    ? 'post cita ' + oferta.cupomAmbiguo.codigos.length
+          + ' cupons e nenhum e do bloco deste link'
+      : oferta.precoDivergente ? 'post anuncia R$ ' + oferta.precoDivergente.declarado
+          + ' e calculamos R$ ' + oferta.precoDivergente.calculado
+      : oferta.revisaoDeEdicao ? 'versao editada de um post que ja saiu'
+      : _seguraPorPreco        ? 'preco veio do texto do grupo, nao da loja'
+      : 'motivo nao identificado';
 
     filaPendentes.unshift(oferta);
     salvarFila();
@@ -7231,16 +7250,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // bot fora do ar ou webhook errado nunca pode segurar o radar.
     enviarCardRevisaoTelegram(oferta).catch(e =>
       console.warn('[BOT-TSP] Card da oferta #' + oferta.id + ' falhou: ' + e.message));
-    const _motivoFila = autoEnvioModoOferta() !== 'on' ? ''
-      : oferta.cupomForaDaBase ? ' — cupom fora da base, exige aprovacao manual'
-      : oferta.cupomAmbiguo ? ' — post cita ' + oferta.cupomAmbiguo.codigos.length
-          + ' cupons e nenhum e do bloco deste link, exige aprovacao manual'
-      : oferta.precoDivergente ? ' — post anuncia R$ ' + oferta.precoDivergente.declarado
-          + ' e calculamos R$ ' + oferta.precoDivergente.calculado + ', exige aprovacao manual'
-      : oferta.revisaoDeEdicao ? ' — versao editada do post, exige aprovacao manual'
-      : _seguraPorPreco ? ' — preco nao verificado, exige aprovacao manual'
-      : '';
-    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco + ' (' + p.desconto + '% off)' + _motivoFila);
+    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco
+      + ' (' + p.desconto + '% off) — ' + oferta.motivoFila);
   }
 }
 
@@ -14915,6 +14926,9 @@ function resumoOfertaFila(o) {
     mensagemFormatada: o.mensagemFormatada,
     grupoOrigemNome: o.grupoOrigemNome || null,
     ajustes: o.ajustes || null, gatilhoTopo: o.gatilhoTopo || null,
+    motivoFila: o.motivoFila || null,
+    falhaAutoEnvio: o.falhaAutoEnvio || null,
+    revisaoDeEdicao: !!o.revisaoDeEdicao,
     cupomForaDaBase: o.cupomForaDaBase || null,
     cupomAmbiguo: o.cupomAmbiguo || null,
     precoDivergente: o.precoDivergente || null,
@@ -14953,6 +14967,8 @@ app.get('/mkt/fila', (req, res) => {
       precoFinal: d.precoFinal ?? d.preco ?? null,
       cupom: d.cupom?.codigo || null,
       ajustado: !!o.ajustes,
+      falhou: !!o.falhaAutoEnvio,
+      motivo: o.motivoFila || null,
       // Um unico sinal para o rotulo do botao: o motivo detalhado esta no card.
       aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.precoDivergente || d.precoDeReferencia),
       timestamp: o.timestamp || null,
