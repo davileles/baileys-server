@@ -363,7 +363,34 @@ function tecladoCard(id) {
     [['💲 Preço', 'r:preco:' + id], ['✏️ Título', 'r:titulo:' + id]],
     [['🏷️ Cupom', 'r:cupom:' + id], ['🔝 Topo', 'r:topo:' + id]],
     [['🔄 Atualizar', 'r:ver:' + id], ['🗑️ Descartar', 'r:descartar:' + id]],
+    [['📋 Voltar à fila', 'r:fila:0']],
   ]);
+}
+
+function brlCurto(v) {
+  return v == null ? '' : 'R$ ' + Number(v).toFixed(2).replace('.', ',');
+}
+
+// Rotulo do botao: o Telegram trunca sem aviso, entao o que importa (id e
+// preco) vem antes do titulo.
+function rotuloItemFila(i) {
+  const partes = ['#' + i.id, brlCurto(i.precoFinal), String(i.titulo || '').slice(0, 30)];
+  return partes.filter(Boolean).join(' · ') + (i.aviso ? ' ⚠️' : '') + (i.ajustado ? ' ✏️' : '');
+}
+
+async function mostrarFila(chatId, msgId) {
+  const r = await apiLocal('GET', '/mkt/fila');
+  if (!r.ok) return falarPlano(chatId, '❌ Não consegui ler a fila: ' + (r.erro || r.http), null, msgId);
+  const itens = r.itens || [];
+  if (!itens.length) return falarPlano(chatId, '📋 Nenhuma oferta de produto pendente na fila.',
+    teclado([[['🔄 Atualizar', 'r:fila:0']]]), msgId);
+
+  const linhas = itens.map(i => [[rotuloItemFila(i), 'r:ver:' + i.id]]);
+  linhas.push([['🔄 Atualizar', 'r:fila:0']]);
+  const cabec = '📋 Ofertas de produto pendentes: ' + r.total
+    + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '')
+    + '\n⚠️ = exige atenção · ✏️ = já ajustada';
+  return falarPlano(chatId, cabec, teclado(linhas), msgId);
 }
 
 /** Chamado pelo server.js quando uma oferta de produto entra na fila. */
@@ -392,13 +419,17 @@ async function tratarRevisao(chatId, msgId, partes) {
   const acao = partes[1];
   const id   = partes[2];
 
+  // Unica acao da familia 'r:' que nao age sobre um item: sai antes da leitura.
+  if (acao === 'fila') return mostrarFila(chatId, msgId);
+
   // Sempre reler antes de agir: o item pode ter sido aprovado no painel web ou
   // varrido pela limpeza da fila desde que o card foi desenhado.
   const rr = await apiLocal('GET', '/mkt/oferta/' + id);
   if (!rr.ok) return falarPlano(chatId, '⚠️ Oferta #' + id + ' saiu da fila (aprovada em outro lugar, rejeitada ou expirada).', null, msgId);
   const o = rr.oferta;
   if (o.status !== 'pendente') {
-    return falarPlano(chatId, corpoCard(o, 'Status: ' + o.status + ' — este item ja foi resolvido.'), null, msgId);
+    return falarPlano(chatId, corpoCard(o, 'Status: ' + o.status + ' — este item ja foi resolvido.'),
+      teclado([[['📋 Voltar à fila', 'r:fila:0']]]), msgId);
   }
 
   if (acao === 'ver') return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId);
@@ -486,6 +517,7 @@ const MENU = '*TSP — criação rápida* 🤖\n\nO que você quer criar?';
 const MENU_KB = () => teclado([
   [['🏷️ Cupom', 'a:novo:cupom'], ['🛍️ Oferta', 'a:novo:oferta']],
   [['📢 Mensagem livre', 'a:novo:msg']],
+  [['📋 Fila de aprovação', 'r:fila:0']],
 ]);
 
 async function tratarTexto(chatId, texto) {
@@ -500,6 +532,8 @@ async function tratarTexto(chatId, texto) {
   if (/^\/msg/i.test(t))    { const s = abrir(chatId, 'msg'); s.passo = 'texto';
     return falar(chatId, '*Mensagem livre* 📢\n\nEscreva o texto que vai para os grupos.',
       teclado([[['❌ Cancelar', 'a:cancelar']]])); }
+
+  if (/^\/fila/i.test(t)) { sessoes.delete(String(chatId)); return mostrarFila(chatId); }
 
   if (/^\/status/i.test(t)) {
     const st = (dep && dep.status) ? dep.status() : {};
