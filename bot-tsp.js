@@ -341,6 +341,9 @@ function cabecalhoCard(o) {
   // Os mesmos motivos que seguram a oferta na fila aparecem no card: sem eles o
   // operador aprovaria pelo celular sem saber por que ela nao auto-enviou.
   const avisos = [];
+  // Por que parou aqui vem antes de tudo: e a pergunta que o operador faz ao
+  // abrir o card. Os detalhes abaixo explicam; esta linha responde.
+  if (o.motivoFila)        avisos.push('🛑 Retida: ' + o.motivoFila);
   if (o.cupomForaDaBase)   avisos.push('⚠️ o post cita cupom que nao esta na base');
   if (o.cupomAmbiguo)      avisos.push('⚠️ o post cita cupons de outro bloco');
   if (o.precoDivergente)   avisos.push('⚠️ o post anuncia R$ ' + o.precoDivergente.declarado
@@ -375,7 +378,8 @@ function brlCurto(v) {
 // preco) vem antes do titulo.
 function rotuloItemFila(i) {
   const partes = ['#' + i.id, brlCurto(i.precoFinal), String(i.titulo || '').slice(0, 30)];
-  return partes.filter(Boolean).join(' · ') + (i.aviso ? ' ⚠️' : '') + (i.ajustado ? ' ✏️' : '');
+  return partes.filter(Boolean).join(' · ')
+    + (i.falhou ? ' 🛑' : i.aviso ? ' ⚠️' : '') + (i.ajustado ? ' ✏️' : '');
 }
 
 async function mostrarFila(chatId, msgId) {
@@ -389,7 +393,7 @@ async function mostrarFila(chatId, msgId) {
   linhas.push([['🔄 Atualizar', 'r:fila:0']]);
   const cabec = '📋 Ofertas de produto pendentes: ' + r.total
     + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '')
-    + '\n⚠️ = exige atenção · ✏️ = já ajustada';
+    + '\n🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada';
   return falarPlano(chatId, cabec, teclado(linhas), msgId);
 }
 
