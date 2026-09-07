@@ -7427,13 +7427,18 @@ const FAXINA_EMERG_ALVO   = Number(process.env.FAXINA_EMERG_ALVO || 20000);
 // Teto do que a pasta de sessao pode ocupar. Segunda rede: num bind-mount o
 // statfs pode responder pelo disco do HOST, e ai o espaco livre pareceria
 // infinito e a protecao contra o ENOSPC de 21/08/2026 sumiria. Em operacao
-// normal a pasta vive em ~60 MB.
-const FAXINA_OCUPADO_MAX_MB = Number(process.env.FAXINA_OCUPADO_MAX_MB || 400);
+// normal a pasta gasta ~300 MB reais (62 MB de dados + o bloco minimo de cada
+// um dos ~48 mil arquivos), entao o teto precisa ficar acima disso.
+const FAXINA_OCUPADO_MAX_MB = Number(process.env.FAXINA_OCUPADO_MAX_MB || 700);
 
 async function ocupacaoSessaoMB() {
-  const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0 };
+  const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0, blocos: 0 };
   try { await _varrer(SESSAO_DIR, '', acc); } catch (e) { return null; }
-  return { mb: +(acc.total / 1048576).toFixed(1), arquivos: acc.arquivos };
+  return {
+    mb: +(acc.blocos * 512 / 1048576).toFixed(1),   // ocupacao real no volume
+    logicoMb: +(acc.total / 1048576).toFixed(1),    // soma dos tamanhos
+    arquivos: acc.arquivos,
+  };
 }
 
 // Espaco REAL do volume. O gatilho da emergencia usava contagem de arquivos, que
@@ -7578,21 +7583,29 @@ async function _varrer(dir, prefixo, acc) {
       cur.arquivos++; cur.bytes += st.size;
       acc.familias.set(fam, cur);
       acc.total += st.size; acc.arquivos++;
+      // Consumo REAL do volume. Um pre-key tem dezenas de bytes mas ocupa um
+      // bloco inteiro (4 KB): com ~48 mil arquivos a soma de st.size subestima
+      // o volume em cerca de 5x. st.blocks conta blocos de 512 bytes.
+      acc.blocos += (st.blocks || 0);
       acc.maiores.push({ arquivo: prefixo + item.name, kb: Math.round(st.size / 1024), em: st.mtime });
     } catch (e) {}
   }
 }
 
 app.get('/manutencao/disco', async (_req, res) => {
-  const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0 };
+  const acc = { familias: new Map(), maiores: [], total: 0, arquivos: 0, blocos: 0 };
   await _varrer(SESSAO_DIR, '', acc);
   await _varrer(UPLOAD_DIR, 'tmp-uploads/', acc);
   const familias = [...acc.familias.entries()]
     .map(([nome, v]) => ({ nome, arquivos: v.arquivos, mb: +(v.bytes / 1048576).toFixed(2) }))
     .sort((a, b) => b.mb - a.mb).slice(0, 25);
   const maiores = acc.maiores.sort((a, b) => b.kb - a.kb).slice(0, 15);
-  res.json({ ok: true, totalMB: +(acc.total / 1048576).toFixed(2), arquivos: acc.arquivos,
-    volume: await espacoVolume(), pisoLivreMB: FAXINA_LIVRE_MIN_MB, familias, maiores });
+  res.json({ ok: true,
+    totalMB: +(acc.total / 1048576).toFixed(2),              // soma dos tamanhos
+    ocupadoMB: +(acc.blocos * 512 / 1048576).toFixed(2),     // o que o volume realmente gasta
+    arquivos: acc.arquivos,
+    volume: await espacoVolume(), pisoLivreMB: FAXINA_LIVRE_MIN_MB,
+    tetoOcupadoMB: FAXINA_OCUPADO_MAX_MB, familias, maiores });
 });
 
 app.post('/manutencao/faxina', async (req, res) => {
