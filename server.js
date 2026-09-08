@@ -14969,8 +14969,14 @@ function remontarOfertaFila(oferta, ov = {}) {
   const p   = produtoDaOfertaFila(oferta);
   const tem = k => Object.prototype.hasOwnProperty.call(ov, k);
 
-  if (tem('preco')) {
-    p.preco = Number(ov.preco);
+  // O 'de' entra ANTES do 'por': o % sai da relacao entre os dois, e calcular
+  // na ordem inversa usaria a base velha quando os dois vem no mesmo ajuste.
+  if (tem('precoDe')) {
+    const v = Number(ov.precoDe);
+    p.precoDe = (ov.precoDe == null || !Number.isFinite(v) || v <= 0) ? null : v;
+  }
+  if (tem('preco')) p.preco = Number(ov.preco);
+  if (tem('preco') || tem('precoDe')) {
     // Preco digitado a mao invalida o % que veio da loja: com 'de' o desconto e
     // recalculado; sem 'de' nao ha base para afirmar desconto nenhum.
     p.desconto = (p.precoDe && p.precoDe > p.preco)
@@ -14995,6 +15001,13 @@ function remontarOfertaFila(oferta, ov = {}) {
     cupom = cupomVigenteDaOferta(oferta, p);
   }
 
+  // 'de' menor ou igual ao 'por' nao derruba o ajuste — o card so sai sem o
+  // riscado. Silenciar isso faria o operador achar que o valor nao entrou.
+  if (p.precoDe && p.precoDe <= p.preco) {
+    aviso = (aviso ? aviso + ' · ' : '')
+      + 'preco de (R$ ' + p.precoDe.toFixed(2) + ') nao e maior que o por — sai sem desconto';
+  }
+
   const gatilho = tem('gatilho') ? String(ov.gatilho || '').trim() : (oferta.gatilhoTopo || '');
   // A chave so entra em opcoes quando ha texto: passar '' suprimiria o
   // gatilhoPadrao da configuracao, que a oferta original teria usado.
@@ -15010,6 +15023,7 @@ function remontarOfertaFila(oferta, ov = {}) {
   const d = oferta.dadosExtraidos || (oferta.dadosExtraidos = {});
   d.titulo   = p.titulo;
   d.preco    = p.preco;
+  d.precoDe  = p.precoDe ?? null;
   d.desconto = p.desconto;
   d.cupom      = cupom ? { codigo: cupom.codigo || cupom.reg?.codigo || '', desconto: cupom.desconto } : null;
   d.precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
@@ -15110,6 +15124,16 @@ app.post('/mkt/remontar/:id', (req, res) => {
     const v = Number(b.preco);
     if (!Number.isFinite(v) || v <= 0) return res.status(400).json({ ok:false, erro:'preco invalido' });
     ov.preco = v;
+  }
+  // '' e 0 sao intencionais: dizem "esta oferta nao tem preco de". Diferente de
+  // omitir a chave, que preserva o valor atual.
+  if (b.precoDe !== undefined) {
+    if (b.precoDe === '' || b.precoDe === null || Number(b.precoDe) === 0) ov.precoDe = null;
+    else {
+      const v = Number(b.precoDe);
+      if (!Number.isFinite(v) || v < 0) return res.status(400).json({ ok:false, erro:'precoDe invalido' });
+      ov.precoDe = v;
+    }
   }
   if (typeof b.titulo  === 'string') ov.titulo  = b.titulo;
   if (typeof b.cupom   === 'string') ov.cupom   = b.cupom;

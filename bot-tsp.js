@@ -382,6 +382,12 @@ function cabecalhoCard(o) {
                                      + ' e calculamos R$ ' + o.precoDivergente.calculado);
   if (d.precoDeReferencia) avisos.push('⚠️ preco veio do TEXTO do grupo, nao da loja');
   if (o.ajustes)           avisos.push('✏️ ajustado: ' + Object.keys(o.ajustes).join(', '));
+  // De/por explicitos no topo: a mensagem formatada abaixo mostra os dois, mas
+  // misturados com emoji e template — aqui o operador confere de relance.
+  const dePor = [d.precoDe ? 'de ' + brlCurto(d.precoDe) : null,
+                 d.preco   ? 'por ' + brlCurto(d.preco)  : null,
+                 d.cupom?.codigo ? 'c/ cupom ' + brlCurto(d.precoFinal) : null].filter(Boolean);
+  if (dePor.length) avisos.push('💲 ' + dePor.join(' · ') + (d.desconto ? '  (-' + d.desconto + '%)' : ''));
   return linha.join(' · ') + (avisos.length ? '\n' + avisos.join('\n') : '');
 }
 
@@ -408,8 +414,9 @@ function corpoCard(o, extra) {
 function tecladoCard(id) {
   return teclado([
     [['🚀 Enviar agora', 'r:enviar:' + id]],
-    [['💲 Preço', 'r:preco:' + id], ['✏️ Título', 'r:titulo:' + id]],
-    [['🏷️ Cupom', 'r:cupom:' + id], ['🔝 Topo', 'r:topo:' + id]],
+    [['💲 Preço por', 'r:preco:' + id], ['🔖 Preço de', 'r:precode:' + id]],
+    [['✏️ Título', 'r:titulo:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
+    [['🔝 Topo', 'r:topo:' + id]],
     [['🔄 Atualizar', 'r:ver:' + id], ['🗑️ Descartar', 'r:descartar:' + id]],
     [['📋 Voltar à fila', 'r:fila:0']],
   ]);
@@ -509,14 +516,21 @@ async function tratarRevisao(chatId, msgId, partes) {
     return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'));
   }
 
-  if (acao === 'preco' || acao === 'titulo' || acao === 'topo') {
+  if (acao === 'preco' || acao === 'precode' || acao === 'titulo' || acao === 'topo') {
     const s = abrir(chatId, 'revisao');
     s.passo = acao; s.ofertaId = id; s.msgId = msgId;
-    const pergunta = acao === 'preco'  ? 'Digite o novo PREÇO (só o número, ex: 149,90).'
-                   : acao === 'titulo' ? 'Digite o novo TÍTULO do produto.'
-                   : 'Digite a MENSAGEM DE TOPO (a chamada que abre a oferta).';
+    // O valor atual vai junto da pergunta: sem ele o operador digita no escuro
+    // e nao percebe que ja estava certo.
+    const d = o.dados || {};
+    const pergunta = acao === 'preco'
+        ? 'Digite o PREÇO POR — o valor com desconto, o que o cliente paga.\nHoje: ' + (brlCurto(d.preco) || 'sem preço') + '\n(só o número, ex: 149,90)'
+      : acao === 'precode'
+        ? 'Digite o PREÇO DE — o valor cheio, que sai riscado.\nHoje: ' + (brlCurto(d.precoDe) || 'sem preço de') + '\n(só o número, ex: 249,90)'
+      : acao === 'titulo' ? 'Digite o novo TÍTULO do produto.'
+                          : 'Digite a MENSAGEM DE TOPO (a chamada que abre a oferta).';
     const linhas = [];
-    if (acao === 'topo') linhas.push([['Sem topo', 'r:semtopo:' + id]]);
+    if (acao === 'topo')    linhas.push([['Sem topo', 'r:semtopo:' + id]]);
+    if (acao === 'precode') linhas.push([['Sem preço de', 'r:sempde:' + id]]);
     linhas.push([['⬅️ Voltar', 'r:ver:' + id]]);
     return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + pergunta, teclado(linhas), msgId);
   }
@@ -524,6 +538,11 @@ async function tratarRevisao(chatId, msgId, partes) {
   if (acao === 'semtopo') {
     sessoes.delete(String(chatId));
     return aplicarAjuste(chatId, msgId, id, { gatilho: '' });
+  }
+
+  if (acao === 'sempde') {
+    sessoes.delete(String(chatId));
+    return aplicarAjuste(chatId, msgId, id, { precoDe: '' });
   }
 
   if (acao === 'cupom') {
@@ -615,6 +634,10 @@ async function tratarTexto(chatId, texto) {
       const v = num(t);
       if (v === null || v <= 0) return falar(chatId, 'Preço inválido. Digite só o número (ex: `149,90`).');
       ov = { preco: v };
+    } else if (s.passo === 'precode') {
+      const v = num(t);
+      if (v === null || v < 0) return falar(chatId, 'Preço inválido. Digite só o número (ex: `249,90`) ou toque em *Sem preço de*.');
+      ov = { precoDe: v };
     } else if (s.passo === 'titulo') ov = { titulo: t };
     else if (s.passo === 'topo')     ov = { gatilho: t };
     if (!ov) return;
