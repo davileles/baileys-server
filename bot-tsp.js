@@ -386,7 +386,14 @@ function cabecalhoCard(o) {
   // misturados com emoji e template — aqui o operador confere de relance.
   const dePor = [d.precoDe ? 'de ' + brlCurto(d.precoDe) : null,
                  d.preco   ? 'por ' + brlCurto(d.preco)  : null,
-                 d.cupom?.codigo ? 'c/ cupom ' + brlCurto(d.precoFinal) : null].filter(Boolean);
+                 // Cupom que nao abate — porque o PRECO POR foi digitado a mao e ja
+                 // e o valor final — repetiria o mesmo numero do 'por'. Ali vale
+                 // mostrar o codigo e dizer que o valor esta fechado.
+                 d.cupom?.codigo
+                   ? (Number(d.precoFinal) < Number(d.preco)
+                       ? 'c/ cupom ' + brlCurto(d.precoFinal)
+                       : 'cupom ' + d.cupom.codigo + ' (preço já final)')
+                   : null].filter(Boolean);
   if (dePor.length) avisos.push('💲 ' + dePor.join(' · ') + (d.desconto ? '  (-' + d.desconto + '%)' : ''));
   return linha.join(' · ') + (avisos.length ? '\n' + avisos.join('\n') : '');
 }
