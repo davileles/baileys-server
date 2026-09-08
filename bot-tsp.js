@@ -342,6 +342,24 @@ async function falarPlano(chatId, texto, kb, editarMsgId) {
 // lista (mensagem compartilhada, volta a ser lista).
 const msgDaFila = new Map();
 
+// Qual oferta cada mensagem de card esta mostrando: 'chatId:msgId' -> ofertaId.
+// A limpeza usa isso para nao apagar card de item que ainda espera decisao.
+// Memoria mesmo — reinicio esvazia, e ai a limpeza so poupa o que ela consegue
+// provar que esta pendente. Nada se perde: o item continua na fila do servidor
+// e volta ao chat pelo /fila.
+const cardsAbertos = new Map();
+const LIMITE_CARDS_ABERTOS = 400;
+
+function registrarCard(chatId, msgId, ofertaId) {
+  if (!chatId || !msgId || !ofertaId) return;
+  cardsAbertos.set(String(chatId) + ':' + msgId, String(ofertaId));
+  // Teto simples: Map preserva ordem de insercao, entao o primeiro e o mais
+  // velho. Sem isso o mapa cresceria para sempre num processo de meses.
+  while (cardsAbertos.size > LIMITE_CARDS_ABERTOS) {
+    cardsAbertos.delete(cardsAbertos.keys().next().value);
+  }
+}
+
 function contextoCallback(cqId) {
   return {
     cqId, respondido: false,
@@ -492,18 +510,81 @@ async function mostrarFila(chatId, msgId) {
   return res;
 }
 
+// ── LIMPEZA DO CHAT ──────────────────────────────────────────────────────────
+// O Telegram nao deixa um bot LER o historico do proprio chat: nao ha como
+// perguntar "quais mensagens ainda estao ai". So da para apagar por id. Entao a
+// limpeza varre para tras a partir do id da mensagem de confirmacao e manda
+// apagar em bloco — o Telegram pula sozinho o que nao existe mais ou nao pode
+// apagar (a API so remove mensagem com menos de 48h).
+//
+// O que escapa da varredura: a lista da fila em uso e os cards de ofertas que
+// AINDA estao pendentes. O resto — recibos de enviada/descartada, previews,
+// menus, comandos digitados — some.
+const LIMPEZA_ALCANCE = 500;   // mensagens para tras
+const LIMPEZA_LOTE    = 100;   // teto do deleteMessages
+
+async function limparChat(chatId, msgId, ctx) {
+  const r = await apiLocal('GET', '/mkt/fila');
+  const pendentes = new Set((r.itens || []).map(i => String(i.id)));
+
+  const preservar = new Set();
+  const daFila = msgDaFila.get(String(chatId));
+  if (daFila) preservar.add(Number(daFila));
+  for (const [chave, ofertaId] of cardsAbertos) {
+    const corte = chave.lastIndexOf(':');
+    if (chave.slice(0, corte) !== String(chatId)) continue;
+    if (pendentes.has(ofertaId)) preservar.add(Number(chave.slice(corte + 1)));
+  }
+
+  const ids = [];
+  const piso = Math.max(1, msgId - LIMPEZA_ALCANCE);
+  for (let i = msgId; i >= piso; i--) if (!preservar.has(i)) ids.push(i);
+
+  let lotesOk = 0, individual = false;
+  for (let i = 0; i < ids.length; i += LIMPEZA_LOTE) {
+    const lote = ids.slice(i, i + LIMPEZA_LOTE);
+    const d = await tg('deleteMessages', { chat_id: chatId, message_ids: lote });
+    if (d.ok) { lotesOk++; continue; }
+    // deleteMessages e da Bot API 7.0. Se este servidor falar com uma API mais
+    // velha, o um-a-um cobre pelo menos o passado recente, que e o que enche a
+    // tela. Sem isso a limpeza falharia inteira e em silencio.
+    individual = true;
+    for (const id of lote.slice(0, 60)) {
+      await tg('deleteMessage', { chat_id: chatId, message_id: id });
+    }
+    // Um lote a um por vez ja custa 60 chamadas e segura o webhook. O passado
+    // recente e o que enche a tela; o resto fica para um segundo /limpar.
+    break;
+  }
+
+  const nota = preservar.size
+    ? '🧹 Chat limpo. Mantive ' + preservar.size + ' mensagem(ns) do que ainda espera decisão.'
+    : '🧹 Chat limpo.';
+  if (ctx) await ctx.toast(nota);
+  // Sem lote nenhum aceito e sem fallback: o silencio pareceria sucesso.
+  if (!lotesOk && !individual) {
+    return falarPlano(chatId, '⚠️ Não consegui apagar nada. O Telegram só deixa o bot remover mensagens com menos de 48h — as mais antigas precisam do "Limpar histórico" do próprio app.',
+      teclado([[['📋 Fila', 'r:fila:0']]]));
+  }
+  return null;
+}
+
 /** Chamado pelo server.js quando uma oferta de produto entra na fila. */
 export async function enviarCardRevisaoTelegram(oferta) {
   if (!TOKEN || !ADMINS.size || !dep) return;
   const r = await apiLocal('GET', '/mkt/oferta/' + oferta.id);
   if (!r.ok) { console.warn('[BOT-TSP] Oferta #' + oferta.id + ' sem card: ' + (r.erro || r.http)); return; }
   for (const chatId of ADMINS) {
-    try { await falarPlano(chatId, corpoCard(r.oferta), tecladoCard(r.oferta.id)); }
+    try {
+      const m = await falarPlano(chatId, corpoCard(r.oferta), tecladoCard(r.oferta.id));
+      registrarCard(chatId, m?.message_id, r.oferta.id);
+    }
     catch (e) { console.warn('[BOT-TSP] Card #' + oferta.id + ' nao chegou em ' + chatId + ': ' + e.message); }
   }
 }
 
 async function aplicarAjuste(chatId, msgId, id, ov) {
+  registrarCard(chatId, msgId, id);
   const r = await apiLocal('POST', '/mkt/remontar/' + id, ov);
   if (!r.ok) {
     const atual = await apiLocal('GET', '/mkt/oferta/' + id);
@@ -530,7 +611,7 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     return encerrarCard(chatId, msgId, reciboCard(o, '✔️ Já resolvida (' + o.status + '):'), ctx);
   }
 
-  if (acao === 'ver') return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId);
+  if (acao === 'ver') { registrarCard(chatId, msgId, id); return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId); }
 
   if (acao === 'enviar') {
     // Tira os botoes ANTES do await: o envio com espacamento entre grupos leva
@@ -660,6 +741,15 @@ async function tratarTexto(chatId, texto) {
 
   if (/^\/fila/i.test(t)) { sessoes.delete(String(chatId)); return mostrarFila(chatId); }
 
+  if (/^\/limpar/i.test(t)) {
+    sessoes.delete(String(chatId));
+    return falar(chatId,
+      '*Limpar a conversa?* 🧹\n\nApaga as mensagens já resolvidas — recibos, prévias, menus e comandos.\n\n'
+      + 'Os cards de ofertas que ainda esperam decisão ficam. Se algum sumir, ele volta em */fila* — nada sai da fila do servidor.\n\n'
+      + '_O Telegram só deixa apagar mensagem com menos de 48h._',
+      teclado([[['🧹 Limpar', 'a:limpar:go'], ['❌ Cancelar', 'a:cancelar']]]));
+  }
+
   if (/^\/status/i.test(t)) {
     const st = (dep && dep.status) ? dep.status() : {};
     return falar(chatId, formatarStatusBot(st));
@@ -740,6 +830,7 @@ async function tratarBotao(chatId, msgId, data, ctx) {
       s2.passo = 'texto';     return falar(chatId, '*Mensagem livre* 📢\n\nEscreva o texto.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
     }
     if (chave === 'cancelar') { sessoes.delete(String(chatId)); return falar(chatId, 'Cancelado.', MENU_KB(), msgId); }
+    if (chave === 'limpar' && valor === 'go') return limparChat(chatId, msgId, ctx);
     if (chave === 'reconectar' && valor === 'go') {
       try { if (dep && dep.forcarReconexao) dep.forcarReconexao('bot-telegram'); }
       catch (e) { return falar(chatId, '❌ Falha ao disparar reconexão: ' + e.message, null, msgId); }
@@ -808,7 +899,7 @@ export async function tratarUpdateBotTsp(update) {
       // Toque que resolve o item guarda a resposta para o fim: e nela que vai o
       // desfecho. Os demais respondem ja, senao o botao fica girando enquanto o
       // servidor remonta a mensagem.
-      if (!/^r:(enviar|descartar):/.test(cq.data || '')) await ctx.toast();
+      if (!/^(r:(enviar|descartar):|a:limpar:go)/.test(cq.data || '')) await ctx.toast();
       try {
         return await tratarBotao(chatId, cq.message.message_id, cq.data || '', ctx);
       } finally {
@@ -850,6 +941,8 @@ export async function bootBotTsp(deps) {
     { command: 'cupom',    description: 'Criar um cupom' },
     { command: 'oferta',   description: 'Criar uma oferta a partir de um link' },
     { command: 'msg',      description: 'Mensagem livre para os grupos' },
+    { command: 'fila',     description: 'Ofertas de produto esperando decisão' },
+    { command: 'limpar',   description: 'Apagar do chat o que já foi aprovado ou descartado' },
     { command: 'status',   description: 'Ver a saúde do servidor (WhatsApp, fila, publicações)' },
     { command: 'reconectar', description: 'Reconectar o WhatsApp (com confirmação)' },
     { command: 'cancelar', description: 'Cancelar o que está em andamento' },
