@@ -336,12 +336,12 @@ async function falarPlano(chatId, texto, kb, editarMsgId) {
 // rastro tiraria a resposta a pergunta "este ai eu ja tratei?".
 // deleteMessage so vale para mensagem com menos de 48h; card mais velho cai no
 // fallback de editar no lugar, que ao menos tira os botoes.
-async function encerrarCard(chatId, msgId, recibo) {
+async function encerrarCard(chatId, msgId, recibo, kb) {
   if (msgId) {
     const d = await tg('deleteMessage', { chat_id: chatId, message_id: msgId });
-    if (!d.ok) return falarPlano(chatId, recibo, null, msgId);
+    if (!d.ok) return falarPlano(chatId, recibo, kb, msgId);
   }
-  return falarPlano(chatId, recibo);
+  return falarPlano(chatId, recibo, kb);
 }
 
 // Id, preco e um pedaco do titulo bastam para reconhecer o item depois. O card
@@ -501,9 +501,12 @@ async function tratarRevisao(chatId, msgId, partes) {
     if (env.naFila) {
       const min = Math.round((env.esperaSeg || 0) / 60);
       const quando = (env.esperaSeg || 0) < 90 ? 'em instantes' : 'em ~' + min + ' min';
-      return falarPlano(chatId, corpoCard(o, '🕒 Na fila de publicação — '
-        + env.posicao + 'º, sai ' + quando + '.\n(o ritmo evita rajada nos grupos)'),
-        teclado([[['🔄 Atualizar', 'r:ver:' + id]], [['📋 Voltar à fila', 'r:fila:0']]]), msgId);
+      // Aprovada e aprovada: o card sai do chat mesmo esperando o portao, senao
+      // com o ritmo ligado quase nada some — o que torna a limpeza inutil.
+      // A linha leva o botao de conferir porque o desfecho ainda nao existe.
+      return encerrarCard(chatId, msgId,
+        reciboCard(o, '🕒 Na fila de publicação (' + env.posicao + 'º, sai ' + quando + '):'),
+        teclado([[['🔄 Ver desfecho', 'r:ver:' + id], ['📋 Fila', 'r:fila:0']]]));
     }
     return encerrarCard(chatId, msgId, reciboCard(o, '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'));
   }
