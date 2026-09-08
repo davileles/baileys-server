@@ -14925,6 +14925,11 @@ function resumoOfertaFila(o) {
     id: o.id, status: o.status, tipoConteudo: o.tipoConteudo,
     mensagemFormatada: o.mensagemFormatada,
     grupoOrigemNome: o.grupoOrigemNome || null,
+    // Post cru do grupo-fonte. O card do Telegram mostra ao lado da mensagem
+    // formatada: sem ele o operador aprova sem saber o que o vendedor escreveu
+    // (cupom citado no texto, condicao de frete, "so hoje") e nao tem como
+    // julgar se a nossa versao traduziu o post direito.
+    conteudoOriginal: o.conteudoOriginal || null,
     ajustes: o.ajustes || null, gatilhoTopo: o.gatilhoTopo || null,
     motivoFila: o.motivoFila || null,
     falhaAutoEnvio: o.falhaAutoEnvio || null,

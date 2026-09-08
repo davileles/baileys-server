@@ -331,7 +331,12 @@ async function falarPlano(chatId, texto, kb, editarMsgId) {
   return d.result || null;
 }
 
-const LIMITE_PREVIA = 3000;   // sendMessage corta em 4096; sobra para cabecalho
+// sendMessage corta em 4096. O card agora carrega DUAS mensagens (a nossa e a
+// do grupo-fonte), entao cada uma tem teto proprio e a soma com o cabecalho
+// fica com folga abaixo do limite — estourar faz o Telegram recusar o card
+// inteiro, que e pior do que truncar.
+const LIMITE_PREVIA   = 2200;
+const LIMITE_ORIGINAL = 800;
 
 function cabecalhoCard(o) {
   const d = o.dados || {};
@@ -353,10 +358,23 @@ function cabecalhoCard(o) {
   return linha.join(' · ') + (avisos.length ? '\n' + avisos.join('\n') : '');
 }
 
+// Post exatamente como chegou no grupo monitorado. Vem depois da nossa versao
+// de proposito: o que vai ao ar e a primeira coisa a conferir; o original e a
+// referencia para decidir se a traducao ficou fiel.
+function blocoOriginal(o) {
+  const t = String(o.conteudoOriginal || '').trim();
+  if (!t) return '';
+  const corte = t.length > LIMITE_ORIGINAL ? t.slice(0, LIMITE_ORIGINAL) + '\n[...]' : t;
+  return '\n\n📥 Post original'
+    + (o.grupoOrigemNome ? ' · ' + o.grupoOrigemNome : '')
+    + '\n- - - - - - - - - -\n' + corte + '\n- - - - - - - - - -';
+}
+
 function corpoCard(o, extra) {
   const msg = String(o.mensagemFormatada || '');
   const previa = msg.length > LIMITE_PREVIA ? msg.slice(0, LIMITE_PREVIA) + '\n[...]' : msg;
   return cabecalhoCard(o) + '\n\n- - - - - - - - - -\n' + previa + '\n- - - - - - - - - -'
+    + blocoOriginal(o)
     + (extra ? '\n\n' + extra : '');
 }
 
