@@ -348,7 +348,13 @@ function cabecalhoCard(o) {
   const avisos = [];
   // Por que parou aqui vem antes de tudo: e a pergunta que o operador faz ao
   // abrir o card. Os detalhes abaixo explicam; esta linha responde.
-  if (o.motivoFila)        avisos.push('🛑 Retida: ' + o.motivoFila);
+  // Com o auto-envio de oferta em 'off' TODA captura para na fila pelo mesmo
+  // motivo: a linha viraria carimbo em 100% dos cards e nao informaria nada.
+  // Os motivos que sao excecao — falha no envio, cupom fora da base, preco
+  // divergente — continuam aparecendo, porque ali o operador precisa saber.
+  if (o.motivoFila && !/auto-envio desligado/i.test(o.motivoFila)) {
+    avisos.push('🛑 Retida: ' + o.motivoFila);
+  }
   if (o.cupomForaDaBase)   avisos.push('⚠️ o post cita cupom que nao esta na base');
   if (o.cupomAmbiguo)      avisos.push('⚠️ o post cita cupons de outro bloco');
   if (o.precoDivergente)   avisos.push('⚠️ o post anuncia R$ ' + o.precoDivergente.declarado
