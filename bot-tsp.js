@@ -331,17 +331,47 @@ async function falarPlano(chatId, texto, kb, editarMsgId) {
   return d.result || null;
 }
 
-// Card resolvido sai do chat: rolando o Telegram o operador ve so o que ainda
-// espera decisao. No lugar fica um recibo de UMA linha — apagar sem deixar
-// rastro tiraria a resposta a pergunta "este ai eu ja tratei?".
+// Toast do Telegram: a confirmacao aparece sobre a tela e some sozinha. Antes o
+// desfecho virava mensagem no chat, e a fileira de recibos ("enviada",
+// "descartada", "na fila de publicacao") acabava competindo com os cards que
+// ainda esperavam decisao — que e exatamente o que o operador rola para achar.
+// O toast so vale nos ~15s seguintes ao toque; passou disso, some em silencio,
+// e o card ter sumido ja e a confirmacao.
+// Ultima mensagem de LISTA da fila, por chat. Serve para o desfecho saber se o
+// card que esta encerrando nasceu de um push (mensagem propria, some) ou da
+// lista (mensagem compartilhada, volta a ser lista).
+const msgDaFila = new Map();
+
+function contextoCallback(cqId) {
+  return {
+    cqId, respondido: false,
+    async toast(texto) {
+      if (this.respondido || !this.cqId) return;
+      this.respondido = true;
+      const p = { callback_query_id: this.cqId };
+      // O Telegram corta em 200 caracteres e recusa o que passar disso.
+      if (texto) { p.text = String(texto).slice(0, 190); p.show_alert = false; }
+      try { await tg('answerCallbackQuery', p); } catch (e) { /* toast e cosmetico */ }
+    },
+  };
+}
+
+// Card resolvido sai do chat sem deixar rastro: o que sobra na conversa e so o
+// que ainda espera decisao. O desfecho vai no toast; o historico completo, com
+// status de cada item, continua na fila e no painel.
 // deleteMessage so vale para mensagem com menos de 48h; card mais velho cai no
-// fallback de editar no lugar, que ao menos tira os botoes.
-async function encerrarCard(chatId, msgId, recibo, kb) {
-  if (msgId) {
-    const d = await tg('deleteMessage', { chat_id: chatId, message_id: msgId });
-    if (!d.ok) return falarPlano(chatId, recibo, kb, msgId);
-  }
-  return falarPlano(chatId, recibo, kb);
+// fallback de editar no lugar, que ao menos tira os botoes e encolhe o card
+// para uma linha.
+async function encerrarCard(chatId, msgId, desfecho, ctx) {
+  if (ctx) await ctx.toast(desfecho);
+  if (!msgId) return null;
+  // Card aberto A PARTIR da lista reusa a mensagem da lista: apagar levaria
+  // junto a fila que o operador esta percorrendo e o proximo item exigiria
+  // /fila de novo. Ali a mensagem volta a ser a lista, ja sem o item resolvido.
+  if (msgDaFila.get(String(chatId)) === msgId) return mostrarFila(chatId, msgId);
+  const d = await tg('deleteMessage', { chat_id: chatId, message_id: msgId });
+  if (d.ok) return null;
+  return falarPlano(chatId, desfecho, null, msgId);
 }
 
 // Id, preco e um pedaco do titulo bastam para reconhecer o item depois. O card
@@ -445,15 +475,21 @@ async function mostrarFila(chatId, msgId) {
   const r = await apiLocal('GET', '/mkt/fila');
   if (!r.ok) return falarPlano(chatId, '❌ Não consegui ler a fila: ' + (r.erro || r.http), null, msgId);
   const itens = r.itens || [];
-  if (!itens.length) return falarPlano(chatId, '📋 Nenhuma oferta de produto pendente na fila.',
-    teclado([[['🔄 Atualizar', 'r:fila:0']]]), msgId);
-
-  const linhas = itens.map(i => [[rotuloItemFila(i), 'r:ver:' + i.id]]);
-  linhas.push([['🔄 Atualizar', 'r:fila:0']]);
-  const cabec = '📋 Ofertas de produto pendentes: ' + r.total
-    + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '')
-    + '\n🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada';
-  return falarPlano(chatId, cabec, teclado(linhas), msgId);
+  let res;
+  if (!itens.length) {
+    res = await falarPlano(chatId, '📋 Nenhuma oferta de produto pendente na fila.',
+      teclado([[['🔄 Atualizar', 'r:fila:0']]]), msgId);
+  } else {
+    const linhas = itens.map(i => [[rotuloItemFila(i), 'r:ver:' + i.id]]);
+    linhas.push([['🔄 Atualizar', 'r:fila:0']]);
+    const cabec = '📋 Ofertas de produto pendentes: ' + r.total
+      + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '')
+      + '\n🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada';
+    res = await falarPlano(chatId, cabec, teclado(linhas), msgId);
+  }
+  const alvo = res?.message_id || msgId;
+  if (alvo) msgDaFila.set(String(chatId), alvo);
+  return res;
 }
 
 /** Chamado pelo server.js quando uma oferta de produto entra na fila. */
@@ -478,7 +514,7 @@ async function aplicarAjuste(chatId, msgId, id, ov) {
   return falarPlano(chatId, corpoCard(r.oferta, r.aviso ? '⚠️ ' + r.aviso : ''), tecladoCard(id), msgId);
 }
 
-async function tratarRevisao(chatId, msgId, partes) {
+async function tratarRevisao(chatId, msgId, partes, ctx) {
   const acao = partes[1];
   const id   = partes[2];
 
@@ -488,10 +524,10 @@ async function tratarRevisao(chatId, msgId, partes) {
   // Sempre reler antes de agir: o item pode ter sido aprovado no painel web ou
   // varrido pela limpeza da fila desde que o card foi desenhado.
   const rr = await apiLocal('GET', '/mkt/oferta/' + id);
-  if (!rr.ok) return encerrarCard(chatId, msgId, '⚠️ #' + id + ' saiu da fila (resolvida em outro lugar ou expirada).');
+  if (!rr.ok) return encerrarCard(chatId, msgId, '⚠️ #' + id + ' saiu da fila (resolvida em outro lugar ou expirada).', ctx);
   const o = rr.oferta;
   if (o.status !== 'pendente') {
-    return encerrarCard(chatId, msgId, reciboCard(o, '✔️ Ja resolvida (' + o.status + '):'));
+    return encerrarCard(chatId, msgId, reciboCard(o, '✔️ Já resolvida (' + o.status + '):'), ctx);
   }
 
   if (acao === 'ver') return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId);
@@ -510,12 +546,12 @@ async function tratarRevisao(chatId, msgId, partes) {
       const quando = (env.esperaSeg || 0) < 90 ? 'em instantes' : 'em ~' + min + ' min';
       // Aprovada e aprovada: o card sai do chat mesmo esperando o portao, senao
       // com o ritmo ligado quase nada some — o que torna a limpeza inutil.
-      // A linha leva o botao de conferir porque o desfecho ainda nao existe.
+      // Quem quiser acompanhar o desfecho abre /fila; deixar um botao para isso
+      // devolvia ao chat a linha que a limpeza acabou de tirar.
       return encerrarCard(chatId, msgId,
-        reciboCard(o, '🕒 Na fila de publicação (' + env.posicao + 'º, sai ' + quando + '):'),
-        teclado([[['🔄 Ver desfecho', 'r:ver:' + id], ['📋 Fila', 'r:fila:0']]]));
+        reciboCard(o, '🕒 Na fila de publicação (' + env.posicao + 'º, sai ' + quando + '):'), ctx);
     }
-    return encerrarCard(chatId, msgId, reciboCard(o, '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'));
+    return encerrarCard(chatId, msgId, reciboCard(o, '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'), ctx);
   }
 
   if (acao === 'descartar') {
@@ -523,7 +559,7 @@ async function tratarRevisao(chatId, msgId, partes) {
     // Falha mantem o card COM botoes: sem eles o item segue pendente na fila e
     // o operador fica sem forma de tentar de novo pelo celular.
     if (!d.ok) return falarPlano(chatId, corpoCard(o, '❌ Falha ao descartar: ' + (d.erro || d.http)), tecladoCard(id), msgId);
-    return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'));
+    return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'), ctx);
   }
 
   if (acao === 'preco' || acao === 'precode' || acao === 'titulo' || acao === 'topo') {
@@ -687,11 +723,11 @@ async function tratarTexto(chatId, texto) {
   }
 }
 
-async function tratarBotao(chatId, msgId, data) {
+async function tratarBotao(chatId, msgId, data, ctx) {
   const partes = data.split(':');
   // Revisao de oferta da fila: ancorada no id do item, nao na sessao — o card
   // continua funcionando depois de um redeploy ou dias depois.
-  if (partes[0] === 'r') return tratarRevisao(chatId, msgId, partes);
+  if (partes[0] === 'r') return tratarRevisao(chatId, msgId, partes, ctx);
 
   const s = sessao(chatId);
   const [ns, chave, valor] = partes;
@@ -766,10 +802,20 @@ export async function tratarUpdateBotTsp(update) {
   try {
     if (update.callback_query) {
       const cq = update.callback_query;
-      await tg('answerCallbackQuery', { callback_query_id: cq.id });
+      const ctx = contextoCallback(cq.id);
       const chatId = cq.message?.chat?.id;
-      if (!autorizado(chatId)) return;
-      return await tratarBotao(chatId, cq.message.message_id, cq.data || '');
+      if (!autorizado(chatId)) return void await ctx.toast();
+      // Toque que resolve o item guarda a resposta para o fim: e nela que vai o
+      // desfecho. Os demais respondem ja, senao o botao fica girando enquanto o
+      // servidor remonta a mensagem.
+      if (!/^r:(enviar|descartar):/.test(cq.data || '')) await ctx.toast();
+      try {
+        return await tratarBotao(chatId, cq.message.message_id, cq.data || '', ctx);
+      } finally {
+        // Rede de seguranca: caminho que nao encerrou card nenhum ainda precisa
+        // desligar o relogio do botao.
+        await ctx.toast();
+      }
     }
     const m = update.message;
     if (!m) return;
