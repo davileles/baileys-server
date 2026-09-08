@@ -15398,6 +15398,11 @@ const CENSO_FILE = SESSAO_DIR + '/grupos_censo.json';
 const CENSO_HIST_ARQ  = 'grupos_censo_hist.json';
 const CENSO_HIST_FILE = SESSAO_DIR + '/' + CENSO_HIST_ARQ;
 const CENSO_HIST_DIAS = 400;
+// Ritmo da consulta individual (fallback). 800ms era rapido demais: a conta
+// levava rate-overlimit e metade dos destinos ficava sem medicao.
+const CENSO_PAUSA_MS     = 2500;
+const CENSO_PAUSA_MAX_MS = 20000;
+const CENSO_OVER_MAX     = 3;     // rate-overlimit seguidos ate desistir da rodada
 let _censo = { atualizadoEm: null, grupos: [] };
 let _censoHist = { dias: {} };
 let _censoRodando = false;
@@ -15487,23 +15492,82 @@ async function recensearGrupos() {
   try {
     const destinos = radarDestinos();
     const anteriores = new Map((_censo.grupos || []).map(g => [g.jid, g]));
+
+    // Fonte primaria: UMA chamada devolve todos os grupos da conta ja com os
+    // participantes. Antes o censo fazia um groupMetadata por destino; com 30+
+    // grupos o WhatsApp respondia rate-overlimit na metade da lista e aqueles
+    // grupos ficavam congelados na contagem da vespera. O mesmo truque ja e
+    // usado em _gaMapaParticipacao pelo mesmo motivo.
+    const emLote = new Map();
+    try {
+      const todos = await sock.groupFetchAllParticipating();
+      for (const [jid, md] of Object.entries(todos || {})) {
+        if (md?.subject) NOMES_GRUPOS.set(jid, md.subject);
+        const n = Array.isArray(md?.participants) && md.participants.length
+          ? md.participants.length
+          : (typeof md?.size === 'number' && md.size > 0 ? md.size : null);
+        if (n) emLote.set(jid, { nome: md.subject || null, membros: n });
+      }
+      console.log('[CENSO] lote: ' + emLote.size + ' grupo(s) da conta em 1 chamada.');
+    } catch (e) {
+      console.warn('[CENSO] groupFetchAllParticipating falhou (' + e.message
+        + ') — caindo para consulta grupo a grupo.');
+    }
+
     const grupos = [];
+    // Backoff para o que sobrar: destino que nao veio no lote (grupo de outra
+    // conta, metadata truncado) ainda vai de groupMetadata, mas devagar e com
+    // desistencia. Insistir depois de um rate-overlimit so prolonga a punicao.
+    let pausa = CENSO_PAUSA_MS;
+    let overSeguidos = 0;
+    let suspenso = false;
     for (const jid of destinos) {
       const ant = anteriores.get(jid);
+      const registrar = (nome, membros, medidoEm, erro) => {
+        grupos.push({
+          jid,
+          nome: nome || NOMES_GRUPOS.get(jid) || ant?.nome || null,
+          membros: typeof membros === 'number' ? membros : (ant?.membros ?? null),
+          variacao: (typeof membros === 'number' && ant && typeof ant.membros === 'number')
+            ? membros - ant.membros : null,
+          medidoEm: medidoEm || ant?.medidoEm || null,
+          ...(erro ? { erro } : {}),
+        });
+      };
+
+      const lote = emLote.get(jid);
+      if (lote) {
+        // Alimenta o cache do distribuidor de brinde: /grupos/info deixa de
+        // bater no WhatsApp logo depois do censo.
+        _ggMetaCache.set(jid, { ts: Date.now(), nome: lote.nome || '(sem nome)',
+          membros: lote.membros, souAdmin: _ggMetaCache.get(jid)?.souAdmin ?? false });
+        registrar(lote.nome, lote.membros, new Date().toISOString());
+        continue;
+      }
+
+      if (suspenso) { registrar(null, null, null, 'rate-overlimit (consulta suspensa nesta rodada)'); continue; }
+
       try {
         const i = await _ggInfoGrupo(jid, true);
-        grupos.push({
-          jid, nome: i.nome, membros: i.membros,
-          variacao: (ant && typeof ant.membros === 'number') ? i.membros - ant.membros : null,
-          medidoEm: new Date().toISOString(),
-        });
-        await new Promise(r => setTimeout(r, 800));
+        registrar(i.nome, i.membros, new Date().toISOString());
+        overSeguidos = 0;
+        await new Promise(r => setTimeout(r, pausa));
       } catch(e) {
-        grupos.push({
-          jid, nome: NOMES_GRUPOS.get(jid) || ant?.nome || null,
-          membros: ant?.membros ?? null, variacao: null,
-          medidoEm: ant?.medidoEm || null, erro: e.message,
-        });
+        const msg = e?.message || String(e);
+        registrar(null, null, null, msg);
+        if (/rate.?overlimit|429|too.?many/i.test(msg)) {
+          overSeguidos++;
+          pausa = Math.min(pausa * 2, CENSO_PAUSA_MAX_MS);
+          if (overSeguidos >= CENSO_OVER_MAX) {
+            suspenso = true;
+            console.warn('[CENSO] rate-overlimit ' + overSeguidos + 'x seguidas — '
+              + 'consulta individual suspensa; os grupos restantes ficam com a ultima contagem.');
+          } else {
+            await new Promise(r => setTimeout(r, pausa));
+          }
+        } else {
+          overSeguidos = 0;
+        }
       }
     }
     _censo = { atualizadoEm: new Date().toISOString(), grupos };
