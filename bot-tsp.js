@@ -392,6 +392,18 @@ async function encerrarCard(chatId, msgId, desfecho, ctx) {
   return falarPlano(chatId, desfecho, null, msgId);
 }
 
+// A bolha com o valor que o operador digitou ("38,68") perde todo o contexto no
+// instante em que o card e remontado: o card volta editado no lugar de sempre e
+// o numero solto fica no historico, sobrevivendo ate ao descarte da oferta. Some
+// assim que o valor e consumido. Em chat privado o bot pode apagar mensagem
+// RECEBIDA; falhar aqui e irrelevante — no maximo a bolha continua ali e o
+// /limpar leva depois.
+async function apagarEntrada(chatId, msgId) {
+  if (!msgId) return;
+  try { await tg('deleteMessage', { chat_id: chatId, message_id: msgId }); }
+  catch (e) { /* apagar a entrada e cosmetico */ }
+}
+
 // Id, preco e um pedaco do titulo bastam para reconhecer o item depois. O card
 // inteiro nao volta: quem quiser o detalhe abre a fila.
 function reciboCard(o, desfecho) {
@@ -726,7 +738,7 @@ const MENU_KB = () => teclado([
   [['📋 Fila de aprovação', 'r:fila:0']],
 ]);
 
-async function tratarTexto(chatId, texto) {
+async function tratarTexto(chatId, texto, msgEntrada) {
   const t = texto.trim();
 
   if (/^\/(start|menu)/i.test(t)) { sessoes.delete(String(chatId)); return falar(chatId, MENU, MENU_KB()); }
@@ -779,6 +791,10 @@ async function tratarTexto(chatId, texto) {
     if (!ov) return;
     const { ofertaId, msgId } = s;
     sessoes.delete(String(chatId));
+    // Antes de remontar: o remontar leva alguns segundos e a bolha ficaria na
+    // tela todo esse tempo. Valor recusado acima nao chega aqui — ali a bolha
+    // fica de proposito, ao lado do aviso de invalido.
+    await apagarEntrada(chatId, msgEntrada);
     return aplicarAjuste(chatId, msgId, ofertaId, ov);
   }
 
@@ -916,7 +932,7 @@ export async function tratarUpdateBotTsp(update) {
       console.warn(`[BOT-TSP] Mensagem de chat nao autorizado: ${chatId}`);
       return void await tg('sendMessage', { chat_id: chatId, text: `Sem permissão. Seu ID: ${chatId}` });
     }
-    if (m.text) return await tratarTexto(chatId, m.text);
+    if (m.text) return await tratarTexto(chatId, m.text, m.message_id);
   } catch (e) {
     console.error('[BOT-TSP] Erro no update:', e.message);
   }
