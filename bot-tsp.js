@@ -466,8 +466,18 @@ async function tratarRevisao(chatId, msgId, partes) {
     // Tira os botoes ANTES do await: o envio com espacamento entre grupos leva
     // segundos, e um segundo toque duplicaria a mensagem nos grupos.
     await falarPlano(chatId, corpoCard(o, '⏳ Enviando...'), null, msgId);
-    const env = await apiLocal('POST', '/painel/aprovar/' + id, {});
+    // naoEsperar: aprovar cinco seguidas nao pode pendurar cinco requisicoes ate
+    // o portao liberar cada uma. Com fila, o servidor confirma na hora e publica
+    // depois; o toque em 🔄 Atualizar mostra o desfecho.
+    const env = await apiLocal('POST', '/painel/aprovar/' + id, { naoEsperar: true });
     if (!env.ok) return falarPlano(chatId, corpoCard(o, '❌ Falha no envio: ' + (env.erro || env.http)), tecladoCard(id), msgId);
+    if (env.naFila) {
+      const min = Math.round((env.esperaSeg || 0) / 60);
+      const quando = (env.esperaSeg || 0) < 90 ? 'em instantes' : 'em ~' + min + ' min';
+      return falarPlano(chatId, corpoCard(o, '🕒 Na fila de publicação — '
+        + env.posicao + 'º, sai ' + quando + '.\n(o ritmo evita rajada nos grupos)'),
+        teclado([[['🔄 Atualizar', 'r:ver:' + id]], [['📋 Voltar à fila', 'r:fila:0']]]), msgId);
+    }
     return falarPlano(chatId, corpoCard(o, '✅ Enviado em ' + (env.enviados ?? '?') + ' grupo(s).'), null, msgId);
   }
 

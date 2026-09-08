@@ -33,6 +33,7 @@ import {
   cupomCitadoDesconhecido,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
+  intervaloPublicacoes, salvarIntervaloPublicacoes, msEntrePublicacoes,
   turnosTsp, salvarTurnosTsp, contaDoTurno,
   numerosGrupo, salvarNumerosGrupo, contaDoGrupo, removerContaDosGrupos,
   gruposOrfaos, cargaPorNumero,
@@ -3451,7 +3452,15 @@ async function verificarAdminGruposCupons() {
 // para todos os grupos leva cerca de um minuto — se o processo cair no meio, e
 // esse rastro que permite retomar sem mandar o mesmo cupom duas vezes para quem
 // ja recebeu.
-async function enviarCupomParaGrupos(mensagem, imagem, oferta) {
+// Cupom divide o mesmo marcapasso da oferta: o que o WhatsApp mede e mensagem
+// caindo no grupo, nao o tipo de conteudo que a gente atribuiu a ela.
+function enviarCupomParaGrupos(mensagem, imagem, oferta) {
+  return comPortaoDePublicacao(
+    () => _despacharCupomParaGrupos(mensagem, imagem, oferta),
+    'cupom #' + (oferta?.id || '?'));
+}
+
+async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   // A conta e decidida POR GRUPO (contaDoGrupo): grupo com numero atribuido sai
   // sempre pelo mesmo remetente, e o resto segue o turno. O que nao pode variar
   // e o remetente DENTRO de um grupo — entre grupos diferentes, variar e o
@@ -3867,7 +3876,70 @@ async function espelharCategoriaNoOperador(oferta, cls) {
   }
 }
 
-async function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
+// ── PORTAO DE PUBLICACAO ─────────────────────────────────────────────────────
+// Uma publicacao por vez, com intervalo minimo entre uma e a proxima. Todos os
+// caminhos de despacho passam por aqui: auto-envio do radar, aprovacao pelo bot
+// do Telegram, aprovacao pelo painel web e monitor de precos.
+//
+// Existia serializacao por grupo de ORIGEM (enfileirarPorGrupo), mas ela nao
+// resolve o caso real: tres grupos-fonte capturando ao mesmo tempo sao tres
+// cadeias independentes, e as tres mensagens caiam no grupo de DESTINO no mesmo
+// segundo. O portao e global de proposito — o que o WhatsApp enxerga como
+// rajada e a saida, nao a entrada.
+//
+// A espera e sempre do FIM da publicacao anterior, e nao do inicio: um despacho
+// para 30 grupos ja leva minutos e nao precisa de mais pausa depois.
+
+let _portaoCadeia   = Promise.resolve();  // cadeia serial: um despacho por vez
+let _portaoUltimoEm = 0;                  // fim da ultima publicacao (ms)
+let _portaoNaFila   = 0;                  // quantos aguardando vez agora
+
+/** Quanto uma publicacao que entrasse agora esperaria, em ms. Estimativa para
+ *  o operador — nao reserva vaga, so responde "vai demorar mais ou menos X". */
+function esperaPrevistaMs() {
+  const { minSeg, maxSeg } = intervaloPublicacoes();
+  if (!maxSeg) return 0;
+  const medio = ((minSeg + maxSeg) / 2) * 1000;
+  const restante = Math.max(0, _portaoUltimoEm + medio - Date.now());
+  return Math.round(restante + _portaoNaFila * medio);
+}
+
+function portaoOcupado() {
+  return _portaoNaFila > 0 || esperaPrevistaMs() > 0;
+}
+
+/** Roda `fn` respeitando a vez e o intervalo. Erro de `fn` sobe para o caller
+ *  normalmente — o portao nunca engole falha de envio. */
+function comPortaoDePublicacao(fn, rotulo = '') {
+  _portaoNaFila++;
+  const proxima = _portaoCadeia.then(async () => {
+    const alvo = _portaoUltimoEm + msEntrePublicacoes();
+    const esperar = Math.max(0, alvo - Date.now());
+    if (esperar > 0) {
+      console.log('[PORTAO] ' + (rotulo || 'publicacao') + ' aguardando '
+        + Math.round(esperar / 1000) + 's — ' + _portaoNaFila + ' na fila.');
+      await new Promise(r => setTimeout(r, esperar));
+    }
+    try { return await fn(); }
+    finally { _portaoUltimoEm = Date.now(); }
+  });
+  // A cadeia nao pode quebrar quando um despacho falha: sem o catch, a rejeicao
+  // se propaga para todos os proximos e o portao trava a operacao inteira.
+  _portaoCadeia = proxima.catch(() => {}).finally(() => { _portaoNaFila--; });
+  return proxima;
+}
+
+// Wrapper: TODO despacho de oferta passa pelo portao. `opcoes.semPortao` existe
+// para o caminho de retomada/outbox, que reenvia o que ja tinha sido publicado
+// e nao deve consumir o ritmo de conteudo novo.
+function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
+  if (opcoes.semPortao) return _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes);
+  return comPortaoDePublicacao(
+    () => _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes),
+    'oferta #' + (oferta?.id || '?'));
+}
+
+async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   // Sem fallback: oferta vai para os grupos marcados como DESTINO na aba
   // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
   // uma mensagem que diz o que fazer — antes isso caia num grupo fixo que o
@@ -11356,19 +11428,40 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     oferta.status = 'enviando';
     oferta.enviandoDesde = new Date().toISOString();
     salvarFila();
-    try {
-      const r = await enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
+
+    // Aprovacao em sequencia (varios toques seguidos no bot) com o portao
+    // ocupado: responder so no fim penduraria o HTTP por minutos e o fetch do
+    // bot estouraria o timeout — o operador leria "falhou" num item que saiu.
+    // Com naoEsperar, a resposta sai na hora com a previsao e o despacho segue
+    // em background. Quem cair no meio e retomado por
+    // retomarEnviosInterrompidos(), que ja cobre o status 'enviando'.
+    const despachar = enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
+    const concluir = despachar.then(r => {
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
       oferta.enviadoEm = new Date().toISOString();
       oferta.destinos = r.enviados; oferta.falhas = r.falhas;
       delete oferta.enviandoDesde;
       salvarFila();
       registrarEnvioHistorico(oferta);
-      res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
-    } catch(err) {
+      return r;
+    }, err => {
       oferta.status = 'pendente';
       delete oferta.enviandoDesde;
       salvarFila();
+      throw err;
+    });
+
+    if (req.body.naoEsperar && portaoOcupado()) {
+      concluir.catch(e => console.error('[PORTAO] Oferta #' + oferta.id
+        + ' falhou apos a espera: ' + e.message));
+      return res.json({ ok:true, naFila:true,
+        posicao: _portaoNaFila, esperaSeg: Math.round(esperaPrevistaMs() / 1000) });
+    }
+
+    try {
+      const r = await concluir;
+      res.json({ ok:true, enviados:r.enviados.length, falhas:r.falhas });
+    } catch(err) {
       res.status(500).json({ ok:false, erro: err.message });
     }
     return;
@@ -11891,6 +11984,7 @@ app.get('/mkt/config', (req, res) => {
     autoEnvioCupom: autoEnvioModo(),
     janelaCupom: janelaCupom(),
     espacamentoGrupos: espacamentoGrupos(),
+    intervaloPublicacoes: intervaloPublicacoes(),
     turnosTsp: turnosTsp(),
     contaAgora: contaDoTurno(),
     // Quem le o que, para o painel do TSP nao continuar afirmando que a
@@ -11933,6 +12027,14 @@ app.post('/mkt/config', (req, res) => {
       espac = salvarEspacamentoGrupos(req.body.espacamentoGrupos || {});
       console.log('[MKT] Espacamento entre grupos — ' + espac.minSeg + 's a ' + espac.maxSeg + 's.');
     }
+    // Intervalo entre publicacoes: gravacao propria pela mesma razao do
+    // espacamento — faixa invertida viraria portao desligado em silencio.
+    let intervPub = intervaloPublicacoes();
+    if (req.body.intervaloPublicacoes !== undefined) {
+      intervPub = salvarIntervaloPublicacoes(req.body.intervaloPublicacoes || {});
+      console.log('[MKT] Intervalo entre publicacoes — '
+        + (intervPub.maxSeg ? intervPub.minSeg + 's a ' + intervPub.maxSeg + 's.' : 'portao desligado.'));
+    }
     let turnos = turnosTsp();
     if (req.body.turnosTsp !== undefined) {
       turnos = salvarTurnosTsp(req.body.turnosTsp || {});
@@ -11943,6 +12045,7 @@ app.post('/mkt/config', (req, res) => {
     res.json({ ok:true, papeis: radarConfig().papeis, fontes: radarFontes(), destinos: radarDestinos(),
                trilhas: trilhas(), destinosGerais: destinosGerais(),
                janelaCupom: janela, espacamentoGrupos: espac,
+               intervaloPublicacoes: intervPub,
                turnosTsp: turnos, contaAgora: contaDoTurno() });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
