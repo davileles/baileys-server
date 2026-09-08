@@ -331,6 +331,27 @@ async function falarPlano(chatId, texto, kb, editarMsgId) {
   return d.result || null;
 }
 
+// Card resolvido sai do chat: rolando o Telegram o operador ve so o que ainda
+// espera decisao. No lugar fica um recibo de UMA linha — apagar sem deixar
+// rastro tiraria a resposta a pergunta "este ai eu ja tratei?".
+// deleteMessage so vale para mensagem com menos de 48h; card mais velho cai no
+// fallback de editar no lugar, que ao menos tira os botoes.
+async function encerrarCard(chatId, msgId, recibo) {
+  if (msgId) {
+    const d = await tg('deleteMessage', { chat_id: chatId, message_id: msgId });
+    if (!d.ok) return falarPlano(chatId, recibo, null, msgId);
+  }
+  return falarPlano(chatId, recibo);
+}
+
+// Id, preco e um pedaco do titulo bastam para reconhecer o item depois. O card
+// inteiro nao volta: quem quiser o detalhe abre a fila.
+function reciboCard(o, desfecho) {
+  const d = (o && o.dados) || {};
+  const partes = ['#' + (o && o.id), brlCurto(d.precoFinal ?? d.preco), String(d.titulo || '').slice(0, 40)];
+  return desfecho + ' ' + partes.filter(Boolean).join(' · ');
+}
+
 // sendMessage corta em 4096. O card agora carrega DUAS mensagens (a nossa e a
 // do grupo-fonte), entao cada uma tem teto proprio e a soma com o cabecalho
 // fica com folga abaixo do limite — estourar faz o Telegram recusar o card
@@ -453,11 +474,10 @@ async function tratarRevisao(chatId, msgId, partes) {
   // Sempre reler antes de agir: o item pode ter sido aprovado no painel web ou
   // varrido pela limpeza da fila desde que o card foi desenhado.
   const rr = await apiLocal('GET', '/mkt/oferta/' + id);
-  if (!rr.ok) return falarPlano(chatId, '⚠️ Oferta #' + id + ' saiu da fila (aprovada em outro lugar, rejeitada ou expirada).', null, msgId);
+  if (!rr.ok) return encerrarCard(chatId, msgId, '⚠️ #' + id + ' saiu da fila (resolvida em outro lugar ou expirada).');
   const o = rr.oferta;
   if (o.status !== 'pendente') {
-    return falarPlano(chatId, corpoCard(o, 'Status: ' + o.status + ' — este item ja foi resolvido.'),
-      teclado([[['📋 Voltar à fila', 'r:fila:0']]]), msgId);
+    return encerrarCard(chatId, msgId, reciboCard(o, '✔️ Ja resolvida (' + o.status + '):'));
   }
 
   if (acao === 'ver') return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId);
@@ -478,13 +498,15 @@ async function tratarRevisao(chatId, msgId, partes) {
         + env.posicao + 'º, sai ' + quando + '.\n(o ritmo evita rajada nos grupos)'),
         teclado([[['🔄 Atualizar', 'r:ver:' + id]], [['📋 Voltar à fila', 'r:fila:0']]]), msgId);
     }
-    return falarPlano(chatId, corpoCard(o, '✅ Enviado em ' + (env.enviados ?? '?') + ' grupo(s).'), null, msgId);
+    return encerrarCard(chatId, msgId, reciboCard(o, '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'));
   }
 
   if (acao === 'descartar') {
     const d = await apiLocal('POST', '/painel/rejeitar/' + id, {});
-    return falarPlano(chatId, cabecalhoCard(o) + '\n\n'
-      + (d.ok ? '🗑️ Descartada.' : '❌ Falha ao descartar: ' + (d.erro || d.http)), null, msgId);
+    // Falha mantem o card COM botoes: sem eles o item segue pendente na fila e
+    // o operador fica sem forma de tentar de novo pelo celular.
+    if (!d.ok) return falarPlano(chatId, corpoCard(o, '❌ Falha ao descartar: ' + (d.erro || d.http)), tecladoCard(id), msgId);
+    return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'));
   }
 
   if (acao === 'preco' || acao === 'titulo' || acao === 'topo') {
