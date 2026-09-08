@@ -14951,10 +14951,22 @@ function cuponsAplicaveisNoPreco(loja, preco) {
 // (cupom percentual muda de valor quando o preco muda). Cupom lido do anuncio,
 // que nao tem registro, e preservado inteiro: as flags semCodigo/segmentado
 // mudam a frase do template e nao da para reconstruir a partir do codigo.
-function cupomVigenteDaOferta(o, p) {
+function cupomVigenteDaOferta(o, p, opc = {}) {
   const c = o.dadosExtraidos?.cupom;
   if (!c) return null;
   const codigo = c.codigo || c.reg?.codigo || '';
+  // Preco POR digitado a mao ja e o valor final: o abatimento do cupom esta
+  // embutido nele. O cupom continua na mensagem, porque e o meio de o cliente
+  // chegar naquele preco, mas com desconto ZERO — recalcular abateria duas
+  // vezes. O zero tambem preserva o cupom quando o novo preco cai abaixo do
+  // minimo do registro, caso em que o recalculo o faria sumir da oferta.
+  if (opc.semAbatimento) {
+    if (codigo) {
+      const reg = cupomPorCodigo(p.loja, codigo);
+      if (reg && cupomVigente(reg)) return { reg, desconto: 0, citado: true };
+    }
+    return { ...c, desconto: 0 };
+  }
   if (codigo) {
     const reg = cupomPorCodigo(p.loja, codigo);
     if (reg && cupomVigente(reg)) {
@@ -14976,6 +14988,14 @@ function remontarOfertaFila(oferta, ov = {}) {
     p.precoDe = (ov.precoDe == null || !Number.isFinite(v) || v <= 0) ? null : v;
   }
   if (tem('preco')) p.preco = Number(ov.preco);
+  // Quem digita o PRECO POR esta informando o valor que o cliente paga, nao a
+  // base para mais um desconto. A marca fica na oferta para sobreviver aos
+  // ajustes seguintes (titulo, topo, 'de'), que remontam a mensagem inteira.
+  // Escolher um cupom explicitamente e o gesto oposto — ai o abatimento volta a
+  // valer e o 'por' passa a ser o preco de balcao outra vez.
+  let precoEhFinal = !!oferta.precoFinalManual;
+  if (tem('preco')) precoEhFinal = true;
+  if (tem('cupom')) precoEhFinal = false;
   if (tem('preco') || tem('precoDe')) {
     // Preco digitado a mao invalida o % que veio da loja: com 'de' o desconto e
     // recalculado; sem 'de' nao ha base para afirmar desconto nenhum.
@@ -14998,7 +15018,7 @@ function remontarOfertaFila(oferta, ov = {}) {
       }
     }
   } else {
-    cupom = cupomVigenteDaOferta(oferta, p);
+    cupom = cupomVigenteDaOferta(oferta, p, { semAbatimento: precoEhFinal });
   }
 
   // 'de' menor ou igual ao 'por' nao derruba o ajuste — o card so sai sem o
@@ -15020,6 +15040,7 @@ function remontarOfertaFila(oferta, ov = {}) {
 
   oferta.mensagemFormatada = mensagem;
   oferta.gatilhoTopo = gatilho || null;
+  oferta.precoFinalManual = precoEhFinal;
   const d = oferta.dadosExtraidos || (oferta.dadosExtraidos = {});
   d.titulo   = p.titulo;
   d.preco    = p.preco;
