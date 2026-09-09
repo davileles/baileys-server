@@ -2081,10 +2081,10 @@ export function precoAnunciadoDe(p, cupom) {
 }
 
 /** Preco a vista do ASIN, com cache. null quando o produto nao tem. */
-export async function lerPrecoAVista(asin, precoApi) {
+export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
   if (!asin || !precoApi) return null;
   const visto = _avistaCache.get(asin);
-  if (visto && Date.now() - visto.em < (visto.dados ? AVISTA_TTL_MS : AVISTA_TTL_VAZIO_MS)) {
+  if (!opcoes.forcar && visto && Date.now() - visto.em < (visto.dados ? AVISTA_TTL_MS : AVISTA_TTL_VAZIO_MS)) {
     return visto.dados;
   }
 
@@ -2107,6 +2107,36 @@ export async function lerPrecoAVista(asin, precoApi) {
   _avistaCache.set(asin, { em: Date.now(), dados });
   if (dados) console.log('[AVISTA] ' + asin + ' R$ ' + dados.preco + ' (' + dados.percentual + '% no ' + dados.meios + ')');
   return dados;
+}
+
+/**
+ * Diagnostico do parse: baixa a PDP e conta o que cada marcador encontrou, sem
+ * cache. Existe porque "avista: null" tem cinco causas possiveis (pagina sem
+ * preco, sem sessao, HTML novo, corte curto, produto sem a vista) e nenhuma
+ * delas aparece no resultado normal.
+ */
+export async function diagnosticarAVista(asin, precoApi) {
+  const passos = [];
+  for (let i = 1; i <= 2; i++) {
+    const html = await baixarPaginaProduto(asin);
+    const mV = RE_AVISTA_VALOR.exec(html);
+    const mM = RE_AVISTA_MSG.exec(html);
+    const mP = RE_AVISTA_PARCELA.exec(html);
+    passos.push({
+      tentativa: i,
+      tamanho: html.length,
+      temCookies: !!_avistaCookies,
+      valor: mV ? mV[1] : null,
+      msg: mM ? (mM[1].replace(/\s+/g, ' ').trim() + ' | ' + mM[2] + '%') : null,
+      parcelas: mP ? mP[1] : null,
+      temBuyBox: html.includes('qualifiedBuybox'),
+      temCorePrice: html.includes('apex-pricetopay-value'),
+      extraido: extrairAVista(html, precoApi),
+      amostraPreco: html.slice(Math.max(0, html.indexOf('corePrice_feature_div')), html.indexOf('corePrice_feature_div') + 400),
+    });
+    if (mV && mM) break;
+  }
+  return passos;
 }
 
 /**
