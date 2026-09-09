@@ -57,6 +57,7 @@ import {
   sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
   contasAmazonSeparadas, formatarOfertaAmazon,
   lerPrecoAVista, diagnosticarAVista, estadoAVista,
+  precosDeclaradosNoTexto, RE_PRECO_EXPLICADO,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -6569,15 +6570,9 @@ const DIVERGENCIA_PRECO_MAX = 0.60;
 // Condicoes que EXPLICAM um preco menor no post sem haver cupom nenhum. Post de
 // recorrencia da Amazon anuncia o valor com 'Programe e Poupe' aplicado; cobrar
 // alarme disso seria alarme diario e o operador para de ler.
-const RE_PRECO_EXPLICADO = /programe e poupe|recorr[êe]ncia|assinatur|assine|primeira compra|1[ªa]\s*compra|cashback|clube/i;
-
-function precosDeclaradosNoTexto(texto) {
-  // Parcela nunca e preco do produto: '12x de R$ 99' viraria divergencia de 90%.
-  const limpo = String(texto || '').replace(/\d+\s*x\s*(?:de\s*)?R\$\s*[\d.]+,?\d*/gi, ' ');
-  return [...limpo.matchAll(/R\$\s*([\d.]{1,12},\d{2}|\d{2,7})(?![\d,])/gi)]
-    .map(m => Number(m[1].replace(/\./g, '').replace(',', '.')))
-    .filter(v => Number.isFinite(v) && v > 0);
-}
+// RE_PRECO_EXPLICADO e precosDeclaradosNoTexto vivem no radar-amazon.js: a
+// deducao do a vista pelo post usa exatamente os mesmos criterios deste gate, e
+// duas copias divergiriam na primeira vez que uma delas fosse ajustada.
 
 /**
  * Divergencia relevante entre o preco do post e o que vamos publicar, ou null.
@@ -15097,6 +15092,8 @@ function resumoOfertaFila(o) {
     cupomForaDaBase: o.cupomForaDaBase || null,
     cupomAmbiguo: o.cupomAmbiguo || null,
     precoDivergente: o.precoDivergente || null,
+    // 'post' = preco a vista deduzido do texto do grupo, nao lido da PDP.
+    avistaOrigem: d.avistaOrigem || null,
     dados: {
       loja: d.loja || '', titulo: d.titulo || '',
       preco: d.preco ?? null, precoDe: d.precoDe ?? null,

@@ -2106,6 +2106,50 @@ export function precoAnunciadoDe(p, cupom) {
   return cupom ? Math.floor(prazo * (1 - p.avistaPct / 100) * 100) / 100 : p.precoAVista;
 }
 
+// ── A VISTA DEDUZIDO DO POST ──────────────────────────────────────────────
+// Quando a Amazon barra a leitura da PDP sobra uma fonte: o proprio post. O
+// grupo copia o numero que a pagina mostra em destaque — que hoje e o a vista.
+// Nao vale para qualquer diferenca: exige que o texto CITE a condicao (pix,
+// nupay, a vista) e que a queda caiba na faixa de desconto de meio de pagamento
+// que a Amazon pratica. Fora disso a diferenca tem outra causa (cupom, oferta
+// que morreu, produto errado) e deduzir seria inventar.
+//
+// Diferenca de confianca em relacao a PDP: aqui a fonte e um terceiro. Fica
+// registrado em avistaOrigem para o card da fila mostrar de onde veio o numero.
+const AVISTA_POST_MIN = 0.05;
+const AVISTA_POST_MAX = 0.35;
+const RE_AVISTA_TEXTO = /\bpix\b|\bnupay\b|[\u00e0a]\s*vista|\bavista\b/i;
+
+// Condicao de outra natureza citada no texto: o preco baixo tem explicacao que
+// nao e desconto a vista, entao nao ha o que deduzir.
+export const RE_PRECO_EXPLICADO = /programe e poupe|recorr[\u00eae]ncia|assinatur|assine|primeira compra|1[\u00aaa]\s*compra|cashback|clube/i;
+
+export function precosDeclaradosNoTexto(texto) {
+  // Parcela nunca e preco do produto: '12x de R$ 99' viraria divergencia de 90%.
+  const limpo = String(texto || '').replace(/\d+\s*x\s*(?:de\s*)?R\$\s*[\d.]+,?\d*/gi, ' ');
+  return [...limpo.matchAll(/R\$\s*([\d.]{1,12},\d{2}|\d{2,7})(?![\d,])/gi)]
+    .map(m => Number(m[1].replace(/\./g, '').replace(',', '.')))
+    .filter(v => Number.isFinite(v) && v > 0);
+}
+
+/** Preco a vista deduzido do texto do post, ou null. */
+export function avistaDoTexto(texto, precoApi) {
+  const t = String(texto || '');
+  if (!precoApi || !RE_AVISTA_TEXTO.test(t) || RE_PRECO_EXPLICADO.test(t)) return null;
+  const declarados = precosDeclaradosNoTexto(t);
+  if (!declarados.length) return null;
+  const declarado = Math.min(...declarados);
+  const queda = 1 - declarado / precoApi;
+  if (queda < AVISTA_POST_MIN || queda > AVISTA_POST_MAX) return null;
+  return {
+    preco: declarado,
+    percentual: Math.round(queda * 100),
+    meios: 'Pix',
+    parcelas: null,
+    origem: 'post',
+  };
+}
+
 /** Preco a vista do ASIN, com cache. null quando o produto nao tem. */
 export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
   if (!asin || !precoApi) return null;
@@ -2187,15 +2231,22 @@ export async function diagnosticarAVista(asin, precoApi) {
  * (cfg.lerAVistaAmazon = false) se a Amazon mudar o HTML e o parse comecar a
  * errar — sem deploy.
  */
-export async function comPrecoAVista(p) {
+export async function comPrecoAVista(p, texto = '') {
   if (!p || p.loja !== 'Amazon' || !p.asin || !p.preco) return p;
   if (E().cfg.lerAVistaAmazon === false) return p;
-  const a = await lerPrecoAVista(p.asin, p.preco);
+  // A PDP vence sempre que responde: e a pagina que o membro vai abrir. O post
+  // so entra quando ela nao veio — bloqueio, timeout ou HTML novo.
+  const a = await lerPrecoAVista(p.asin, p.preco)
+         || (E().cfg.avistaDoPost === false ? null : avistaDoTexto(texto, p.preco));
   if (!a) return p;
   p.precoAVista = a.preco;
   p.avistaPct   = a.percentual;
   p.avistaMeios = a.meios;
   p.avistaParcelas = a.parcelas;
+  p.avistaOrigem = a.origem || 'pdp';
+  if (a.origem === 'post') {
+    console.log('[AVISTA] ' + p.asin + ' R$ ' + a.preco + ' (' + a.percentual + '%) deduzido do post');
+  }
   return p;
 }
 
@@ -2555,11 +2606,15 @@ export function varsDoProduto(p, cupom) {
     // que nao tem desconto de meio de pagamento sem precisar de condicional.
     preco_prazo: avista ? brl(precoPrazo) : '',
     avista_str: avista ? ('\u00e0 vista no ' + (p.avistaMeios || 'Pix') + ' (' + p.avistaPct + '% off)') : '',
-    parcelas_str: (avista && p.avistaParcelas)
-      ? ('ou em at\u00e9 ' + p.avistaParcelas + 'x de R$ '
-         + brl(Math.ceil(precoPrazo / p.avistaParcelas * 100) / 100)
-         + ' sem juros (total R$ ' + brl(precoPrazo) + ')')
-      : '',
+    parcelas_str: !avista ? ''
+      : (p.avistaParcelas
+          ? ('ou em at\u00e9 ' + p.avistaParcelas + 'x de R$ '
+             + brl(Math.ceil(precoPrazo / p.avistaParcelas * 100) / 100)
+             + ' sem juros (total R$ ' + brl(precoPrazo) + ')')
+          // Sem a PDP nao sabemos em quantas vezes parcela, mas o valor a prazo
+          // e o da API e precisa aparecer: sem ele a mensagem anuncia 72,02 sem
+          // dizer que 100,04 e o que sai no cartao.
+          : ('ou R$ ' + brl(precoPrazo) + ' parcelado no cart\u00e3o')),
     preco_de: (riscado && riscado > precoFinal) ? brl(riscado) : '',
     desconto: descTotal > 0 ? descTotal : '',
     economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
@@ -2869,10 +2924,10 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto esgotado' }); continue; }
 
-    // O a vista so existe na PDP: a API nao tem campo para desconto de meio de
-    // pagamento. Depois dos descartes de proposito — pagina de produto esgotado
-    // nao tem preco para ler.
-    await comPrecoAVista(p);
+    // O a vista nao existe na API: vem da PDP e, quando ela e barrada, do texto
+    // do proprio post. Depois dos descartes de proposito — pagina de produto
+    // esgotado nao tem preco para ler.
+    await comPrecoAVista(p, texto);
     // Piso de desconto e deduplicacao NAO ficam mais aqui: subiram para o gate
     // central de processarRadarMarketplace (server.js), que vale para todas as
     // lojas. Este pipeline e reusado por /mkt/montar e /mkt/testar, onde quem
