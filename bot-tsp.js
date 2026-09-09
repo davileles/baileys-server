@@ -266,7 +266,14 @@ function emLinhas(botoes, porLinha) {
 // cupom que nao abate, os botoes vao um por linha.
 function linhasDeCupons(cupons, escolhido, prefixo) {
   const porLinha = cupons.some(c => c.aplicavel === false) ? 1 : 2;
-  return emLinhas(cupons.map(c => [rotuloCupomBotao(c, escolhido), prefixo + c.codigo]), porLinha);
+  // QUEM entra no teclado ja foi decidido por desconto, la em cuponsAtivosDaLoja
+  // (o corte precisa premiar o que abate mais). A ORDEM em que aparecem e outra
+  // conversa: o operador procura pelo codigo que viu na loja, e varrer nomes
+  // fora de ordem e mais lento do que ler um desconto ordenado. Alfabetica aqui,
+  // como em todo select do ecossistema.
+  const emOrdem = cupons.slice().sort((a, b) =>
+    String(a.codigo).localeCompare(String(b.codigo), 'pt-BR', { numeric: true, sensitivity: 'base' }));
+  return emLinhas(emOrdem.map(c => [rotuloCupomBotao(c, escolhido), prefixo + c.codigo]), porLinha);
 }
 
 // Recebe a lista COMPLETA da loja e quantos viraram botao: contar so os
