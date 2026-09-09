@@ -1955,6 +1955,178 @@ export function normalizar(item) {
   };
 }
 
+// ── PRECO A VISTA (Pix/NuPay) ─────────────────────────────────────────────
+// A Creators API devolve SO o preco a prazo. No ASIN B07G7VTQ29 ela diz
+// R$ 100,04 enquanto a pagina mostra R$ 72,02 em destaque, com "a vista no Pix
+// ou NuPay (28% off)" logo abaixo e "ou em ate 4x de R$ 25,01 (total parcelado
+// R$ 100,04)". Nao e cupom nem promocao de vendedor: e desconto de meio de
+// pagamento, e o enum de recursos aceitos pela API (validado em 09/09 pedindo
+// um recurso invalido de proposito) nao tem NENHUM campo para ele. Publicar o
+// numero da API era anunciar 28% acima do que o membro ve ao abrir o link —
+// pior do que errar para cima: perde a oferta para quem anuncia o certo.
+//
+// Unica fonte e a propria PDP. Tres marcadores estaveis:
+//   items[0.base][customerVisiblePrice][amount]  valor exato do buy box
+//   oneTimePaymentPrice_feature_div              "a vista no X (N% off)"
+//   promotionMessageInsideBuyBox_feature_div     "Ou em ate 4x de R$ ..."
+//
+// Detalhe que faz toda a diferenca: a PRIMEIRA requisicao de um IP sem cookie
+// volta com a pagina inteira (1,2 MB, sem CAPTCHA) porem com o bloco de preco
+// VAZIO. Com o cookie de sessao da resposta anterior ela vem completa. Sem o
+// jar e a segunda tentativa o scraping parece funcionar e nao extrai nada.
+const AVISTA_TTL_MS       = 30 * 60 * 1000;   // achou: preco muda, mas nao a cada minuto
+const AVISTA_TTL_VAZIO_MS = 6 * 3600e3;       // nao tem a vista: raramente passa a ter
+// Os tres marcadores vivem nos primeiros ~400 KB; ler 1,5 MB por produto so
+// para descartar 1,1 MB multiplicaria a banda de um disparo de lista por dez.
+const AVISTA_CORTE_BYTES  = 700 * 1024;
+
+const _avistaCache = new Map();
+let _avistaCookies = '';
+
+const RE_AVISTA_VALOR   = /customerVisiblePrice\]\[amount\]"\s+value="([\d.]+)"/;
+const RE_AVISTA_MSG     = /[\u00e0a]\s*vista\s+no\s+([^<(]{1,60}?)\s*\((\d{1,2})%\s*off\)/i;
+const RE_AVISTA_PARCELA = /em at[\u00e9e]\s*(\d{1,2})x\s*de\s*R\$\s*[\d.]*\d,\d{2}/i;
+
+function guardarCookiesAmazon(res) {
+  const brutos = typeof res.headers.getSetCookie === 'function'
+    ? res.headers.getSetCookie()
+    : (res.headers.get('set-cookie') ? [res.headers.get('set-cookie')] : []);
+  if (!brutos.length) return;
+  const jar = new Map();
+  for (const par of String(_avistaCookies).split('; ').filter(Boolean)) {
+    const i = par.indexOf('=');
+    if (i > 0) jar.set(par.slice(0, i), par.slice(i + 1));
+  }
+  for (const c of brutos) {
+    const par = String(c).split(';')[0];
+    const i = par.indexOf('=');
+    if (i > 0) jar.set(par.slice(0, i).trim(), par.slice(i + 1).trim());
+  }
+  _avistaCookies = [...jar].map(([k, v]) => k + '=' + v).join('; ');
+}
+
+/** Le a PDP ate os marcadores aparecerem ou ate o corte, e aborta o resto. */
+async function baixarPaginaProduto(asin) {
+  const res = await fetch('https://www.amazon.com.br/dp/' + asin, {
+    redirect: 'follow',
+    headers: {
+      'User-Agent': UA_NAVEGADOR,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+      'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none', 'Upgrade-Insecure-Requests': '1',
+      ...(_avistaCookies ? { 'Cookie': _avistaCookies } : {}),
+    },
+    signal: AbortSignal.timeout(20000),
+  });
+  guardarCookiesAmazon(res);
+  if (!res.ok || !res.body) return '';
+
+  const leitor = res.body.getReader();
+  const dec = new TextDecoder('utf-8');
+  let html = '', bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await leitor.read();
+      if (done) break;
+      bytes += value.length;
+      html += dec.decode(value, { stream: true });
+      if (bytes >= AVISTA_CORTE_BYTES) break;
+      if (RE_AVISTA_VALOR.test(html) && RE_AVISTA_MSG.test(html)) break;
+    }
+  } finally {
+    try { await leitor.cancel(); } catch (_) {}
+  }
+  return html;
+}
+
+/**
+ * Extrai o preco a vista do HTML. Devolve null quando nao ha desconto de meio
+ * de pagamento — que e o caso da maioria dos produtos.
+ *
+ * Guarda de sanidade contra o pior erro possivel aqui: anunciar um numero menor
+ * que o real. Sem os dois marcadores, ou com valor >= preco da API, ou abaixo
+ * da metade dele (sinal de que a regex pegou preco de outro item da pagina),
+ * devolve null e a mensagem sai com o preco da API, como sempre saiu.
+ */
+function extrairAVista(html, precoApi) {
+  const mValor = RE_AVISTA_VALOR.exec(html);
+  const mMsg   = RE_AVISTA_MSG.exec(html);
+  if (!mValor || !mMsg) return null;
+
+  const preco = Number(mValor[1]);
+  const pct   = Number(mMsg[2]);
+  const api   = Number(precoApi);
+  if (!Number.isFinite(preco) || !Number.isFinite(api) || !pct) return null;
+  if (preco >= api || preco < api * 0.5) return null;
+
+  const mPar = RE_AVISTA_PARCELA.exec(html);
+  return {
+    preco,
+    percentual: pct,
+    meios: mMsg[1].replace(/\s+/g, ' ').trim(),
+    parcelas: mPar ? Number(mPar[1]) : null,
+  };
+}
+
+/**
+ * Preco que a mensagem vai anunciar: o a vista quando existir, senao o a prazo.
+ * Mesma conta do varsDoProduto — existe separada porque o gate de divergencia
+ * de preco (server.js) precisa do numero publicado sem renderizar o template.
+ */
+export function precoAnunciadoDe(p, cupom) {
+  const prazo = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
+  if (!p.precoAVista || !p.avistaPct) return prazo;
+  return cupom ? Math.floor(prazo * (1 - p.avistaPct / 100) * 100) / 100 : p.precoAVista;
+}
+
+/** Preco a vista do ASIN, com cache. null quando o produto nao tem. */
+export async function lerPrecoAVista(asin, precoApi) {
+  if (!asin || !precoApi) return null;
+  const visto = _avistaCache.get(asin);
+  if (visto && Date.now() - visto.em < (visto.dados ? AVISTA_TTL_MS : AVISTA_TTL_VAZIO_MS)) {
+    return visto.dados;
+  }
+
+  let dados = null;
+  try {
+    let html = await baixarPaginaProduto(asin);
+    // Primeira leitura sem cookie volta sem o bloco de preco: repete uma vez,
+    // agora com a sessao que a propria resposta acabou de entregar.
+    if (html && !RE_AVISTA_VALOR.test(html) && _avistaCookies) {
+      html = await baixarPaginaProduto(asin);
+    }
+    dados = html ? extrairAVista(html, precoApi) : null;
+  } catch (e) {
+    // Falha de rede NAO vira cache negativo: seria silenciar o a vista por 6h
+    // por causa de um timeout.
+    console.warn('[AVISTA] ' + asin + ' — ' + e.message);
+    return null;
+  }
+
+  _avistaCache.set(asin, { em: Date.now(), dados });
+  if (dados) console.log('[AVISTA] ' + asin + ' R$ ' + dados.preco + ' (' + dados.percentual + '% no ' + dados.meios + ')');
+  return dados;
+}
+
+/**
+ * Anexa o preco a vista ao produto normalizado. Muta e devolve o mesmo objeto
+ * para os chamadores continuarem lineares. Desligavel por config
+ * (cfg.lerAVistaAmazon = false) se a Amazon mudar o HTML e o parse comecar a
+ * errar — sem deploy.
+ */
+export async function comPrecoAVista(p) {
+  if (!p || p.loja !== 'Amazon' || !p.asin || !p.preco) return p;
+  if (E().cfg.lerAVistaAmazon === false) return p;
+  const a = await lerPrecoAVista(p.asin, p.preco);
+  if (!a) return p;
+  p.precoAVista = a.preco;
+  p.avistaPct   = a.percentual;
+  p.avistaMeios = a.meios;
+  p.avistaParcelas = a.parcelas;
+  return p;
+}
+
 // ── FORMATACAO ────────────────────────────────────────────────────────────
 // Segue exatamente o formato da aba Oferta do gerador, para a mensagem do robo
 // ser indistinguivel da que voce escreve na mao.
@@ -1998,6 +2170,8 @@ function templatePadrao() {
     '',
     'De: ~R$ {{preco_de}}~',
     'Por: R$ {{preco}}',
+    '{{avista_str}}',
+    '{{parcelas_str}}',
     '',
     '\uD83C\uDFAB *CUPOM* {{cupom}}',
     '\u26A0\uFE0F *IMPORTANTE* {{alerta}}',
@@ -2271,7 +2445,16 @@ export function renderTemplate(corpo, vars) {
 
 /** Variaveis disponiveis no template, a partir do produto ja normalizado. */
 export function varsDoProduto(p, cupom) {
-  const precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
+  const precoPrazo = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
+  // O preco principal e o mesmo que a PDP mostra em destaque: o a vista. Sem
+  // cupom usa o valor exato lido da pagina. Com cupom a pagina desconhece o
+  // desconto, entao aplica o percentual sobre o preco ja descontado e TRUNCA os
+  // centavos — e assim que a Amazon arredonda (100,04 x 0,72 = 72,0288 -> 72,02);
+  // arredondar para cima anunciaria um centavo que o checkout nao cobra.
+  const avista = (p.precoAVista && p.avistaPct)
+    ? (cupom ? Math.floor(precoPrazo * (1 - p.avistaPct / 100) * 100) / 100 : p.precoAVista)
+    : null;
+  const precoFinal = avista ?? precoPrazo;
   // Com cupom e sem preco de lista, o preco cheio faz as vezes de valor riscado
   // — legitimo quando ele veio de fonte verificavel. Se veio do texto do grupo
   // (precoDeReferencia), o 'De' seria um numero que ninguem confirmou, entao fica vazio.
@@ -2295,6 +2478,16 @@ export function varsDoProduto(p, cupom) {
     titulo_curto: encurtarTitulo(p.titulo),
     preco: brl(precoFinal),
     preco_cheio: brl(p.preco),
+    // Vazias quando nao ha a vista, e a regra de omissao do renderTemplate faz
+    // a linha inteira sumir — template com as duas linhas serve para as lojas
+    // que nao tem desconto de meio de pagamento sem precisar de condicional.
+    preco_prazo: avista ? brl(precoPrazo) : '',
+    avista_str: avista ? ('\u00e0 vista no ' + (p.avistaMeios || 'Pix') + ' (' + p.avistaPct + '% off)') : '',
+    parcelas_str: (avista && p.avistaParcelas)
+      ? ('ou em at\u00e9 ' + p.avistaParcelas + 'x de R$ '
+         + brl(Math.ceil(precoPrazo / p.avistaParcelas * 100) / 100)
+         + ' sem juros (total R$ ' + brl(precoPrazo) + ')')
+      : '',
     preco_de: (riscado && riscado > precoFinal) ? brl(riscado) : '',
     desconto: descTotal > 0 ? descTotal : '',
     economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
@@ -2330,8 +2523,11 @@ export function varsDoProduto(p, cupom) {
 export const VARIAVEIS_TEMPLATE = [
   { chave:'titulo_curto',  desc:'Título do produto, cortado em 80 caracteres' },
   { chave:'titulo',        desc:'Título completo do produto' },
-  { chave:'preco',         desc:'Preço final, já com o cupom aplicado' },
+  { chave:'preco',         desc:'Preço final — o à vista quando houver, já com o cupom aplicado' },
   { chave:'preco_cheio',   desc:'Preço da API, sem o cupom' },
+  { chave:'preco_prazo',   desc:'Preço a prazo (vazio quando não há desconto à vista)' },
+  { chave:'avista_str',    desc:'Ex: "à vista no Pix ou NuPay (28% off)" — vazio quando não há' },
+  { chave:'parcelas_str',  desc:'Ex: "ou em até 4x de R$ 25,01 sem juros (total R$ 100,04)"' },
   { chave:'preco_de',      desc:'Preço de lista (vazio quando não há)' },
   { chave:'desconto',      desc:'Percentual total de desconto' },
   { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
@@ -2600,6 +2796,11 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 
     if (!p.preco)      { saida.push({ produto: p, descartadoPor: 'sem preço disponível' }); continue; }
     if (!p.disponivel) { saida.push({ produto: p, descartadoPor: 'produto esgotado' }); continue; }
+
+    // O a vista so existe na PDP: a API nao tem campo para desconto de meio de
+    // pagamento. Depois dos descartes de proposito — pagina de produto esgotado
+    // nao tem preco para ler.
+    await comPrecoAVista(p);
     // Piso de desconto e deduplicacao NAO ficam mais aqui: subiram para o gate
     // central de processarRadarMarketplace (server.js), que vale para todas as
     // lojas. Este pipeline e reusado por /mkt/montar e /mkt/testar, onde quem
@@ -2618,6 +2819,9 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
       cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado,
                        generico: !!cupom.generico } : null,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      // Preco que a mensagem realmente anuncia. Quem le isto para comparar com
+      // o preco declarado no post precisa do numero publicado, nao do a prazo.
+      precoAnunciado: precoAnunciadoDe(p, cupom),
       mensagem: formatarOfertaAmazon(p, { ...opcoes, cupom }),
     });
   }
@@ -2817,6 +3021,8 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
     if (!p.preco)      { descartados.push({ asin:p.asin, nome, motivo:'sem preço disponível' }); continue; }
     if (!p.disponivel) { descartados.push({ asin:p.asin, nome, motivo:'produto esgotado' }); continue; }
 
+    await comPrecoAVista(p);
+
     // Cupom do disparo vence o vinculado; sem nenhum dos dois, vai sem cupom.
     // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
     // produto vence o automatico. Cupom fixo do disparo vence tudo; 'nenhum' sai
@@ -2854,6 +3060,7 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
       cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
       avisoCupom,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
+      precoAnunciado: precoAnunciadoDe(p, cupom),
       mensagem: formatarOfertaAmazon(p, { cupom }),
     });
   }

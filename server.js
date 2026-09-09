@@ -56,6 +56,7 @@ import {
   recarregarRadarTenants, refDeterministico,
   sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
   contasAmazonSeparadas, formatarOfertaAmazon,
+  lerPrecoAVista,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -7111,7 +7112,11 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 
     // O post declara um preco bem abaixo do que vamos publicar e nenhum cupom
     // entrou: sinal de condicao nao capturada. Nao auto-envia e avisa.
-    const _divPreco = divergenciaPrecoPost(texto, r.precoFinal ?? p.preco, !!r.cupom);
+    // Compara com o preco que a mensagem anuncia, nao com o a prazo: desde que
+    // a Amazon passou a publicar o a vista (Pix/NuPay) como preco principal, o
+    // post do grupo escreve esse numero e o nosso a prazo ficava 28% acima —
+    // divergencia real do ponto de vista do gate, mas com causa conhecida.
+    const _divPreco = divergenciaPrecoPost(texto, r.precoAnunciado ?? r.precoFinal ?? p.preco, !!r.cupom);
     if (_divPreco) avisarPrecoDivergente(_divPreco, p, jid).catch(() => {});
 
     const imagem = await baixarImagemProduto(p.imagemUrl);
@@ -14527,6 +14532,22 @@ app.post('/publico/publicar', async (req, res) => {
 app.post('/mkt/sonda', async (req, res) => {
   try {
     res.json(await sondarRecursos(req.body?.asin, req.body?.recursos || []));
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Diagnostico: mostra o que a leitura da PDP extraiu de preco a vista. Serve
+// para conferir o parse quando a Amazon mexe no HTML — a API nunca devolve esse
+// numero, entao sem isto a unica forma de saber que o parse quebrou seria a
+// mensagem sair com o preco a prazo de novo, sem ninguem reclamar.
+app.get('/mkt/avista', async (req, res) => {
+  try {
+    const asin = String(req.query.asin || '').trim().toUpperCase();
+    if (!asin) return res.status(400).json({ ok:false, erro:'passe ?asin=' });
+    const itens = await buscarProdutos([asin]);
+    const p = itens.length ? normalizar(itens[0]) : null;
+    if (!p?.preco) return res.json({ ok:false, erro:'API nao devolveu preco para ' + asin });
+    const avista = await lerPrecoAVista(asin, p.preco);
+    res.json({ ok:true, asin, precoApi: p.preco, avista });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
