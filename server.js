@@ -15004,8 +15004,13 @@ function formatarOfertaDaLoja(tipo, p, opcoes) {
 // algo no preco atual; agora vem todos, com 'aplicavel' dizendo quais rendem
 // desconto — o teto de 20 e a folga do teclado do Telegram, nao um filtro.
 function cuponsDoCard(o) {
+  // Lista INTEIRA da loja, de proposito. Um .slice(0, 20) aqui cortava antes do
+  // limite de botoes do bot e, pior, antes do contador da mensagem: o card dizia
+  // "20 cupons ativos na base" havendo 52, e o operador concluia que o cupom que
+  // ele procurava nao tinha sido capturado. Quem corta para caber no teclado e o
+  // bot, que sabe quantos exibiu e informa quantos ficaram de fora.
   const d = o.dadosExtraidos || {};
-  return cuponsAtivosDaLoja(d.loja || '', Number(d.preco) || 0).slice(0, 20);
+  return cuponsAtivosDaLoja(d.loja || '', Number(d.preco) || 0);
 }
 
 // Cupom que ja estava na oferta. Com o codigo na base o desconto e RECALCULADO

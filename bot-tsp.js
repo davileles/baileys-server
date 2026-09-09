@@ -788,10 +788,25 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
   if (acao === 'cupom') {
     const cupons = rr.cupons || [];
     const atual  = o.dados?.cupom?.codigo || '';
-    const linhas = linhasDeCupons(cupons, atual, 'r:cup:' + id + ':');
+    // Mesmo corte da previa por link: viram botao os de maior desconto, e o
+    // resumo conta a lista INTEIRA. Quem fica de fora — inclusive o cupom que
+    // nao abate ESTE preco, que a ordenacao joga para o fim — segue alcancavel
+    // por "Digitar codigo", entao nenhum cupom da base fica inacessivel aqui.
+    const daBase = cupons.slice(0, MAX_BOTOES_CUPOM);
+    const linhas = daBase.length ? linhasDeCupons(daBase, atual, 'r:cup:' + id + ':') : [];
+    linhas.push([['🔎 Digitar código', 'r:cupdig:' + id]]);
     linhas.push([['🚫 Sem cupom', 'r:cup:' + id + ':'], ['⬅️ Voltar', 'r:ver:' + id]]);
-    return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + resumoCupons(cupons),
+    return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + resumoCupons(cupons, daBase.length),
       teclado(linhas), msgId);
+  }
+
+  if (acao === 'cupdig') {
+    const s = abrir(chatId, 'revisao');
+    s.passo = 'cupomcodigo'; s.ofertaId = id; s.msgId = msgId;
+    return falarPlano(chatId, cabecalhoCard(o)
+      + '\n\nDigite o *CÓDIGO* do cupom.\nHoje: ' + ((o.dados?.cupom?.codigo || '').trim() || 'sem cupom')
+      + '\n(vale qualquer cupom da base, inclusive os que não abatem este preço — o aviso aparece na remontagem)',
+      teclado([[['⬅️ Voltar', 'r:cupom:' + id]]]), msgId);
   }
 
   if (acao === 'cup') {
@@ -890,6 +905,16 @@ async function tratarTexto(chatId, texto, msgEntrada) {
     } else if (s.passo === 'titulo') ov = { titulo: t };
     else if (s.passo === 'topo')     ov = { gatilho: t };
     else if (s.passo === 'importante') ov = { importante: t };
+    else if (s.passo === 'cupomcodigo') {
+      // Validacao de existencia/vigencia fica no /mkt/remontar, que devolve
+      // aviso para codigo fora da base, vencido ou que nao abate este preco.
+      // Aqui so barra o que nem parece codigo. Mesma regra da previa por link.
+      const cod = t.trim().toUpperCase().replace(/\s+/g, '');
+      if (!/^[A-Z0-9._-]{2,40}$/.test(cod)) {
+        return falar(chatId, 'Código inválido. Mande só o código, sem espaços (ex: `DESCONTAO`).');
+      }
+      ov = { cupom: cod };
+    }
     if (!ov) return;
     const { ofertaId, msgId } = s;
     sessoes.delete(String(chatId));
