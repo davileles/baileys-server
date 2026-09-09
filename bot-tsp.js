@@ -234,6 +234,43 @@ async function montarOfertaPorLink(link, cupom) {
   return r.json();
 }
 
+// ── CUPONS DA BASE NOS BOTOES ────────────────────────────────────────────────
+// Todos os cupons ATIVOS da loja viram botao, inclusive os que nao abatem o
+// preco atual — filtrar por criterio escondia do operador cupom que existe na
+// base, e ele so descobria abrindo o painel. Quem nao se aplica vem marcado no
+// proprio rotulo; a escolha continua sendo sempre dele.
+function valorCupomTxt(c) {
+  return c.tipo === 'pct' ? (c.valor + '%') : ('R$ ' + c.valor);
+}
+
+function rotuloCupomBotao(c, escolhido) {
+  const igual = escolhido && String(escolhido).toUpperCase() === String(c.codigo).toUpperCase();
+  const detalhe = c.aplicavel === false
+    ? ' · ' + valorCupomTxt(c) + (c.motivo ? ' (' + c.motivo + ')' : '')
+    : ' (-R$ ' + c.descontoAplicado + ')';
+  return (igual ? '✅ ' : '🏷️ ') + (c.restrito ? '🎯 ' : '') + c.codigo + detalhe;
+}
+
+function emLinhas(botoes, porLinha) {
+  const linhas = [];
+  for (let i = 0; i < botoes.length; i += porLinha) linhas.push(botoes.slice(i, i + porLinha));
+  return linhas;
+}
+
+// Rotulo com motivo fica longo e o Telegram trunca sem aviso: quando ha algum
+// cupom que nao abate, os botoes vao um por linha.
+function linhasDeCupons(cupons, escolhido, prefixo) {
+  const porLinha = cupons.some(c => c.aplicavel === false) ? 1 : 2;
+  return emLinhas(cupons.map(c => [rotuloCupomBotao(c, escolhido), prefixo + c.codigo]), porLinha);
+}
+
+function resumoCupons(cupons) {
+  if (!cupons.length) return 'Nenhum cupom ativo na base para esta loja.';
+  const abatem = cupons.filter(c => c.aplicavel !== false).length;
+  return 'Cupons ativos na base para esta loja: *' + cupons.length + '*'
+    + ' — ' + abatem + ' abate(m) este preço.';
+}
+
 async function previewOferta(chatId, s, editar) {
   s.passo = 'preview';
   const d = s.dados;
@@ -246,16 +283,18 @@ async function previewOferta(chatId, s, editar) {
   d.mensagem  = r.mensagem;
   d.imagemUrl = r.produto?.imagemUrl || null;
 
-  const linhas = [[['🚀 Enviar agora', 'a:enviar'], ['❌ Cancelar', 'a:cancelar']]];
-  // Cupons da base que realmente abatem NESTE preco viram botao. O cupom nunca
-  // entra sozinho: quem escolhe e o operador.
-  const aplicaveis = (r.cupons || []).slice(0, 3);
-  if (aplicaveis.length && !d.codigoCupom) {
-    linhas.unshift(aplicaveis.map(c => [`🏷️ ${c.codigo} (-R$${c.descontoAplicado})`, 'o:cupom:' + c.codigo]));
-  }
+  // Todos os cupons ativos da loja viram botao — os que nao abatem este preco
+  // inclusive, marcados no rotulo. O cupom nunca entra sozinho: quem escolhe e
+  // o operador, e ele pode trocar ou tirar a qualquer momento.
+  const daBase = (r.cuponsBase || r.cupons || []).slice(0, 20);
+  const linhas = daBase.length ? linhasDeCupons(daBase, d.codigoCupom, 'o:cupom:') : [];
+  if (daBase.length && d.codigoCupom) linhas.push([['🚫 Sem cupom', 'o:cupom:']]);
+  linhas.push([['🚀 Enviar agora', 'a:enviar'], ['❌ Cancelar', 'a:cancelar']]);
+
   const aviso = r.avisoCupom ? `\n\n⚠️ _${r.avisoCupom}_` : '';
   return falar(chatId,
-    '*Prévia da oferta* 👇\n\n- - - - - - - - - -\n' + r.mensagem + '\n- - - - - - - - - -' + aviso,
+    '*Prévia da oferta* 👇\n\n- - - - - - - - - -\n' + r.mensagem + '\n- - - - - - - - - -' + aviso
+    + '\n\n' + resumoCupons(daBase),
     teclado(linhas), editar);
 }
 
@@ -729,10 +768,10 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
 
   if (acao === 'cupom') {
     const cupons = rr.cupons || [];
-    const linhas = cupons.map(cp => [['🏷️ ' + cp.codigo + ' (-R$ ' + cp.descontoAplicado + ')', 'r:cup:' + id + ':' + cp.codigo]]);
-    linhas.push([['Sem cupom', 'r:cup:' + id + ':'], ['⬅️ Voltar', 'r:ver:' + id]]);
-    return falarPlano(chatId, cabecalhoCard(o) + '\n\n'
-      + (cupons.length ? 'Cupons da base que abatem neste preço:' : 'Nenhum cupom da base abate neste preço.'),
+    const atual  = o.dados?.cupom?.codigo || '';
+    const linhas = linhasDeCupons(cupons, atual, 'r:cup:' + id + ':');
+    linhas.push([['🚫 Sem cupom', 'r:cup:' + id + ':'], ['⬅️ Voltar', 'r:ver:' + id]]);
+    return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + resumoCupons(cupons),
       teclado(linhas), msgId);
   }
 

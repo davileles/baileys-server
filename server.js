@@ -14797,6 +14797,44 @@ function chaveLojaSimples(s) {
     .replace(/[^a-z0-9]/g, '');
 }
 
+/**
+ * TODOS os cupons ATIVOS da loja, com o desconto que cada um renderia NESTE
+ * preco. Nada e filtrado por criterio do cupom (minimo, teto, restricao): a
+ * lista existe para o OPERADOR escolher, e esconder um cupom porque o minimo
+ * nao bate so o obrigava a abrir o painel para descobrir que ele existe.
+ *
+ * O que nao se aplica vira rotulo, nao filtro: 'aplicavel:false' + 'motivo'.
+ * Restrito entra sinalizado — escolha explicita para UMA oferta e diferente de
+ * escolha automatica, que continua barrada por cupomGeralDisponivel().
+ */
+function cuponsAtivosDaLoja(loja, preco) {
+  const alvo = chaveLojaSimples(loja);
+  if (!alvo) return [];
+  return listarCuponsBase()
+    .filter(cp => cp.codigo && cupomVigente(cp) && chaveLojaSimples(cp.loja) === alvo)
+    .map(cp => {
+      const descontoAplicado = calcularDesconto(cp, preco);
+      let motivo = null;
+      if (!(descontoAplicado > 0)) {
+        if (!(preco > 0))                               motivo = 'sem preco para calcular';
+        else if (cp.minimo != null && preco < cp.minimo) motivo = 'minimo R$ ' + cp.minimo;
+        else if (cp.maximo != null && preco > cp.maximo) motivo = 'so ate R$ ' + cp.maximo;
+        else                                            motivo = 'nao abate neste preco';
+      }
+      return {
+        codigo: cp.codigo, tipo: cp.tipo, valor: cp.valor,
+        minimo: cp.minimo ?? null, maximo: cp.maximo ?? null, limite: cp.limite ?? null,
+        validadeAte: cp.validadeAte || null, restrito: cupomRestrito(cp),
+        descontoAplicado, aplicavel: descontoAplicado > 0, motivo,
+      };
+    })
+    // Aplicaveis primeiro (maior desconto na frente); os demais logo abaixo, em
+    // ordem de codigo, para a lista nao trocar de posicao a cada abertura.
+    .sort((a, b) => (Number(b.aplicavel) - Number(a.aplicavel))
+                 || (b.descontoAplicado - a.descontoAplicado)
+                 || String(a.codigo).localeCompare(String(b.codigo), 'pt-BR'));
+}
+
 function pipelineDoLink(texto) {
   // viaNossoLink: link colado a mao pode ser anuncio classico, que hoje so tem
   // preco pelo card do nosso proprio perfil social. Vale aqui e nao no radar
@@ -14854,15 +14892,12 @@ app.post('/mkt/montar', async (req, res) => {
 
   const loja = p.loja || pipe.loja;
 
-  // Cupons vinculaveis: vigentes, da mesma loja e que realmente rendem desconto
-  // neste preco — cupom com minimo acima do produto nem aparece na lista.
-  const cupons = listarCuponsBase()
-    .filter(cp => cupomVigente(cp) && chaveLojaSimples(cp.loja) === chaveLojaSimples(loja))
-    .map(cp => ({ codigo:cp.codigo, tipo:cp.tipo, valor:cp.valor, minimo:cp.minimo,
-                  maximo:cp.maximo, limite:cp.limite, validadeAte:cp.validadeAte,
-                  descontoAplicado: calcularDesconto(cp, p.preco) }))
-    .filter(cp => cp.descontoAplicado > 0)
-    .sort((a, b) => b.descontoAplicado - a.descontoAplicado);
+  // Cupons vinculaveis: TODOS os que estao ativos na base para esta loja,
+  // inclusive os que nao abatem neste preco (vem marcados com aplicavel:false).
+  // 'cupons' segue existindo so com os que rendem desconto porque o painel do
+  // TSP monta o select "cupom adicional" com ele e mostra a economia no rotulo.
+  const cuponsBase = cuponsAtivosDaLoja(loja, p.preco);
+  const cupons     = cuponsBase.filter(cp => cp.aplicavel);
 
   // O cupom so entra se o operador pedir pelo codigo. Aplicar sozinho o "melhor
   // da base" anunciaria um desconto que ele nao escolheu.
@@ -14874,9 +14909,16 @@ app.post('/mkt/montar', async (req, res) => {
     else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
     else {
       const desconto = calcularDesconto(reg, p.preco);
-      if (desconto > 0) cupom = { reg, desconto, citado: true };
-      else avisoCupom = 'cupom ' + codigo + ' nao se aplica a este preco'
-        + (reg.minimo != null ? ' (minimo R$ ' + reg.minimo + ')' : '');
+      // Cupom vigente que nao abate NESTE preco continua entrando na mensagem,
+      // com desconto zero: quem escolheu foi o operador e o preco anunciado
+      // segue sendo o lido na loja. Abater o que o checkout nao abateria e que
+      // seria erro; sumir com o cupom que ele acabou de escolher, so confusao.
+      cupom = { reg, desconto, citado: true };
+      if (!(desconto > 0)) {
+        avisoCupom = 'cupom ' + codigo + ' entrou sem abater o preco'
+          + (reg.minimo != null ? ' (minimo R$ ' + reg.minimo + ')'
+            : reg.maximo != null ? ' (so ate R$ ' + reg.maximo + ')' : '');
+      }
     }
   }
 
@@ -14910,6 +14952,7 @@ app.post('/mkt/montar', async (req, res) => {
     avisoCupom,
     precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
     cupons,
+    cuponsBase,
     // Mensagem pelo mesmo template da loja que o radar usa, para a oferta montada
     // a mao sair no formato identico ao das automaticas.
     mensagem: renderTemplate(templateDaLoja(loja)?.corpo || '', vars),
@@ -14957,15 +15000,12 @@ function formatarOfertaDaLoja(tipo, p, opcoes) {
   }
 }
 
-// Cupons da base que abatem algo NESTE preco — e o que vira botao no card.
-function cuponsAplicaveisNoPreco(loja, preco) {
-  if (!loja || !(preco > 0)) return [];
-  return listarCuponsBase()
-    .filter(cp => cp.codigo && cupomVigente(cp) && chaveLojaSimples(cp.loja) === chaveLojaSimples(loja))
-    .map(cp => ({ codigo: cp.codigo, descontoAplicado: calcularDesconto(cp, preco) }))
-    .filter(cp => cp.descontoAplicado > 0)
-    .sort((a, b) => b.descontoAplicado - a.descontoAplicado)
-    .slice(0, 4);
+// Cupons ATIVOS da loja para o card do bot. Antes so entravam os que abatiam
+// algo no preco atual; agora vem todos, com 'aplicavel' dizendo quais rendem
+// desconto — o teto de 20 e a folga do teclado do Telegram, nao um filtro.
+function cuponsDoCard(o) {
+  const d = o.dadosExtraidos || {};
+  return cuponsAtivosDaLoja(d.loja || '', Number(d.preco) || 0).slice(0, 20);
 }
 
 // Cupom que ja estava na oferta. Com o codigo na base o desconto e RECALCULADO
@@ -15036,9 +15076,13 @@ function remontarOfertaFila(oferta, ov = {}) {
       if (!reg)                    aviso = 'cupom ' + cod + ' nao esta na base de ' + p.loja;
       else if (!cupomVigente(reg)) aviso = 'cupom ' + cod + ' expirado ou inativo';
       else {
+        // Mesma regra do /mkt/montar: escolha do operador vale mesmo quando o
+        // cupom nao abate neste preco. Entra com desconto zero — a linha CUPOM
+        // aparece na mensagem e o 'por' continua sendo o preco lido na loja.
         const desconto = calcularDesconto(reg, p.preco);
-        if (desconto > 0) cupom = { reg, desconto, citado: true };
-        else aviso = 'cupom ' + cod + ' nao abate nada neste preco';
+        cupom = { reg, desconto, citado: true };
+        if (!(desconto > 0)) aviso = 'cupom ' + cod + ' entrou sem abater o preco'
+          + (reg.minimo != null ? ' (minimo R$ ' + reg.minimo + ')' : '');
       }
     }
   } else {
@@ -15151,8 +15195,7 @@ app.get('/mkt/fila', (req, res) => {
 app.get('/mkt/oferta/:id', (req, res) => {
   const o = ofertaDaFilaPara(req, req.params.id);
   if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
-  res.json({ ok:true, oferta: resumoOfertaFila(o),
-    cupons: cuponsAplicaveisNoPreco(o.dadosExtraidos?.loja || '', Number(o.dadosExtraidos?.preco) || 0) });
+  res.json({ ok:true, oferta: resumoOfertaFila(o), cupons: cuponsDoCard(o) });
 });
 
 app.post('/mkt/remontar/:id', (req, res) => {
@@ -15193,7 +15236,7 @@ app.post('/mkt/remontar/:id', (req, res) => {
   try {
     const r = remontarOfertaFila(o, ov);
     res.json({ ok:true, mensagem:r.mensagem, aviso:r.aviso, oferta: resumoOfertaFila(o),
-      cupons: cuponsAplicaveisNoPreco(o.dadosExtraidos?.loja || '', Number(o.dadosExtraidos?.preco) || 0) });
+      cupons: cuponsDoCard(o) });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
