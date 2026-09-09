@@ -56,7 +56,7 @@ import {
   recarregarRadarTenants, refDeterministico,
   sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
   contasAmazonSeparadas, formatarOfertaAmazon,
-  lerPrecoAVista, diagnosticarAVista,
+  lerPrecoAVista, diagnosticarAVista, estadoAVista,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -14548,7 +14548,7 @@ app.get('/mkt/avista', async (req, res) => {
     if (!p?.preco) return res.json({ ok:false, erro:'API nao devolveu preco para ' + asin });
     const avista = await lerPrecoAVista(asin, p.preco, { forcar: req.query.forcar === '1' });
     const diag = req.query.diag === '1' ? await diagnosticarAVista(asin, p.preco) : undefined;
-    res.json({ ok:true, asin, precoApi: p.preco, avista, diag });
+    res.json({ ok:true, asin, precoApi: p.preco, avista, estado: estadoAVista(), diag });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 

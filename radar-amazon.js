@@ -1983,6 +1983,28 @@ const AVISTA_CORTE_BYTES  = 700 * 1024;
 const _avistaCache = new Map();
 let _avistaCookies = '';
 
+// A Amazon nao devolve 403 nem CAPTCHA quando barra: manda 200 com uma pagina
+// de ~4 KB em ingles. Confirmado em producao — a leitura funcionou algumas
+// vezes e depois passou a voltar 3.900 bytes com lang="en-us". Sem reconhecer
+// isso o pipeline gravaria "produto sem a vista" por 6h a cada bloqueio, que e
+// exatamente o erro que esta feature existe para corrigir.
+const AVISTA_MIN_BYTES  = 200 * 1024;   // PDP real passa de 1 MB; bloqueio nao chega a 5 KB
+const AVISTA_FALHAS_MAX = 3;
+const AVISTA_PAUSA_MS   = 30 * 60 * 1000;
+let _avistaFalhas = 0;
+let _avistaPausaAte = 0;
+
+/** Estado da leitura de PDP, para o painel e para o diagnostico. */
+export function estadoAVista() {
+  return {
+    pausadoAte: _avistaPausaAte ? new Date(_avistaPausaAte).toISOString() : null,
+    pausado: Date.now() < _avistaPausaAte,
+    falhasSeguidas: _avistaFalhas,
+    emCache: _avistaCache.size,
+    comAVista: [..._avistaCache.values()].filter(v => v.dados).length,
+  };
+}
+
 const RE_AVISTA_VALOR   = /customerVisiblePrice\]\[amount\]"\s+value="([\d.]+)"/;
 const RE_AVISTA_MSG     = /[\u00e0a]\s*vista\s+no\s+([^<(]{1,60}?)\s*\((\d{1,2})%\s*off\)/i;
 const RE_AVISTA_PARCELA = /em at[\u00e9e]\s*(\d{1,2})x\s*de\s*R\$\s*[\d.]*\d,\d{2}/i;
@@ -2037,6 +2059,10 @@ async function baixarPaginaProduto(asin) {
   } finally {
     try { await leitor.cancel(); } catch (_) {}
   }
+
+  // Pagina barrada: curta demais para ser uma PDP. Devolve vazio para o
+  // chamador tratar como falha de rede, nao como "produto sem a vista".
+  if (html.length < AVISTA_MIN_BYTES && !RE_AVISTA_VALOR.test(html)) return '';
   return html;
 }
 
@@ -2088,9 +2114,13 @@ export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
     return visto.dados;
   }
 
-  let dados = null;
+  // Bloqueado ha pouco: nao insiste. Cada tentativa durante a pausa so renova
+  // o motivo do bloqueio, e a oferta sai com o preco a prazo de qualquer jeito.
+  if (!opcoes.forcar && Date.now() < _avistaPausaAte) return null;
+
+  let dados = null, html = '';
   try {
-    let html = await baixarPaginaProduto(asin);
+    html = await baixarPaginaProduto(asin);
     // Primeira leitura sem cookie volta sem o bloco de preco: repete uma vez,
     // agora com a sessao que a propria resposta acabou de entregar.
     if (html && !RE_AVISTA_VALOR.test(html) && _avistaCookies) {
@@ -2103,6 +2133,18 @@ export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
     console.warn('[AVISTA] ' + asin + ' — ' + e.message);
     return null;
   }
+
+  if (!html) {
+    // Sem pagina nao ha o que concluir sobre o produto: nada de cache negativo.
+    if (++_avistaFalhas >= AVISTA_FALHAS_MAX) {
+      _avistaPausaAte = Date.now() + AVISTA_PAUSA_MS;
+      _avistaFalhas = 0;
+      console.warn('[AVISTA] Amazon barrando a leitura de PDP — pausado por 30 min. '
+        + 'As ofertas seguem saindo com o preco a prazo da API.');
+    }
+    return null;
+  }
+  _avistaFalhas = 0;
 
   _avistaCache.set(asin, { em: Date.now(), dados });
   if (dados) console.log('[AVISTA] ' + asin + ' R$ ' + dados.preco + ' (' + dados.percentual + '% no ' + dados.meios + ')');
