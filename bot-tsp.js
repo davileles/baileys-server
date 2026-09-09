@@ -517,7 +517,7 @@ function tecladoCard(id) {
     [['🚀 Enviar agora', 'r:enviar:' + id]],
     [['💲 Preço por', 'r:preco:' + id], ['🔖 Preço de', 'r:precode:' + id]],
     [['✏️ Título', 'r:titulo:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
-    [['🔝 Topo', 'r:topo:' + id]],
+    [['🔝 Topo', 'r:topo:' + id], ['⚠️ Importante', 'r:importante:' + id]],
     [['🔄 Atualizar', 'r:ver:' + id], ['🗑️ Descartar', 'r:descartar:' + id]],
     [['📋 Voltar à fila', 'r:fila:0']],
   ]);
@@ -689,7 +689,7 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'), ctx);
   }
 
-  if (acao === 'preco' || acao === 'precode' || acao === 'titulo' || acao === 'topo') {
+  if (acao === 'preco' || acao === 'precode' || acao === 'titulo' || acao === 'topo' || acao === 'importante') {
     const s = abrir(chatId, 'revisao');
     s.passo = acao; s.ofertaId = id; s.msgId = msgId;
     // O valor atual vai junto da pergunta: sem ele o operador digita no escuro
@@ -700,9 +700,13 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
       : acao === 'precode'
         ? 'Digite o PREÇO DE — o valor cheio, que sai riscado.\nHoje: ' + (brlCurto(d.precoDe) || 'sem preço de') + '\n(só o número, ex: 249,90)'
       : acao === 'titulo' ? 'Digite o novo TÍTULO do produto.'
+      : acao === 'importante'
+        ? 'Digite o texto da linha *IMPORTANTE*.\nHoje: ' + ((d.importante || '').trim() || 'vazia (a linha não sai)')
+          + '\n(é escrita por você — não é calculada)'
                           : 'Digite a MENSAGEM DE TOPO (a chamada que abre a oferta).';
     const linhas = [];
     if (acao === 'topo')    linhas.push([['Sem topo', 'r:semtopo:' + id]]);
+    if (acao === 'importante') linhas.push([['Sem importante', 'r:semimport:' + id]]);
     if (acao === 'precode') linhas.push([['Sem preço de', 'r:sempde:' + id]]);
     linhas.push([['⬅️ Voltar', 'r:ver:' + id]]);
     return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + pergunta, teclado(linhas), msgId);
@@ -711,6 +715,11 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
   if (acao === 'semtopo') {
     sessoes.delete(String(chatId));
     return aplicarAjuste(chatId, msgId, id, { gatilho: '' });
+  }
+
+  if (acao === 'semimport') {
+    sessoes.delete(String(chatId));
+    return aplicarAjuste(chatId, msgId, id, { importante: '' });
   }
 
   if (acao === 'sempde') {
@@ -822,6 +831,7 @@ async function tratarTexto(chatId, texto, msgEntrada) {
       ov = { precoDe: v };
     } else if (s.passo === 'titulo') ov = { titulo: t };
     else if (s.passo === 'topo')     ov = { gatilho: t };
+    else if (s.passo === 'importante') ov = { importante: t };
     if (!ov) return;
     const { ofertaId, msgId } = s;
     sessoes.delete(String(chatId));

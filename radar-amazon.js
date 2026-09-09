@@ -2293,8 +2293,6 @@ function templatePadrao() {
     '',
     'De: ~R$ {{preco_de}}~',
     'Por: R$ {{preco}}',
-    '{{avista_str}}',
-    '{{parcelas_str}}',
     '',
     '\uD83C\uDFAB *CUPOM* {{cupom}}',
     '\u26A0\uFE0F *IMPORTANTE* {{alerta}}',
@@ -2588,13 +2586,11 @@ export function varsDoProduto(p, cupom) {
     ? Math.round((1 - precoFinal / riscado) * 100)
     : p.desconto;
 
-  const alertas = [];
-  if (descTotal >= 40) alertas.push(descTotal + '% de desconto');
-  if (p.dealTermina) {
-    alertas.push('Oferta relâmpago, termina em ' + new Date(p.dealTermina).toLocaleString('pt-BR', {
-      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
-    }));
-  }
+  // A linha IMPORTANTE e MANUAL. Ate aqui ela era calculada ("44% de desconto",
+  // "Oferta relampago, termina em ..."), o que repetia numero que a mensagem ja
+  // mostra e enchia a linha de aviso automatico. Agora so entra o que o operador
+  // digitar; vazio faz a linha inteira sumir pela regra de omissao do
+  // renderTemplate. 'p.importante' e a unica fonte.
 
   return {
     titulo: p.titulo || '',
@@ -2634,7 +2630,8 @@ export function varsDoProduto(p, cupom) {
           : (cupom.codigo || cupom.reg?.codigo || ''))
       : '',
     cupom_desconto: cupom ? brl(cupom.desconto) : '',
-    alerta: alertas.join('. '),
+    alerta: String(p.importante || '').trim(),
+    importante: String(p.importante || '').trim(),
     link: p.link || '',
     loja: p.loja || '',
     loja_upper: (p.loja || '').toUpperCase(),
@@ -2660,7 +2657,8 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
   { chave:'cupom',         desc:'Código do cupom (vazio quando não há)' },
   { chave:'cupom_desconto',desc:'Valor do desconto do cupom, em R$' },
-  { chave:'alerta',        desc:'Aviso de desconto alto ou oferta relâmpago' },
+  { chave:'alerta',        desc:'Linha IMPORTANTE — texto que VOCÊ digita; vazio some da mensagem' },
+  { chave:'importante',    desc:'Mesmo conteúdo de {{alerta}}, com nome mais claro' },
   { chave:'link',          desc:'Link do produto com a sua tag de afiliado' },
   { chave:'loja',          desc:'Nome da loja' },
   { chave:'loja_upper',    desc:'Nome da loja em maiúsculas' },

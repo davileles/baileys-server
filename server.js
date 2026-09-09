@@ -14880,6 +14880,7 @@ app.post('/mkt/montar', async (req, res) => {
     }
   }
 
+  if (typeof req.body?.importante === 'string') p.importante = req.body.importante.trim();
   const vars = varsDoProduto(p, cupom);
   vars.vendas       = p.vendas || '';
   vars.codigo_busca = p.codigoBusca || '';
@@ -14936,6 +14937,9 @@ function produtoDaOfertaFila(o) {
     asin: d.asin || null, codigoBusca: d.codigoBusca || null, vendas: d.vendas || '',
     dealTermina: d.dealTermina || null,
     precoDeReferencia: !!d.precoDeReferencia,
+    // Linha IMPORTANTE, digitada pelo operador. Nao ha calculo por tras: se
+    // estiver vazia, o template omite a linha inteira.
+    importante: d.importante || '',
     // O ref de rastreio do ML sai da CATEGORIA; sem ela a remontagem trocaria a
     // etiqueta do produto e o coletor de comissoes perderia o casamento.
     categoria: d.categoria || null,
@@ -15020,6 +15024,9 @@ function remontarOfertaFila(oferta, ov = {}) {
       ? Math.round((1 - p.preco / p.precoDe) * 100) : 0;
   }
   if (tem('titulo')) p.titulo = String(ov.titulo || '').trim();
+  // Texto da linha IMPORTANTE. String vazia LIMPA (a linha some); omitir a
+  // chave preserva o que ja estava.
+  if (tem('importante')) p.importante = String(ov.importante || '').trim();
 
   let cupom = null, aviso = null;
   if (tem('cupom')) {
@@ -15060,6 +15067,7 @@ function remontarOfertaFila(oferta, ov = {}) {
   oferta.precoFinalManual = precoEhFinal;
   const d = oferta.dadosExtraidos || (oferta.dadosExtraidos = {});
   d.titulo   = p.titulo;
+  d.importante = p.importante || '';
   d.preco    = p.preco;
   d.precoDe  = p.precoDe ?? null;
   d.desconto = p.desconto;
@@ -15099,6 +15107,7 @@ function resumoOfertaFila(o) {
       preco: d.preco ?? null, precoDe: d.precoDe ?? null,
       desconto: d.desconto ?? null, precoFinal: d.precoFinal ?? null,
       cupom: d.cupom || null, precoDeReferencia: !!d.precoDeReferencia,
+      importante: d.importante || '',
     },
   };
 }
@@ -15178,6 +15187,7 @@ app.post('/mkt/remontar/:id', (req, res) => {
   if (typeof b.titulo  === 'string') ov.titulo  = b.titulo;
   if (typeof b.cupom   === 'string') ov.cupom   = b.cupom;
   if (typeof b.gatilho === 'string') ov.gatilho = b.gatilho;
+  if (typeof b.importante === 'string') ov.importante = b.importante;
   if (!Object.keys(ov).length) return res.status(400).json({ ok:false, erro:'nada para ajustar' });
 
   try {
