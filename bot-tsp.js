@@ -239,6 +239,11 @@ async function montarOfertaPorLink(link, cupom) {
 // preco atual — filtrar por criterio escondia do operador cupom que existe na
 // base, e ele so descobria abrindo o painel. Quem nao se aplica vem marcado no
 // proprio rotulo; a escolha continua sendo sempre dele.
+// Telegram aguenta teclado grande, mas 50+ botoes viram rolagem sem fim no
+// celular. O corte fica em 30 e o que sobra continua alcancavel pelo passo
+// "Digitar codigo" — nenhum cupom da base fica inacessivel por causa do limite.
+const MAX_BOTOES_CUPOM = 30;
+
 function valorCupomTxt(c) {
   return c.tipo === 'pct' ? (c.valor + '%') : ('R$ ' + c.valor);
 }
@@ -264,11 +269,20 @@ function linhasDeCupons(cupons, escolhido, prefixo) {
   return emLinhas(cupons.map(c => [rotuloCupomBotao(c, escolhido), prefixo + c.codigo]), porLinha);
 }
 
-function resumoCupons(cupons) {
+// Recebe a lista COMPLETA da loja e quantos viraram botao: contar so os
+// exibidos dizia "20 cupons ativos" quando havia 52 na base, e o operador
+// concluia que o cupom que ele procurava nao tinha sido capturado.
+function resumoCupons(cupons, mostrados) {
   if (!cupons.length) return 'Nenhum cupom ativo na base para esta loja.';
-  const abatem = cupons.filter(c => c.aplicavel !== false).length;
+  const abatem  = cupons.filter(c => c.aplicavel !== false).length;
+  const exibidos = mostrados == null ? cupons.length : mostrados;
+  const ocultos = cupons.length - exibidos;
   return 'Cupons ativos na base para esta loja: *' + cupons.length + '*'
-    + ' — ' + abatem + ' abate(m) este preço.';
+    + ' — ' + abatem + ' abate(m) este preço.'
+    + (ocultos > 0
+        ? '\nBotões: os *' + exibidos + '* de maior desconto. Os outros *' + ocultos
+          + '* estão na base e entram por *🔎 Digitar código*.'
+        : '');
 }
 
 async function previewOferta(chatId, s, editar) {
@@ -286,15 +300,20 @@ async function previewOferta(chatId, s, editar) {
   // Todos os cupons ativos da loja viram botao — os que nao abatem este preco
   // inclusive, marcados no rotulo. O cupom nunca entra sozinho: quem escolhe e
   // o operador, e ele pode trocar ou tirar a qualquer momento.
-  const daBase = (r.cuponsBase || r.cupons || []).slice(0, 20);
+  const todos  = r.cuponsBase || r.cupons || [];
+  const daBase = todos.slice(0, MAX_BOTOES_CUPOM);
   const linhas = daBase.length ? linhasDeCupons(daBase, d.codigoCupom, 'o:cupom:') : [];
-  if (daBase.length && d.codigoCupom) linhas.push([['🚫 Sem cupom', 'o:cupom:']]);
+  // Digitar codigo sempre disponivel: alcanca o cupom que ficou fora do corte e
+  // tambem o que o operador viu na loja e ainda nao foi capturado.
+  const extras = [['🔎 Digitar código', 'o:cupom:__digitar']];
+  if (d.codigoCupom) extras.push(['🚫 Sem cupom', 'o:cupom:']);
+  linhas.push(extras);
   linhas.push([['🚀 Enviar agora', 'a:enviar'], ['❌ Cancelar', 'a:cancelar']]);
 
   const aviso = r.avisoCupom ? `\n\n⚠️ _${r.avisoCupom}_` : '';
   return falar(chatId,
     '*Prévia da oferta* 👇\n\n- - - - - - - - - -\n' + r.mensagem + '\n- - - - - - - - - -' + aviso
-    + '\n\n' + resumoCupons(daBase),
+    + '\n\n' + resumoCupons(todos, daBase.length),
     teclado(linhas), editar);
 }
 
@@ -890,6 +909,18 @@ async function tratarTexto(chatId, texto, msgEntrada) {
       await falar(chatId, '⏳ Lendo o produto...');
       return previewOferta(chatId, s);
     }
+    // Codigo na mao: a validacao fica no /mkt/montar, que ja devolve avisoCupom
+    // para codigo fora da base, vencido ou que nao abate este preco. A previa
+    // mostra o aviso e o operador decide — mesma regra dos botoes.
+    if (s.passo === 'cupomcodigo') {
+      const cod = t.trim().toUpperCase().replace(/\s+/g, '');
+      if (!/^[A-Z0-9._-]{2,40}$/.test(cod)) {
+        return falar(chatId, 'Código inválido. Mande só o código, sem espaços (ex: `MELIMAISPOSDD`).');
+      }
+      s.dados.codigoCupom = cod;
+      await falar(chatId, '⏳ Remontando a oferta...');
+      return previewOferta(chatId, s);
+    }
   }
 
   if (s.fluxo === 'cupom') {
@@ -952,7 +983,16 @@ async function tratarBotao(chatId, msgId, data, ctx) {
 
   if (!s) return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
 
-  if (ns === 'o' && chave === 'cupom') { s.dados.codigoCupom = valor; return previewOferta(chatId, s, msgId); }
+  if (ns === 'o' && chave === 'cupom') {
+    if (valor === '__digitar') {
+      s.passo = 'cupomcodigo';
+      return falar(chatId,
+        'Digite o *código do cupom*.\n\nVale qualquer cupom vigente da base desta loja — inclusive os que não couberam nos botões.',
+        teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
+    }
+    s.dados.codigoCupom = valor;
+    return previewOferta(chatId, s, msgId);
+  }
 
   if (ns === 'c') {
     const d = s.dados;
