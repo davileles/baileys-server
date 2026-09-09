@@ -16855,6 +16855,14 @@ bootBotTsp({
   PORT,
   formatarCupomTSP,
   enfileirarCupomTSP,
+  // "So cadastrar na base" do bot: grava o cupom e tenta ativa-lo na conta da
+  // loja, sem fila, sem envio e sem registrarCupomVisto() — nada aqui pode
+  // consumir o gate de duplicata, que serve ao disparo, nao ao cadastro.
+  cadastrarCupomBase: (c) => {
+    const reg = registrarCupomBase(c);
+    try { ativarCupomCapturadoMl(c, reg); } catch (e) { console.warn('[CUPONS] Ativacao no ML falhou:', e.message); }
+    return reg;
+  },
   enviarCupomParaGrupos,
   enviarMensagem,
   radarDestinos,

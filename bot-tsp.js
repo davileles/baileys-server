@@ -106,7 +106,7 @@ function num(v) {
 // ── FLUXO CUPOM ──────────────────────────────────────────────────────────────
 const LOJAS = ['Amazon', 'Mercado Livre', 'Shopee', 'Magazine Luiza', 'Zé Delivery'];
 
-const PASSOS_CUPOM = ['loja', 'codigo', 'tipo', 'valor', 'minimo', 'limite', 'maximo', 'gatilho', 'preview'];
+const PASSOS_CUPOM = ['loja', 'codigo', 'tipo', 'valor', 'minimo', 'limite', 'maximo', 'restrito', 'gatilho', 'preview'];
 
 function proximoPassoCupom(s) {
   const i = PASSOS_CUPOM.indexOf(s.passo);
@@ -167,6 +167,16 @@ async function pedirPassoCupom(chatId, s, editar) {
         [['❌ Cancelar', 'a:cancelar']],
       ]), editar);
 
+    case 'restrito':
+      // Cupom restrito nao pode entrar em oferta generica: o desconto anunciado
+      // nao existiria no checkout do produto errado. O operador precisa dizer —
+      // inferir pelo texto e exatamente o que da errado no radar.
+      return falar(chatId, 'Esse cupom vale em *qualquer produto* da loja ou só numa *seleção específica*?', teclado([
+        [['🛒 Qualquer produto', 'c:restrito:__nao']],
+        [['🎯 Só produtos específicos', 'c:restrito:__sim']],
+        [['❌ Cancelar', 'a:cancelar']],
+      ]), editar);
+
     case 'gatilho':
       return falar(chatId, 'Quer um *gatilho* no topo da mensagem?', teclado([
         [['Sem gatilho', 'c:gatilho:__vazio'], ['✏️ Digitar', 'c:gatilho:__digitar']],
@@ -190,6 +200,7 @@ function dadosCupom(s) {
     codigo:  d.codigo || '',
     gatilho: d.gatilho || '',
     minimoDesconhecido: !!d.minimoDesconhecido,
+    restrito: d.restrito === true,
   };
 }
 
@@ -199,10 +210,14 @@ async function previewCupom(chatId, s, editar) {
   try { msg = dep.formatarCupomTSP(dadosCupom(s)); }
   catch (e) { return falar(chatId, '⚠️ Erro ao montar a mensagem: ' + e.message, null, editar); }
   s.dados.mensagem = msg;
+  const selo = s.dados.restrito === true
+    ? '\n\n🎯 _Marcado como só produtos específicos: fica na base, mas fora da escolha automática, do combo “Cupons ativos” e do site público._'
+    : '';
   return falar(chatId,
-    '*Prévia da mensagem* 👇\n\n- - - - - - - - - -\n' + msg + '\n- - - - - - - - - -',
+    '*Prévia da mensagem* 👇\n\n- - - - - - - - - -\n' + msg + '\n- - - - - - - - - -' + selo,
     teclado([
       [['🚀 Enviar agora', 'a:enviar'], ['📋 Mandar pra fila', 'a:fila']],
+      [['🗂 Só cadastrar na base', 'a:base']],
       [['🔁 Refazer', 'a:refazer'], ['❌ Cancelar', 'a:cancelar']],
     ]), editar);
 }
@@ -271,6 +286,25 @@ async function confirmarEnvio(chatId, s, acao, editar) {
 
   if (s.fluxo === 'cupom') {
     const c = dadosCupom(s);
+
+    // "So cadastrar" nao passa pelo dedup nem marca o cupom como visto. O gate
+    // de duplicata existe para impedir DISPARO repetido; aqui nao ha disparo, e
+    // marcar como visto silenciaria uma captura futura do mesmo codigo num
+    // grupo monitorado — o cupom ficaria na base sem nunca ter sido publicado.
+    if (acao === 'base') {
+      let reg;
+      try { reg = await dep.cadastrarCupomBase(c); }
+      catch (e) { return falar(chatId, '⚠️ Erro ao gravar na base: ' + e.message, null, editar); }
+      sessoes.delete(String(chatId));
+      return falar(chatId,
+        '🗂 Cupom *' + (reg?.codigo || c.codigo || 'sem código') + '* gravado na base — '
+        + 'não foi enviado e não entrou na fila.\n\n'
+        + 'Loja: *' + c.loja + '*\n'
+        + 'Vale até: ' + (reg?.validadeAte ? new Date(reg.validadeAte).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) : '24h')
+        + (c.restrito ? '\n🎯 Só produtos específicos — não entra em oferta automática.' : ''),
+        null, editar);
+    }
+
     const ctx = { origem: 'bot-telegram', textoOriginal: '[criado no bot]', somenteFila: true };
     let r;
     try { r = await dep.enfileirarCupomTSP(c, ctx); }
@@ -858,7 +892,7 @@ async function tratarBotao(chatId, msgId, data, ctx) {
       s.passo = s.fluxo === 'oferta' ? 'link' : 'texto';
       return falar(chatId, 'Manda de novo.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
     }
-    if (chave === 'enviar' || chave === 'fila') return confirmarEnvio(chatId, s, chave, msgId);
+    if (chave === 'enviar' || chave === 'fila' || chave === 'base') return confirmarEnvio(chatId, s, chave, msgId);
     if (chave === 'forcar') {
       const res = await dep.enviarCupomParaGrupos(s.dados.mensagem, null);
       sessoes.delete(String(chatId));
@@ -892,6 +926,8 @@ async function tratarBotao(chatId, msgId, data, ctx) {
       case 'maximo':
         if (valor === '__digitar') { s.passo = 'maximo'; return falar(chatId, 'Digite o *preço máximo do produto* em reais.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId); }
         d.maximo = null; break;
+      case 'restrito':
+        d.restrito = valor === '__sim'; break;
       case 'gatilho':
         if (valor === '__digitar') { s.passo = 'gatilho'; return falar(chatId, 'Digite o *gatilho*.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId); }
         d.gatilho = ''; break;
