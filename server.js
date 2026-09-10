@@ -1577,7 +1577,11 @@ function estadoConta(id) {
 
 function contaDisponivel(id) {
   const c = contasExtras.get(id);
-  return !!(c && c.conectado && c.sock);
+  if (c && c.conectado && c.sock) return true;
+  // Conta no motor whatsmeow: o envio sai pelo wa-envio mesmo com o Baileys
+  // dela fora do ar (ver MOTOR DE ENVIO WHATSMEOW).
+  const ap = apelidoDaConta(id);
+  return !!(c && tenantDaConta(id) === TENANT_PADRAO && WA_ENVIO_CONTAS.has(ap) && waEnvioContaConectada(ap));
 }
 
 // Uma conta deslogada pelo WhatsApp (401) fica com creds.json marcado como
@@ -1634,6 +1638,15 @@ async function conectarConta(id) {
     });
     c.sock = s;
     s.ev.on('creds.update', saveCreds);
+    // Telemetria de "Aguardando mensagem" nos grupos desta conta. SO CONTA:
+    // a autocura segue exclusiva da principal (ver o handler de leitura abaixo).
+    if (tenantDaConta(id) === TENANT_PADRAO) {
+      try {
+        if (typeof s.ws?.on === 'function') {
+          s.ws.on('CB:receipt,type:retry', (node) => registrarRetryTelemetria(apelidoDaConta(id), node));
+        }
+      } catch (e) {}
+    }
     s.ev.on('connection.update', async (u) => {
       if (u.qr) c.qr = await QRCode.toDataURL(u.qr);
       if (u.connection === 'open') {
@@ -1687,6 +1700,177 @@ async function conectarConta(id) {
   return c;
 }
 
+// ── MOTOR DE ENVIO WHATSMEOW (wa-envio) ──────────────────────────────────────
+// "Aguardando mensagem" nos grupos: o Baileys so manda a sender key para os
+// aparelhos que o sender-key-memory-<grupo> diz que ainda nao a tem. Quando
+// essa memoria diverge (membro trocou de aparelho, entrou pelo distribuidor,
+// LID x telefone), o aparelho dele recebe mensagem cifrada com chave que nunca
+// recebeu. O whatsmeow nao tem essa memoria: redistribui a chave a todos os
+// aparelhos em TODA mensagem de grupo.
+//
+// O servico wa-envio (pasta wa-envio/ deste repo) e SO transporte. Tudo o que
+// vem antes — portao, trilhas, rodape, tag por grupo, marca d'agua, outbox —
+// continua aqui. So entram no motor: conta listada em WA_ENVIO_CONTAS, destino
+// grupo (@g.us), operacao padrao, e conteudo texto / texto+card / imagem.
+// Qualquer outra coisa segue pelo Baileys, byte a byte como antes.
+//
+// Fallback: falha ANTES do envio (wa-envio fora, conta desconectada, upload)
+// cai no Baileys do MESMO numero. Falha ambigua (timeout, erro depois de o no
+// sair) NAO cai em lugar nenhum: sobe para o chamador e vai para a outbox —
+// reenviar na hora por outro caminho duplicaria a oferta no grupo.
+const WA_ENVIO_URL    = String(process.env.WA_ENVIO_URL || '').trim().replace(/\/+$/, '');
+const WA_ENVIO_TOKEN  = String(process.env.WA_ENVIO_TOKEN || '').trim();
+const _listaEnvWm     = (v) => String(v || '').split(',').map(s => s.trim()).filter(Boolean);
+const WA_ENVIO_CONTAS = new Set(_listaEnvWm(process.env.WA_ENVIO_CONTAS).map(s => s.toLowerCase()));
+const WA_ENVIO_GRUPOS = new Set(_listaEnvWm(process.env.WA_ENVIO_GRUPOS));   // vazio = todos os grupos da conta
+const WA_ENVIO_TIMEOUT_MS = 115000;   // primeiro envio num grupo grande abre sessao com todos os aparelhos
+const _waEnvio = { em: 0, contas: {}, erro: null };
+
+async function atualizarEstadoWaEnvio() {
+  if (!WA_ENVIO_URL) return;
+  try {
+    const r = await fetch(WA_ENVIO_URL + '/health', { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    const contas = {};
+    for (const c of (d.contas || [])) contas[String(c.id)] = !!c.conectado;
+    _waEnvio.contas = contas; _waEnvio.erro = null;
+  } catch (e) {
+    if (_waEnvio.erro !== e.message) console.warn('[WA-ENVIO] /health indisponivel: ' + e.message);
+    _waEnvio.contas = {}; _waEnvio.erro = e.message;
+  }
+  _waEnvio.em = Date.now();
+}
+if (WA_ENVIO_URL && WA_ENVIO_TOKEN && WA_ENVIO_CONTAS.size) {
+  console.log('[WA-ENVIO] Motor whatsmeow ativo para: ' + [...WA_ENVIO_CONTAS].join(', ')
+    + (WA_ENVIO_GRUPOS.size ? ' — restrito a ' + WA_ENVIO_GRUPOS.size + ' grupo(s).' : ' — todos os grupos dessas contas.'));
+  atualizarEstadoWaEnvio();
+  const _tWm = setInterval(atualizarEstadoWaEnvio, 30000);
+  if (typeof _tWm.unref === 'function') _tWm.unref();
+}
+
+function waEnvioContaConectada(apelido) {
+  return Date.now() - _waEnvio.em < 90000 && _waEnvio.contas[String(apelido || '').toLowerCase()] === true;
+}
+
+function usaWhatsmeow(apelido, destino) {
+  if (!WA_ENVIO_URL || !WA_ENVIO_TOKEN) return false;
+  if (!WA_ENVIO_CONTAS.has(String(apelido || '').toLowerCase())) return false;
+  const jid = String(destino || '');
+  if (!jid.endsWith('@g.us')) return false;
+  if (WA_ENVIO_GRUPOS.size && !WA_ENVIO_GRUPOS.has(jid)) return false;
+  return (tenantContexto() || TENANT_PADRAO) === TENANT_PADRAO;
+}
+
+// Traduz o conteudo do Baileys para o contrato do wa-envio. null = formato que o
+// motor nao cobre (documento, audio, mencoes, contextInfo...) -> fica no Baileys.
+function conteudoParaWhatsmeow(conteudo) {
+  if (!conteudo || typeof conteudo !== 'object') return null;
+  const permitidas = new Set(['text', 'linkPreview', 'image', 'caption', 'mimetype']);
+  const chaves = Object.keys(conteudo).filter(k => conteudo[k] !== undefined && conteudo[k] !== null);
+  if (chaves.some(k => !permitidas.has(k))) return null;
+  if (conteudo.image !== undefined && conteudo.image !== null) {
+    if (!Buffer.isBuffer(conteudo.image)) return null;   // imagem por URL/stream: Baileys
+    return {
+      texto: String(conteudo.caption || ''),
+      imagem: { base64: conteudo.image.toString('base64'), mime: conteudo.mimetype || 'image/jpeg' },
+    };
+  }
+  if (typeof conteudo.text !== 'string' || !conteudo.text) return null;
+  const out = { texto: conteudo.text };
+  const lp = conteudo.linkPreview;
+  if (lp && typeof lp === 'object') {
+    const url = lp['matched-text'] || lp['canonical-url'];
+    if (url) {
+      out.linkPreview = {
+        url, titulo: lp.title || '', descricao: lp.description || '',
+        thumbBase64: Buffer.isBuffer(lp.jpegThumbnail) ? lp.jpegThumbnail.toString('base64') : '',
+      };
+    }
+  }
+  return out;
+}
+
+async function enviarPeloWhatsmeow(apelido, destino, payload) {
+  let r;
+  try {
+    r = await fetch(WA_ENVIO_URL + '/contas/' + encodeURIComponent(apelido) + '/enviar', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + WA_ENVIO_TOKEN },
+      body: JSON.stringify({ jid: destino, ...payload }),
+      signal: AbortSignal.timeout(WA_ENVIO_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const expirou = e?.name === 'TimeoutError' || e?.name === 'AbortError';
+    const err = new Error('wa-envio: ' + (expirou ? 'timed out' : (e?.message || String(e))));
+    if (expirou) err.semFallback = true;   // o pedido chegou: pode ter saido
+    throw err;
+  }
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  if (r.ok && d.ok) {
+    return { key: { remoteJid: destino, fromMe: true, id: d.id }, messageTimestamp: d.timestamp, motor: 'whatsmeow' };
+  }
+  const err = new Error('wa-envio [' + (d.fase || ('HTTP ' + r.status)) + ']: ' + (d.erro || 'falha sem detalhe'));
+  err.fase = d.fase || null;
+  // Sem fase conhecida, trata como ambiguo: melhor outbox do que oferta dobrada.
+  if (!d.fase || d.fase === 'envio') err.semFallback = true;
+  throw err;
+}
+
+// ── TELEMETRIA DE ENTREGA EM GRUPOS ──────────────────────────────────────────
+// Retry receipt vindo de grupo = o aparelho de um membro nao decifrou a nossa
+// mensagem ("Aguardando mensagem"). Ocorrencia = primeiro pedido (count 1) de um
+// aparelho; os pedidos seguintes da mesma mensagem so somam em retries. Conta
+// por NUMERO de envio e por motor, por dia de SP, persistido em health.json
+// (14 dias) — e a regua para comparar Baileys x whatsmeow. Os retries das
+// mensagens enviadas pelo whatsmeow chegam ao aparelho dele: contados no
+// proprio wa-envio (/metricas) e somados em /entrega/grupos.
+function _entregaDoDia() {
+  const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: TZ_SP });
+  let e = _health.entregaGrupos;
+  if (!e || e.data !== hoje) {
+    if (e && e.data) {
+      const hist = Array.isArray(_health.entregaGruposHist) ? _health.entregaGruposHist : [];
+      hist.push(e);
+      _health.entregaGruposHist = hist.slice(-14);
+    }
+    e = _health.entregaGrupos = { data: hoje, contas: {} };
+  }
+  return e;
+}
+function _entregaConta(apelido) {
+  const e = _entregaDoDia();
+  if (!e.contas[apelido]) e.contas[apelido] = { envios: { baileys: 0, whatsmeow: 0 }, ocorrencias: 0, retries: 0, grupos: {} };
+  return e.contas[apelido];
+}
+function _entregaGrupo(c, jid) {
+  if (!c.grupos[jid]) c.grupos[jid] = { b: 0, w: 0, oc: 0 };
+  return c.grupos[jid];
+}
+function registrarEnvioTelemetria(apelido, destino, motor) {
+  try {
+    if (!String(destino || '').endsWith('@g.us')) return;
+    if ((tenantContexto() || TENANT_PADRAO) !== TENANT_PADRAO) return;
+    const c = _entregaConta(String(apelido || 'principal'));
+    c.envios[motor] = (c.envios[motor] || 0) + 1;
+    const g = _entregaGrupo(c, destino);
+    if (motor === 'whatsmeow') g.w++; else g.b++;
+    _salvarHealth();
+  } catch (e) {}
+}
+function registrarRetryTelemetria(apelido, node) {
+  try {
+    const de = String(node?.attrs?.from || '');
+    if (!de.endsWith('@g.us')) return;
+    const filho = Array.isArray(node?.content) ? node.content.find(n => n && n.tag === 'retry') : null;
+    const tentativa = Number(filho?.attrs?.count || 1);
+    const c = _entregaConta(String(apelido || 'principal'));
+    c.retries++;
+    if (tentativa <= 1) { c.ocorrencias++; _entregaGrupo(c, de).oc++; }
+    _salvarHealth();
+  } catch (e) {}
+}
+
 // ── TETO DE TEMPO NO ENVIO (evita worker pendurado) ─────────────────────────
 // sock.sendMessage pode ficar pendurado indefinidamente num socket zumbi que
 // nao rejeitou a promessa (TCP meio-aberto sem close limpo). Isso trava o
@@ -1709,9 +1893,27 @@ function _enviarComTeto(promessaEnvio) {
 }
 
 async function enviarPelaConta(id, destino, conteudo) {
+  const apelidoEnvio = apelidoDaConta(id);
+  const contaPadrao = tenantDaConta(id) === TENANT_PADRAO;
+  if (contaPadrao && usaWhatsmeow(apelidoEnvio, destino)) {
+    const payload = conteudoParaWhatsmeow(conteudo);
+    if (payload && waEnvioContaConectada(apelidoEnvio)) {
+      try {
+        const rw = await enviarPeloWhatsmeow(apelidoEnvio, destino, payload);
+        const cw = contasExtras.get(id);
+        if (cw) cw.ultimoEnvio = new Date().toISOString();
+        registrarEnvioTelemetria(apelidoEnvio, destino, 'whatsmeow');
+        return rw;
+      } catch (e) {
+        if (e.semFallback) throw e;
+        console.warn('[WA-ENVIO] ' + apelidoEnvio + ' falhou antes de enviar (' + e.message + ') — indo pelo Baileys do mesmo numero.');
+      }
+    }
+  }
   const c = contasExtras.get(id);
   if (!c?.conectado || !c.sock) throw new Error('conta ' + id + ' nao conectada');
   const r = await _enviarComTeto(c.sock.sendMessage(destino, conteudo));
+  if (contaPadrao) registrarEnvioTelemetria(apelidoEnvio, destino, 'baileys');
   try {
     if (r?.key?.id && r?.message) {
       c.enviadas.set(r.key.id, r.message);
@@ -1764,11 +1966,32 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
         return _r;
       }
       catch (e) {
+        // Falha ambigua do wa-envio: a oferta pode ter saido. Cair na principal
+        // agora dobraria a mensagem no grupo — sobe para a outbox.
+        if (e.semFallback) {
+          const cf = contasExtras.get(contaId); if (cf) cf.ultimoErro = e.message;
+          throw e;
+        }
         console.warn('[WA] Envio pela conta ' + contaId + ' falhou (' + e.message + ') — indo pela principal.');
         const c = contasExtras.get(contaId); if (c) c.ultimoErro = e.message;
       }
     } else {
       console.warn('[WA] Conta ' + contaId + ' indisponivel — enviando pela principal.');
+    }
+  }
+
+  if (usaWhatsmeow('principal', destino)) {
+    const payload = conteudoParaWhatsmeow(conteudo);
+    if (payload && waEnvioContaConectada('principal')) {
+      try {
+        const rw = await enviarPeloWhatsmeow('principal', destino, payload);
+        registrarPublicacaoHealth(destino);
+        registrarEnvioTelemetria('principal', destino, 'whatsmeow');
+        return rw;
+      } catch (e) {
+        if (e.semFallback) throw e;
+        console.warn('[WA-ENVIO] principal falhou antes de enviar (' + e.message + ') — indo pelo Baileys.');
+      }
     }
   }
 
@@ -1780,6 +2003,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
     const resultado = await _enviarComTeto(sock.sendMessage(destino, conteudo));
     guardarMensagemEnviada(resultado);
     registrarPublicacaoHealth(destino);
+    registrarEnvioTelemetria('principal', destino, 'baileys');
     return resultado;
   } catch (err) {
     const retryable = err.message?.includes('Connection Closed') ||
@@ -9149,7 +9373,7 @@ async function conectar() {
     // rastro nenhum no log — todo sendMessage tera retornado sucesso.
     try {
       if (typeof novaSock.ws?.on === 'function') {
-        novaSock.ws.on('CB:receipt,type:retry', (node) => registrarRetryReceipt(node));
+        novaSock.ws.on('CB:receipt,type:retry', (node) => { registrarRetryTelemetria('principal', node); registrarRetryReceipt(node); });
       }
     } catch (e) { console.warn('[ENTREGA] Nao foi possivel escutar retry receipts:', e.message); }
     sock.ev.on('connection.update', async (update) => {
@@ -10740,6 +10964,59 @@ app.get('/debug-fila', (req, res) => {
     res.json({ total: dados.length, itens: dados });
   } catch(e) {
     res.json({ erro: e.message });
+  }
+});
+
+// ── ENTREGA EM GRUPOS ("Aguardando mensagem") ────────────────────────────────
+// Ocorrencias de retry por 1000 envios, por numero e por motor, nos ultimos
+// ?dias= (1-14). Baileys vem do health.json; whatsmeow, do /metricas do wa-envio.
+app.get('/entrega/grupos', async (req, res) => {
+  try {
+    const dias = Math.min(14, Math.max(1, parseInt(req.query.dias, 10) || 7));
+    const hoje = _entregaDoDia();
+    const historico = [...(Array.isArray(_health.entregaGruposHist) ? _health.entregaGruposHist : []), hoje].slice(-dias);
+    let wm = null, erroWhatsmeow = null;
+    if (WA_ENVIO_URL && WA_ENVIO_TOKEN) {
+      try {
+        const r = await fetch(WA_ENVIO_URL + '/metricas', {
+          headers: { 'Authorization': 'Bearer ' + WA_ENVIO_TOKEN }, signal: AbortSignal.timeout(5000),
+        });
+        wm = (await r.json()).dias || {};
+      } catch (e) { erroWhatsmeow = e.message; }
+    }
+    const porMil = (oc, env) => env > 0 ? Math.round((oc / env) * 10000) / 10 : null;
+    const nome = (jid) => NOMES_GRUPOS.get(jid) || null;
+    const resumo = historico.map(dia => {
+      const contas = {};
+      const apelidos = new Set([...Object.keys(dia.contas || {}), ...Object.keys((wm && wm[dia.data]) || {})]);
+      for (const ap of apelidos) {
+        const b = (dia.contas || {})[ap] || null;
+        const w = (wm && wm[dia.data] && wm[dia.data][ap]) || null;
+        const envB = b ? (b.envios.baileys || 0) : 0;
+        contas[ap] = {
+          baileys: b ? { envios: envB, ocorrencias: b.ocorrencias, retries: b.retries, porMilEnvios: porMil(b.ocorrencias, envB) } : null,
+          whatsmeow: w ? { envios: w.envios, ocorrencias: w.ocorrencias, retries: w.retries, falhas: w.falhas, porMilEnvios: porMil(w.ocorrencias, w.envios) } : null,
+          gruposBaileys: b ? Object.entries(b.grupos || {}).filter(([, g]) => g.oc > 0)
+            .sort((x, y) => y[1].oc - x[1].oc).slice(0, 8)
+            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.oc, envios: g.b })) : [],
+          gruposWhatsmeow: w ? Object.entries(w.grupos || {}).filter(([, g]) => g.ocorrencias > 0)
+            .sort((x, y) => y[1].ocorrencias - x[1].ocorrencias).slice(0, 8)
+            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.ocorrencias, envios: g.envios })) : [],
+        };
+      }
+      return { data: dia.data, contas };
+    });
+    res.json({
+      ok: true,
+      motor: {
+        configurado: !!(WA_ENVIO_URL && WA_ENVIO_TOKEN), contas: [...WA_ENVIO_CONTAS],
+        grupos: WA_ENVIO_GRUPOS.size ? [...WA_ENVIO_GRUPOS] : 'todos', conectadas: _waEnvio.contas, erro: _waEnvio.erro,
+      },
+      erroWhatsmeow,
+      dias: resumo.reverse(),
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
   }
 });
 

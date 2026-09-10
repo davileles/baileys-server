@@ -139,7 +139,12 @@
         "const CAMPANHAS_KEY",
         "function rotaDeRoteamento",
         "function saidaSerializada",
-        "saidaSerializada(() => enviarMensagem(item.destino"
+        "saidaSerializada(() => enviarMensagem(item.destino",
+        "app.get('/entrega/grupos'",
+        "function enviarPeloWhatsmeow",
+        "function conteudoParaWhatsmeow",
+        "function registrarRetryTelemetria",
+        "function registrarEnvioTelemetria"
       ]
     },
     "radar-awin.js": {
