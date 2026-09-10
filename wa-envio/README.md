@@ -10,10 +10,18 @@ que chama este serviço pela rede interna do Railway quando a conta está em `WA
 
 ## Railway
 
-- Serviço novo neste repositório, **Root Directory** `wa-envio`, config file `/wa-envio/railway.json`.
+Serviço `wa-envio` neste repositório, configurado **pelo painel** (Config as Code não vale para serviços novos):
+
+- **Root Directory** `wa-envio` — o `Dockerfile` é detectado sozinho.
+- **Watch Paths** `/wa-envio/**`.
 - **Volume** montado em `/data` (sessões `<conta>.db` + `metricas.json`).
-- Variáveis: `WA_ENVIO_TOKEN` (obrigatória), `WA_LOG_NIVEL` (padrão `WARN`).
-- `overlapSeconds: 0`: duas instâncias na mesma sessão derrubam uma à outra.
+- **Variáveis**:
+  - `WA_ENVIO_TOKEN` (obrigatória), `PORT=8080`, `WA_LOG_NIVEL` (padrão `WARN`)
+  - `RAILWAY_DEPLOYMENT_OVERLAP_SECONDS=0` — duas instâncias na mesma sessão derrubam uma à outra
+  - `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15`
+
+No `baileys-server`: `WA_ENVIO_URL=http://wa-envio.railway.internal:8080`, `WA_ENVIO_TOKEN=${{wa-envio.WA_ENVIO_TOKEN}}`,
+`WA_ENVIO_CONTAS` (liga o motor por conta) e `WA_ENVIO_GRUPOS` (opcional, restringe a grupos).
 
 ## Rotas
 
@@ -28,10 +36,12 @@ que chama este serviço pela rede interna do Railway quando a conta está em `WA
 | POST | `/contas/{id}/logout` | sim | desloga e apaga a sessão |
 | POST | `/contas/{id}/enviar` | sim | `{jid, texto, linkPreview?, imagem?}` |
 | GET | `/contas/{id}/grupos` | sim | grupos, participantes, só-admins, sou admin |
-| GET | `/metricas` | sim | envios e retries por conta/grupo/dia (30 dias) |
+| GET | `/metricas` | sim | envios, retries por hora/grupo/dia, tentativas e eventos de conexão (30 dias) |
 
 Erro de envio devolve `fase`: `validacao`, `conexao`, `preparo`, `upload` (nada saiu, pode
 tentar por outro caminho) ou `envio` (ambíguo: não reenviar por outro número).
 
 Pareamento: cada número vira um **dispositivo vinculado novo** ("Tica Envio"). A sessão do
-Baileys não é convertível. Limite do WhatsApp: 4 dispositivos por número.
+Baileys não é convertível. Limite do WhatsApp: 4 dispositivos por número. O código deve ser
+pedido com o número **como aparece no celular**; celular brasileiro sem o nono dígito
+(`553190110150`) é corrigido sozinho para `5531990110150`.

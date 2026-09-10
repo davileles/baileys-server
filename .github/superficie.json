@@ -144,7 +144,8 @@
         "function enviarPeloWhatsmeow",
         "function conteudoParaWhatsmeow",
         "function registrarRetryTelemetria",
-        "function registrarEnvioTelemetria"
+        "function registrarEnvioTelemetria",
+        "function registrarEventoEntrega"
       ]
     },
     "radar-awin.js": {

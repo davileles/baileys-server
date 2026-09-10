@@ -1841,8 +1841,36 @@ function _entregaDoDia() {
 function _entregaConta(apelido) {
   const e = _entregaDoDia();
   if (!e.contas[apelido]) e.contas[apelido] = { envios: { baileys: 0, whatsmeow: 0 }, ocorrencias: 0, retries: 0, grupos: {} };
-  return e.contas[apelido];
+  const c = e.contas[apelido];
+  // Registros gravados antes da contagem por hora nao tem estes campos.
+  if (!c.horas) c.horas = {};
+  if (!c.tentativas) c.tentativas = {};
+  return c;
 }
+const _fmtHoraSP = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', hourCycle: 'h23' });
+const _fmtHoraMinSP = new Intl.DateTimeFormat('en-GB', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+function _entregaHora(c) {
+  const h = _fmtHoraSP.format(new Date());
+  if (!c.horas[h]) c.horas[h] = { b: 0, w: 0, oc: 0, rt: 0 };
+  return c.horas[h];
+}
+// Eventos que podem disparar uma ONDA de "Aguardando mensagem": boot do
+// processo, abertura/queda do socket da principal e autocura de sender key.
+// Com eles na mesma regua das horas, da para ver o que veio antes de cada onda.
+function registrarEventoEntrega(tipo, detalhe) {
+  try {
+    const e = _entregaDoDia();
+    if (!Array.isArray(e.eventos)) e.eventos = [];
+    const agora = new Date();
+    e.eventos.push({ em: agora.toISOString(), hora: _fmtHoraMinSP.format(agora), tipo, detalhe: detalhe || undefined });
+    if (e.eventos.length > 300) e.eventos = e.eventos.slice(-300);
+    _healthGravadoEm = 0;   // evento e raro: grava na hora
+    _salvarHealth();
+  } catch (e) {}
+}
+// Amostra BRUTA dos ultimos retries (so memoria): confere se o count do no
+// esta sendo lido — hoje ocorrencias sempre sai igual a retries no Baileys.
+const _amostrasRetry = [];
 function _entregaGrupo(c, jid) {
   if (!c.grupos[jid]) c.grupos[jid] = { b: 0, w: 0, oc: 0 };
   return c.grupos[jid];
@@ -1854,7 +1882,8 @@ function registrarEnvioTelemetria(apelido, destino, motor) {
     const c = _entregaConta(String(apelido || 'principal'));
     c.envios[motor] = (c.envios[motor] || 0) + 1;
     const g = _entregaGrupo(c, destino);
-    if (motor === 'whatsmeow') g.w++; else g.b++;
+    const h = _entregaHora(c);
+    if (motor === 'whatsmeow') { g.w++; h.w++; } else { g.b++; h.b++; }
     _salvarHealth();
   } catch (e) {}
 }
@@ -1863,10 +1892,31 @@ function registrarRetryTelemetria(apelido, node) {
     const de = String(node?.attrs?.from || '');
     if (!de.endsWith('@g.us')) return;
     const filho = Array.isArray(node?.content) ? node.content.find(n => n && n.tag === 'retry') : null;
-    const tentativa = Number(filho?.attrs?.count || 1);
+    const bruto = filho?.attrs?.count;
+    const tentativa = Number(bruto || 1);
     const c = _entregaConta(String(apelido || 'principal'));
-    c.retries++;
-    if (tentativa <= 1) { c.ocorrencias++; _entregaGrupo(c, de).oc++; }
+    const h = _entregaHora(c);
+    // '?' = no sem filho 'retry' legivel: se dominar, a leitura do count esta errada.
+    const chaveT = filho ? String(bruto ?? 'sem-count') : '?';
+    c.tentativas[chaveT] = (c.tentativas[chaveT] || 0) + 1;
+    c.retries++; h.rt++;
+    if (tentativa <= 1) {
+      c.ocorrencias++; h.oc++;
+      const g = _entregaGrupo(c, de);
+      g.oc++;
+      if (!g.h) g.h = {};
+      const hh = _fmtHoraSP.format(new Date());
+      g.h[hh] = (g.h[hh] || 0) + 1;
+    }
+    try {
+      _amostrasRetry.push({
+        em: new Date().toISOString(), conta: apelido, attrs: node?.attrs || null,
+        filhos: Array.isArray(node?.content)
+          ? node.content.map(n => ({ tag: n?.tag, attrs: n?.attrs || null }))
+          : (node?.content === undefined ? 'sem-content' : typeof node.content),
+      });
+      if (_amostrasRetry.length > 8) _amostrasRetry.shift();
+    } catch (e) {}
     _salvarHealth();
   } catch (e) {}
 }
@@ -8537,6 +8587,7 @@ async function curarSenderKeyGrupo(grupoJid) {
     const nome = ('sender-key-memory-' + grupoJid + '.json').replace(/\//g, '__').replace(/:/g, '-');
     await unlink(SESSAO_DIR + '/' + nome).catch(() => {});
     console.warn('[ENTREGA] sender-key-memory de ' + grupoJid + ' apagado — próximo envio redistribui a sender key a todos.');
+    registrarEventoEntrega('autocura-sender-key', (NOMES_GRUPOS.get(grupoJid) || grupoJid));
   } catch (e) { console.error('[ENTREGA] Falha ao curar sender key de ' + grupoJid + ':', e.message); }
 }
 
@@ -9401,6 +9452,7 @@ async function conectar() {
         }
         resetarHealthTimer();
         console.log('[WA] ✓ WhatsApp conectado!');
+        registrarEventoEntrega('principal-conectou');
         // Aquece o cache de nomes: a fila mostra de qual grupo veio cada oferta.
         atualizarNomesGrupos().catch(()=>{});
         // Pos-renovacao de identidade: sobe o bundle novo (registration +
@@ -9448,6 +9500,7 @@ async function conectar() {
         if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log('[WA] Conexão fechada. Código:', codigo);
+        registrarEventoEntrega('principal-caiu', 'codigo ' + codigo);
         if (codigo === DisconnectReason.loggedOut) {
           // ── LOGOUT (401) ────────────────────────────────────────────────
           // Ate 22/08/2026 este ramo era so um console.log, e por isso o
@@ -10994,17 +11047,17 @@ app.get('/entrega/grupos', async (req, res) => {
         const w = (wm && wm[dia.data] && wm[dia.data][ap]) || null;
         const envB = b ? (b.envios.baileys || 0) : 0;
         contas[ap] = {
-          baileys: b ? { envios: envB, ocorrencias: b.ocorrencias, retries: b.retries, porMilEnvios: porMil(b.ocorrencias, envB) } : null,
-          whatsmeow: w ? { envios: w.envios, ocorrencias: w.ocorrencias, retries: w.retries, falhas: w.falhas, porMilEnvios: porMil(w.ocorrencias, w.envios) } : null,
+          baileys: b ? { envios: envB, ocorrencias: b.ocorrencias, retries: b.retries, porMilEnvios: porMil(b.ocorrencias, envB), tentativas: b.tentativas || {}, horas: b.horas || {} } : null,
+          whatsmeow: w ? { envios: w.envios, ocorrencias: w.ocorrencias, retries: w.retries, falhas: w.falhas, porMilEnvios: porMil(w.ocorrencias, w.envios), tentativas: w.tentativas || {}, horas: w.horas || {}, eventos: w.eventos || [] } : null,
           gruposBaileys: b ? Object.entries(b.grupos || {}).filter(([, g]) => g.oc > 0)
             .sort((x, y) => y[1].oc - x[1].oc).slice(0, 8)
-            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.oc, envios: g.b })) : [],
+            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.oc, envios: g.b, horas: g.h || {} })) : [],
           gruposWhatsmeow: w ? Object.entries(w.grupos || {}).filter(([, g]) => g.ocorrencias > 0)
             .sort((x, y) => y[1].ocorrencias - x[1].ocorrencias).slice(0, 8)
-            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.ocorrencias, envios: g.envios })) : [],
+            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.ocorrencias, envios: g.envios, horas: g.horas || {} })) : [],
         };
       }
-      return { data: dia.data, contas };
+      return { data: dia.data, eventos: dia.eventos || [], contas };
     });
     res.json({
       ok: true,
@@ -11013,6 +11066,7 @@ app.get('/entrega/grupos', async (req, res) => {
         grupos: WA_ENVIO_GRUPOS.size ? [...WA_ENVIO_GRUPOS] : 'todos', conectadas: _waEnvio.contas, erro: _waEnvio.erro,
       },
       erroWhatsmeow,
+      amostrasRetry: String(req.query.amostra || '') === '1' ? _amostrasRetry : undefined,
       dias: resumo.reverse(),
     });
   } catch (e) {
@@ -17387,6 +17441,7 @@ iniciarAgendaActions({ onAlerta: registrarAlerta });
 // Conecta ao WhatsApp imediatamente no startup.
 // Garante que mensagens dos grupos monitorados não sejam perdidas após deploy.
 console.log("[SERVER] Iniciando conexão com WhatsApp...");
+registrarEventoEntrega('boot');
 conectar();
 
 // Retoma as contas secundarias que ja foram pareadas alguma vez. O atraso deixa

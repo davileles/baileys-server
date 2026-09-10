@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -141,6 +142,7 @@ func (c *Conta) abrir(ctx context.Context) error {
 func (c *Conta) onEvento(evt any) {
 	switch e := evt.(type) {
 	case *events.Connected:
+		registrarEvento(c.ID, "conectou", "")
 		c.mu.Lock()
 		c.conectadoEm, c.qr, c.pareando, c.ultimoErro = time.Now(), "", false, ""
 		c.mu.Unlock()
@@ -149,16 +151,19 @@ func (c *Conta) onEvento(evt any) {
 		log.Printf("[CONTA:%s] pareada como %s", c.ID, e.ID)
 	case *events.LoggedOut:
 		log.Printf("[CONTA:%s] DESLOGADA (%v) — precisa parear de novo", c.ID, e.Reason)
+		registrarEvento(c.ID, "logout", fmt.Sprint(e.Reason))
 		go c.descartar("deslogada — pareie de novo")
 	case *events.StreamReplaced:
 		// Outra instancia abriu a mesma sessao (deploy com overlap). Sem
 		// overlapSeconds=0 no railway.json isto vira loop.
 		log.Printf("[CONTA:%s] stream substituido por outra instancia", c.ID)
+		registrarEvento(c.ID, "stream-substituido", "")
 		c.mu.Lock()
 		c.ultimoErro = "sessao aberta em outra instancia"
 		c.mu.Unlock()
 	case *events.Disconnected:
 		log.Printf("[CONTA:%s] desconectada (auto-reconexao ativa)", c.ID)
+		registrarEvento(c.ID, "desconectou", "")
 	}
 }
 
@@ -377,6 +382,22 @@ func montarMensagem(ctx context.Context, cli *whatsmeow.Client, p pedidoEnvio) (
 	return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String(p.Texto)}}, nil
 }
 
+// comNonoDigito: o pareamento por codigo confere o numero COMO APARECE NO
+// CELULAR. Contas antigas de celular brasileiro sao guardadas pelo WhatsApp sem
+// o 9 (553190110150), e pedir o codigo nesse formato falha com "confira se voce
+// inseriu o numero correto". Celular BR = 55 + DDD (sem zero) + 8 digitos
+// comecando em 6-9; fixo (2-5) fica como veio.
+func comNonoDigito(n string) (string, bool) {
+	if len(n) != 12 || !strings.HasPrefix(n, "55") {
+		return n, false
+	}
+	ddd, local := n[2:4], n[4:]
+	if ddd[0] == '0' || ddd[1] == '0' || !strings.ContainsRune("6789", rune(local[0])) {
+		return n, false
+	}
+	return "55" + ddd + "9" + local, true
+}
+
 func decodificarOpcional(s string) []byte {
 	if s == "" {
 		return nil
@@ -444,9 +465,24 @@ func gerarMiniatura(dados []byte) []byte {
 // de um aparelho para uma mensagem; retries conta todos os pedidos.
 
 type metGrupo struct {
+	Envios      int            `json:"envios"`
+	Ocorrencias int            `json:"ocorrencias"`
+	Retries     int            `json:"retries"`
+	Horas       map[string]int `json:"horas,omitempty"` // ocorrencias por hora SP ("00".."23")
+}
+
+type metHora struct {
 	Envios      int `json:"envios"`
+	Falhas      int `json:"falhas"`
 	Ocorrencias int `json:"ocorrencias"`
 	Retries     int `json:"retries"`
+}
+
+type evento struct {
+	Em      string `json:"em"`
+	Hora    string `json:"hora"`
+	Tipo    string `json:"tipo"`
+	Detalhe string `json:"detalhe,omitempty"`
 }
 
 type metConta struct {
@@ -456,6 +492,11 @@ type metConta struct {
 	Retries     int                  `json:"retries"`
 	RetriesDM   int                  `json:"retriesDM"`
 	Grupos      map[string]*metGrupo `json:"grupos"`
+	// Por hora, para enxergar ONDAS de "Aguardando mensagem" e cruzar com
+	// eventos (reconexao, deploy). Tentativas: distribuicao do count do retry.
+	Horas      map[string]*metHora `json:"horas"`
+	Tentativas map[string]int      `json:"tentativas"`
+	Eventos    []evento            `json:"eventos"`
 }
 
 var (
@@ -464,7 +505,8 @@ var (
 	metSujo  bool
 )
 
-func diaSP() string { return time.Now().In(tzSP).Format("2006-01-02") }
+func diaSP() string  { return time.Now().In(tzSP).Format("2006-01-02") }
+func horaSP() string { return time.Now().In(tzSP).Format("15") }
 
 func metDe(contaID string) *metConta {
 	d := diaSP()
@@ -473,11 +515,42 @@ func metDe(contaID string) *metConta {
 	}
 	m := metricas[d][contaID]
 	if m == nil {
-		m = &metConta{Grupos: map[string]*metGrupo{}}
+		m = &metConta{}
 		metricas[d][contaID] = m
+	}
+	// Metricas gravadas antes destes campos existirem voltam com mapas nil.
+	if m.Grupos == nil {
+		m.Grupos = map[string]*metGrupo{}
+	}
+	if m.Horas == nil {
+		m.Horas = map[string]*metHora{}
+	}
+	if m.Tentativas == nil {
+		m.Tentativas = map[string]int{}
 	}
 	metSujo = true
 	return m
+}
+
+func horaDe(m *metConta) *metHora {
+	h := horaSP()
+	x := m.Horas[h]
+	if x == nil {
+		x = &metHora{}
+		m.Horas[h] = x
+	}
+	return x
+}
+
+func registrarEvento(contaID, tipo, detalhe string) {
+	metMu.Lock()
+	defer metMu.Unlock()
+	m := metDe(contaID)
+	agora := time.Now()
+	m.Eventos = append(m.Eventos, evento{Em: agora.UTC().Format(time.RFC3339), Hora: agora.In(tzSP).Format("15:04"), Tipo: tipo, Detalhe: detalhe})
+	if len(m.Eventos) > 200 {
+		m.Eventos = m.Eventos[len(m.Eventos)-200:]
+	}
 }
 
 func grupoDe(m *metConta, jid string) *metGrupo {
@@ -493,11 +566,14 @@ func registrarEnvio(contaID, jid string, ok bool) {
 	metMu.Lock()
 	defer metMu.Unlock()
 	m := metDe(contaID)
+	h := horaDe(m)
 	if !ok {
 		m.Falhas++
+		h.Falhas++
 		return
 	}
 	m.Envios++
+	h.Envios++
 	if strings.HasSuffix(jid, "@g.us") {
 		grupoDe(m, jid).Envios++
 	}
@@ -512,11 +588,19 @@ func registrarRetry(contaID string, r *events.Receipt, tentativa int) {
 		return
 	}
 	g := grupoDe(m, r.Chat.String())
+	h := horaDe(m)
+	m.Tentativas[strconv.Itoa(tentativa)]++
 	m.Retries++
 	g.Retries++
+	h.Retries++
 	if tentativa <= 1 {
 		m.Ocorrencias++
 		g.Ocorrencias++
+		h.Ocorrencias++
+		if g.Horas == nil {
+			g.Horas = map[string]int{}
+		}
+		g.Horas[horaSP()]++
 	}
 }
 
@@ -652,6 +736,10 @@ func rotas() *http.ServeMux {
 			responder(w, 400, map[string]any{"ok": false, "erro": "numero com DDI e DDD, so digitos"})
 			return
 		}
+		if n, mudou := comNonoDigito(numero); mudou {
+			log.Printf("[CONTA:%s] pareamento: %s sem o nono digito — usando %s", c.ID, numero, n)
+			numero = n
+		}
 		if err := c.conectar(r.Context()); err != nil {
 			responder(w, 500, map[string]any{"ok": false, "erro": err.Error()})
 			return
@@ -678,7 +766,7 @@ func rotas() *http.ServeMux {
 			responder(w, 500, map[string]any{"ok": false, "erro": err.Error()})
 			return
 		}
-		responder(w, 200, map[string]any{"ok": true, "codigo": codigo})
+		responder(w, 200, map[string]any{"ok": true, "codigo": codigo, "numero": numero})
 	}))
 
 	mux.HandleFunc("POST /contas/{id}/logout", autenticado(func(w http.ResponseWriter, r *http.Request) {
@@ -803,7 +891,7 @@ function h(){return{'Authorization':'Bearer '+document.getElementById('tk').valu
 function c(){return encodeURIComponent(document.getElementById('conta').value.trim().toLowerCase())}
 async function parear(){var s=document.getElementById('saida');s.textContent='gerando…';
  var r=await fetch('/contas/'+c()+'/pair',{method:'POST',headers:h(),body:JSON.stringify({numero:document.getElementById('num').value})});
- var d=await r.json();s.textContent=d.ok?d.codigo:('erro: '+d.erro)}
+ var d=await r.json();s.textContent=d.ok?(d.codigo+'\n'+'('+d.numero+')'):('erro: '+d.erro)}
 async function estado(){var r=await fetch('/contas/'+c(),{headers:h()});var d=await r.json();
  document.getElementById('saida').textContent=d.ok?JSON.stringify(d.conta,null,1):('erro: '+d.erro)}
 </script></html>`
@@ -841,6 +929,7 @@ func main() {
 			continue
 		}
 		if pareada {
+			registrarEvento(id, "boot", "")
 			log.Printf("[CONTA:%s] retomando sessao", id)
 			if err := c.conectar(context.Background()); err != nil {
 				log.Printf("[CONTA:%s] falha ao conectar: %v", id, err)
