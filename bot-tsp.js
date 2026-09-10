@@ -225,13 +225,44 @@ async function previewCupom(chatId, s, editar) {
 // ── FLUXO OFERTA ─────────────────────────────────────────────────────────────
 // Um link basta: o pipeline do radar le preco, titulo e imagem, e o template da
 // loja monta a mensagem — a mesma das ofertas automaticas.
-async function montarOfertaPorLink(link, cupom) {
+async function montarOfertaPorLink(link, cupom, importante) {
   const r = await fetch(`http://127.0.0.1:${dep.PORT}/mkt/montar`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ link, cupom: cupom || '' }),
+    body: JSON.stringify({ link, cupom: cupom || '', importante: importante || '' }),
   });
   return r.json();
+}
+
+// ── LINHA IMPORTANTE: TEXTOS PRONTOS ─────────────────────────────────────────
+// Frases que se repetem entre ofertas viram botao no passo IMPORTANTE — tanto
+// no card da fila quanto na criacao por link. Digitar texto livre continua
+// valendo; o botao so poupa a digitacao do que e recorrente.
+// O botao carrega o INDICE, nao o texto: callback_data do Telegram aceita so
+// 64 bytes. Por isso frase nova entra no FIM da lista — reordenar faria um
+// teclado ja aberto aplicar a frase vizinha.
+const IMPORTANTES_PRONTOS = [
+  { rotulo: '🔁 Recorrência',       texto: 'Compre na recorrência para manter este valor.' },
+  { rotulo: '📦 Programe e Poupe',  texto: 'Utilize o Programe e Poupe para chegar neste valor.' },
+  { rotulo: '2️⃣ Adicione 2 itens',  texto: 'Adicione 2 itens para chegar neste valor.' },
+  { rotulo: '3️⃣ Adicione 3 itens',  texto: 'Adicione 3 itens para chegar neste valor.' },
+];
+
+// Rotulo curto no botao (o Telegram corta sem aviso) e o texto inteiro listado
+// na pergunta, para o operador saber exatamente o que vai ao ar. O que ja esta
+// na oferta vem marcado.
+function linhasImportantesProntos(atual, prefixo) {
+  const cur = String(atual || '').trim();
+  const linhas = [];
+  for (let i = 0; i < IMPORTANTES_PRONTOS.length; i += 2) {
+    linhas.push(IMPORTANTES_PRONTOS.slice(i, i + 2).map((it, j) =>
+      [(it.texto === cur ? '✅ ' : '') + it.rotulo, prefixo + (i + j)]));
+  }
+  return linhas;
+}
+
+function listaImportantesProntos() {
+  return IMPORTANTES_PRONTOS.map(it => it.rotulo + ' — ' + it.texto).join('\n');
 }
 
 // ── CUPONS DA BASE NOS BOTOES ────────────────────────────────────────────────
@@ -295,7 +326,7 @@ function resumoCupons(cupons, mostrados) {
 async function previewOferta(chatId, s, editar) {
   s.passo = 'preview';
   const d = s.dados;
-  const r = await montarOfertaPorLink(d.link, d.codigoCupom);
+  const r = await montarOfertaPorLink(d.link, d.codigoCupom, d.importante);
   if (!r.ok) {
     s.passo = 'link';
     return falar(chatId, '⚠️ Não consegui ler esse produto:\n`' + (r.erro || 'erro desconhecido') + '`\n\nMande outro link.',
@@ -315,6 +346,7 @@ async function previewOferta(chatId, s, editar) {
   const extras = [['🔎 Digitar código', 'o:cupom:__digitar']];
   if (d.codigoCupom) extras.push(['🚫 Sem cupom', 'o:cupom:']);
   linhas.push(extras);
+  linhas.push([['⚠️ Importante' + (d.importante ? ' ✏️' : ''), 'o:imp:__menu']]);
   linhas.push([['🚀 Enviar agora', 'a:enviar'], ['❌ Cancelar', 'a:cancelar']]);
 
   const aviso = r.avisoCupom ? `\n\n⚠️ _${r.avisoCupom}_` : '';
@@ -766,12 +798,15 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
         ? 'Digite o PREÇO DE — o valor cheio, que sai riscado.\nHoje: ' + (brlCurto(d.precoDe) || 'sem preço de') + '\n(só o número, ex: 249,90)'
       : acao === 'titulo' ? 'Digite o novo TÍTULO do produto.'
       : acao === 'importante'
-        ? 'Digite o texto da linha *IMPORTANTE*.\nHoje: ' + ((d.importante || '').trim() || 'vazia (a linha não sai)')
-          + '\n(é escrita por você — não é calculada)'
+        ? 'Toque num texto pronto ou digite o texto da linha IMPORTANTE.\nHoje: ' + ((d.importante || '').trim() || 'vazia (a linha não sai)')
+          + '\n\nProntos:\n' + listaImportantesProntos()
                           : 'Digite a MENSAGEM DE TOPO (a chamada que abre a oferta).';
     const linhas = [];
     if (acao === 'topo')    linhas.push([['Sem topo', 'r:semtopo:' + id]]);
-    if (acao === 'importante') linhas.push([['Sem importante', 'r:semimport:' + id]]);
+    if (acao === 'importante') {
+      linhas.push(...linhasImportantesProntos(d.importante, 'r:impp:' + id + ':'));
+      linhas.push([['Sem importante', 'r:semimport:' + id]]);
+    }
     if (acao === 'precode') linhas.push([['Sem preço de', 'r:sempde:' + id]]);
     linhas.push([['⬅️ Voltar', 'r:ver:' + id]]);
     return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + pergunta, teclado(linhas), msgId);
@@ -785,6 +820,13 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
   if (acao === 'semimport') {
     sessoes.delete(String(chatId));
     return aplicarAjuste(chatId, msgId, id, { importante: '' });
+  }
+
+  if (acao === 'impp') {
+    const pronto = IMPORTANTES_PRONTOS[Number(partes[3])];
+    if (!pronto) return falarPlano(chatId, corpoCard(o, '⚠️ Texto pronto não encontrado — digite ou escolha de novo.'), tecladoCard(id), msgId);
+    sessoes.delete(String(chatId));
+    return aplicarAjuste(chatId, msgId, id, { importante: pronto.texto });
   }
 
   if (acao === 'sempde') {
@@ -944,6 +986,11 @@ async function tratarTexto(chatId, texto, msgEntrada) {
     // Codigo na mao: a validacao fica no /mkt/montar, que ja devolve avisoCupom
     // para codigo fora da base, vencido ou que nao abate este preco. A previa
     // mostra o aviso e o operador decide — mesma regra dos botoes.
+    if (s.passo === 'importante') {
+      s.dados.importante = t;
+      await falar(chatId, '⏳ Remontando a oferta...');
+      return previewOferta(chatId, s);
+    }
     if (s.passo === 'cupomcodigo') {
       const cod = t.trim().toUpperCase().replace(/\s+/g, '');
       if (!/^[A-Z0-9._-]{2,40}$/.test(cod)) {
@@ -1014,6 +1061,29 @@ async function tratarBotao(chatId, msgId, data, ctx) {
   }
 
   if (!s) return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
+
+  if (ns === 'o' && chave === 'imp') {
+    const d = s.dados;
+    if (valor === '__menu') {
+      s.passo = 'importante';
+      const linhas = linhasImportantesProntos(d.importante, 'o:imp:');
+      if (d.importante) linhas.push([['Sem importante', 'o:imp:__sem']]);
+      linhas.push([['⬅️ Voltar', 'o:imp:__voltar']]);
+      // Sem parse_mode: o texto atual foi digitado a mao e pode ter * ou _.
+      return falarPlano(chatId,
+        'Toque num texto pronto ou digite o texto da linha IMPORTANTE.\nHoje: '
+        + ((d.importante || '').trim() || 'vazia (a linha não sai)')
+        + '\n\nProntos:\n' + listaImportantesProntos(),
+        teclado(linhas), msgId);
+    }
+    if (valor === '__sem') d.importante = '';
+    else if (valor !== '__voltar') {
+      const pronto = IMPORTANTES_PRONTOS[Number(valor)];
+      if (!pronto) return falar(chatId, 'Texto pronto não encontrado.', null, msgId);
+      d.importante = pronto.texto;
+    }
+    return previewOferta(chatId, s, msgId);
+  }
 
   if (ns === 'o' && chave === 'cupom') {
     if (valor === '__digitar') {
