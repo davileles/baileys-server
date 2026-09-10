@@ -714,21 +714,26 @@ function cabecalhoCard(o) {
 const LIMITE_PREVIA   = 2200;
 const LIMITE_ORIGINAL = 800;
 
-// Bloco recolhido: o Telegram mostra as primeiras linhas e abre com um toque.
-// O corte e feito no texto CRU, antes de escapar, para nunca partir uma
-// entidade (&amp;) ao meio.
-function blocoRecolhido(rotulo, texto, limite) {
-  const t = String(texto || '').trim();
+// Bloco de citacao SEMPRE aberto: o conteudo aparece inteiro, sem toque para
+// expandir. A barra lateral do blockquote ja separa visualmente a mensagem do
+// cabecalho. O corte e feito no texto CRU, antes de escapar, para nunca partir
+// uma entidade (&amp;) ao meio.
+// `compacto` tira as linhas em branco: serve ao post original, que e so
+// referencia e costuma vir cheio de espacamento do vendedor. A previa do
+// WhatsApp mantem os espacos, porque e assim que ela sai no grupo.
+function blocoCitacao(rotulo, texto, limite, compacto) {
+  let t = String(texto || '').trim();
+  if (compacto) t = t.split('\n').filter(l => l.trim()).join('\n');
   if (!t) return '';
   const corte = t.length > limite ? t.slice(0, limite) + '\n[...]' : t;
-  return '<blockquote expandable><b>' + rotulo + '</b>\n' + formatacaoParaHtml(esc(corte)) + '</blockquote>';
+  return '<b>' + rotulo + '</b>\n<blockquote>' + formatacaoParaHtml(esc(corte)) + '</blockquote>';
 }
 
 function corpoCard(o, extra) {
   const origem = o.grupoOrigemNome ? ' · ' + esc(o.grupoOrigemNome) : '';
   return cabecalhoCard(o)
-    + '\n\n' + blocoRecolhido('📱 Como sai no WhatsApp', o.mensagemFormatada, LIMITE_PREVIA)
-    + (o.conteudoOriginal ? '\n' + blocoRecolhido('📥 Post original' + origem, o.conteudoOriginal, LIMITE_ORIGINAL) : '')
+    + '\n\n' + blocoCitacao('📱 Como sai no WhatsApp', o.mensagemFormatada, LIMITE_PREVIA, false)
+    + (o.conteudoOriginal ? '\n\n' + blocoCitacao('📥 Post original' + origem, o.conteudoOriginal, LIMITE_ORIGINAL, true) : '')
     + (extra ? '\n\n<b>' + esc(extra) + '</b>' : '');
 }
 
