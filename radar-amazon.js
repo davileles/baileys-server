@@ -405,17 +405,31 @@ export function destinosDaOferta({ fonte, categoria, categoriaConfiavel } = {}) 
   return [...new Set(alvos)];
 }
 
-/** Diagnostico para o log: quais trilhas entregaram e quais recusaram. */
-export function explicarRoteamento({ fonte, categoria, categoriaConfiavel } = {}) {
+/**
+ * Roteamento trilha a trilha, estruturado. Base do log (explicarRoteamento) e
+ * do card de revisao do bot: os dois leem a MESMA regra (trilhaEntrega), entao
+ * o card nunca diz "vai para Bebidas" quando o despacho mandaria para outro
+ * lugar. So lista as trilhas candidatas — as que tem a fonte da oferta, ou as
+ * gerais quando a oferta nao tem fonte conhecida.
+ * @returns {Array<{id:string,nome:string,categoria:string|null,entrega:boolean,porFonte:boolean,destinos:number}>}
+ */
+export function detalharRoteamento({ fonte, categoria, categoriaConfiavel } = {}) {
   const cat = String(categoria || '').trim();
   const f = String(fonte || '').trim();
   const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
-  if (!candidatas.length) return 'nenhuma trilha tem esta fonte';
   return candidatas.map(t => {
     const entrega = trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel });
-    const porFonte = entrega && t.categoria && !(categoriaConfiavel && t.categoria === cat);
-    return t.nome + (entrega ? (porFonte ? ' ✓(fonte)' : ' ✓') : ' ✗');
-  }).join(', ');
+    // Entregou sem a categoria confirmada bater: foi a fonte dedicada que abriu.
+    const porFonte = !!(entrega && t.categoria && !(categoriaConfiavel && t.categoria === cat));
+    return { id: t.id, nome: t.nome, categoria: t.categoria || null, entrega, porFonte, destinos: t.destinos.length };
+  });
+}
+
+/** Diagnostico para o log: quais trilhas entregaram e quais recusaram. */
+export function explicarRoteamento(rota = {}) {
+  const det = detalharRoteamento(rota);
+  if (!det.length) return 'nenhuma trilha tem esta fonte';
+  return det.map(t => t.nome + (t.entrega ? (t.porFonte ? ' ✓(fonte)' : ' ✓') : ' ✗')).join(', ');
 }
 
 // ── RODAPE EXTRA POR NICHO (convite cruzado) ──────────────────────────────

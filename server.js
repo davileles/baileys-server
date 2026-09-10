@@ -22,7 +22,7 @@ import QRCode from 'qrcode';
 import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
-  trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento,
+  trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento, detalharRoteamento,
   ehDestinoDeNicho,
   comRodapeExtra, rodapeExtraParaGrupo,
   comTagDoGrupo, previewComTagDoGrupo,
@@ -3941,6 +3941,44 @@ function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
     'oferta #' + (oferta?.id || '?'));
 }
 
+// Entrada unica do roteamento por trilha. O despacho e o card de revisao do bot
+// montam a rota por aqui: se cada um lesse os campos por conta propria, o card
+// poderia anunciar uma trilha e o envio seguir outra.
+function rotaDeRoteamento(oferta) {
+  return {
+    fonte: oferta?.grupoOrigem || null,
+    categoria: oferta?.dadosExtraidos?.categoria || null,
+    categoriaConfiavel: categoriaConfiavel({
+      categoria: oferta?.dadosExtraidos?.categoria || null,
+      confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0,
+    }),
+  };
+}
+
+// Retrato do roteamento para o card do Telegram: quais trilhas entregam, quais
+// ficaram de fora e quantos grupos recebem de fato (grupo so-cupons sai da
+// conta, como no despacho). Falha aqui nunca derruba o card — sem rota, o bot
+// so omite o bloco.
+function resumoRotaOferta(o) {
+  try {
+    const r = rotaDeRoteamento(o);
+    const d = o?.dadosExtraidos || {};
+    const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
+    return {
+      fonte: r.fonte,
+      categoria: r.categoria,
+      categoriaNome: d.categoriaNome || r.categoria || null,
+      confianca: typeof d.categoriaConfianca === 'number' ? d.categoriaConfianca : null,
+      confiavel: !!r.categoriaConfiavel,
+      grupos: destinosDaOferta(r).filter(j => !soCupons.has(j)).length,
+      trilhas: detalharRoteamento(r),
+    };
+  } catch (e) {
+    console.warn('[MKT] Rota da oferta #' + (o?.id || '?') + ' indisponivel para o card: ' + e.message);
+    return null;
+  }
+}
+
 async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   // Sem fallback: oferta vai para os grupos marcados como DESTINO na aba
   // Grupos, e para mais nenhum. Se nao ha destino marcado, o envio falha com
@@ -3950,14 +3988,7 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   // fonte dela. Trilha geral entrega tudo o que capturou; trilha de nicho so
   // entrega quando o classificador confirmou a categoria — sem isso, o grupo de
   // bebidas receberia "produto que talvez seja bebida".
-  const _rota = {
-    fonte: oferta?.grupoOrigem || null,
-    categoria: oferta?.dadosExtraidos?.categoria || null,
-    categoriaConfiavel: categoriaConfiavel({
-      categoria: oferta?.dadosExtraidos?.categoria || null,
-      confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0,
-    }),
-  };
+  const _rota = rotaDeRoteamento(oferta);
   let alvos = destinosDaOferta(_rota);
   console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' roteamento: ' + explicarRoteamento(_rota)
     + ' -> ' + alvos.length + ' grupo(s).');
@@ -15232,6 +15263,9 @@ function resumoOfertaFila(o) {
     // julgar se a nossa versao traduziu o post direito.
     conteudoOriginal: o.conteudoOriginal || null,
     ajustes: o.ajustes || null, gatilhoTopo: o.gatilhoTopo || null,
+    timestamp: o.timestamp || null,
+    // Trilhas que entregam / recusam esta oferta, pela mesma regra do despacho.
+    rota: resumoRotaOferta(o),
     motivoFila: o.motivoFila || null,
     falhaAutoEnvio: o.falhaAutoEnvio || null,
     revisaoDeEdicao: !!o.revisaoDeEdicao,
@@ -15282,6 +15316,9 @@ app.get('/mkt/fila', (req, res) => {
       // Um unico sinal para o rotulo do botao: o motivo detalhado esta no card.
       aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.precoDivergente || d.precoDeReferencia),
       timestamp: o.timestamp || null,
+      // Nichos que recebem a oferta: o botao da lista mostra de relance quando o
+      // item sai num grupo nichado alem do geral.
+      nichos: (resumoRotaOferta(o)?.trilhas || []).filter(t => t.entrega && t.categoria).map(t => t.nome),
     };
   });
   res.json({ ok:true, total: pendentes.length, itens });

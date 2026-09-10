@@ -462,6 +462,55 @@ async function falarPlano(chatId, texto, kb, editarMsgId) {
   return d.result || null;
 }
 
+// ── HTML DO CARD ─────────────────────────────────────────────────────────────
+// O card de revisao sai em parse_mode HTML. Diferente do Markdown — que quebra
+// com qualquer * ou _ do vendedor —, no HTML basta escapar &, < e > do texto
+// dinamico para a mensagem ser sempre valida. Mesmo assim, se o Telegram
+// recusar (entidade malformada, recurso nao suportado), o card cai em texto
+// puro: aparecer sem formatacao e melhor do que nao aparecer.
+function esc(v) {
+  return String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function htmlParaPlano(html) {
+  return String(html || '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?[a-z][^>]*>/gi, '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+}
+
+// Formatacao do WhatsApp (e do Markdown legado do bot) vira tag HTML, sobre
+// texto JA escapado. Cada regra so envolve trecho sem '<' dentro: assim nenhuma
+// tag abre dentro de outra e o aninhamento sai sempre valido. As bordas exigem
+// espaco/pontuacao antes e depois, como o proprio WhatsApp — sublinhado no meio
+// de URL nao vira italico.
+function formatacaoParaHtml(textoEscapado) {
+  const antes = '(^|[\\s(\\[{"\'.,:;!?\\-])';
+  const depois = '(?=$|[\\s)\\]}"\'.,:;!?\\-])';
+  const regra = (marca, tag) => {
+    const m = marca === '*' ? '\\*' : marca;
+    const re = new RegExp(antes + m + '(?=[^\\s' + m + '])([^' + m + '\\n<]*?[^\\s' + m + '<])' + m + depois, 'gm');
+    return (t) => t.replace(re, (_, a, miolo) => a + '<' + tag + '>' + miolo + '</' + tag + '>');
+  };
+  return [regra('*', 'b'), regra('~', 's'), regra('_', 'i')].reduce((t, f) => f(t), String(textoEscapado || ''));
+}
+
+async function falarHtml(chatId, html, kb, editarMsgId) {
+  const base = { chat_id: chatId, text: html, parse_mode: 'HTML', disable_web_page_preview: true };
+  if (kb) base.reply_markup = kb;
+  if (editarMsgId) {
+    const d = await tg('editMessageText', { ...base, message_id: editarMsgId });
+    if (d.ok) return d.result;
+    // 🔄 Atualizar sem nada novo: o card ja esta certo. Antes isso caia no
+    // sendMessage e duplicava o card no chat.
+    if (/not modified/i.test(d.description || '')) return { message_id: editarMsgId };
+    if (/entit|tag|parse/i.test(d.description || '')) return falarPlano(chatId, htmlParaPlano(html), kb, editarMsgId);
+  }
+  const d = await tg('sendMessage', base);
+  if (d.ok) return d.result;
+  return falarPlano(chatId, htmlParaPlano(html), kb);
+}
+
 // Toast do Telegram: a confirmacao aparece sobre a tela e some sozinha. Antes o
 // desfecho virava mensagem no chat, e a fileira de recibos ("enviada",
 // "descartada", "na fila de publicacao") acabava competindo com os cards que
@@ -543,91 +592,154 @@ function reciboCard(o, desfecho) {
   return desfecho + ' ' + partes.filter(Boolean).join(' · ');
 }
 
-// sendMessage corta em 4096. O card agora carrega DUAS mensagens (a nossa e a
-// do grupo-fonte), entao cada uma tem teto proprio e a soma com o cabecalho
-// fica com folga abaixo do limite — estourar faz o Telegram recusar o card
-// inteiro, que e pior do que truncar.
+// Hora curta da captura no fuso de SP. Item de outro dia leva a data junto:
+// "16:39" sozinho mentiria sobre uma oferta de ontem.
+function horaCurta(iso) {
+  if (!iso) return '';
+  const dt = new Date(iso);
+  if (isNaN(dt.getTime())) return '';
+  const tz = 'America/Sao_Paulo';
+  const dia = (x) => x.toLocaleDateString('pt-BR', { timeZone: tz });
+  const hora = dt.toLocaleTimeString('pt-BR', { timeZone: tz, hour: '2-digit', minute: '2-digit' });
+  return dia(dt) === dia(new Date()) ? hora
+    : dt.toLocaleDateString('pt-BR', { timeZone: tz, day: '2-digit', month: '2-digit' }) + ' ' + hora;
+}
+
+const ROTULO_AJUSTE = { preco: 'preço', precoDe: 'preço de', titulo: 'título', cupom: 'cupom', gatilho: 'topo', importante: 'importante' };
+
+// Topo do card: o que e, onde, quando. Titulo em negrito numa linha propria —
+// e por ele que o operador reconhece o item antes de ler qualquer numero.
+function tituloCard(o) {
+  const d = o.dados || {};
+  const titulo = String(d.titulo || '(sem título)').trim();
+  const curto = titulo.length > 90 ? titulo.slice(0, 88).trimEnd() + '…' : titulo;
+  const meta = [d.loja || '?', '#' + o.id, horaCurta(o.timestamp)].filter(Boolean);
+  if (o.ajustes) {
+    meta.push('✏️ ' + Object.keys(o.ajustes).map(k => ROTULO_AJUSTE[k] || k).join(', '));
+  }
+  return '<b>' + esc(curto) + '</b>\n' + esc(meta.join(' · '));
+}
+
+// Preco numa linha so, na ordem em que o desconto acontece: cheio → por →
+// com cupom. So o ultimo valor, o que o cliente paga, vai em negrito. O cupom
+// sai em <code> porque no Telegram um toque copia o codigo.
+function blocoPreco(o) {
+  const d = o.dados || {};
+  const final = d.precoFinal ?? d.preco;
+  const cadeia = [];
+  if (d.precoDe && Number(d.precoDe) > Number(d.preco ?? 0)) cadeia.push(d.precoDe);
+  const cupomAbate = d.cupom?.codigo && d.preco != null && Number(final) < Number(d.preco);
+  if (cupomAbate) cadeia.push(d.preco);
+  const linhas = [];
+  if (final != null) {
+    const topo = cadeia.length ? Number(cadeia[0]) : null;
+    const pct = topo && topo > 0 ? Math.round((1 - Number(final) / topo) * 100) : 0;
+    linhas.push('💰 ' + cadeia.map(v => esc(brlCurto(v)) + ' → ').join('')
+      + '<b>' + esc(brlCurto(final)) + '</b>' + (pct > 0 ? '  (−' + pct + '%)' : ''));
+  } else {
+    linhas.push('💰 sem preço');
+  }
+  if (d.cupom?.codigo) {
+    const abate = cupomAbate ? '  −' + esc(brlCurto(Number(d.preco) - Number(final))) : '  (preço já final)';
+    linhas.push('🏷️ <code>' + esc(d.cupom.codigo) + '</code>' + abate);
+  }
+  return linhas.join('\n');
+}
+
+// Para onde a oferta vai. A primeira linha responde a pergunta inteira (trilha
+// e quantos grupos); as de baixo explicam o porque — quem ficou de fora, qual
+// categoria o classificador leu e de qual grupo a oferta veio.
+function blocoTrilha(o) {
+  const r = o.rota;
+  if (!r) return '';
+  const lista = Array.isArray(r.trilhas) ? r.trilhas : [];
+  const entregam = lista.filter(t => t.entrega);
+  const fora = lista.filter(t => !t.entrega);
+  const linhas = [];
+  if (!entregam.length) {
+    linhas.push('🧭 <b>Nenhuma trilha entrega</b> — confira fontes e destinos na aba Grupos');
+  } else {
+    linhas.push('🧭 ' + entregam.map(t => '<b>' + esc(t.nome) + '</b>' + (t.porFonte ? ' (pela fonte)' : '')).join(' + ')
+      + ' → ' + r.grupos + ' grupo' + (r.grupos === 1 ? '' : 's'));
+  }
+  if (fora.length) linhas.push('     fora: ' + esc(fora.map(t => t.nome).join(' · ')));
+  const cat = r.categoria
+    ? 'categoria ' + esc(r.categoriaNome || r.categoria)
+      + (r.confianca != null ? ' (' + Math.round(r.confianca * 100) + '%' + (r.confiavel ? '' : ', abaixo do limiar') + ')' : '')
+    : 'sem categoria de nicho';
+  const fonte = r.fonte
+    ? 'fonte ' + esc(o.grupoOrigemNome || r.fonte)
+    : 'sem fonte (feed ou painel)';
+  linhas.push('     ' + cat + ' · ' + fonte);
+  return linhas.join('\n');
+}
+
+// Os mesmos motivos que seguram a oferta na fila aparecem no card: sem eles o
+// operador aprovaria pelo celular sem saber por que ela nao auto-enviou. Com o
+// auto-envio de oferta em 'off' TODA captura para na fila pelo mesmo motivo: a
+// linha viraria carimbo em 100% dos cards e nao informaria nada.
+function blocoAtencao(o) {
+  const d = o.dados || {};
+  const avisos = [];
+  if (o.motivoFila && !/auto-envio desligado/i.test(o.motivoFila)) avisos.push('🛑 Retida: ' + esc(o.motivoFila));
+  if (o.cupomForaDaBase) avisos.push('o post cita cupom que não está na base');
+  if (o.cupomAmbiguo)    avisos.push('o post cita cupons de outro bloco');
+  if (o.precoDivergente) avisos.push('o post anuncia R$ ' + esc(o.precoDivergente.declarado)
+                                     + ' e calculamos R$ ' + esc(o.precoDivergente.calculado));
+  // Preco do post no lugar do da loja: os dois numeros lado a lado, para o
+  // operador decidir sem abrir o link. Quer o da loja? Digita no Por.
+  if (o.precoDoPost?.aplicado) {
+    avisos.push('preço do post ' + esc(brlCurto(o.precoDoPost.declarado)) + ' · loja '
+      + esc(brlCurto(o.precoDoPost.calculado)) + ' (' + (o.precoDoPost.diferencaPct > 0 ? '+' : '')
+      + esc(o.precoDoPost.diferencaPct) + '%)');
+  } else if (o.precoDoPost) {
+    avisos.push('post anuncia ' + esc(brlCurto(o.precoDoPost.declarado)) + ', longe da loja ('
+      + esc(brlCurto(o.precoDoPost.calculado)) + ') — mantive o da loja'
+      + (o.precoDoPost.falha ? ' · falha: ' + esc(o.precoDoPost.falha) : ''));
+  }
+  if (d.precoDeReferencia) avisos.push('preço veio do texto do grupo, não da loja');
+  if (!avisos.length) return '';
+  return '⚠️ <b>Atenção</b>\n' + avisos.map(a => (a.startsWith('🛑') ? a : '• ' + a)).join('\n');
+}
+
+// Cabecalho compartilhado pelo card e pelas telas de ajuste (preco, cupom...):
+// o operador nunca perde de vista QUAL oferta esta editando e para onde ela vai.
+function cabecalhoCard(o) {
+  return [tituloCard(o), blocoPreco(o), blocoTrilha(o), blocoAtencao(o)].filter(Boolean).join('\n\n');
+}
+
+// sendMessage corta em 4096 (contados DEPOIS de tirar as tags). O card carrega
+// duas mensagens — a nossa e a do grupo-fonte —, entao cada uma tem teto
+// proprio e a soma com o cabecalho fica com folga abaixo do limite.
 const LIMITE_PREVIA   = 2200;
 const LIMITE_ORIGINAL = 800;
 
-function cabecalhoCard(o) {
-  const d = o.dados || {};
-  const linha = ['🛍️ #' + o.id, d.loja || '?'];
-  if (o.grupoOrigemNome) linha.push('via ' + o.grupoOrigemNome);
-
-  // Os mesmos motivos que seguram a oferta na fila aparecem no card: sem eles o
-  // operador aprovaria pelo celular sem saber por que ela nao auto-enviou.
-  const avisos = [];
-  // Por que parou aqui vem antes de tudo: e a pergunta que o operador faz ao
-  // abrir o card. Os detalhes abaixo explicam; esta linha responde.
-  // Com o auto-envio de oferta em 'off' TODA captura para na fila pelo mesmo
-  // motivo: a linha viraria carimbo em 100% dos cards e nao informaria nada.
-  // Os motivos que sao excecao — falha no envio, cupom fora da base, preco
-  // divergente — continuam aparecendo, porque ali o operador precisa saber.
-  if (o.motivoFila && !/auto-envio desligado/i.test(o.motivoFila)) {
-    avisos.push('🛑 Retida: ' + o.motivoFila);
-  }
-  if (o.cupomForaDaBase)   avisos.push('⚠️ o post cita cupom que nao esta na base');
-  if (o.cupomAmbiguo)      avisos.push('⚠️ o post cita cupons de outro bloco');
-  if (o.precoDivergente)   avisos.push('⚠️ o post anuncia R$ ' + o.precoDivergente.declarado
-                                     + ' e calculamos R$ ' + o.precoDivergente.calculado);
-  // Preco do post no lugar do da loja: os dois numeros lado a lado, para o
-  // operador decidir sem abrir o link. Quer o da loja? Digita no PRECO POR.
-  if (o.precoDoPost?.aplicado) {
-    avisos.push('📌 preço do post ' + brlCurto(o.precoDoPost.declarado) + ' · loja '
-      + brlCurto(o.precoDoPost.calculado) + ' (' + (o.precoDoPost.diferencaPct > 0 ? '+' : '')
-      + o.precoDoPost.diferencaPct + '%)');
-  } else if (o.precoDoPost) {
-    avisos.push('⚠️ post anuncia ' + brlCurto(o.precoDoPost.declarado) + ', longe da loja ('
-      + brlCurto(o.precoDoPost.calculado) + ') — mantive o da loja'
-      + (o.precoDoPost.falha ? ' · falha: ' + o.precoDoPost.falha : ''));
-  }
-  if (d.precoDeReferencia) avisos.push('⚠️ preco veio do TEXTO do grupo, nao da loja');
-  if (o.ajustes)           avisos.push('✏️ ajustado: ' + Object.keys(o.ajustes).join(', '));
-  // De/por explicitos no topo: a mensagem formatada abaixo mostra os dois, mas
-  // misturados com emoji e template — aqui o operador confere de relance.
-  const dePor = [d.precoDe ? 'de ' + brlCurto(d.precoDe) : null,
-                 d.preco   ? 'por ' + brlCurto(d.preco)  : null,
-                 // Cupom que nao abate — porque o PRECO POR foi digitado a mao e ja
-                 // e o valor final — repetiria o mesmo numero do 'por'. Ali vale
-                 // mostrar o codigo e dizer que o valor esta fechado.
-                 d.cupom?.codigo
-                   ? (Number(d.precoFinal) < Number(d.preco)
-                       ? 'c/ cupom ' + brlCurto(d.precoFinal)
-                       : 'cupom ' + d.cupom.codigo + ' (preço já final)')
-                   : null].filter(Boolean);
-  if (dePor.length) avisos.push('💲 ' + dePor.join(' · ') + (d.desconto ? '  (-' + d.desconto + '%)' : ''));
-  return linha.join(' · ') + (avisos.length ? '\n' + avisos.join('\n') : '');
-}
-
-// Post exatamente como chegou no grupo monitorado. Vem depois da nossa versao
-// de proposito: o que vai ao ar e a primeira coisa a conferir; o original e a
-// referencia para decidir se a traducao ficou fiel.
-function blocoOriginal(o) {
-  const t = String(o.conteudoOriginal || '').trim();
+// Bloco recolhido: o Telegram mostra as primeiras linhas e abre com um toque.
+// O corte e feito no texto CRU, antes de escapar, para nunca partir uma
+// entidade (&amp;) ao meio.
+function blocoRecolhido(rotulo, texto, limite) {
+  const t = String(texto || '').trim();
   if (!t) return '';
-  const corte = t.length > LIMITE_ORIGINAL ? t.slice(0, LIMITE_ORIGINAL) + '\n[...]' : t;
-  return '\n\n📥 Post original'
-    + (o.grupoOrigemNome ? ' · ' + o.grupoOrigemNome : '')
-    + '\n- - - - - - - - - -\n' + corte + '\n- - - - - - - - - -';
+  const corte = t.length > limite ? t.slice(0, limite) + '\n[...]' : t;
+  return '<blockquote expandable><b>' + rotulo + '</b>\n' + formatacaoParaHtml(esc(corte)) + '</blockquote>';
 }
 
 function corpoCard(o, extra) {
-  const msg = String(o.mensagemFormatada || '');
-  const previa = msg.length > LIMITE_PREVIA ? msg.slice(0, LIMITE_PREVIA) + '\n[...]' : msg;
-  return cabecalhoCard(o) + '\n\n- - - - - - - - - -\n' + previa + '\n- - - - - - - - - -'
-    + blocoOriginal(o)
-    + (extra ? '\n\n' + extra : '');
+  const origem = o.grupoOrigemNome ? ' · ' + esc(o.grupoOrigemNome) : '';
+  return cabecalhoCard(o)
+    + '\n\n' + blocoRecolhido('📱 Como sai no WhatsApp', o.mensagemFormatada, LIMITE_PREVIA)
+    + (o.conteudoOriginal ? '\n' + blocoRecolhido('📥 Post original' + origem, o.conteudoOriginal, LIMITE_ORIGINAL) : '')
+    + (extra ? '\n\n<b>' + esc(extra) + '</b>' : '');
 }
 
+// Decisao no topo e sozinha na linha; ajustes agrupados de tres em tres;
+// Descartar longe do Enviar, na ultima linha, para nao sair por toque errado.
 function tecladoCard(id) {
   return teclado([
     [['🚀 Enviar agora', 'r:enviar:' + id]],
-    [['💲 Preço por', 'r:preco:' + id], ['🔖 Preço de', 'r:precode:' + id]],
-    [['✏️ Título', 'r:titulo:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
-    [['🔝 Topo', 'r:topo:' + id], ['⚠️ Importante', 'r:importante:' + id]],
-    [['🔄 Atualizar', 'r:ver:' + id], ['🗑️ Descartar', 'r:descartar:' + id]],
-    [['📋 Voltar à fila', 'r:fila:0']],
+    [['💲 Por', 'r:preco:' + id], ['🔖 De', 'r:precode:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
+    [['✏️ Título', 'r:titulo:' + id], ['🔝 Topo', 'r:topo:' + id], ['⚠️ Importante', 'r:importante:' + id]],
+    [['🔄 Atualizar', 'r:ver:' + id], ['📋 Fila', 'r:fila:0'], ['🗑️ Descartar', 'r:descartar:' + id]],
   ]);
 }
 
@@ -638,7 +750,8 @@ function brlCurto(v) {
 // Rotulo do botao: o Telegram trunca sem aviso, entao o que importa (id e
 // preco) vem antes do titulo.
 function rotuloItemFila(i) {
-  const partes = ['#' + i.id, brlCurto(i.precoFinal), String(i.titulo || '').slice(0, 30)];
+  const nicho = Array.isArray(i.nichos) && i.nichos.length ? '🎯' + i.nichos.join('+') : null;
+  const partes = ['#' + i.id, brlCurto(i.precoFinal), nicho, String(i.titulo || '').slice(0, 30)];
   return partes.filter(Boolean).join(' · ')
     + (i.falhou ? ' 🛑' : i.aviso ? ' ⚠️' : '') + (i.ajustado ? ' ✏️' : '');
 }
@@ -656,7 +769,7 @@ async function mostrarFila(chatId, msgId) {
     linhas.push([['🔄 Atualizar', 'r:fila:0']]);
     const cabec = '📋 Ofertas de produto pendentes: ' + r.total
       + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '')
-      + '\n🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada';
+      + '\n🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada · 🎯 = sai também em grupo de nicho';
     res = await falarPlano(chatId, cabec, teclado(linhas), msgId);
   }
   const alvo = res?.message_id || msgId;
@@ -730,7 +843,7 @@ export async function enviarCardRevisaoTelegram(oferta) {
   if (!r.ok) { console.warn('[BOT-TSP] Oferta #' + oferta.id + ' sem card: ' + (r.erro || r.http)); return; }
   for (const chatId of ADMINS) {
     try {
-      const m = await falarPlano(chatId, corpoCard(r.oferta), tecladoCard(r.oferta.id));
+      const m = await falarHtml(chatId, corpoCard(r.oferta), tecladoCard(r.oferta.id));
       registrarCard(chatId, m?.message_id, r.oferta.id);
     }
     catch (e) { console.warn('[BOT-TSP] Card #' + oferta.id + ' nao chegou em ' + chatId + ': ' + e.message); }
@@ -742,11 +855,11 @@ async function aplicarAjuste(chatId, msgId, id, ov) {
   const r = await apiLocal('POST', '/mkt/remontar/' + id, ov);
   if (!r.ok) {
     const atual = await apiLocal('GET', '/mkt/oferta/' + id);
-    return falarPlano(chatId,
-      (atual.ok ? corpoCard(atual.oferta) + '\n\n' : '') + '❌ ' + (r.erro || 'falha ao remontar'),
+    return falarHtml(chatId,
+      atual.ok ? corpoCard(atual.oferta, '❌ ' + (r.erro || 'falha ao remontar')) : esc('❌ ' + (r.erro || 'falha ao remontar')),
       atual.ok ? tecladoCard(id) : null, msgId);
   }
-  return falarPlano(chatId, corpoCard(r.oferta, r.aviso ? '⚠️ ' + r.aviso : ''), tecladoCard(id), msgId);
+  return falarHtml(chatId, corpoCard(r.oferta, r.aviso ? '⚠️ ' + r.aviso : ''), tecladoCard(id), msgId);
 }
 
 async function tratarRevisao(chatId, msgId, partes, ctx) {
@@ -765,17 +878,17 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     return encerrarCard(chatId, msgId, reciboCard(o, '✔️ Já resolvida (' + o.status + '):'), ctx);
   }
 
-  if (acao === 'ver') { registrarCard(chatId, msgId, id); return falarPlano(chatId, corpoCard(o), tecladoCard(id), msgId); }
+  if (acao === 'ver') { registrarCard(chatId, msgId, id); return falarHtml(chatId, corpoCard(o), tecladoCard(id), msgId); }
 
   if (acao === 'enviar') {
     // Tira os botoes ANTES do await: o envio com espacamento entre grupos leva
     // segundos, e um segundo toque duplicaria a mensagem nos grupos.
-    await falarPlano(chatId, corpoCard(o, '⏳ Enviando...'), null, msgId);
+    await falarHtml(chatId, corpoCard(o, '⏳ Enviando...'), null, msgId);
     // naoEsperar: aprovar cinco seguidas nao pode pendurar cinco requisicoes ate
     // o portao liberar cada uma. Com fila, o servidor confirma na hora e publica
     // depois; o toque em 🔄 Atualizar mostra o desfecho.
     const env = await apiLocal('POST', '/painel/aprovar/' + id, { naoEsperar: true });
-    if (!env.ok) return falarPlano(chatId, corpoCard(o, '❌ Falha no envio: ' + (env.erro || env.http)), tecladoCard(id), msgId);
+    if (!env.ok) return falarHtml(chatId, corpoCard(o, '❌ Falha no envio: ' + (env.erro || env.http)), tecladoCard(id), msgId);
     if (env.naFila) {
       const min = Math.round((env.esperaSeg || 0) / 60);
       const quando = (env.esperaSeg || 0) < 90 ? 'em instantes' : 'em ~' + min + ' min';
@@ -793,7 +906,7 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     const d = await apiLocal('POST', '/painel/rejeitar/' + id, {});
     // Falha mantem o card COM botoes: sem eles o item segue pendente na fila e
     // o operador fica sem forma de tentar de novo pelo celular.
-    if (!d.ok) return falarPlano(chatId, corpoCard(o, '❌ Falha ao descartar: ' + (d.erro || d.http)), tecladoCard(id), msgId);
+    if (!d.ok) return falarHtml(chatId, corpoCard(o, '❌ Falha ao descartar: ' + (d.erro || d.http)), tecladoCard(id), msgId);
     return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'), ctx);
   }
 
@@ -820,7 +933,7 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     }
     if (acao === 'precode') linhas.push([['Sem preço de', 'r:sempde:' + id]]);
     linhas.push([['⬅️ Voltar', 'r:ver:' + id]]);
-    return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + pergunta, teclado(linhas), msgId);
+    return falarHtml(chatId, cabecalhoCard(o) + '\n\n' + esc(pergunta), teclado(linhas), msgId);
   }
 
   if (acao === 'semtopo') {
@@ -835,7 +948,7 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
 
   if (acao === 'impp') {
     const pronto = IMPORTANTES_PRONTOS[Number(partes[3])];
-    if (!pronto) return falarPlano(chatId, corpoCard(o, '⚠️ Texto pronto não encontrado — digite ou escolha de novo.'), tecladoCard(id), msgId);
+    if (!pronto) return falarHtml(chatId, corpoCard(o, '⚠️ Texto pronto não encontrado — digite ou escolha de novo.'), tecladoCard(id), msgId);
     sessoes.delete(String(chatId));
     return aplicarAjuste(chatId, msgId, id, { importante: pronto.texto });
   }
@@ -856,15 +969,15 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     const linhas = daBase.length ? linhasDeCupons(daBase, atual, 'r:cup:' + id + ':') : [];
     linhas.push([['🔎 Digitar código', 'r:cupdig:' + id]]);
     linhas.push([['🚫 Sem cupom', 'r:cup:' + id + ':'], ['⬅️ Voltar', 'r:ver:' + id]]);
-    return falarPlano(chatId, cabecalhoCard(o) + '\n\n' + resumoCupons(cupons, daBase.length),
+    return falarHtml(chatId, cabecalhoCard(o) + '\n\n' + formatacaoParaHtml(esc(resumoCupons(cupons, daBase.length))),
       teclado(linhas), msgId);
   }
 
   if (acao === 'cupdig') {
     const s = abrir(chatId, 'revisao');
     s.passo = 'cupomcodigo'; s.ofertaId = id; s.msgId = msgId;
-    return falarPlano(chatId, cabecalhoCard(o)
-      + '\n\nDigite o *CÓDIGO* do cupom.\nHoje: ' + ((o.dados?.cupom?.codigo || '').trim() || 'sem cupom')
+    return falarHtml(chatId, cabecalhoCard(o)
+      + '\n\nDigite o <b>CÓDIGO</b> do cupom.\nHoje: ' + esc((o.dados?.cupom?.codigo || '').trim() || 'sem cupom')
       + '\n(vale qualquer cupom da base, inclusive os que não abatem este preço — o aviso aparece na remontagem)',
       teclado([[['⬅️ Voltar', 'r:cupom:' + id]]]), msgId);
   }
