@@ -571,6 +571,17 @@ function cabecalhoCard(o) {
   if (o.cupomAmbiguo)      avisos.push('⚠️ o post cita cupons de outro bloco');
   if (o.precoDivergente)   avisos.push('⚠️ o post anuncia R$ ' + o.precoDivergente.declarado
                                      + ' e calculamos R$ ' + o.precoDivergente.calculado);
+  // Preco do post no lugar do da loja: os dois numeros lado a lado, para o
+  // operador decidir sem abrir o link. Quer o da loja? Digita no PRECO POR.
+  if (o.precoDoPost?.aplicado) {
+    avisos.push('📌 preço do post ' + brlCurto(o.precoDoPost.declarado) + ' · loja '
+      + brlCurto(o.precoDoPost.calculado) + ' (' + (o.precoDoPost.diferencaPct > 0 ? '+' : '')
+      + o.precoDoPost.diferencaPct + '%)');
+  } else if (o.precoDoPost) {
+    avisos.push('⚠️ post anuncia ' + brlCurto(o.precoDoPost.declarado) + ', longe da loja ('
+      + brlCurto(o.precoDoPost.calculado) + ') — mantive o da loja'
+      + (o.precoDoPost.falha ? ' · falha: ' + o.precoDoPost.falha : ''));
+  }
   if (d.precoDeReferencia) avisos.push('⚠️ preco veio do TEXTO do grupo, nao da loja');
   if (o.ajustes)           avisos.push('✏️ ajustado: ' + Object.keys(o.ajustes).join(', '));
   // De/por explicitos no topo: a mensagem formatada abaixo mostra os dois, mas

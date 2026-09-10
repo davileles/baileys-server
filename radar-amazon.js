@@ -2132,6 +2132,66 @@ export function precosDeclaradosNoTexto(texto) {
     .filter(v => Number.isFinite(v) && v > 0);
 }
 
+// ── PRECO 'POR' DECLARADO NO POST ─────────────────────────────────────────
+// Regra da operacao (10/09): oferta capturada de grupo/canal monitorado sai com
+// o preco que o POST anuncia, nao com o da API. API do ML, Amazon e Shopee
+// devolve preco de balcao: nao enxerga Pix, Programe e Poupe, campanha do
+// anuncio nem o preco que o vendedor mostrou para quem clicou. O post escreve o
+// que o comprador paga. A oferta cai no bot e o operador julga.
+//
+// Diferente de precosDeclaradosNoTexto (que pega o MENOR valor para o gate de
+// divergencia), aqui o numero vai AO AR — entao a leitura e por contexto:
+// descarta 'de'/riscado, parcela, frete/minimo/cashback/OFF e preco por
+// unidade; prefere o valor rotulado ('por', 'valor', 'a vista', 'com cupom').
+// Ambiguo (dois 'por', tres valores soltos) devolve null e nada muda.
+const RE_REAIS_POST = /(~?)[ \t]*R\$[ \t]*([\d.]{1,12},\d{1,2}|\d{1,3}(?:\.\d{3})+|\d{1,7})(?![\d,])([ \t]*~)?/gi;
+const RE_RUIDO_ANTES = /(?:acima de|a partir de|m[ií]nim[oa](?: de)?|compras? (?:de|acima)|frete|cashback|economi[sz]e|economia de|ganhe|desconto de|limite de|at[eé]|vale|cupom de|off de)\s*:?$/;
+const RE_RUIDO_DEPOIS = /^\s*(?:off\b|de desconto|em desconto|de cashback|em cashback|de volta|de economia|em compras|na primeira|a menos|(?:de\s+)?frete|(?:a|cada|por)\s+unidade|\/\s*un|(?:o|por|\/)\s*(?:kg|litro|l\b|metro|m\b))/;
+const RE_DE_ANTES  = /(?:^|\s)(?:de|era|antes)\s*:?$/;
+const RE_POR_ANTES = /(?:^|\s)(?:por|apenas|so|só|valor|pre[cç]o|sai|saindo)\s*:?$/;
+const RE_POR_DEPOIS = /^\s*(?:[àa]\s*vista|avista|no\s+pix|pix|com\s+(?:o\s+)?cupom|usando)/;
+
+const normCtx = s => String(s || '').toLowerCase()
+  .replace(/[^\p{L}\p{N}:$\/,.\s]/gu, ' ').replace(/[ \t]+/g, ' ').trim();
+
+/** Preco POR anunciado no post, ou null quando nao da para afirmar. */
+export function precoPorDoPost(texto) {
+  const t = String(texto || '')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\d+\s*x\s*(?:de\s*)?R\$\s*[\d.]+(?:,\d{1,2})?/gi, ' ')
+    .replace(/(?:em\s+at[eé]\s+)?\d+\s*x\s+sem\s+juros/gi, ' ');
+  const por = [], neutros = [];
+  for (const m of t.matchAll(RE_REAIS_POST)) {
+    const valor = Number(m[2].replace(/\./g, '').replace(',', '.'));
+    if (!Number.isFinite(valor) || valor <= 0) continue;
+    const iniLinha = t.lastIndexOf('\n', m.index) + 1;
+    const fimM = m.index + m[0].length;
+    const fimLinha = t.indexOf('\n', fimM) < 0 ? t.length : t.indexOf('\n', fimM);
+    let antes = normCtx(t.slice(Math.max(iniLinha, m.index - 40), m.index));
+    const depois = normCtx(t.slice(fimM, Math.min(fimLinha, fimM + 30)));
+    if (RE_RUIDO_ANTES.test(antes) || RE_RUIDO_DEPOIS.test(depois)) continue;
+    // Rotulo na linha de cima ("*VALOR*" + linha em branco + "R$ 49"): so vale
+    // quando a propria linha nao tem texto antes do valor e a de cima e curta.
+    if (!antes) {
+      const anterior = t.slice(0, iniLinha).split('\n').map(normCtx).filter(Boolean).pop() || '';
+      if (anterior.length <= 20) antes = anterior;
+    }
+    const riscado = !!m[1] && !!m[3];
+    if (riscado || RE_DE_ANTES.test(antes)) continue;
+    const item = { valor, semCentavos: !m[2].includes(',') };
+    if (RE_POR_ANTES.test(antes) || RE_POR_DEPOIS.test(depois)) por.push(item);
+    else neutros.push(item);
+  }
+  const unicos = a => [...new Map(a.map(x => [x.valor, x])).values()];
+  const p = unicos(por), n = unicos(neutros);
+  if (p.length === 1) return { preco: p[0].valor, semCentavos: p[0].semCentavos, rotulado: true };
+  if (p.length > 1)   return null;
+  if (n.length === 1) return { preco: n[0].valor, semCentavos: n[0].semCentavos, rotulado: false };
+  // Dois valores soltos numa oferta de um produto so: o maior e o 'de' sem rotulo.
+  if (n.length === 2) { const x = n[0].valor < n[1].valor ? n[0] : n[1]; return { preco: x.valor, semCentavos: x.semCentavos, rotulado: false }; }
+  return null;
+}
+
 /** Preco a vista deduzido do texto do post, ou null. */
 export function avistaDoTexto(texto, precoApi) {
   const t = String(texto || '');

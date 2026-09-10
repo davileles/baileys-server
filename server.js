@@ -57,7 +57,7 @@ import {
   sondarApiAmazon, apiAmazonIndisponivel, estadoApiAmazon, disparoSemApiLiberado,
   contasAmazonSeparadas, formatarOfertaAmazon,
   lerPrecoAVista, diagnosticarAVista, estadoAVista,
-  precosDeclaradosNoTexto, RE_PRECO_EXPLICADO,
+  precosDeclaradosNoTexto, RE_PRECO_EXPLICADO, precoPorDoPost,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -6595,6 +6595,51 @@ function divergenciaPrecoPost(texto, precoFinal, temCupom) {
   };
 }
 
+// ── PRECO 'POR' DO POST COMO BASE DA OFERTA ─────────────────────────────────
+// Regra da operacao (10/09): Amazon, ML e Shopee saem com o preco que o post
+// monitorado anuncia. A API devolve preco de balcao e errava para cima (Pix,
+// Programe e Poupe, campanha do anuncio): R$ 3.769 no post saia R$ 3.967,37.
+// O preco da loja fica guardado em precoDoPost.calculado para o card mostrar
+// os dois, e a oferta NUNCA auto-envia quando o numero foi trocado — o operador
+// julga no bot e, se quiser o da loja, digita no PRECO POR.
+//
+// Fica de fora, de proposito:
+//   - Amazon sem API e Magalu: o preco JA veio do texto.
+//   - Post com mais de um link de loja: nao ha como atribuir o valor ao produto.
+//   - Valor fora de 35%..150% do nosso calculo: quase sempre outro numero do
+//     texto lido como preco. Mantem o da loja e segura na fila com o aviso.
+const LOJAS_PRECO_DO_POST = new Set(['Amazon', 'Mercado Livre', 'Shopee']);
+const PRECO_POST_FAIXA_MIN = 0.35;
+const PRECO_POST_FAIXA_MAX = 1.50;
+const RE_LINK_LOJA_POST = /https?:\/\/(?:[\w-]+\.)*(?:amazon\.com\.br|amzn\.to|a\.co|mercadolivre\.com(?:\.br)?|meli\.la|shopee\.com\.br|magazineluiza\.com\.br|magazinevoce\.com\.br)(?=[\/?#\s]|$)\S*/gi;
+
+function precoDoPostParaOferta(texto, p, r, umProdutoSo) {
+  if (!LOJAS_PRECO_DO_POST.has(p?.loja)) return null;
+  if (p.semApi || r.precoDeReferencia) return null;
+  if (!umProdutoSo) return null;
+  const links = new Set((String(texto || '').match(RE_LINK_LOJA_POST) || [])
+    .map(u => u.replace(/[)\]}.,;!*_~]+$/, '')));
+  if (links.size > 1) return null;
+  const lido = precoPorDoPost(texto);
+  if (!lido) return null;
+  const calculado = Math.round(Number(r.precoAnunciado ?? r.precoFinal ?? p.preco) * 100) / 100;
+  if (!(calculado > 0)) return null;
+  const declarado = lido.preco;
+  // Post que arredonda ('R$ 359' para 359,91) esta falando do mesmo preco.
+  const igual = Math.abs(declarado - calculado) < 0.01
+    || (lido.semCentavos && calculado >= declarado && calculado < declarado + 1);
+  const razao = declarado / calculado;
+  const base = {
+    declarado, calculado, rotulado: !!lido.rotulado,
+    diferencaPct: Math.round((razao - 1) * 1000) / 10,
+  };
+  if (igual) return { ...base, igual: true, aplicar: false, retem: false };
+  if (razao < PRECO_POST_FAIXA_MIN || razao > PRECO_POST_FAIXA_MAX) {
+    return { ...base, aplicar: false, retem: true, foraDaFaixa: true };
+  }
+  return { ...base, aplicar: true, retem: true };
+}
+
 const AVISOS_PRECO_DIVERGENTE = new Map();
 const AVISO_PRECO_DIVERGENTE_TTL_MS = 6 * 3600e3;
 
@@ -7079,8 +7124,12 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // maior: etiqueta da loja OU preco final com cupom. O piso continua o mesmo,
     // e teto de cupom (calcularDesconto) entra no calculo — item caro com cupom
     // de teto baixo segue barrado, como deve.
-    const _descEfetivo = (Number(p.preco) > 0 && Number(r.precoFinal) > 0 && r.precoFinal < p.preco)
-      ? Math.round((1 - r.precoFinal / p.preco) * 100) : 0;
+    // Preco do post (quando vai substituir o nosso) entra na medida do piso: o
+    // desconto que a oferta anuncia e o do numero que vai ao ar.
+    const _precoPost = precoDoPostParaOferta(texto, p, r, _umProdutoSo);
+    const _precoGate = _precoPost?.aplicar ? _precoPost.declarado : Number(r.precoFinal);
+    const _descEfetivo = (Number(p.preco) > 0 && _precoGate > 0 && _precoGate < p.preco)
+      ? Math.round((1 - _precoGate / p.preco) * 100) : 0;
     const _descGate = Math.max(Number(p.desconto || 0), _descEfetivo);
     if (!p.ehDeal && _descGate < _pisoDesc) {
       console.log('[MKT] ' + (p.asin || '?') + ' descartado — desconto '
@@ -7111,7 +7160,10 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // a Amazon passou a publicar o a vista (Pix/NuPay) como preco principal, o
     // post do grupo escreve esse numero e o nosso a prazo ficava 28% acima —
     // divergencia real do ponto de vista do gate, mas com causa conhecida.
-    const _divPreco = divergenciaPrecoPost(texto, r.precoAnunciado ?? r.precoFinal ?? p.preco, !!r.cupom);
+    // Com o preco do post identificado o gate antigo perde o objeto: ou o numero
+    // ja e o do post, ou a diferenca ficou registrada em precoDoPost.
+    const _divPreco = _precoPost ? null
+      : divergenciaPrecoPost(texto, r.precoAnunciado ?? r.precoFinal ?? p.preco, !!r.cupom);
     if (_divPreco) avisarPrecoDivergente(_divPreco, p, jid).catch(() => {});
 
     const imagem = await baixarImagemProduto(p.imagemUrl);
@@ -7199,7 +7251,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       const _st = estatisticasPreco(p.asin);
       if (_st) {
         const _ref = _st.mediana30 ?? null;
-        const _final = Number(r.precoFinal ?? p.preco);
+        const _final = Number(_precoPost?.aplicar ? _precoPost.declarado : (r.precoFinal ?? p.preco));
         oferta.dadosExtraidos.stats = {
           dias: _st.dias, min90: _st.min90, mediana30: _st.mediana30,
           dePor: _st.dePor || null,
@@ -7224,6 +7276,38 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
     oferta.dadosExtraidos.categoriaSinal     = _cls.sinal;
     console.log('[CAT] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' -> ' + explicarClassificacao(_cls));
+
+    // ── PRECO DO POST NA MENSAGEM ──────────────────────────────────────────
+    // Depois da categoria (o ref de rastreio do ML sai dela) e antes do espelho
+    // no operador (que publicaria a versao com o preco velho). Remonta pelo
+    // mesmo caminho do PRECO POR digitado no bot: valor final, cupom mantido na
+    // mensagem com abatimento zero.
+    if (_precoPost && !_precoPost.igual) {
+      oferta.precoDoPost = {
+        declarado: _precoPost.declarado, calculado: _precoPost.calculado,
+        diferencaPct: _precoPost.diferencaPct, rotulado: _precoPost.rotulado,
+        aplicado: false, foraDaFaixa: !!_precoPost.foraDaFaixa, retem: true,
+      };
+      if (_precoPost.aplicar) {
+        try {
+          const _rm = remontarOfertaFila(oferta, { preco: _precoPost.declarado });
+          // Nao foi ajuste do operador: sem a marca, o card nao diz 'ajustado'.
+          delete oferta.ajustes; delete oferta.ajustadoEm;
+          oferta.precoDoPost.aplicado = true;
+          console.log('[PRECO-POST] #' + oferta.id + ' ' + (p.asin || '?') + ' — post R$ '
+            + _precoPost.declarado + ' no lugar de R$ ' + _precoPost.calculado
+            + ' (' + (_precoPost.diferencaPct > 0 ? '+' : '') + _precoPost.diferencaPct + '%)'
+            + (_rm?.aviso ? ' · ' + _rm.aviso : ''));
+        } catch (e) {
+          // Remontagem falhou: segue com a mensagem original e o card avisa.
+          oferta.precoDoPost.falha = e.message;
+          console.warn('[PRECO-POST] #' + oferta.id + ' remontagem falhou: ' + e.message);
+        }
+      } else {
+        console.log('[PRECO-POST] #' + oferta.id + ' ' + (p.asin || '?') + ' — post R$ '
+          + _precoPost.declarado + ' fora da faixa contra R$ ' + _precoPost.calculado + ', mantido o da loja.');
+      }
+    }
 
     // Modo observacao (fase 1): categoria listada em espelhoOperador sai tambem
     // no grupo interno. Fire-and-forget para nunca segurar o pipeline.
@@ -7276,7 +7360,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
                          && !oferta.dadosExtraidos.autoEnvioMesmoSemVerificar;
     if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
         && !oferta.cupomAmbiguo
-        && !oferta.precoDivergente && !oferta.revisaoDeEdicao) {
+        && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
         oferta.status = 'enviado';
@@ -7311,6 +7395,11 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
           + ' cupons e nenhum e do bloco deste link'
       : oferta.precoDivergente ? 'post anuncia R$ ' + oferta.precoDivergente.declarado
           + ' e calculamos R$ ' + oferta.precoDivergente.calculado
+      : oferta.precoDoPost?.retem ? (oferta.precoDoPost.aplicado
+          ? 'preco do post (R$ ' + oferta.precoDoPost.declarado + ') no lugar do da loja (R$ '
+            + oferta.precoDoPost.calculado + ')'
+          : 'post anuncia R$ ' + oferta.precoDoPost.declarado + ', longe demais do da loja (R$ '
+            + oferta.precoDoPost.calculado + ') — mantido o da loja')
       : oferta.revisaoDeEdicao ? 'versao editada de um post que ja saiu'
       : _seguraPorPreco        ? 'preco veio do texto do grupo, nao da loja'
       : 'motivo nao identificado';
@@ -7322,7 +7411,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // bot fora do ar ou webhook errado nunca pode segurar o radar.
     enviarCardRevisaoTelegram(oferta).catch(e =>
       console.warn('[BOT-TSP] Card da oferta #' + oferta.id + ' falhou: ' + e.message));
-    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + p.preco
+    console.log('[MKT] Oferta #' + oferta.id + ' na fila — ' + p.asin + ' R$ ' + (oferta.dadosExtraidos.precoFinal ?? p.preco)
       + ' (' + p.desconto + '% off) — ' + oferta.motivoFila);
   }
 }
@@ -15149,6 +15238,7 @@ function resumoOfertaFila(o) {
     cupomForaDaBase: o.cupomForaDaBase || null,
     cupomAmbiguo: o.cupomAmbiguo || null,
     precoDivergente: o.precoDivergente || null,
+    precoDoPost: o.precoDoPost || null,
     // 'post' = preco a vista deduzido do texto do grupo, nao lido da PDP.
     avistaOrigem: d.avistaOrigem || null,
     dados: {
