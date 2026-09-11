@@ -88,6 +88,7 @@ type Conta struct {
 	ultimoErro  string
 	ultimoEnvio time.Time
 	conectadoEm time.Time
+	recriadoEm  time.Time
 }
 
 var (
@@ -122,7 +123,14 @@ func (c *Conta) abrir(ctx context.Context) error {
 		_ = container.Close()
 		return fmt.Errorf("ler aparelho: %w", err)
 	}
-	cli := whatsmeow.NewClient(dev, waLog.Stdout("WM:"+c.ID, nivelLog, false))
+	c.container, c.cli = container, novoCliente(c, dev)
+	return nil
+}
+
+// novoCliente monta o whatsmeow.Client com a configuracao da conta. Usado na
+// abertura e na renovacao de cache (recriarCliente).
+func novoCliente(c *Conta, dev *store.Device) *whatsmeow.Client {
+	cli := whatsmeow.NewClient(dev, &logConta{base: waLog.Stdout("WM:"+c.ID, nivelLog, false), c: c})
 	cli.EnableAutoReconnect = true
 	// Retry receipt costuma chegar horas depois (membro offline). O cache em
 	// memoria do whatsmeow guarda so 256 mensagens e zera no restart; com o
@@ -135,8 +143,83 @@ func (c *Conta) abrir(ctx context.Context) error {
 		return true
 	}
 	cli.AddEventHandler(func(evt any) { c.onEvento(evt) })
-	c.container, c.cli = container, cli
-	return nil
+	return cli
+}
+
+// ── RENOVACAO DE CACHE ───────────────────────────────────────────────────────
+// Quando o servidor devolve um participant hash diferente do calculado, parte
+// dos aparelhos do grupo nao recebeu a sender key. O whatsmeow descarta o cache
+// de PARTICIPANTES do grupo, mas mantem o cache de APARELHOS de cada usuario
+// (send.go: "TODO also invalidate device list caches"). Quem trocou/adicionou
+// aparelho segue fora da lista nos envios seguintes e pede reenvio a cada oferta.
+// Os caches sao privados do Client: a unica forma de zera-los de fora e montar
+// um Client novo sobre o mesmo device store (sessoes, chaves e o store de retry
+// ficam no banco — nada se perde). Leva ~1s e so acontece nesse aviso.
+
+type logConta struct {
+	base waLog.Logger
+	c    *Conta
+}
+
+func (l *logConta) Warnf(msg string, args ...any) {
+	l.base.Warnf(msg, args...)
+	if strings.Contains(msg, "different participant list hash") {
+		grupo := ""
+		if len(args) >= 3 {
+			grupo = fmt.Sprint(args[2])
+		}
+		registrarPhash(l.c.ID, grupo)
+		// Assincrono: o aviso sai de dentro do SendMessage, que roda com envioMu
+		// travado; recriarCliente espera esse envio terminar.
+		go l.c.recriarCliente("participant hash divergente em " + grupo)
+	}
+}
+func (l *logConta) Errorf(msg string, args ...any) { l.base.Errorf(msg, args...) }
+func (l *logConta) Infof(msg string, args ...any)  { l.base.Infof(msg, args...) }
+func (l *logConta) Debugf(msg string, args ...any) { l.base.Debugf(msg, args...) }
+func (l *logConta) Sub(module string) waLog.Logger {
+	return &logConta{base: l.base.Sub(module), c: l.c}
+}
+
+func (c *Conta) recriarCliente(motivo string) {
+	c.envioMu.Lock() // nenhum envio pela metade
+	defer c.envioMu.Unlock()
+
+	c.mu.Lock()
+	antigo, container := c.cli, c.container
+	if antigo == nil || container == nil || time.Since(c.recriadoEm) < 2*time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.recriadoEm = time.Now()
+	c.mu.Unlock()
+
+	inicio := time.Now()
+	antigo.Disconnect()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dev, err := container.GetFirstDevice(ctx)
+	if err != nil || dev.ID == nil {
+		log.Printf("[CONTA:%s] renovacao de cache abortada (aparelho: %v) — reconectando o cliente antigo", c.ID, err)
+		_ = antigo.Connect()
+		return
+	}
+	novo := novoCliente(c, dev)
+	c.mu.Lock()
+	c.cli = novo
+	c.mu.Unlock()
+	// Connect que falha nao aciona a auto-reconexao (ela so age depois de uma
+	// conexao que caiu): tenta de novo algumas vezes antes de desistir.
+	for tentativa := 1; tentativa <= 6; tentativa++ {
+		err := novo.Connect()
+		if err == nil || novo.IsConnected() {
+			break
+		}
+		log.Printf("[CONTA:%s] renovacao de cache: falha ao conectar (tentativa %d): %v", c.ID, tentativa, err)
+		time.Sleep(time.Duration(tentativa) * 5 * time.Second)
+	}
+	log.Printf("[CONTA:%s] cache de aparelhos renovado em %s (%s)", c.ID, time.Since(inicio).Round(time.Millisecond), motivo)
+	registrarEvento(c.ID, "cache-renovado", motivo)
 }
 
 func (c *Conta) onEvento(evt any) {
@@ -286,6 +369,10 @@ type erroEnvio struct {
 func (e *erroEnvio) Error() string { return e.Err.Error() }
 
 func (c *Conta) enviar(ctx context.Context, p pedidoEnvio) (whatsmeow.SendResponse, error) {
+	// envioMu antes de pegar o cliente: uma renovacao de cache em curso termina
+	// primeiro, e o envio usa o Client novo em vez do que acabou de ser fechado.
+	c.envioMu.Lock()
+	defer c.envioMu.Unlock()
 	cli := c.cliente()
 	if cli == nil || !cli.IsLoggedIn() {
 		return whatsmeow.SendResponse{}, &erroEnvio{"conexao", 503, errors.New("conta nao pareada")}
@@ -297,9 +384,6 @@ func (c *Conta) enviar(ctx context.Context, p pedidoEnvio) (whatsmeow.SendRespon
 	if err != nil || jid.User == "" {
 		return whatsmeow.SendResponse{}, &erroEnvio{"validacao", 400, fmt.Errorf("jid invalido: %q", p.JID)}
 	}
-
-	c.envioMu.Lock()
-	defer c.envioMu.Unlock()
 
 	msg, errMsg := montarMensagem(ctx, cli, p)
 	if errMsg != nil {
@@ -469,6 +553,7 @@ type metGrupo struct {
 	Ocorrencias int            `json:"ocorrencias"`
 	Retries     int            `json:"retries"`
 	Horas       map[string]int `json:"horas,omitempty"` // ocorrencias por hora SP ("00".."23")
+	Phash       int            `json:"phash,omitempty"` // avisos de participant hash divergente
 }
 
 type metHora struct {
@@ -497,6 +582,7 @@ type metConta struct {
 	Horas      map[string]*metHora `json:"horas"`
 	Tentativas map[string]int      `json:"tentativas"`
 	Eventos    []evento            `json:"eventos"`
+	Phash      int                 `json:"phash"`
 }
 
 var (
@@ -577,6 +663,17 @@ func registrarEnvio(contaID, jid string, ok bool) {
 	if strings.HasSuffix(jid, "@g.us") {
 		grupoDe(m, jid).Envios++
 	}
+}
+
+func registrarPhash(contaID, grupo string) {
+	metMu.Lock()
+	m := metDe(contaID)
+	m.Phash++
+	if strings.HasSuffix(grupo, "@g.us") {
+		grupoDe(m, grupo).Phash++
+	}
+	metMu.Unlock()
+	registrarEvento(contaID, "phash-divergente", grupo)
 }
 
 func registrarRetry(contaID string, r *events.Receipt, tentativa int) {
