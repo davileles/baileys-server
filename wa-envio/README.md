@@ -58,3 +58,13 @@ protojson, com a imagem já baixada. Nesta fase o servidor só compara com o Bai
 O whatsmeow emite um evento por parte decifrada de cada mensagem de grupo (primeiro a parte 1:1
 com a sender key, depois o conteudo), com o mesmo id. A parte que so distribui a chave nao e
 repassada: o Baileys entrega as duas juntas, e o dedup por id do servidor descartaria o conteudo.
+
+## Aparelhos instáveis
+
+Cada pedido de reenvio traz o *registration id* do aparelho, que só muda quando o WhatsApp dele é
+ativado de novo. Aparelho reativado mais de uma vez no dia (3+ registration ids ou 2+ trocas de
+identidade) fica marcado como **instável**: não consegue decifrar o que chega entre uma ativação e
+outra, por melhor que seja o envio. Em `GET /metricas`, cada conta ganha `resumoAparelhos`
+(aparelhos com pedido, instáveis, `ocorrenciasSemInstaveis`, lista dos instáveis e dos aparelhos
+com mais pedidos) e cada grupo ganha `aparelhos` e `ocorrenciasInstaveis`. O detalhe cru por
+aparelho vem com `?aparelhos=1` (guardado por 7 dias).

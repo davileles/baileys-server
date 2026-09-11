@@ -178,6 +178,7 @@ func (l *logConta) Warnf(msg string, args ...any) {
 func (l *logConta) Errorf(msg string, args ...any) { l.base.Errorf(msg, args...) }
 func (l *logConta) Infof(msg string, args ...any)  { l.base.Infof(msg, args...) }
 func (l *logConta) Debugf(msg string, args ...any) {
+	observarRecibo(l.c.ID, l.modulo, args)
 	diagDebug(l.c.ID, l.modulo, msg, args)
 	l.base.Debugf(msg, args...)
 }
@@ -229,6 +230,13 @@ func (c *Conta) recriarCliente(motivo string) {
 func (c *Conta) onEvento(evt any) {
 	c.repassarEvento(evt)
 	switch e := evt.(type) {
+	case *events.IdentityChange:
+		// So as implicitas: vieram de um "untrusted identity" ao processar as
+		// chaves de um pedido de reenvio (o aparelho foi reativado desde a ultima
+		// sessao). As notificacoes do servidor repetiriam a mesma troca.
+		if e.Implicit {
+			registrarIdentidade(c.ID, e.JID.String())
+		}
 	case *events.Connected:
 		registrarEvento(c.ID, "conectou", "")
 		c.mu.Lock()
@@ -584,10 +592,11 @@ type metConta struct {
 	Grupos      map[string]*metGrupo `json:"grupos"`
 	// Por hora, para enxergar ONDAS de "Aguardando mensagem" e cruzar com
 	// eventos (reconexao, deploy). Tentativas: distribuicao do count do retry.
-	Horas      map[string]*metHora `json:"horas"`
-	Tentativas map[string]int      `json:"tentativas"`
-	Eventos    []evento            `json:"eventos"`
-	Phash      int                 `json:"phash"`
+	Horas      map[string]*metHora     `json:"horas"`
+	Tentativas map[string]int          `json:"tentativas"`
+	Eventos    []evento                `json:"eventos"`
+	Phash      int                     `json:"phash"`
+	Aparelhos  map[string]*metAparelho `json:"aparelhos,omitempty"`
 }
 
 var (
@@ -691,6 +700,7 @@ func registrarRetry(contaID string, r *events.Receipt, tentativa int) {
 	}
 	g := grupoDe(m, r.Chat.String())
 	h := horaDe(m)
+	contarPedidoAparelho(m, r.Sender.String(), r.Chat.String(), tentativa)
 	m.Tentativas[strconv.Itoa(tentativa)]++
 	m.Retries++
 	g.Retries++
@@ -734,6 +744,7 @@ func salvarMetricas(forcar bool) {
 		delete(metricas, dias[0])
 		dias = dias[1:]
 	}
+	podarAparelhos(dias)
 	b, err := json.Marshal(metricas)
 	metSujo = false
 	metMu.Unlock()
@@ -960,11 +971,7 @@ func rotas() *http.ServeMux {
 	}))
 
 	mux.HandleFunc("GET /metricas", autenticado(func(w http.ResponseWriter, r *http.Request) {
-		metMu.Lock()
-		b, _ := json.Marshal(metricas)
-		metMu.Unlock()
-		var copia map[string]any
-		_ = json.Unmarshal(b, &copia)
+		copia := metricasParaResposta(r.URL.Query().Get("aparelhos") == "1")
 		responder(w, 200, map[string]any{"ok": true, "hoje": diaSP(), "dias": copia})
 	}))
 
@@ -1082,3 +1089,6 @@ func main() {
 	contasMu.Unlock()
 	salvarMetricas(true)
 }
+
+func jsonMarshal(v any) ([]byte, error)   { return json.Marshal(v) }
+func jsonUnmarshal(b []byte, v any) error { return json.Unmarshal(b, v) }
