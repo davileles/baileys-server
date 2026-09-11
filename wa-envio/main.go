@@ -157,8 +157,9 @@ func novoCliente(c *Conta, dev *store.Device) *whatsmeow.Client {
 // ficam no banco — nada se perde). Leva ~1s e so acontece nesse aviso.
 
 type logConta struct {
-	base waLog.Logger
-	c    *Conta
+	base   waLog.Logger
+	c      *Conta
+	modulo string
 }
 
 func (l *logConta) Warnf(msg string, args ...any) {
@@ -176,9 +177,12 @@ func (l *logConta) Warnf(msg string, args ...any) {
 }
 func (l *logConta) Errorf(msg string, args ...any) { l.base.Errorf(msg, args...) }
 func (l *logConta) Infof(msg string, args ...any)  { l.base.Infof(msg, args...) }
-func (l *logConta) Debugf(msg string, args ...any) { l.base.Debugf(msg, args...) }
+func (l *logConta) Debugf(msg string, args ...any) {
+	diagDebug(l.c.ID, l.modulo, msg, args)
+	l.base.Debugf(msg, args...)
+}
 func (l *logConta) Sub(module string) waLog.Logger {
-	return &logConta{base: l.base.Sub(module), c: l.c}
+	return &logConta{base: l.base.Sub(module), c: l.c, modulo: module}
 }
 
 func (c *Conta) recriarCliente(motivo string) {
@@ -1012,6 +1016,7 @@ func main() {
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 	carregarMetricas()
 	iniciarLeitura()
+	iniciarDiagRetry()
 
 	// Retoma so as contas ja pareadas. Conta sem pareamento nao abre QR sozinha.
 	arquivos, _ := filepath.Glob(filepath.Join(dataDir, "*.db"))
