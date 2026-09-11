@@ -27,6 +27,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -173,6 +174,14 @@ func (c *Conta) repassarEvento(evt any) {
 		if raw == nil {
 			raw = e.Message
 		}
+		// O whatsmeow emite UM evento por parte decifrada: a parte 1:1 (so a
+		// sender key) e a parte de grupo (o conteudo), com o MESMO id. O Baileys
+		// junta as duas numa mensagem so. Repassar a parte da chave faria o
+		// servidor ver "senderKeyDistributionMessage" e — pior, no modo ativo —
+		// o dedup por id descartaria o conteudo que chega logo depois.
+		if soProtocoloDeChave(raw) {
+			return
+		}
 		corpo, err := protojson.Marshal(raw)
 		if err != nil {
 			return
@@ -190,6 +199,21 @@ func (c *Conta) repassarEvento(evt any) {
 		it.Indecifravel = true
 		enfileirarLeitura(it)
 	}
+}
+
+// soProtocoloDeChave: true quando a mensagem carrega apenas a distribuicao da
+// sender key e/ou metadados, sem nenhum conteudo.
+func soProtocoloDeChave(m *waE2E.Message) bool {
+	if m == nil {
+		return true
+	}
+	if ds := m.GetDeviceSentMessage().GetMessage(); ds != nil {
+		m = ds
+	}
+	c := proto.Clone(m).(*waE2E.Message)
+	c.SenderKeyDistributionMessage = nil
+	c.MessageContextInfo = nil
+	return proto.Size(c) == 0
 }
 
 func baseItem(conta string, info types.MessageInfo) *itemLeitura {
