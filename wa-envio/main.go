@@ -968,6 +968,8 @@ func rotas() *http.ServeMux {
 		responder(w, 200, map[string]any{"ok": true, "hoje": diaSP(), "dias": copia})
 	}))
 
+	mux.HandleFunc("GET /contas/{id}/participante/{lid}", autenticado(rotaParticipante))
+
 	mux.HandleFunc("GET /leitura", autenticado(func(w http.ResponseWriter, r *http.Request) {
 		responder(w, 200, map[string]any{"ok": true, "leitura": estadoAtualLeitura()})
 	}))
