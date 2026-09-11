@@ -266,6 +266,7 @@
         "export async function sondarMl",
         "export async function trocarCodePorToken",
         "export async function verificarTokenAff",
+        "export function amostrasCardSocialMl",
         "export function chavesCookieAff",
         "export function comTagAfiliado",
         "export function cookieAff",

@@ -671,24 +671,50 @@ function idsCatalogoMl(urlResolvida, urlOriginal, opcoes = {}) {
   return [...new Set([daUrl, dica].filter(Boolean))];
 }
 
+/**
+ * O item que o LINK aponta — que nem sempre e o vencedor do catalogo.
+ *
+ * /products/{id}/items devolve as ofertas na ordem do buy box, e o pipeline
+ * lia sempre a primeira. So que o link do grupo (e o CTA do perfil social)
+ * carrega o anuncio especifico em pdp_filters=item_id%3AMLB... ou wid=MLB...:
+ * e esse que a pagina abre e o que o cliente paga. Medido no catalogo da sonda
+ * em 11/09: vencedor a R$ 269,00 e nona oferta a R$ 242,42 — o preco divulgado
+ * saia R$ 26,58 acima do real, sempre para cima, sempre contra a oferta.
+ *
+ * Ordem de confianca: o id do card do perfil social (metadata.id, renderizado
+ * pelo proprio ML para o item compartilhado) vem antes do id da URL, que pode
+ * ter sido colado por terceiro.
+ */
+function itemAlvoMl(urlResolvida, urlOriginal, opcoes = {}) {
+  const doCard = String(opcoes.card?.itemId || '').toUpperCase();
+  if (/^MLB\d{6,}$/.test(doCard)) return doCard;
+  return itemIdDaUrlCta(urlResolvida) || itemIdDaUrlCta(urlOriginal) || null;
+}
+
 async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
   if (!apiMlAutorizada()) return null;
   const candidatos = idsCatalogoMl(urlResolvida, urlOriginal, opcoes);
   if (!candidatos.length) return null;
+  const alvo = itemAlvoMl(urlResolvida, urlOriginal, opcoes);
 
   for (const catalogo of candidatos) {
     let lista;
     // A checagem e sempre em /items: e o unico endpoint que responde 200 tanto
     // para MLB quanto para MLBU. 404 = o id e de anuncio, nao de catalogo.
     try {
-      const ofertas = await apiMl('/products/' + encodeURIComponent(catalogo) + '/items?limit=10');
+      // limit=100, nao 10: o anuncio do link costuma estar fora do topo do buy
+      // box (no catalogo da sonda ele era a 9a de 9 ofertas).
+      const ofertas = await apiMl('/products/' + encodeURIComponent(catalogo) + '/items?limit=100');
       lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
     } catch (e) {
       if (/\b404\b/.test(e.message)) continue;
       console.warn('[ML] API oficial /products/' + catalogo + '/items:', e.message);
       return null;
     }
-    const venc = lista[0] || null;
+    const escolhido = alvo
+      ? lista.find(r => String(r.item_id || '').toUpperCase() === alvo) || null
+      : null;
+    const venc = escolhido || lista[0] || null;
     if (!venc) {
       console.log('[ML] ' + catalogo + ' — catalogo sem oferta ativa na API oficial');
       return null;
@@ -707,21 +733,41 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
     // mesmo produto (ver tituloDoTextoMl) e alimenta o classificador de nicho.
     const trilha = await trilhaDeCategoriaMl(venc.category_id);
 
-    const preco = Number(venc.price);
-    const original = Number(venc.original_price) || null;
+    let preco = Number(venc.price);
+    let original = Number(venc.original_price) || null;
+    let itemId = venc.item_id || null;
+    let freteGratis = !!venc.shipping?.free_shipping;
+    let fontePreco = FONTE_API;
+
+    // O anuncio do link nao esta no catalogo (saiu do ar, ou o link e de um
+    // classico que so o card mostra): entao o preco do vencedor NAO e o deste
+    // anuncio. O card do perfil social ja traz o numero do item certo, sem
+    // requisicao nova — e ele que vale. O resto (nome, foto, trilha) segue da
+    // API, que e melhor fonte para isso.
+    const precoCard = Number(opcoes.card?.preco) || null;
+    if (!escolhido && precoCard && Math.abs(precoCard - preco) >= 0.01) {
+      console.log('[ML] ' + catalogo + ' — item do link (' + (alvo || 'sem id')
+        + ') fora do catalogo: preco do card do perfil social R$ ' + precoCard
+        + ' no lugar do vencedor R$ ' + preco);
+      preco = precoCard;
+      original = Number(opcoes.card?.precoDe) || null;
+      itemId = opcoes.card?.itemId || itemId;
+      freteGratis = !!opcoes.card?.freteGratis;
+      fontePreco = FONTE_SOCIAL;
+    }
+
     const precoDe = original && original > preco ? original : null;
     const imagem = (prod?.pictures || []).map(pic => pic?.url).find(Boolean) || null;
     console.log('[ML] ' + catalogo + ' — preco lido pela API oficial (catalogo, ' + lista.length
-      + ' oferta(s), vencedor ' + venc.item_id + ': R$ ' + preco + ')');
+      + ' oferta(s), ' + (escolhido ? 'item do link ' : 'vencedor ') + itemId + ': R$ ' + preco + ')');
     return {
       titulo: prod?.name || null, preco, precoDe, imagem,
       disponivel: String(prod?.status || 'active') === 'active',
-      precoDeFonte: precoDe ? FONTE_API : null, precoDeDescartes: [], descontoDeclarado: null,
+      precoDeFonte: precoDe ? fontePreco : null, precoDeDescartes: [], descontoDeclarado: null,
       marca: (prod?.attributes || []).find(a => a?.id === 'BRAND')?.value_name || '',
       nota: null, avaliacoes: null, vendedor: venc.seller_id ? String(venc.seller_id) : null,
-      achouLd: false, trilha, cuponsPagina: [], fonte: 'api',
-      itemId: venc.item_id || null, catalogoId: catalogo,
-      freteGratis: !!venc.shipping?.free_shipping,
+      achouLd: false, trilha, cuponsPagina: [], fonte: fontePreco === FONTE_SOCIAL ? 'api+card' : 'api',
+      itemId, catalogoId: catalogo, freteGratis,
     };
   }
   return null;
@@ -1482,6 +1528,46 @@ const numeroOuNulo = (v) => (Number(v) > 0 ? Number(v) : null);
 // Rotulo da origem do preco "de", para o relatorio saber de onde veio o numero.
 const FONTE_SOCIAL = 'card-perfil-social';
 
+// ── AMOSTRAS DO CARD DO PERFIL SOCIAL (medicao) ───────────────────────────
+// O card e o mesmo componente que a busca do ML renderiza, ja filtrado pela
+// conta logada — e o candidato natural a substituir o bloco de cupom que a
+// pagina do anuncio publicava antes do bloqueio. So que o parser atual le
+// preco e frete e descarta o resto, entao nao da para saber se o selo de cupom
+// vem junto. Aqui os ultimos cards ficam inteiros na memoria (nenhuma
+// requisicao nova: sao os mesmos ~270 perfis que o radar ja abre por dia) para
+// que o formato real seja lido em /ml/diagnostico-card-social.
+// Fase de medicao: nada disso alimenta preco nem cupom.
+const MAX_AMOSTRAS_CARD = 12;
+const _amostrasCard = [];
+
+function guardarAmostraCard(card) {
+  try {
+    const bruto = JSON.stringify(card);
+    // Card gigante e sinal de grade inteira, nao de item: nao serve de amostra.
+    if (!bruto || bruto.length > 60000) return;
+    const tipos = [...new Set([...bruto.matchAll(/"type"\s*:\s*"([^"]{1,40})"/g)].map(m => m[1]))];
+    _amostrasCard.unshift({
+      em: new Date().toISOString(),
+      itemId: card?.metadata?.id || null,
+      catalogoId: card?.metadata?.product_id || card?.metadata?.user_product_id || null,
+      tipos,
+      // O que interessa de fato: o card fala de cupom em algum lugar?
+      mencionaCupom: /cupom|coupon|discount_code|voucher/i.test(bruto),
+      trechosCupom: [...bruto.matchAll(/.{0,120}(?:cupom|coupon)[\s\S]{0,160}/gi)]
+        .slice(0, 4).map(m => m[0]),
+      card,
+    });
+    if (_amostrasCard.length > MAX_AMOSTRAS_CARD) _amostrasCard.length = MAX_AMOSTRAS_CARD;
+  } catch (e) { /* amostra e diagnostico: nunca derruba a leitura */ }
+}
+
+/** Ultimos cards de perfil social lidos, inteiros, para diagnostico. */
+export function amostrasCardSocialMl() {
+  return { total: _amostrasCard.length, maximo: MAX_AMOSTRAS_CARD,
+           comCupom: _amostrasCard.filter(a => a.mencionaCupom).length,
+           amostras: _amostrasCard };
+}
+
 /**
  * Preco e ids do card cujo produto bate com QUALQUER um dos ids informados.
  *
@@ -1512,6 +1598,7 @@ function dadosDoPolycard(html, ...ids) {
     });
     if (!card) continue;
 
+    guardarAmostraCard(card);
     const noPreco = acharNo(card, (n) => n?.type === 'price' && n?.price?.current_price);
     const noFrete = acharNo(card, (n) => n?.type === 'shipping' && n?.shipping?.text);
     const preco = numeroOuNulo(noPreco?.price?.current_price?.value);
@@ -2850,6 +2937,18 @@ function codigoCupomValidoMl(codigo) {
   return REGEX_CODIGO_CUPOM_ML.test(c) ? c.toUpperCase() : null;
 }
 
+// Teto por lista: campanha de categoria pode trazer centenas de ids, e o mapa
+// de campanhas vive em memoria e sai inteiro em /ml/campanhas. 200 e folgado
+// para ver o formato e decidir o cruzamento sem inchar a resposta.
+const MAX_IDS_ELEGIVEIS = 200;
+function idsElegiveis(lista) {
+  if (!Array.isArray(lista)) return [];
+  return lista.slice(0, MAX_IDS_ELEGIVEIS)
+    .map(x => (x && typeof x === 'object') ? (x.id ?? x.value ?? x.category_id ?? null) : x)
+    .filter(x => x !== null && x !== undefined)
+    .map(x => String(x));
+}
+
 // Campanhas do ML conhecidas, indexadas pelo id que a pagina do produto publica.
 // Alimentado pelo sync (que ja roda de hora em hora). A pagina do produto diz
 // QUE ha cupom; so a pagina de cupons diz se ele tem codigo e se e segmentado.
@@ -2907,6 +3006,18 @@ export function extrairCuponsTrackingMl(html) {
           categorias: c.segmentations?.categories?.length || 0,
           containers: c.segmentations?.containers?.length || 0,
           itens: c.item_ids?.length || 0,
+        },
+        // As LISTAS, nao so o tamanho delas. Ate aqui o sync contava e jogava
+        // fora — e e exatamente esse conteudo que responde "este cupom vale
+        // para este produto?", pergunta que a pagina do anuncio respondia antes
+        // do bloqueio. Categoria e item vem da API oficial sem custo nenhum,
+        // entao o cruzamento nao depende de ler pagina. Fase de medicao: aqui
+        // so guardamos o formato real, sem aplicar desconto por conta disso.
+        elegibilidade: {
+          categorias: idsElegiveis(c.segmentations?.categories),
+          itens: idsElegiveis(c.item_ids),
+          containers: idsElegiveis(c.segmentations?.containers),
+          chaves: Object.keys(c.segmentations || {}).slice(0, 20),
         },
         criadoPor: c.created_by || null,
       });
@@ -2972,6 +3083,10 @@ export async function sincronizarCuponsContaMl() {
       tipo: c.tipo, valor: c.valor, minimo: c.minimo, limite: c.limite,
       segmentado, segmentacaoConfirmada: !!ehAtivos || !!anterior?.segmentacaoConfirmada,
       ativoNoMl: c.ativoNoMl,
+      // Listas de elegibilidade (medicao): a versao com conteudo prevalece,
+      // porque os filtros costumam vir com o campo vazio.
+      elegibilidade: (c.elegibilidade?.categorias?.length || c.elegibilidade?.itens?.length)
+        ? c.elegibilidade : (anterior?.elegibilidade || c.elegibilidade),
     });
   };
 

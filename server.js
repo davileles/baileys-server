@@ -178,7 +178,7 @@ import {
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
   estadoOrigemSocialMl,
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
-  formatarOfertaMl,
+  formatarOfertaMl, amostrasCardSocialMl,
 } from './radar-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -15370,6 +15370,23 @@ app.get('/ml/diagnostico-cupom', async (req, res) => {
   if (!req.query.url) return res.status(400).json({ ok:false, erro:'passe ?url=' });
   try { res.json({ ok:true, ...await dumpCupomMl(req.query.url, { forcar: req.query.forcar === '1' }) }); }
   catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Diagnostico: os ultimos cards de perfil social lidos, inteiros. Nao dispara
+// nenhuma leitura — devolve o que o radar ja leu. Serve para descobrir se o
+// card publica o selo de cupom do anuncio (o bloco que a pagina do produto
+// publicava antes do bloqueio do antibot) e em que formato.
+app.get('/ml/diagnostico-card-social', (req, res) => {
+  try {
+    const r = amostrasCardSocialMl();
+    // ?resumo=1 corta o card cru: da para ver a incidencia de cupom sem baixar
+    // dezenas de KB de JSON no celular.
+    if (req.query.resumo === '1') {
+      return res.json({ ok:true, total:r.total, comCupom:r.comCupom,
+        amostras: r.amostras.map(({ card, ...resto }) => resto) });
+    }
+    res.json({ ok:true, ...r });
+  } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // Diagnostico: procura campaign_id na pagina de cupons da conta. Se existir,
