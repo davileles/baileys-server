@@ -36,6 +36,7 @@ No `baileys-server`: `WA_ENVIO_URL=http://wa-envio.railway.internal:8080`, `WA_E
 | POST | `/contas/{id}/logout` | sim | desloga e apaga a sessão |
 | POST | `/contas/{id}/enviar` | sim | `{jid, texto, linkPreview?, imagem?}` |
 | GET | `/contas/{id}/grupos` | sim | grupos, participantes, só-admins, sou admin |
+| GET | `/leitura` | sim | estado do repasse de leitura (fila, entregues, falhas, imagens) |
 | GET | `/metricas` | sim | envios, retries por hora/grupo/dia, tentativas e eventos de conexão (30 dias) |
 
 Erro de envio devolve `fase`: `validacao`, `conexao`, `preparo`, `upload` (nada saiu, pode
@@ -45,3 +46,11 @@ Pareamento: cada número vira um **dispositivo vinculado novo** ("Tica Envio"). 
 Baileys não é convertível. Limite do WhatsApp: 4 dispositivos por número. O código deve ser
 pedido com o número **como aparece no celular**; celular brasileiro sem o nono dígito
 (`553190110150`) é corrigido sozinho para `5531990110150`.
+
+## Leitura (modo sombra)
+
+Com `LEITURA_URL` (base do baileys-server) e `LEITURA_CONTAS` (padrão `principal`), as mensagens
+recebidas nos grupos que o servidor lê — fontes do radar TSP e monitorados do CDV, lista em
+`GET /interno/wa-leitura/grupos` — são repassadas para `POST /interno/wa-leitura/mensagens`, em
+protojson, com a imagem já baixada. Nesta fase o servidor só compara com o Baileys
+(`GET /interno/wa-leitura/comparacao`); nada entra no pipeline.

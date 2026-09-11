@@ -145,7 +145,10 @@
         "function conteudoParaWhatsmeow",
         "function registrarRetryTelemetria",
         "function registrarEnvioTelemetria",
-        "function registrarEventoEntrega"
+        "function registrarEventoEntrega",
+        "function registrarSombra",
+        "app.post('/interno/wa-leitura/mensagens'",
+        "app.get('/interno/wa-leitura/comparacao'"
       ]
     },
     "radar-awin.js": {

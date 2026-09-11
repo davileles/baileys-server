@@ -223,6 +223,7 @@ func (c *Conta) recriarCliente(motivo string) {
 }
 
 func (c *Conta) onEvento(evt any) {
+	c.repassarEvento(evt)
 	switch e := evt.(type) {
 	case *events.Connected:
 		registrarEvento(c.ID, "conectou", "")
@@ -963,6 +964,10 @@ func rotas() *http.ServeMux {
 		responder(w, 200, map[string]any{"ok": true, "hoje": diaSP(), "dias": copia})
 	}))
 
+	mux.HandleFunc("GET /leitura", autenticado(func(w http.ResponseWriter, r *http.Request) {
+		responder(w, 200, map[string]any{"ok": true, "leitura": estadoAtualLeitura()})
+	}))
+
 	mux.HandleFunc("GET /pair", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(paginaPair))
@@ -1006,6 +1011,7 @@ func main() {
 	store.SetOSInfo("Tica Envio", [3]uint32{1, 0, 0})
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 	carregarMetricas()
+	iniciarLeitura()
 
 	// Retoma so as contas ja pareadas. Conta sem pareamento nao abre QR sozinha.
 	arquivos, _ := filepath.Glob(filepath.Join(dataDir, "*.db"))

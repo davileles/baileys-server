@@ -1687,6 +1687,7 @@ async function conectarConta(id) {
       registrarPulsoLeitor(id);
       const ctx = { contaId: id, sock: c.sock };
       for (const msg of (messages || [])) {
+        if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (!msg.message) continue;
         try { await despacharParaPipeline(msg, ctx); }
         catch (e) { console.error('[CONTA:' + id + '] Falha ao processar mensagem:', e.message); }
@@ -1921,6 +1922,110 @@ function registrarRetryTelemetria(apelido, node) {
   } catch (e) {}
 }
 
+// ── LEITURA PELO WHATSMEOW — MODO SOMBRA ─────────────────────────────────────
+// O wa-envio repassa as mensagens que os aparelhos dele recebem nos grupos que
+// este servidor le (fontes do radar TSP + monitorados do CDV). Nesta fase NADA
+// entra no pipeline: cada mensagem e so comparada, por id, com o que os sockets
+// Baileys (principal e contas extras) receberam. A pergunta que o modo sombra
+// responde e objetiva: o whatsmeow captura tudo o que o Baileys captura, com o
+// mesmo conteudo — e o que ele captura que o Baileys perde (grupo indecifravel)?
+// Resultado em GET /interno/wa-leitura/comparacao.
+const _sombraLeitura = new Map();      // msgId -> { jid, primeiraEm, fontes: { origem: resumo } }
+const SOMBRA_MAX = 30000;
+const SOMBRA_TTL_MS = 36 * 60 * 60 * 1000;
+const _sombraContadores = { recebidasWm: 0, imagensWm: 0, imagensErroWm: 0, invalidasWm: 0, desdeEm: Date.now() };
+
+function _gruposLidosAgora() {
+  const set = new Set();
+  try { for (const j of radarFontes()) if (String(j).endsWith('@g.us')) set.add(j); } catch (e) {}
+  try { for (const j of gruposMonitoradosCdv()) if (String(j).endsWith('@g.us')) set.add(j); } catch (e) {}
+  return set;
+}
+
+function _hashTexto(s) {
+  let h = 5381;
+  const t = String(s || '');
+  for (let i = 0; i < t.length; i++) h = ((h << 5) + h + t.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+// Mesmo recorte que processarMensagem usa para decidir tipo e texto. Duplicado
+// de proposito: mexer no pipeline para o modo sombra arriscaria a captura real.
+function _resumoConteudo(message) {
+  let m = desembrulharMessage(message);
+  const edit = m?.protocolMessage?.editedMessage;
+  if (edit) m = desembrulharMessage(edit);
+  const tipo = _TIPOS_TRATADOS.find(t => m && m[t]) || Object.keys(m || {})[0] || null;
+  let texto = '';
+  if (tipo === 'conversation') texto = m.conversation || '';
+  else if (tipo === 'extendedTextMessage') texto = m.extendedTextMessage?.text || '';
+  else if (tipo === 'imageMessage') texto = m.imageMessage?.caption || '';
+  return { tipo, edicao: !!edit, texto: texto.length, hash: texto ? _hashTexto(texto) : null };
+}
+
+function registrarSombra(origem, msg) {
+  try {
+    const jid = msg?.key?.remoteJid;
+    const id = msg?.key?.id;
+    if (!jid || !id || !jid.endsWith('@g.us')) return;
+    if (!ehFonteRadar(jid) && !ehMonitoradoCdv(jid)) return;
+    const agora = Date.now();
+    let e = _sombraLeitura.get(id);
+    if (!e) {
+      e = { jid, primeiraEm: agora, fontes: {} };
+      _sombraLeitura.set(id, e);
+      if (_sombraLeitura.size > SOMBRA_MAX) {
+        for (const [k, v] of _sombraLeitura) {
+          if (_sombraLeitura.size <= SOMBRA_MAX && agora - v.primeiraEm < SOMBRA_TTL_MS) break;
+          _sombraLeitura.delete(k);
+        }
+      }
+    }
+    if (e.fontes[origem]) return;   // primeira chegada vale (append/notify repetidos)
+    const indecifravel = msg.messageStubType === 2 || !msg.message;
+    e.fontes[origem] = indecifravel
+      ? { em: agora, indecifravel: true }
+      : { em: agora, ..._resumoConteudo(msg.message) };
+  } catch (e) {}
+}
+
+// Protobuf em JSON (protojson) -> formato que o pipeline conhece. Os nomes de
+// campo de mensagem ja coincidem com os do Baileys; o que muda: bytes chegam em
+// base64 e campos com sigla chegam em maiusculas (JPEGThumbnail).
+function _normalizarMensagemWm(obj) {
+  if (Array.isArray(obj)) return obj.map(_normalizarMensagemWm);
+  if (!obj || typeof obj !== 'object') return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === 'JPEGThumbnail' && typeof v === 'string') { out.jpegThumbnail = Buffer.from(v, 'base64'); continue; }
+    out[k] = _normalizarMensagemWm(v);
+  }
+  // Edicao no formato FutureProof ({editedMessage:{message}}) vira o formato
+  // que o pipeline ja trata: protocolMessage.editedMessage.
+  if (out.editedMessage?.message && !out.protocolMessage) {
+    out.protocolMessage = { type: 'MESSAGE_EDIT', editedMessage: out.editedMessage.message };
+    delete out.editedMessage;
+  }
+  return out;
+}
+
+function mensagemWmParaBaileys(item) {
+  return {
+    key: { remoteJid: item.chat, fromMe: !!item.fromMe, id: item.id, participant: item.sender },
+    message: item.indecifravel ? null : _normalizarMensagemWm(item.message || {}),
+    messageStubType: item.indecifravel ? 2 : undefined,
+    messageTimestamp: item.timestamp,
+    pushName: item.pushName || undefined,
+    _imagemBase64: item.imagemBase64 || null,
+  };
+}
+
+function _authWaLeitura(req, res) {
+  const tk = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!WA_ENVIO_TOKEN || tk !== WA_ENVIO_TOKEN) { res.status(401).json({ ok: false, erro: 'nao autorizado' }); return false; }
+  return true;
+}
+
 // ── TETO DE TEMPO NO ENVIO (evita worker pendurado) ─────────────────────────
 // sock.sendMessage pode ficar pendurado indefinidamente num socket zumbi que
 // nao rejeitou a promessa (TCP meio-aberto sem close limpo). Isso trava o
@@ -2022,7 +2127,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
           const cf = contasExtras.get(contaId); if (cf) cf.ultimoErro = e.message;
           throw e;
         }
-        console.warn('[WA] Envio pela conta ' + contaId + ' falhou (' + e.message + ') — indo pela principal.');
+        console.warn('[WA] Envio pela conta ' + contaId + ' falhou (' + e.message + ') em ' + (NOMES_GRUPOS.get(destino) || destino) + ' — indo pela principal.');
         const c = contasExtras.get(contaId); if (c) c.ultimoErro = e.message;
       }
     } else {
@@ -9671,6 +9776,7 @@ async function conectar() {
             stub: mm.messageStubType ?? null,
           });
           if (_debugUpserts.length > 60) _debugUpserts.shift();
+          registrarSombra('baileys:principal', mm);
           if (mm.messageStubType === 2) {
             _stub2Total++;
             const jid2 = mm.key?.remoteJid || '(sem jid)';
@@ -11017,6 +11123,84 @@ app.get('/debug-fila', (req, res) => {
     res.json({ total: dados.length, itens: dados });
   } catch(e) {
     res.json({ erro: e.message });
+  }
+});
+
+// ── LEITURA PELO WHATSMEOW: rotas internas (wa-envio) e comparacao ───────────
+app.get('/interno/wa-leitura/grupos', (req, res) => {
+  if (!_authWaLeitura(req, res)) return;
+  res.json({ ok: true, grupos: [..._gruposLidosAgora()] });
+});
+
+app.post('/interno/wa-leitura/mensagens', (req, res) => {
+  if (!_authWaLeitura(req, res)) return;
+  try {
+    const item = req.body || {};
+    if (!item.id || !String(item.chat || '').endsWith('@g.us')) {
+      _sombraContadores.invalidasWm++;
+      return res.status(400).json({ ok: false, erro: 'id e chat de grupo obrigatorios' });
+    }
+    _sombraContadores.recebidasWm++;
+    if (item.imagemBase64) _sombraContadores.imagensWm++;
+    if (item.imagemErro) _sombraContadores.imagensErroWm++;
+    registrarSombra('whatsmeow:' + String(item.conta || '?'), mensagemWmParaBaileys(item));
+    res.json({ ok: true, modo: 'sombra' });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
+  }
+});
+
+// Compara, por grupo, quem recebeu e quem DECIFROU cada mensagem. So entram
+// mensagens com mais de 2 min, para dar tempo de todas as fontes chegarem.
+app.get('/interno/wa-leitura/comparacao', (req, res) => {
+  try {
+    const horas = Math.min(36, Math.max(1, parseFloat(req.query.horas) || 6));
+    const ref = String(req.query.ref || 'baileys:principal');
+    const alvo = String(req.query.alvo || 'whatsmeow:principal');
+    const agora = Date.now();
+    const porGrupo = {};
+    const exemplos = { soAlvo: [], soRef: [], conteudoDiferente: [] };
+    for (const [id, e] of _sombraLeitura) {
+      if (agora - e.primeiraEm < 120000 || agora - e.primeiraEm > horas * 3600000) continue;
+      const g = porGrupo[e.jid] || (porGrupo[e.jid] = {
+        nome: NOMES_GRUPOS.get(e.jid) || null, papel: ehFonteRadar(e.jid) ? 'fonte-tsp' : 'monitorado-cdv',
+        mensagens: 0, fontes: {}, soAlvo: 0, soRef: 0, ambos: 0, nenhum: 0, conteudoDiferente: 0,
+      });
+      g.mensagens++;
+      for (const [origem, r] of Object.entries(e.fontes)) {
+        const f = g.fontes[origem] || (g.fontes[origem] = { recebidas: 0, decifradas: 0, indecifraveis: 0 });
+        f.recebidas++;
+        if (r.indecifravel) f.indecifraveis++; else f.decifradas++;
+      }
+      const a = e.fontes[alvo], r = e.fontes[ref];
+      const okA = a && !a.indecifravel, okR = r && !r.indecifravel;
+      if (okA && okR) {
+        g.ambos++;
+        if (a.tipo !== r.tipo || a.hash !== r.hash) {
+          g.conteudoDiferente++;
+          if (exemplos.conteudoDiferente.length < 15) exemplos.conteudoDiferente.push({ id, grupo: g.nome || e.jid, [alvo]: a, [ref]: r });
+        }
+      } else if (okA) {
+        g.soAlvo++;
+        if (exemplos.soAlvo.length < 15) exemplos.soAlvo.push({ id, grupo: g.nome || e.jid, tipo: a.tipo, [ref]: r ? 'indecifravel' : 'nao recebeu' });
+      } else if (okR) {
+        g.soRef++;
+        if (exemplos.soRef.length < 15) exemplos.soRef.push({ id, grupo: g.nome || e.jid, tipo: r.tipo, [alvo]: a ? 'indecifravel' : 'nao recebeu' });
+      } else {
+        g.nenhum++;
+      }
+    }
+    const tot = { mensagens: 0, soAlvo: 0, soRef: 0, ambos: 0, nenhum: 0, conteudoDiferente: 0 };
+    for (const g of Object.values(porGrupo)) for (const k of Object.keys(tot)) tot[k] += g[k];
+    res.json({
+      ok: true, modo: 'sombra', janelaHoras: horas, ref, alvo, totais: tot,
+      contadores: { ..._sombraContadores, desdeEm: new Date(_sombraContadores.desdeEm).toISOString() },
+      emMemoria: _sombraLeitura.size,
+      grupos: Object.fromEntries(Object.entries(porGrupo).sort((x, y) => (y[1].soAlvo + y[1].soRef) - (x[1].soAlvo + x[1].soRef))),
+      exemplos,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
   }
 });
 
