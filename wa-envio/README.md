@@ -54,3 +54,7 @@ recebidas nos grupos que o servidor lê — fontes do radar TSP e monitorados do
 `GET /interno/wa-leitura/grupos` — são repassadas para `POST /interno/wa-leitura/mensagens`, em
 protojson, com a imagem já baixada. Nesta fase o servidor só compara com o Baileys
 (`GET /interno/wa-leitura/comparacao`); nada entra no pipeline.
+
+O whatsmeow emite um evento por parte decifrada de cada mensagem de grupo (primeiro a parte 1:1
+com a sender key, depois o conteudo), com o mesmo id. A parte que so distribui a chave nao e
+repassada: o Baileys entrega as duas juntas, e o dedup por id do servidor descartaria o conteudo.
