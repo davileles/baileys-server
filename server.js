@@ -1960,8 +1960,83 @@ function _resumoConteudo(message) {
   if (tipo === 'conversation') texto = m.conversation || '';
   else if (tipo === 'extendedTextMessage') texto = m.extendedTextMessage?.text || '';
   else if (tipo === 'imageMessage') texto = m.imageMessage?.caption || '';
-  return { tipo, edicao: !!edit, texto: texto.length, hash: texto ? _hashTexto(texto) : null };
+  return { tipo, edicao: !!edit, texto: texto.length, hash: texto ? _hashTexto(texto) : null,
+           comConteudo: _TIPOS_TRATADOS.includes(tipo) };
 }
+
+// Par comparado no resumo persistido. A memoria continua permitindo comparar
+// qualquer par (?ref=&alvo=), mas so este atravessa restart.
+const SOMBRA_PAR = { ref: 'baileys:principal', alvo: 'whatsmeow:principal' };
+const SOMBRA_ESPERA_MS = 120000;   // tempo para todas as fontes chegarem
+
+function _sombraZero() {
+  return { mensagens: 0, ambos: 0, soAlvo: 0, soRef: 0, nenhum: 0, semConteudo: 0, conteudoDiferente: 0, recuperadasRef: 0 };
+}
+
+// Resumo do dia em health.json: o Map vive so em memoria e o servidor reinicia
+// varias vezes por dia (deploy, variavel, autocura) — sem isto a comparacao
+// recomeca do zero e nunca fecha um dia inteiro.
+function _sombraDia() {
+  const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: TZ_SP });
+  let s = _health.sombra;
+  if (!s || s.data !== hoje) {
+    if (s && s.data) {
+      const hist = Array.isArray(_health.sombraHist) ? _health.sombraHist : [];
+      hist.push(s);
+      _health.sombraHist = hist.slice(-7);
+    }
+    s = _health.sombra = { data: hoje, ...SOMBRA_PAR, totais: _sombraZero(), grupos: {} };
+  }
+  return s;
+}
+
+function _sombraCaso(e, ref, alvo) {
+  const a = e.fontes[alvo], r = e.fontes[ref];
+  const okA = a && !a.indecifravel, okR = r && !r.indecifravel;
+  // Reacao, protocolo, enquete, audio: o pipeline descarta todos. Cada motor
+  // rotula essas partes de um jeito, entao comparar tipo/texto ali so produz
+  // divergencia falsa — ficam fora da comparacao de conteudo.
+  if ((okA && !a.comConteudo) || (okR && !r.comConteudo)) return { caso: 'semConteudo', dif: false };
+  if (okA && okR) return { caso: 'ambos', dif: a.tipo !== r.tipo || a.hash !== r.hash };
+  if (okA) return { caso: 'soAlvo', dif: false };
+  if (okR) return { caso: 'soRef', dif: false };
+  return { caso: 'nenhum', dif: false };
+}
+
+function _sombraConsolidar() {
+  const agora = Date.now();
+  let dia = null, mudou = false;
+  for (const e of _sombraLeitura.values()) {
+    if (e.consolidado || agora - e.primeiraEm < SOMBRA_ESPERA_MS) continue;
+    e.consolidado = true;
+    if (!dia) dia = _sombraDia();
+    const g = dia.grupos[e.jid] || (dia.grupos[e.jid] = {
+      nome: NOMES_GRUPOS.get(e.jid) || null,
+      papel: ehFonteRadar(e.jid) ? 'fonte-tsp' : 'monitorado-cdv',
+      fontes: {}, ..._sombraZero(),
+    });
+    if (!g.nome) g.nome = NOMES_GRUPOS.get(e.jid) || null;
+    g.mensagens++; dia.totais.mensagens++;
+    for (const [origem, r] of Object.entries(e.fontes)) {
+      const f = g.fontes[origem] || (g.fontes[origem] = { recebidas: 0, decifradas: 0, indecifraveis: 0, recuperadas: 0 });
+      f.recebidas++;
+      if (r.indecifravel) f.indecifraveis++; else f.decifradas++;
+      if (r.recuperada) f.recuperadas++;
+      if (r.em && (!f.ultimaEm || r.em > f.ultimaEm)) f.ultimaEm = r.em;
+    }
+    const { caso, dif } = _sombraCaso(e, SOMBRA_PAR.ref, SOMBRA_PAR.alvo);
+    g[caso]++; dia.totais[caso]++;
+    if (dif) { g.conteudoDiferente++; dia.totais.conteudoDiferente++; }
+    if (e.fontes[SOMBRA_PAR.ref]?.recuperada) { g.recuperadasRef++; dia.totais.recuperadasRef++; }
+    mudou = true;
+  }
+  if (mudou) _salvarHealth();
+  return dia;
+}
+
+// Tambem fora das consultas: o resumo precisa sobreviver a um restart mesmo que
+// ninguem abra a comparacao no dia.
+setInterval(() => { try { _sombraConsolidar(); } catch (e) {} }, 2 * 60 * 1000);
 
 function registrarSombra(origem, msg) {
   try {
@@ -1981,11 +2056,15 @@ function registrarSombra(origem, msg) {
         }
       }
     }
-    if (e.fontes[origem]) return;   // primeira chegada vale (append/notify repetidos)
     const indecifravel = msg.messageStubType === 2 || !msg.message;
+    const anterior = e.fontes[origem];
+    // Primeira chegada vale (append/notify repetidos). A excecao que importa:
+    // o Baileys pede retry e RECEBE a mensagem depois — isso nao e perda, e
+    // recuperacao, e contava como "so o whatsmeow decifrou".
+    if (anterior && !(anterior.indecifravel && !indecifravel)) return;
     e.fontes[origem] = indecifravel
       ? { em: agora, indecifravel: true }
-      : { em: agora, ..._resumoConteudo(msg.message) };
+      : { em: agora, ..._resumoConteudo(msg.message), recuperada: !!anterior };
   } catch (e) {}
 }
 
@@ -11152,51 +11231,54 @@ app.post('/interno/wa-leitura/mensagens', (req, res) => {
 
 // Compara, por grupo, quem recebeu e quem DECIFROU cada mensagem. So entram
 // mensagens com mais de 2 min, para dar tempo de todas as fontes chegarem.
+// Resumo persistido (dia corrente + historico) e, da memoria, os exemplos e a
+// possibilidade de comparar outro par de fontes (?ref=&alvo=).
 app.get('/interno/wa-leitura/comparacao', (req, res) => {
   try {
+    const dias = Math.min(8, Math.max(1, parseInt(req.query.dias, 10) || 1));
     const horas = Math.min(36, Math.max(1, parseFloat(req.query.horas) || 6));
-    const ref = String(req.query.ref || 'baileys:principal');
-    const alvo = String(req.query.alvo || 'whatsmeow:principal');
+    const ref = String(req.query.ref || SOMBRA_PAR.ref);
+    const alvo = String(req.query.alvo || SOMBRA_PAR.alvo);
+    const parPadrao = ref === SOMBRA_PAR.ref && alvo === SOMBRA_PAR.alvo;
     const agora = Date.now();
-    const porGrupo = {};
-    const exemplos = { soAlvo: [], soRef: [], conteudoDiferente: [] };
+
+    _sombraConsolidar();
+    const hoje = _sombraDia();
+    const historico = [...(Array.isArray(_health.sombraHist) ? _health.sombraHist : []), hoje].slice(-dias).reverse();
+
+    // Memoria: exemplos (sempre) e, para um par nao-padrao, os totais da janela.
+    const exemplos = { soAlvo: [], soRef: [], conteudoDiferente: [], recuperadasRef: [] };
+    const memTotais = { ..._sombraZero(), aguardando: 0 };
+    const memGrupos = {};
     for (const [id, e] of _sombraLeitura) {
-      if (agora - e.primeiraEm < 120000 || agora - e.primeiraEm > horas * 3600000) continue;
-      const g = porGrupo[e.jid] || (porGrupo[e.jid] = {
-        nome: NOMES_GRUPOS.get(e.jid) || null, papel: ehFonteRadar(e.jid) ? 'fonte-tsp' : 'monitorado-cdv',
-        mensagens: 0, fontes: {}, soAlvo: 0, soRef: 0, ambos: 0, nenhum: 0, conteudoDiferente: 0,
-      });
-      g.mensagens++;
-      for (const [origem, r] of Object.entries(e.fontes)) {
-        const f = g.fontes[origem] || (g.fontes[origem] = { recebidas: 0, decifradas: 0, indecifraveis: 0 });
-        f.recebidas++;
-        if (r.indecifravel) f.indecifraveis++; else f.decifradas++;
+      if (agora - e.primeiraEm > horas * 3600000) continue;
+      if (agora - e.primeiraEm < SOMBRA_ESPERA_MS) { memTotais.aguardando++; continue; }
+      const { caso, dif } = _sombraCaso(e, ref, alvo);
+      memTotais.mensagens++; memTotais[caso]++;
+      if (dif) memTotais.conteudoDiferente++;
+      if (!parPadrao) {
+        const g = memGrupos[e.jid] || (memGrupos[e.jid] = { nome: NOMES_GRUPOS.get(e.jid) || null, ..._sombraZero() });
+        g.mensagens++; g[caso]++;
+        if (dif) g.conteudoDiferente++;
       }
+      const nome = NOMES_GRUPOS.get(e.jid) || e.jid;
       const a = e.fontes[alvo], r = e.fontes[ref];
-      const okA = a && !a.indecifravel, okR = r && !r.indecifravel;
-      if (okA && okR) {
-        g.ambos++;
-        if (a.tipo !== r.tipo || a.hash !== r.hash) {
-          g.conteudoDiferente++;
-          if (exemplos.conteudoDiferente.length < 15) exemplos.conteudoDiferente.push({ id, grupo: g.nome || e.jid, [alvo]: a, [ref]: r });
-        }
-      } else if (okA) {
-        g.soAlvo++;
-        if (exemplos.soAlvo.length < 15) exemplos.soAlvo.push({ id, grupo: g.nome || e.jid, tipo: a.tipo, [ref]: r ? 'indecifravel' : 'nao recebeu' });
-      } else if (okR) {
-        g.soRef++;
-        if (exemplos.soRef.length < 15) exemplos.soRef.push({ id, grupo: g.nome || e.jid, tipo: r.tipo, [alvo]: a ? 'indecifravel' : 'nao recebeu' });
-      } else {
-        g.nenhum++;
-      }
+      if (dif && exemplos.conteudoDiferente.length < 15) exemplos.conteudoDiferente.push({ id, grupo: nome, [alvo]: a, [ref]: r });
+      else if (caso === 'soAlvo' && exemplos.soAlvo.length < 15) exemplos.soAlvo.push({ id, grupo: nome, tipo: a.tipo, [ref]: r ? 'indecifravel' : 'nao recebeu' });
+      else if (caso === 'soRef' && exemplos.soRef.length < 15) exemplos.soRef.push({ id, grupo: nome, tipo: r.tipo, [alvo]: a ? 'indecifravel' : 'nao recebeu' });
+      if (r?.recuperada) { memTotais.recuperadasRef++; if (exemplos.recuperadasRef.length < 10) exemplos.recuperadasRef.push({ id, grupo: nome, tipo: r.tipo }); }
     }
-    const tot = { mensagens: 0, soAlvo: 0, soRef: 0, ambos: 0, nenhum: 0, conteudoDiferente: 0 };
-    for (const g of Object.values(porGrupo)) for (const k of Object.keys(tot)) tot[k] += g[k];
+
     res.json({
-      ok: true, modo: 'sombra', janelaHoras: horas, ref, alvo, totais: tot,
+      ok: true, modo: 'sombra', par: { ref, alvo }, parPadrao,
       contadores: { ..._sombraContadores, desdeEm: new Date(_sombraContadores.desdeEm).toISOString() },
       emMemoria: _sombraLeitura.size,
-      grupos: Object.fromEntries(Object.entries(porGrupo).sort((x, y) => (y[1].soAlvo + y[1].soRef) - (x[1].soAlvo + x[1].soRef))),
+      dias: historico.map(d => ({
+        data: d.data, totais: d.totais,
+        grupos: Object.fromEntries(Object.entries(d.grupos || {})
+          .sort((x, y) => (y[1].soAlvo + y[1].soRef + y[1].conteudoDiferente) - (x[1].soAlvo + x[1].soRef + x[1].conteudoDiferente))),
+      })),
+      memoria: { janelaHoras: horas, totais: memTotais, grupos: parPadrao ? undefined : memGrupos },
       exemplos,
     });
   } catch (e) {
@@ -11232,13 +11314,20 @@ app.get('/entrega/grupos', async (req, res) => {
         const envB = b ? (b.envios.baileys || 0) : 0;
         contas[ap] = {
           baileys: b ? { envios: envB, ocorrencias: b.ocorrencias, retries: b.retries, porMilEnvios: porMil(b.ocorrencias, envB), tentativas: b.tentativas || {}, horas: b.horas || {} } : null,
-          whatsmeow: w ? { envios: w.envios, ocorrencias: w.ocorrencias, retries: w.retries, falhas: w.falhas, porMilEnvios: porMil(w.ocorrencias, w.envios), tentativas: w.tentativas || {}, horas: w.horas || {}, eventos: w.eventos || [] } : null,
+          whatsmeow: w ? { envios: w.envios, ocorrencias: w.ocorrencias, retries: w.retries, falhas: w.falhas, porMilEnvios: porMil(w.ocorrencias, w.envios),
+            // Aparelho reativado varias vezes no dia nao decifra o que chega
+            // entre uma ativacao e outra: o pedido dele nao mede a nossa entrega.
+            ocorrenciasSemInstaveis: w.resumoAparelhos ? w.resumoAparelhos.ocorrenciasSemInstaveis : null,
+            porMilEnviosSemInstaveis: w.resumoAparelhos ? porMil(w.resumoAparelhos.ocorrenciasSemInstaveis, w.envios) : null,
+            aparelhos: w.resumoAparelhos || null,
+            tentativas: w.tentativas || {}, horas: w.horas || {}, eventos: w.eventos || [] } : null,
           gruposBaileys: b ? Object.entries(b.grupos || {}).filter(([, g]) => g.oc > 0)
             .sort((x, y) => y[1].oc - x[1].oc).slice(0, 8)
             .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.oc, envios: g.b, horas: g.h || {} })) : [],
           gruposWhatsmeow: w ? Object.entries(w.grupos || {}).filter(([, g]) => g.ocorrencias > 0)
             .sort((x, y) => y[1].ocorrencias - x[1].ocorrencias).slice(0, 8)
-            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.ocorrencias, envios: g.envios, horas: g.horas || {} })) : [],
+            .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.ocorrencias, envios: g.envios,
+              aparelhos: g.aparelhos ?? null, ocorrenciasInstaveis: g.ocorrenciasInstaveis ?? null, horas: g.horas || {} })) : [],
         };
       }
       return { data: dia.data, eventos: dia.eventos || [], contas };
