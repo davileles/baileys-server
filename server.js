@@ -106,7 +106,7 @@ import {
 import {
   carregarConfigCdv, configCdv, salvarConfigCdv, PAPEIS_CDV,
   grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv,
-  gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv,
+  gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
 } from './config-cdv.js';
 
@@ -7926,6 +7926,230 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
   }
 }
 
+// ══ OFERTAS DE PONTOS/MILHAS CAPTURADAS EM GRUPO DE WHATSAPP ═════════════════
+// Grupos de "plantao de milhas" publicam o mesmo tipo de conteudo que o coletor
+// de RSS do painel le: transferencia bonificada, compra de pontos, clube,
+// cartao. O que muda e a forma — texto curto de WhatsApp, muitas vezes so um
+// print — e o que NAO muda e o destino: a fila de aprovacao do gerador, no
+// schema de ofertas-pendentes.json. Por isso o system prompt daqui e o mesmo
+// de painel-cdv/coletar-radar.js, com duas diferencas obrigatorias:
+//   1. o conteudo pode vir em imagem (o coletor so ve texto);
+//   2. existe um portao "valido": grupo de WhatsApp tem bom-dia, duvida de
+//      membro e print de emissao, e nada disso pode virar card na fila.
+//
+// O grupo SEMPRE passa por aprovacao humana — nunca ha auto-publicacao deste
+// caminho. O que a IA erra, a tela conserta antes de sair.
+const OFERTA_MILHAS_JANELA_MS = 45000;   // debounce: plantao posta texto e print separados
+const OFERTA_MILHAS_MAX_IMGS  = 3;       // teto de imagens por extracao (custo/tempo)
+const bufferOfertaMilhas = new Map();    // jid -> { itens, timer }
+
+const OFERTA_MILHAS_EMOJI = {
+  compra: '💰',
+  transferencia: '🔄',
+  cartao: '💳',
+  compra_bonificada: '🛍️',
+  clube: '🎁',
+};
+
+// Identico ao texto fixo do coletor: o campo nao e escrito pela IA.
+const OFERTA_MILHAS_IMPORTANTE =
+  'Sempre verifique a necessidade de uso de cupom, formas de pagamento e produtos específicos participantes, além do prazo para receber os pontos. ' +
+  'Recomendamos fortemente que todo processo seja gravado para possível reclamação futura. Sem a gravação você não obterá os pontos se eles não forem creditados corretamente.';
+
+const OFERTA_MILHAS_SYSTEM = `Você é um redator que escreve posts originais e independentes sobre promoções e oportunidades do mercado de pontos e milhas no Brasil (transferências bonificadas, compra de pontos, compras bonificadas em parceiros, clubes de fidelidade, cartões de crédito).
+
+O material de origem é uma ou mais mensagens publicadas em um grupo de WhatsApp de plantão de milhas — texto, imagem (print) ou os dois juntos. Leia TUDO antes de decidir.
+
+PORTÃO DE VALIDADE (decida primeiro):
+- "valido": true SOMENTE se o conteúdo descrever uma promoção/oportunidade concreta de pontos e milhas (transferência bonificada, compra de pontos, compra bonificada em parceiro, clube de fidelidade, oferta de cartão de crédito).
+- "valido": false para conversa de grupo, bom dia, dúvida de membro, opinião, notícia sem promoção, alerta de PASSAGEM/EMISSÃO (rota, trecho, "GRU-LIS por X mil milhas"), divulgação de grupo/serviço, ou qualquer coisa que você não conseguiria transformar em um card de oferta com bônus e programa.
+- Na dúvida, "valido": false — no destino há uma fila de aprovação humana e é muito pior encher a fila de ruído do que perder um post.
+- Quando "valido" for false, preencha "motivo" com uma frase curta e devolva os demais campos vazios.
+
+REGRAS GERAIS OBRIGATÓRIAS:
+- NUNCA mencione, cite ou faça referência a qualquer site, blog, veículo de imprensa, grupo de WhatsApp ou nome de fonte. O texto deve parecer 100% autoral.
+- NUNCA copie frases literais do texto de origem — reescreva tudo com suas próprias palavras.
+- Se alguma informação não estiver clara, use "" — nunca invente dados, valores, percentuais ou prazos.
+- Retorne APENAS um JSON válido, sem texto antes ou depois, sem blocos de código markdown.
+- categoria deve ser uma destas: transferencia, compra, compra_bonificada, clube, cartao, geral.
+  • "compra_bonificada" = a pessoa GANHA pontos/milhas por real ou dólar gasto em um parceiro/loja.
+  • "compra" = compra direta de pontos/milhas com dinheiro.
+  • "transferencia" = transferência de pontos entre programas com bônus.
+
+REGRAS POR CATEGORIA:
+
+[compra_bonificada]
+- "titulo" DEVE seguir exatamente este template: "[X] pontos por [real/dólar] entre [Parceiro] e [Programa]". Use "Até [X] pontos..." SOMENTE se houver variação de pontuação por perfil/categoria/produto.
+- "restricoes": um item por condição (perfil, categoria de produto, cupom necessário, prazo específico), cada um começando com hífen.
+- "loja": nome do parceiro/e-commerce. "cupom": código principal, se houver.
+- "importante" e "milheiro": deixe "".
+
+[compra] e [transferencia]
+- SEMPRE calcule o custo do milheiro quando houver valor pago e quantidade de pontos recebidos.
+  Fórmula: CUSTO_MILHEIRO = (VALOR_TOTAL_PAGO / PONTOS_RECEBIDOS) * 1000, com 2 casas decimais.
+  Formato EXATO: "💰 Custo do milheiro: R$ XX,XX por 1.000 pontos". Vários cenários = uma linha por cenário, separados por \\n.
+  Sem dados suficientes, "milheiro" = "".
+- "loja" = "". "cupom" só se houver cupom de desconto na compra. "importante" = "".
+
+[transferencia] — REGRA ADICIONAL DO TETO DE BÔNUS:
+- Transferências bonificadas costumam ter TETO de bônus (ex: "limite de 300.000 milhas bônus por CPF"). Procure ativamente por "limite", "máximo", "até X por CPF". Havendo teto, calcule o volume máximo a transferir para atingi-lo, para CADA percentual aplicável.
+  Fórmula: PONTOS_PARA_ATINGIR_TETO = TETO_DE_BONUS_EM_PONTOS / (PERCENTUAL_DE_BONUS / 100)
+  Formato de "tetoTransferencia": "🎯 Bônus de [X]% ([perfil, se houver]): transfira até [N] pontos para atingir o teto de [TETO] milhas/pontos de bônus", uma linha por cenário separada por \\n.
+  Sem teto explícito, "tetoTransferencia" = "".
+
+[clube] e [cartao] e [geral]
+- Sem regra especial de título. "loja", "cupom", "milheiro", "tetoTransferencia", "importante": "" salvo se claramente aplicável.
+
+REGRA DE PRAZO (todas as categorias):
+- "prazo" = data de ENCERRAMENTO da campanha. NUNCA prazo de crédito dos pontos, validade dos pontos ou check-in de hotel — isso vai em "restricoes".
+- Sem prazo explícito de encerramento, "prazo" = "".
+
+REGRA DE LINK (todas as categorias):
+- "link" = link OFICIAL da oferta (programa, banco, cia aérea, loja parceira) que apareça no conteúdo.
+- NUNCA invente um link, NUNCA use encurtador de afiliado de terceiros (bit.ly, cutt.ly e afins) e NUNCA use link de convite de grupo de WhatsApp (chat.whatsapp.com). Na dúvida, "link" = "".
+
+Formato exato de saída (todos os campos sempre presentes, mesmo que vazios):
+{
+  "valido": true,
+  "motivo": "",
+  "titulo": "string",
+  "emoji": "um único emoji",
+  "resumo": "2 a 3 frases",
+  "programa": "nome do(s) programa(s) de fidelidade envolvido(s)",
+  "bonus": "valor do bônus/ganho de forma objetiva",
+  "prazo": "data de encerramento da campanha, ou \\"\\"",
+  "categoria": "transferencia | compra | compra_bonificada | clube | cartao | geral",
+  "loja": "string ou \\"\\"",
+  "cupom": "string ou \\"\\"",
+  "milheiro": "string ou \\"\\"",
+  "tetoTransferencia": "string ou \\"\\"",
+  "importante": "",
+  "link": "string ou \\"\\"",
+  "restricoes": ["item com hífen", "..."]
+}`;
+
+// Debounce por grupo: cada mensagem nova reinicia a contagem, entao o print que
+// chega 20s depois do texto entra na MESMA extracao, e nao em duas.
+function bufferarOfertaMilhas(jid, texto, imagemBase64) {
+  if (!bufferOfertaMilhas.has(jid)) bufferOfertaMilhas.set(jid, { itens: [], timer: null });
+  const entrada = bufferOfertaMilhas.get(jid);
+  if (entrada.timer) clearTimeout(entrada.timer);
+  entrada.itens.push({ texto: texto || '', imagemBase64: imagemBase64 || null, em: Date.now() });
+  entrada.timer = setTimeout(() => {
+    processarBufferOfertaMilhas(jid).catch(e =>
+      console.error('[CDV-OFERTA] Falha no buffer de ' + jid.split('@')[0] + ': ' + e.message));
+  }, OFERTA_MILHAS_JANELA_MS);
+}
+
+// Chave de deduplicacao: o texto normalizado da rajada. O mesmo post reenviado
+// no dia seguinte, ou o mesmo post copiado em dois grupos monitorados, gera a
+// mesma chave e o proxy responde 'duplicada' sem criar segundo card. Post so de
+// imagem entra sem texto: cai no fallback com o carimbo de tempo, porque duas
+// imagens diferentes nao tem como ser comparadas aqui.
+function chaveDedupOfertaMilhas(itens) {
+  const txt = itens.map(i => i.texto || '').join(' ')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return txt.length >= 40 ? txt.slice(0, 400) : ('img:' + Date.now());
+}
+
+async function processarBufferOfertaMilhas(jid) {
+  const entrada = bufferOfertaMilhas.get(jid);
+  if (!entrada) return;
+  bufferOfertaMilhas.delete(jid);
+  const itens = entrada.itens || [];
+  if (!itens.length) return;
+
+  const nomeGrupo = nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+  const textoBruto = itens.map(i => i.texto).filter(Boolean).join('\n').trim();
+  const imagens = itens.map(i => i.imagemBase64).filter(Boolean).slice(0, OFERTA_MILHAS_MAX_IMGS);
+  console.log('[CDV-OFERTA] Janela fechada em "' + nomeGrupo + '" — ' + itens.length
+    + ' item(ns), ' + imagens.length + ' imagem(ns).');
+
+  if (!textoBruto && !imagens.length) return;
+
+  const conteudo = [
+    ...imagens.map(b64 => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } })),
+    { type: 'text', text:
+        (imagens.length
+          ? 'Conteúdo publicado em um grupo de plantão de milhas. Há ' + imagens.length
+            + ' imagem(ns) acima — leia os valores, percentuais e prazos direto delas.\n\n'
+          : 'Conteúdo publicado em um grupo de plantão de milhas.\n\n')
+        + (textoBruto ? 'Texto da(s) mensagem(ns):\n"""\n' + textoBruto + '\n"""' : '(as mensagens vieram sem texto)')
+    },
+  ];
+
+  const ia = await chamarClaude(OFERTA_MILHAS_SYSTEM, conteudo, 1800);
+  if (!ia) {
+    registrarDescarteCdv({ jid, motivo: 'extracao de oferta falhou',
+      detalhe: _ultimoMotivoClaude || 'IA nao respondeu', texto: textoBruto });
+    return;
+  }
+  if (ia.valido === false || !ia.titulo) {
+    console.log('[CDV-OFERTA] Descartada: ' + (ia.motivo || 'sem titulo'));
+    registrarDescarteCdv({ jid, motivo: 'nao reconhecido como oferta',
+      detalhe: ia.motivo || 'a extracao nao identificou promocao de pontos', texto: textoBruto });
+    return;
+  }
+
+  const CATEGORIAS = ['transferencia', 'compra', 'compra_bonificada', 'clube', 'cartao', 'geral'];
+  const categoria = CATEGORIAS.includes(ia.categoria) ? ia.categoria : 'geral';
+  // Link de convite de grupo e encurtador de afiliado nunca entram: o card vai
+  // para o radar publico e para o WhatsApp dos assinantes.
+  const link = /^https?:\/\//i.test(ia.link || '') && !/chat\.whatsapp\.com/i.test(ia.link)
+    ? ia.link : '';
+
+  const item = {
+    titulo:            String(ia.titulo || '').trim(),
+    emoji:             OFERTA_MILHAS_EMOJI[categoria] || ia.emoji || '📰',
+    resumo:            String(ia.resumo || '').trim(),
+    programa:          String(ia.programa || '').trim(),
+    bonus:             String(ia.bonus || '').trim(),
+    prazo:             String(ia.prazo || '').trim(),
+    categoria,
+    loja:              categoria === 'compra_bonificada' ? String(ia.loja || '').trim() : '',
+    cupom:             String(ia.cupom || '').trim(),
+    milheiro:          String(ia.milheiro || '').trim(),
+    tetoTransferencia: categoria === 'transferencia' ? String(ia.tetoTransferencia || '').trim() : '',
+    importante:        categoria === 'compra_bonificada' ? OFERTA_MILHAS_IMPORTANTE : '',
+    link,
+    restricoes:        Array.isArray(ia.restricoes) ? ia.restricoes.filter(Boolean).map(String) : [],
+  };
+
+  try {
+    const r = await fetch(CDV_PROXY_URL + '/ofertas/pendentes', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        item,
+        chaveDedup: chaveDedupOfertaMilhas(itens),
+        fonte: 'whatsapp',
+        grupoOrigem: jid,
+        grupoNome: nomeGrupo,
+        conteudoOriginal: textoBruto.slice(0, 1500),
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) {
+      console.warn('[CDV-OFERTA] Proxy recusou: ' + (d.erro || 'status ' + r.status));
+      registrarDescarteCdv({ jid, motivo: 'fila de ofertas recusou',
+        detalhe: d.erro || 'status ' + r.status, texto: textoBruto });
+      return;
+    }
+    if (d.duplicada) console.log('[CDV-OFERTA] Ja estava na fila/histórico (#' + d.id + ') — ignorada.');
+    else console.log('[CDV-OFERTA] Na fila de aprovacao #' + d.id + ' — ' + item.titulo);
+  } catch (e) {
+    console.error('[CDV-OFERTA] Falha ao enfileirar: ' + e.message);
+    registrarDescarteCdv({ jid, motivo: 'fila de ofertas inacessivel',
+      detalhe: e.message, texto: textoBruto });
+  }
+}
+
 // ctx = { contaId, sock } da conta que RECEBEU a mensagem. Importa para a
 // midia: o reupload precisa do socket que tem a sessao daquela mensagem —
 // pedir pelo principal uma imagem que chegou na secundaria falha.
@@ -7996,6 +8220,14 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
       registrarCapturaBruta(jid, msg, texto, tipo, _ehEdicao);
       await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao, thumbFonte: _thumbFonte });
       if (!ehMonitoradoCdv(jid)) return;
+    }
+
+    // Grupo cadastrado como fonte de OFERTAS de pontos/milhas nao entra no
+    // buffer de emissoes: aquele pipeline exige rota, milhas e datas, e uma
+    // transferencia bonificada nao tem nada disso — morria toda no descarte.
+    if (ehMonitoradoOfertaCdv(jid)) {
+      bufferarOfertaMilhas(jid, texto, imagemB64);
+      return;
     }
 
     if (!bufferAgrupamento.has(jid)) bufferAgrupamento.set(jid, { itens:[], timer:null });
