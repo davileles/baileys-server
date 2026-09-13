@@ -150,7 +150,9 @@
         "app.post('/interno/wa-leitura/mensagens'",
         "app.get('/interno/wa-leitura/comparacao'",
         "function _sombraConsolidar",
-        "function _sombraCaso"
+        "function _sombraCaso",
+        "function silencioUtilMs",
+        "async function verificarPulsoLojas"
       ]
     },
     "radar-awin.js": {

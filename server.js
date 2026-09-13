@@ -798,7 +798,14 @@ async function registrarAlerta(a = {}) {
 // segue "no ar", o watchdog segue verde, e simplesmente nao sai mais nada
 // daquela plataforma. Sem esta medida ninguem percebe ate o faturamento cair.
 const PULSO_PATH = SESSAO_DIR + '/pulso_lojas.json';
-const PULSO_LIMITE_MS   = 12 * 3600e3;   // silencio que vira alerta
+const PULSO_LIMITE_MS   = 12 * 3600e3;   // silencio UTIL que vira alerta
+// Os grupos-fonte param de postar de madrugada: entre ~00:30 e ~07:00 o silencio
+// e normal e nao diz nada sobre a loja. Contar essas horas fazia o alerta de 12h
+// disparar toda manhã ("Shopee ha 12h", "Magazine Luiza ha 18h") com o proprio
+// texto admitindo que a loja nao estava parada — ruido que treina o operador a
+// ignorar o canal. Agora so as horas ATIVAS contam, entao uma loja que para de
+// verdade as 09:00 alerta na mesma noite, e nao 18h depois.
+const PULSO_HORA_ATIVA  = 7;             // antes disso (hora SP) nao conta
 const PULSO_ESQUECER_MS = 7 * 24 * 3600e3; // loja parada ha uma semana nao e novidade
 let pulsoLojas = {};
 // Segunda via do pulso: qualquer despacho da loja, venha do radar de grupo ou
@@ -827,6 +834,19 @@ function salvarPulso() {
   } catch (e) {}
 }
 
+// Silencio descontando a madrugada. Passo de 15 min: barato (roda a cada 30 min
+// para um punhado de lojas) e preciso o bastante para um limite em horas.
+function silencioUtilMs(desde, ate) {
+  const passo = 15 * 60e3;
+  const inicio = Math.max(Number(desde) || 0, ate - PULSO_ESQUECER_MS);
+  let util = 0;
+  for (let t = Math.ceil(inicio / passo) * passo; t < ate; t += passo) {
+    const h = Number(new Date(t).toLocaleString('en-US', { timeZone: TZ_SP, hour: '2-digit', hour12: false })) % 24;
+    if (h >= PULSO_HORA_ATIVA) util += passo;
+  }
+  return util;
+}
+
 function registrarPulsoLoja(loja) {
   const nome = String(loja || '').trim();
   if (!nome) return;
@@ -846,25 +866,26 @@ async function verificarPulsoLojas() {
   const agora = Date.now();
   for (const [loja, ts] of Object.entries(pulsoLojas)) {
     const parado = agora - Number(ts || 0);
-    if (parado < PULSO_LIMITE_MS) continue;
+    const paradoUtil = silencioUtilMs(ts, agora);
+    if (paradoUtil < PULSO_LIMITE_MS) continue;
     // Loja que nunca mais apareceu deixou de ser operada: alertar todo dia sobre
     // ela seria ruido permanente.
     if (parado > PULSO_ESQUECER_MS) continue;
-    const horas = Math.floor(parado / 3600e3);
+    const horas = Math.floor(paradoUtil / 3600e3);   // horas ativas, sem a madrugada
 
     // O radar de grupo parou — mas a loja parou mesmo? Se ela seguiu publicando
     // por outro caminho, o problema e de CAPTURA, nao da plataforma, e o alerta
     // nao pode ser critico: alerta critico que se repete sem a loja estar parada
     // treina o operador a ignorar o canal justamente quando ele for verdadeiro.
     const tsDesp     = Number(pulsoDespacho[loja] || 0);
-    const lojaViva   = tsDesp > 0 && (agora - tsDesp) < PULSO_LIMITE_MS;
+    const lojaViva   = tsDesp > 0 && silencioUtilMs(tsDesp, agora) < PULSO_LIMITE_MS;
     const quando     = (t) => new Date(Number(t)).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 
     if (lojaViva) {
       await registrarAlerta({
         nivel: 'atencao', origem: 'radar', chave: 'pulso-radar:' + loja,
-        titulo: 'Radar de grupo sem ' + loja + ' ha ' + horas + 'h',
-        corpo: '⚠️ *Radar de grupo sem ' + loja + ' ha ' + horas + 'h*\n\n'
+        titulo: 'Radar de grupo sem ' + loja + ' ha ' + horas + 'h ativas',
+        corpo: '⚠️ *Radar de grupo sem ' + loja + ' ha ' + horas + 'h ativas*\n\n'
           + 'A loja NAO esta parada: o ultimo despacho foi ' + quando(tsDesp) + '.\n'
           + 'O que parou foi a captura em grupo monitorado, desde ' + quando(ts) + '.\n\n'
           + 'Vale conferir: janela de captura na aba Grupos e se os grupos-fonte '
@@ -875,8 +896,8 @@ async function verificarPulsoLojas() {
 
     await registrarAlerta({
       nivel: 'critico', origem: 'radar', chave: 'pulso:' + loja,
-      titulo: loja + ' sem oferta ha ' + horas + 'h',
-      corpo: '🛑 *' + loja + ' parada ha ' + horas + 'h*\n\n'
+      titulo: loja + ' sem oferta ha ' + horas + 'h ativas',
+      corpo: '🛑 *' + loja + ' parada ha ' + horas + 'h ativas*\n\n'
         + 'Nenhuma oferta desta loja saiu de grupo monitorado desde ' + quando(ts) + '.\n'
         + (tsDesp ? 'E nenhum despacho por qualquer caminho desde ' + quando(tsDesp) + '.\n' : '')
         + '\nVale conferir: janela de captura na aba Grupos, antibot/token da loja '
@@ -11658,20 +11679,25 @@ app.get('/alertas/pulso', (req, res) => {
   // parada" de "captura em grupo parada" — que pedem acoes diferentes.
   const lojas = new Set([...Object.keys(pulsoLojas), ...Object.keys(pulsoDespacho)]);
   const horas = (ts) => ts ? Math.floor((agora - Number(ts)) / 3600e3) : null;
+  // Mesmo criterio do alerta, para a tela nao dizer "parada" enquanto o alerta
+  // (com razao) fica quieto durante a madrugada.
+  const horasUteis = (ts) => ts ? Math.floor(silencioUtilMs(ts, agora) / 3600e3) : null;
   const itens = [...lojas]
     .map((loja) => {
       const tsRadar = Number(pulsoLojas[loja] || 0);
       const tsDesp  = Number(pulsoDespacho[loja] || 0);
-      const radarParado = tsRadar > 0 && (agora - tsRadar) >= PULSO_LIMITE_MS;
-      const despParado  = tsDesp  > 0 && (agora - tsDesp)  >= PULSO_LIMITE_MS;
+      const radarParado = tsRadar > 0 && silencioUtilMs(tsRadar, agora) >= PULSO_LIMITE_MS;
+      const despParado  = tsDesp  > 0 && silencioUtilMs(tsDesp,  agora) >= PULSO_LIMITE_MS;
       return {
         loja,
         ultimaEm:     tsRadar ? new Date(tsRadar).toISOString() : null,
         horasParada:  horas(tsRadar),
+        horasAtivas:  horasUteis(tsRadar),
         parada:       radarParado,
         despacho: {
           ultimaEm:    tsDesp ? new Date(tsDesp).toISOString() : null,
           horasParada: horas(tsDesp),
+          horasAtivas: horasUteis(tsDesp),
           parada:      despParado,
         },
         // 'ok' = tudo fluindo | 'so-radar' = captura parou, loja viva
