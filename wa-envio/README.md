@@ -55,16 +55,11 @@ recebidas nos grupos que o servidor lê — fontes do radar TSP e monitorados do
 protojson, com a imagem já baixada. Nesta fase o servidor só compara com o Baileys
 (`GET /interno/wa-leitura/comparacao`); nada entra no pipeline.
 
-O whatsmeow emite um evento por parte decifrada de cada mensagem de grupo (primeiro a parte 1:1
-com a sender key, depois o conteudo), com o mesmo id. A parte que so distribui a chave nao e
-repassada: o Baileys entrega as duas juntas, e o dedup por id do servidor descartaria o conteudo.
+## Recuperação de fila x problema de entrega
 
-## Aparelhos instáveis
+Celular que fica fora do ar pede, ao voltar, o reenvio de tudo o que perdeu — um aparelho só chegou a
+86 pedidos numa hora. Isso não mede a nossa entrega. Cada pedido é classificado pela idade da mensagem:
+acima de 30 min é `recuperacao`, abaixo é `entrega`, e `desconhecido` quando a mensagem é anterior ao
+boot. Em `GET /metricas`, `resumoAparelhos` traz `ocorrenciasEntrega` (o indicador que importa),
+`ocorrenciasRecuperacao` e `classes`; cada grupo ganha `ocorrenciasRecuperacao`.
 
-Cada pedido de reenvio traz o *registration id* do aparelho, que só muda quando o WhatsApp dele é
-ativado de novo. Aparelho reativado mais de uma vez no dia (3+ registration ids ou 2+ trocas de
-identidade) fica marcado como **instável**: não consegue decifrar o que chega entre uma ativação e
-outra, por melhor que seja o envio. Em `GET /metricas`, cada conta ganha `resumoAparelhos`
-(aparelhos com pedido, instáveis, `ocorrenciasSemInstaveis`, lista dos instáveis e dos aparelhos
-com mais pedidos) e cada grupo ganha `aparelhos` e `ocorrenciasInstaveis`. O detalhe cru por
-aparelho vem com `?aparelhos=1` (guardado por 7 dias).

@@ -15,6 +15,18 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
+func contemParticipante(info *types.GroupInfo, lid types.JID) bool {
+	if info == nil {
+		return false
+	}
+	for _, p := range info.Participants {
+		if p.LID.User == lid.User || p.JID.User == lid.User {
+			return true
+		}
+	}
+	return false
+}
+
 func rotaParticipante(w http.ResponseWriter, r *http.Request) {
 	c := contaDaRota(w, r)
 	if c == nil {
@@ -50,7 +62,22 @@ func rotaParticipante(w http.ResponseWriter, r *http.Request) {
 			responder(w, 400, map[string]any{"ok": false, "erro": "grupo invalido"})
 			return
 		}
-		info, err := cli.GetGroupInfo(ctx, gj)
+		// Sob carga, a lista de participantes as vezes volta vazia ou sem o
+		// membro: uma consulta dessas ja levou a concluir "nao e membro" para
+		// quem era. Repete antes de responder.
+		var info *types.GroupInfo
+		for tentativa := 1; tentativa <= 3; tentativa++ {
+			info, err = cli.GetGroupInfo(ctx, gj)
+			if err == nil && contemParticipante(info, lid) {
+				break
+			}
+			if err == nil && tentativa == 3 {
+				out["listaConferida"] = 3
+			}
+			if tentativa < 3 {
+				time.Sleep(time.Duration(tentativa) * 700 * time.Millisecond)
+			}
+		}
 		if err != nil {
 			out["grupoErro"] = err.Error()
 		} else {

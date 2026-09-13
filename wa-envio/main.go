@@ -139,7 +139,7 @@ func novoCliente(c *Conta, dev *store.Device) *whatsmeow.Client {
 	// Este aparelho so envia: nao baixa historico no pareamento.
 	cli.ManualHistorySyncDownload = true
 	cli.PreRetryCallback = func(r *events.Receipt, id types.MessageID, tentativa int, _ *waE2E.Message) bool {
-		registrarRetry(c.ID, r, tentativa)
+		registrarRetry(c.ID, r, id, tentativa)
 		return true
 	}
 	cli.AddEventHandler(func(evt any) { c.onEvento(evt) })
@@ -403,6 +403,9 @@ func (c *Conta) enviar(ctx context.Context, p pedidoEnvio) (whatsmeow.SendRespon
 		return whatsmeow.SendResponse{}, errMsg
 	}
 	resp, err := cli.SendMessage(ctx, jid, msg)
+	if err == nil && jid.Server == types.GroupServer {
+		marcarEnviada(resp.ID)
+	}
 	if err != nil {
 		fase := "preparo"
 		if errors.Is(err, whatsmeow.ErrNotConnected) || errors.Is(err, whatsmeow.ErrNotLoggedIn) {
@@ -565,8 +568,9 @@ type metGrupo struct {
 	Envios      int            `json:"envios"`
 	Ocorrencias int            `json:"ocorrencias"`
 	Retries     int            `json:"retries"`
-	Horas       map[string]int `json:"horas,omitempty"` // ocorrencias por hora SP ("00".."23")
-	Phash       int            `json:"phash,omitempty"` // avisos de participant hash divergente
+	Horas       map[string]int `json:"horas,omitempty"`   // ocorrencias por hora SP ("00".."23")
+	Phash       int            `json:"phash,omitempty"`   // avisos de participant hash divergente
+	Classes     map[string]int `json:"classes,omitempty"` // ocorrencias por classe de pedido
 }
 
 type metHora struct {
@@ -596,6 +600,7 @@ type metConta struct {
 	Tentativas map[string]int          `json:"tentativas"`
 	Eventos    []evento                `json:"eventos"`
 	Phash      int                     `json:"phash"`
+	Classes    map[string]int          `json:"classes,omitempty"`
 	Aparelhos  map[string]*metAparelho `json:"aparelhos,omitempty"`
 }
 
@@ -690,7 +695,7 @@ func registrarPhash(contaID, grupo string) {
 	registrarEvento(contaID, "phash-divergente", grupo)
 }
 
-func registrarRetry(contaID string, r *events.Receipt, tentativa int) {
+func registrarRetry(contaID string, r *events.Receipt, id types.MessageID, tentativa int) {
 	metMu.Lock()
 	defer metMu.Unlock()
 	m := metDe(contaID)
@@ -700,7 +705,8 @@ func registrarRetry(contaID string, r *events.Receipt, tentativa int) {
 	}
 	g := grupoDe(m, r.Chat.String())
 	h := horaDe(m)
-	contarPedidoAparelho(m, r.Sender.String(), r.Chat.String(), tentativa)
+	classe := classePedido(id)
+	contarPedidoAparelho(m, r.Sender.String(), r.Chat.String(), tentativa, classe)
 	m.Tentativas[strconv.Itoa(tentativa)]++
 	m.Retries++
 	g.Retries++
@@ -713,6 +719,14 @@ func registrarRetry(contaID string, r *events.Receipt, tentativa int) {
 			g.Horas = map[string]int{}
 		}
 		g.Horas[horaSP()]++
+		if m.Classes == nil {
+			m.Classes = map[string]int{}
+		}
+		m.Classes[classe]++
+		if g.Classes == nil {
+			g.Classes = map[string]int{}
+		}
+		g.Classes[classe]++
 	}
 }
 

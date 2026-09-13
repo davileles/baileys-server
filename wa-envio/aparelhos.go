@@ -33,6 +33,7 @@ type metAparelho struct {
 	Ocorrencias int            `json:"ocorrencias"`
 	Retries     int            `json:"retries"`
 	Grupos      map[string]int `json:"grupos,omitempty"` // ocorrencias por grupo
+	Classes     map[string]int `json:"classes,omitempty"`
 	Ultimo      string         `json:"ultimo,omitempty"`
 	Instavel    bool           `json:"instavel,omitempty"`
 }
@@ -118,7 +119,7 @@ func registrarIdentidade(contaID, jid string) {
 }
 
 // chamar com metMu travado (de dentro de registrarRetry)
-func contarPedidoAparelho(m *metConta, sender, grupo string, tentativa int) {
+func contarPedidoAparelho(m *metConta, sender, grupo string, tentativa int, classe string) {
 	a := aparelhoDe(m, sender)
 	a.Retries++
 	a.Ultimo = time.Now().In(tzSP).Format("15:04")
@@ -128,19 +129,23 @@ func contarPedidoAparelho(m *metConta, sender, grupo string, tentativa int) {
 			a.Grupos = map[string]int{}
 		}
 		a.Grupos[grupo]++
+		if a.Classes == nil {
+			a.Classes = map[string]int{}
+		}
+		a.Classes[classe]++
 	}
 }
 
 // resumoAparelhos: calculado na leitura, entao reclassifica tambem os pedidos
 // que o aparelho fez ANTES de ser marcado como instavel.
-func resumoAparelhos(m *metConta) (map[string]any, map[string][2]int) {
+func resumoAparelhos(m *metConta) (map[string]any, map[string][3]int) {
 	type item struct {
 		jid string
 		a   *metAparelho
 	}
 	var todos, instaveis []item
-	porGrupo := map[string][2]int{} // jid -> {aparelhos com pedido, ocorrencias de instaveis}
-	ocInst := 0
+	porGrupo := map[string][3]int{} // jid -> {aparelhos, ocorrencias de instaveis, de recuperacao}
+	ocInst, ocRecup := 0, 0
 	for jid, a := range m.Aparelhos {
 		if a.Ocorrencias == 0 {
 			continue
@@ -153,6 +158,15 @@ func resumoAparelhos(m *metConta) (map[string]any, map[string][2]int) {
 				v[1] += n
 			}
 			porGrupo[g] = v
+		}
+		if r := a.Classes[pedidoRecuperacao]; r > 0 {
+			ocRecup += r
+			// distribui pelo(s) grupo(s) do aparelho, proporcional as ocorrencias
+			for g, n := range a.Grupos {
+				v := porGrupo[g]
+				v[2] += r * n / max(1, a.Ocorrencias)
+				porGrupo[g] = v
+			}
 		}
 		if a.Instavel {
 			instaveis = append(instaveis, item{jid, a})
@@ -173,7 +187,7 @@ func resumoAparelhos(m *metConta) (map[string]any, map[string][2]int) {
 			out = append(out, map[string]any{
 				"aparelho": it.jid, "ocorrencias": it.a.Ocorrencias, "retries": it.a.Retries,
 				"registros": len(it.a.Registros), "identidades": it.a.Identidades,
-				"instavel": it.a.Instavel, "grupos": it.a.Grupos, "ultimo": it.a.Ultimo,
+				"instavel": it.a.Instavel, "grupos": it.a.Grupos, "classes": it.a.Classes, "ultimo": it.a.Ultimo,
 			})
 		}
 		return out
@@ -182,11 +196,16 @@ func resumoAparelhos(m *metConta) (map[string]any, map[string][2]int) {
 	if semInst < 0 {
 		semInst = 0
 	}
+	// Indicador de entrega: fora os aparelhos instaveis e fora a fila que o
+	// aparelho recupera depois de passar um tempo fora do ar.
 	return map[string]any{
 		"aparelhosComPedido":      len(todos),
 		"instaveis":               len(instaveis),
 		"ocorrenciasInstaveis":    ocInst,
 		"ocorrenciasSemInstaveis": semInst,
+		"ocorrenciasRecuperacao":  ocRecup,
+		"ocorrenciasEntrega":      m.Classes[pedidoEntrega],
+		"classes":                 m.Classes,
 		"listaInstaveis":          lista(instaveis, 30),
 		"topAparelhos":            lista(todos, 15),
 	}, porGrupo
@@ -214,6 +233,7 @@ func metricasParaResposta(comDetalhe bool) map[string]any {
 					if g, ok := gs[jid].(map[string]any); ok {
 						g["aparelhos"] = v[0]
 						g["ocorrenciasInstaveis"] = v[1]
+						g["ocorrenciasRecuperacao"] = v[2]
 					}
 				}
 			}
