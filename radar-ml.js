@@ -3026,6 +3026,71 @@ export function extrairCuponsTrackingMl(html) {
   return [...porCampanha.values()];
 }
 
+/** Desfaz o escape JSON de um valor recortado do HTML ("\u002F" -> "/"). */
+function textoJson(bruto) {
+  try { return JSON.parse('"' + String(bruto ?? '') + '"'); }
+  catch (e) { return String(bruto ?? '').replace(/\\u002F/gi, '/'); }
+}
+
+/**
+ * Cupons como o CARD da pagina exibe. E a unica fonte do link "Conferir", que
+ * leva a listagem dos produtos participantes — a resposta para "quais produtos
+ * aceitam este cupom?", que ate aqui so existia abrindo o ML na mao.
+ *
+ * Por que nao reconstruir a URL a partir do tracking: 'segmentations.container'
+ * traz os dois numeros que a URL usa, mas so 9 dos 36 cupons com codigo o
+ * publicam. Para o resto a reconstrucao daria link errado ou nenhum, enquanto o
+ * card tem o link pronto para todos.
+ *
+ * Formato observado, nesta ordem dentro de cada card:
+ *   "action":{"text":"Conferir","type":"link","value":"https:\u002F\u002Flista..."},
+ *   "code":"COMPRAFACIL","inputCode":"COMPRAFACIL",
+ *   "items":[{"imageUrl":"...","altText":"4 Travesseiros Antialergico..."}]
+ *
+ * 'items' e amostra (o ML mostra 4), nao a lista inteira — mas sao produtos
+ * reais que aceitam o cupom, o que ja serve de prova e de ponto de partida.
+ */
+export function extrairCuponsCardMl(html) {
+  const texto = String(html || '');
+  const porCodigo = new Map();
+  const reAcao = /"type"\s*:\s*"link"\s*,\s*"value"\s*:\s*"([^"]+)"/g;
+  let m;
+  while ((m = reAcao.exec(texto)) !== null) {
+    const link = textoJson(m[1]);
+    // Acao que nao aponta para o ML (modal, ajuda) nao responde nada sobre
+    // produto e nao pode virar botao "Ver produtos" no painel.
+    if (!/^https?:\/\/[^/]*mercadolivre\.com/i.test(link)) continue;
+
+    // O codigo vem DEPOIS da acao, no mesmo card. Janela curta de proposito: o
+    // card seguinte comeca bem mais adiante, e invadi-lo casaria o link de um
+    // cupom com o codigo de outro.
+    const janela = texto.slice(m.index, m.index + 800);
+    const posRel = janela.indexOf('"inputCode"');
+    if (posRel === -1) continue;
+    const mCod = janela.slice(posRel).match(/"inputCode"\s*:\s*"([A-Za-z0-9]{3,25})"/);
+    if (!mCod) continue;
+    const codigo = mCod[1].toUpperCase();
+    // O estado sai duas vezes no HTML (SSR + hidratacao); fica a primeira.
+    if (porCodigo.has(codigo)) continue;
+
+    // Amostra de itens: do codigo ate o proximo card. Sem esse limite a leitura
+    // atravessaria para o card seguinte quando um cupom vem sem itens.
+    const posCodigo = m.index + posRel;
+    const prox = texto.indexOf('"inputCode"', posCodigo + 11);
+    const trecho = texto.slice(posCodigo, prox === -1 ? posCodigo + 4000 : prox);
+    const itens = [];
+    const reItem = /"imageUrl"\s*:\s*"([^"]*)"\s*,\s*"altText"\s*:\s*"([^"]*)"/g;
+    let mi;
+    while ((mi = reItem.exec(trecho)) !== null && itens.length < 8) {
+      const nome = textoJson(mi[2]).trim();
+      if (nome) itens.push({ nome, imagem: textoJson(mi[1]) || null });
+    }
+
+    porCodigo.set(codigo, { codigo, linkProdutos: link, itensAmostra: itens });
+  }
+  return [...porCodigo.values()];
+}
+
 /**
  * Le os cupons da conta e grava na base com codigo, idCampanhaLoja e regras reais.
  * Cupom sem codigo digitavel (o ML tem campanhas que aplicam sozinhas) nao entra
@@ -3067,7 +3132,7 @@ export async function sincronizarCuponsContaMl() {
   _campanhasMl.clear();
   const gravados = [], semCodigo = [], inativos = [], fontes = [];
 
-  const registrarNoMapa = (c, ehAtivos) => {
+  const registrarNoMapa = (c, ehAtivos, card) => {
     const anterior = _campanhasMl.get(c.idCampanhaLoja);
     // Um mesmo cupom pode aparecer em varios filtros; fica a versao com codigo.
     if (anterior && anterior.codigo && !c.codigo) return;
@@ -3087,15 +3152,25 @@ export async function sincronizarCuponsContaMl() {
       // porque os filtros costumam vir com o campo vazio.
       elegibilidade: (c.elegibilidade?.categorias?.length || c.elegibilidade?.itens?.length)
         ? c.elegibilidade : (anterior?.elegibilidade || c.elegibilidade),
+      // Link oficial dos produtos participantes e a amostra que o card exibe.
+      // Vem do CARD, nao do tracking, e so a pagina /active traz os SEUS cupons
+      // com card completo — por isso a versao com link prevalece sobre a sem.
+      linkProdutos: card?.linkProdutos || anterior?.linkProdutos || null,
+      itensAmostra: (card?.itensAmostra?.length ? card.itensAmostra
+                                                : anterior?.itensAmostra) || [],
     });
   };
 
   for (const url of FILTROS_CUPONS_ML) {
     const ehAtivos = url.endsWith('/cupons/active');
     try {
-      const lidos = extrairCuponsTrackingMl(await buscar(url));
+      const html = await buscar(url);
+      const lidos = extrairCuponsTrackingMl(html);
+      // O tracking traz as regras; o card traz o link "Conferir" e a amostra de
+      // itens. Sao dois blocos diferentes do mesmo HTML — casam pelo codigo.
+      const cards = new Map(extrairCuponsCardMl(html).map(x => [x.codigo, x]));
       for (const c of lidos) {
-        registrarNoMapa(c, ehAtivos);
+        registrarNoMapa(c, ehAtivos, c.codigo ? cards.get(c.codigo) : null);
         if (!ehAtivos) continue;            // filtros so alimentam o mapa
         if (!c.ativoNoMl) { inativos.push(c.idCampanhaLoja); continue; }
         if (!c.codigo)    { semCodigo.push({ idCampanhaLoja: c.idCampanhaLoja, titulo: c.titulo,
@@ -3111,7 +3186,7 @@ export async function sincronizarCuponsContaMl() {
                                  tipo: reg.tipo, valor: reg.valor, minimo: reg.minimo,
                                  limite: reg.limite, validadeAte: reg.validadeAte });
       }
-      fontes.push({ url, lidos: lidos.length });
+      fontes.push({ url, lidos: lidos.length, cards: cards.size });
     } catch (e) { fontes.push({ url, erro: e.message }); }
     await new Promise(r => setTimeout(r, 600));
   }
