@@ -32,6 +32,14 @@ export const PAPEIS_CDV = ['config', 'aprovar', 'disparar', 'avisos'];
 const RE_JID_GRUPO = /^\d{5,}@g\.us$/;
 const RE_CONTA     = /^[a-z0-9_-]{2,24}$/i;
 
+// Para que serve cada grupo monitorado. Ate esta versao havia um destino so:
+// tudo que era lido virava candidato a EMISSAO (rota + milhas + datas). Grupos
+// de plantao de milhas publicam outra coisa — transferencia bonificada, compra
+// de pontos, clube, cartao — que nao tem rota nenhuma e por isso caia inteira
+// no descarte "nao reconhecido como emissao". 'oferta' manda o conteudo para a
+// fila de aprovacao do radar, o mesmo lugar onde cai o coletor de RSS.
+const TIPOS_MONITORADO = ['emissao', 'oferta'];
+
 // Padrao = exatamente o que estava hardcoded no server.js ate esta versao. Um
 // deploy sem config gravada se comporta como o sistema se comportava antes
 // desta camada existir — nenhum grupo entra, nenhum grupo sai.
@@ -141,6 +149,10 @@ function normalizarMonitorados(bruto) {
       // Ausencia do campo = ativo. Config gravada antes deste campo existir
       // (ou editada a mao no repositorio) nao pode desligar grupo por omissao.
       ativo: o.ativo !== false,
+      // Ausencia do campo = 'emissao': e o que TODO grupo cadastrado antes
+      // desta versao era. Tipo desconhecido tambem vira 'emissao' — mudar o
+      // destino de um grupo por erro de digitacao seria pior que ignorar.
+      tipo:  TIPOS_MONITORADO.includes(o.tipo) ? o.tipo : 'emissao',
     });
   }
   return [...porJid.values()];
@@ -183,9 +195,11 @@ function carregarUm() {
 
 export function carregarConfigCdv() {
   carregarUm();
-  const ativos = _cfg.monitorados.filter(m => m.ativo).length;
-  console.log('[CFG-CDV] Config carregada — ' + ativos + '/' + _cfg.monitorados.length
-    + ' grupo(s) monitorado(s) ativo(s), ' + _cfg.admins.length + ' admin(s).');
+  const ativos = _cfg.monitorados.filter(m => m.ativo);
+  const deOferta = ativos.filter(m => m.tipo === 'oferta').length;
+  console.log('[CFG-CDV] Config carregada — ' + ativos.length + '/' + _cfg.monitorados.length
+    + ' grupo(s) monitorado(s) ativo(s) (' + (ativos.length - deOferta) + ' de emissao, '
+    + deOferta + ' de oferta), ' + _cfg.admins.length + ' admin(s).');
   return _cfg;
 }
 
@@ -265,6 +279,31 @@ export function ehMonitoradoCdv(jid) {
   const j = String(jid || '').trim();
   if (!j) return false;
   return configCdv().monitorados.some(m => m.ativo && m.jid === j);
+}
+
+/** Tipo do grupo monitorado ('emissao' | 'oferta'). JID desconhecido -> null. */
+export function tipoMonitoradoCdv(jid) {
+  const j = String(jid || '').trim();
+  if (!j) return null;
+  const m = configCdv().monitorados.find(x => x.ativo && x.jid === j);
+  return m ? (m.tipo || 'emissao') : null;
+}
+
+/** Grupo cadastrado como fonte de OFERTAS de pontos/milhas (radar). */
+export function ehMonitoradoOfertaCdv(jid) {
+  return tipoMonitoradoCdv(jid) === 'oferta';
+}
+
+/** Grupo cadastrado como fonte de EMISSOES (alerta de passagem). */
+export function ehMonitoradoEmissaoCdv(jid) {
+  return tipoMonitoradoCdv(jid) === 'emissao';
+}
+
+/** Nome cadastrado do grupo monitorado, para log e para a tela. */
+export function nomeMonitoradoCdv(jid) {
+  const j = String(jid || '').trim();
+  const m = configCdv().monitorados.find(x => x.jid === j);
+  return (m && m.nome) || '';
 }
 
 /** Apelido da conta que dispara o CDV. Vazio -> principal. */
