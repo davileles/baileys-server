@@ -4498,6 +4498,27 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   // fundo o bastante para interromper o grupo geral: a MESMA oferta sai, so que
   // num subconjunto dos destinos. Sem opcoes, nada muda — todos os outros
   // caminhos de envio continuam recebendo a lista inteira.
+  // ── DESTINOS DA TRILHA DO NICHO ──
+  // destinosDaOferta so considera trilhas GERAIS quando a oferta nao tem fonte
+  // — e oferta de lista manual nunca tem. A trilha do nicho nao chega nem a ser
+  // candidata, por mais confirmada que a categoria esteja, entao injetar a
+  // categoria sozinha nao levava nada ao grupo do nicho: o filtro abaixo
+  // peneirava um conjunto que jamais o continha e o envio morria com "nenhum
+  // grupo de nicho". Aqui os destinos daquela categoria entram na lista. So
+  // acontece quando o chamador pede o nicho explicitamente; sem a opcao, todos
+  // os outros caminhos de envio seguem exatamente como eram.
+  if (opcoes.categoriaNicho) {
+    const doNicho = trilhas()
+      .filter(t => t.categoria === opcoes.categoriaNicho)
+      .flatMap(t => t.destinos);
+    if (doNicho.length) {
+      const antes = alvos.length;
+      alvos = [...new Set([...alvos, ...doNicho])];
+      console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' + trilha de nicho '
+        + opcoes.categoriaNicho + ' — ' + alvos.length + ' grupo(s) (antes ' + antes + ').');
+    }
+  }
+
   if (opcoes.somenteNicho) {
     const antes = alvos.length;
     alvos = alvos.filter(jid => ehDestinoDeNicho(jid, opcoes.categoriaNicho || null));
@@ -14512,10 +14533,11 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
     // confianca 1 e o passaporte que a trilha de nicho exige.
     oferta.dadosExtraidos.categoria = _nicho;
     oferta.dadosExtraidos.categoriaConfianca = 1;
-    if (roteamento === 'so_nicho') {
-      _opcoesEnvio.somenteNicho   = true;
-      _opcoesEnvio.categoriaNicho = _nicho;
-    }
+    // categoriaNicho vai nos dois modos: e ela que traz os destinos da trilha do
+    // nicho para a lista de alvos. 'somenteNicho' e o que corta os gerais — sem
+    // ele, nicho + geral.
+    _opcoesEnvio.categoriaNicho = _nicho;
+    if (roteamento === 'so_nicho') _opcoesEnvio.somenteNicho = true;
   }
 
   const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta, _opcoesEnvio);
