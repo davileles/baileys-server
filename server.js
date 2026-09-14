@@ -13378,8 +13378,41 @@ function estadoLeitores() {
   return [montar(contaLeitoraCdv(), 'cdv'), montar(contaLeitoraTsp(), 'tsp')];
 }
 
-app.get('/config-cdv', (req, res) => {
+// Nomes dos grupos das contas SECUNDARIAS (Tico). A tela de config montava o
+// seletor so com NOMES_GRUPOS, que vem da conta principal — entao grupo em que
+// apenas um Tico esta (caso do Super Promos CDV) nao aparecia para cadastrar na
+// reentrada, justamente onde o Tico e quem tem poder de adicionar.
+//
+// Mapa SEPARADO de proposito: jogar isso dentro de NOMES_GRUPOS mudaria o que
+// /grupos devolve e faria surgir, nos seletores de destino do CDV e do TSP,
+// grupos em que a principal nem esta.
+const NOMES_GRUPOS_EXTRAS = new Map();
+let _nomesExtrasEm = 0;
+const NOMES_EXTRAS_TTL = 15 * 60 * 1000;
+
+async function atualizarNomesGruposExtras() {
+  for (const c of contasExtras.values()) {
+    if (!c?.conectado || !c.sock) continue;
+    if (tenantDaConta(c.id) !== TENANT_PADRAO) continue;
+    try {
+      const chats = await c.sock.groupFetchAllParticipating();
+      for (const g of Object.values(chats || {})) {
+        if (g?.id) NOMES_GRUPOS_EXTRAS.set(g.id, g.subject || '(sem nome)');
+      }
+    } catch (e) {
+      console.warn('[CFG-CDV] nomes de ' + apelidoDaConta(c.id) + ' falharam: ' + e.message);
+    }
+  }
+  _nomesExtrasEm = Date.now();
+}
+
+app.get('/config-cdv', async (req, res) => {
   if (!NOMES_GRUPOS.size) atualizarNomesGrupos().catch(() => {});
+  // groupFetchAllParticipating custa segundos por conta, e a lista de grupos
+  // muda raramente: TTL evita pagar isso a cada abertura da aba Config.
+  if (req.query.refresh === '1' || Date.now() - _nomesExtrasEm > NOMES_EXTRAS_TTL) {
+    try { await atualizarNomesGruposExtras(); } catch (e) { console.warn('[CFG-CDV] nomes extras: ' + e.message); }
+  }
   const cfg = configCdv();
   const contas = [...contasExtras.values()]
     .filter(c => tenantDaConta(c.id) === TENANT_PADRAO)
@@ -13391,7 +13424,10 @@ app.get('/config-cdv', (req, res) => {
     // Nome atual de cada grupo monitorado, direto do WhatsApp: o cadastro
     // guarda o nome do dia em que foi salvo, e grupo renomeado ficaria com um
     // rotulo velho na tela para sempre.
-    nomes: Object.fromEntries(NOMES_GRUPOS),
+    // Principal + secundarias na MESMA lista: para cadastrar um grupo na
+    // reentrada o que importa e existir um numero conectado que seja admin
+    // dele, nao ser um grupo da principal.
+    nomes: { ...Object.fromEntries(NOMES_GRUPOS_EXTRAS), ...Object.fromEntries(NOMES_GRUPOS) },
     contas,
     // A conta principal entra na MESMA lista da tela: para quem opera, ela e
     // so mais um numero com papeis. A diferenca (ser o socket que sustenta
