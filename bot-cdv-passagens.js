@@ -219,6 +219,51 @@ export async function enviarCardPassagem(oferta) {
   });
 }
 
+// ── CRIAR EMISSAO A PARTIR DE TEXTO OU PRINT ─────────────────────────────────
+// Reusa /injetar, a mesma porta que a varredura do seats.aero usa: o conteudo
+// passa pelo classificador de sempre, cai na fila e o card volta sozinho por
+// enviarCardPassagem. Nada de prompt novo aqui.
+//
+// PDF nao entra por este caminho: o classificador de emissao monta bloco de
+// imagem, e aceitar documento ali mexeria no trecho que roda em toda captura de
+// grupo. Print resolve o caso real de quem opera pelo celular.
+const ESPERA_MAX_MS  = 75000;
+const ESPERA_PASSO_MS = 5000;
+
+async function idsDaFila() {
+  const r = await apiLocal('GET', '/cdv/fila?n=20');
+  return new Set((r.itens || []).map(i => String(i.id)));
+}
+
+async function criarEmissao(chatId, { texto, imagens }) {
+  const aviso = await bot.falarPlano(chatId, '⏳ Analisando... o card aparece aqui quando ficar pronto.');
+  const antes = await idsDaFila();
+
+  const r = await apiLocal('POST', '/injetar', { texto: texto || '', imagens: imagens || [], origem: 'manual' });
+  if (!r.ok) {
+    return bot.falarPlano(chatId, '❌ Não consegui injetar: ' + (r.erro || r.http), null, aviso?.message_id);
+  }
+
+  // O /injetar responde antes de a IA rodar. Sem esta espera o operador ficaria
+  // sem saber se o conteudo nao era emissao ou se o bot apenas engoliu a
+  // mensagem — e "nao reconheci" e uma resposta muito melhor que silencio.
+  const limite = Date.now() + ESPERA_MAX_MS;
+  while (Date.now() < limite) {
+    await new Promise(r2 => setTimeout(r2, ESPERA_PASSO_MS));
+    const agora = await idsDaFila();
+    const novos = [...agora].filter(id => !antes.has(id));
+    if (novos.length) {
+      // O card ja foi mandado por enviarCardPassagem; o aviso vira ruido.
+      if (aviso?.message_id) await bot.tg('deleteMessage', { chat_id: chatId, message_id: aviso.message_id });
+      return;
+    }
+  }
+  return bot.falarPlano(chatId,
+    'Não identifiquei uma emissão nesse conteúdo — ou ela foi descartada por ser repetida. '
+    + 'Se foi print, tente mandar junto a legenda com rota e programa.',
+    null, aviso?.message_id);
+}
+
 // ── FILA ─────────────────────────────────────────────────────────────────────
 function rotuloItemFila(i) {
   const rota = (i.origem || '?') + '→' + (i.destino || '?');
@@ -370,6 +415,27 @@ export async function tratarUpdateBotPassagens(update) {
       console.warn(bot.TAG + ' mensagem de chat nao autorizado: ' + chatId);
       return void await bot.falarPlano(chatId, 'Sem permissão. Seu ID: ' + chatId);
     }
+    // Foto (ou imagem mandada como arquivo) vira emissao nova. Vem antes do
+    // texto porque a legenda da foto chega no mesmo update, em m.caption.
+    const legenda = String(m.caption || '').trim();
+    const doc = m.document;
+    const ehImagemDoc = doc && /^image\//i.test(doc.mime_type || '');
+    if (m.photo?.length || ehImagemDoc) {
+      sessoes.delete(String(chatId));
+      // O Telegram manda a mesma foto em varios tamanhos; o ultimo e o maior.
+      const fileId = ehImagemDoc ? doc.file_id : m.photo[m.photo.length - 1].file_id;
+      try {
+        const arq = await bot.baixarArquivo(fileId);
+        return void await criarEmissao(chatId, { texto: legenda, imagens: [arq.base64] });
+      } catch (err) {
+        return void await bot.falarPlano(chatId, '❌ Não consegui baixar a imagem: ' + err.message);
+      }
+    }
+    if (doc) {
+      return void await bot.falarPlano(chatId,
+        'Para emissão eu leio texto e print. Esse arquivo não — mande um print da tela ou cole o texto.');
+    }
+
     const bruto = String(m.text || '').trim();
     const texto = bruto.toLowerCase().split('@')[0];
     if (texto === '/cancelar') {
@@ -380,10 +446,18 @@ export async function tratarUpdateBotPassagens(update) {
       sessoes.delete(String(chatId));
       return void await mostrarFila(chatId, null);
     }
-    // Valor de campo tem prioridade sobre a mensagem de ajuda.
+    if (texto === '/nova') {
+      sessoes.delete(String(chatId));
+      return void await bot.falarPlano(chatId,
+        'Cole o texto da emissão ou mande o print. Eu leio, monto o card e devolvo aqui para aprovar.');
+    }
+    // Valor de campo tem prioridade: dentro de uma edicao, o texto e o valor.
     if (await tratarTexto(chatId, bruto, m.message_id)) return;
+    // Texto solto e material de emissao. O piso de 15 caracteres separa conteudo
+    // de "oi" e de toque errado — abaixo disso nada vira rota de qualquer jeito.
+    if (bruto.length >= 15) return void await criarEmissao(chatId, { texto: bruto, imagens: [] });
     if (bruto) {
-      await bot.falarPlano(chatId, 'Este bot só mostra passagens esperando decisão. Use /fila.',
+      await bot.falarPlano(chatId, 'Mande o texto da emissão ou um print — ou use /fila para ver o que está esperando decisão.',
         bot.teclado([[['📋 Fila', 'p:fila:0']]]));
     }
   } catch (err) {
@@ -395,6 +469,7 @@ export async function bootBotPassagens(deps) {
   dep = deps;
   await bot.bootWebhook([
     { command: 'fila',     description: 'Passagens esperando decisão' },
+    { command: 'nova',     description: 'Criar emissão a partir de texto ou print' },
     { command: 'cancelar', description: 'Cancelar a edição em andamento' },
   ]);
 }
