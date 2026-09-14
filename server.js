@@ -7942,6 +7942,14 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 // caminho. O que a IA erra, a tela conserta antes de sair.
 const OFERTA_MILHAS_JANELA_MS = 45000;   // debounce: plantao posta texto e print separados
 const OFERTA_MILHAS_MAX_IMGS  = 3;       // teto de imagens por extracao (custo/tempo)
+// Categorias que NAO devem virar card na aba de aprovacao: ja existe pipeline
+// paralelo cuidando delas (compra bonificada e coberta pelo radar de compras
+// bonificadas do painel). Editavel por env no Railway, sem novo deploy de
+// codigo: CDV_OFERTA_CATEGORIAS_BLOQUEADAS="compra_bonificada,clube".
+const OFERTA_MILHAS_CATEGORIAS_BLOQUEADAS = new Set(
+  String(process.env.CDV_OFERTA_CATEGORIAS_BLOQUEADAS ?? 'compra_bonificada')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
 const bufferOfertaMilhas = new Map();    // jid -> { itens, timer }
 
 const OFERTA_MILHAS_EMOJI = {
@@ -8099,6 +8107,18 @@ async function processarBufferOfertaMilhas(jid) {
 
   const CATEGORIAS = ['transferencia', 'compra', 'compra_bonificada', 'clube', 'cartao', 'geral'];
   const categoria = CATEGORIAS.includes(ia.categoria) ? ia.categoria : 'geral';
+
+  // Portao de categoria: chega DEPOIS da IA porque so ela sabe distinguir
+  // "transferencia bonificada" (que queremos) de "compra bonificada em
+  // parceiro" (que ja temos em paralelo) — a palavra "bonificada" aparece nas
+  // duas, entao filtro por texto bruto derrubaria transferencia junto.
+  if (OFERTA_MILHAS_CATEGORIAS_BLOQUEADAS.has(categoria)) {
+    console.log('[CDV-OFERTA] Categoria "' + categoria + '" bloqueada — nao vai para aprovacao: '
+      + String(ia.titulo || '').slice(0, 80));
+    registrarDescarteCdv({ jid, motivo: 'categoria bloqueada',
+      detalhe: categoria + ' — ja tratada por pipeline paralelo', texto: textoBruto });
+    return;
+  }
   // Link de convite de grupo e encurtador de afiliado nunca entram: o card vai
   // para o radar publico e para o WhatsApp dos assinantes.
   const link = /^https?:\/\//i.test(ia.link || '') && !/chat\.whatsapp\.com/i.test(ia.link)
