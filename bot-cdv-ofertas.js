@@ -9,9 +9,11 @@
 // do repositorio. Observar a fila cobre as duas fontes com um mecanismo so e
 // mantem o token em um lugar unico.
 //
-// O bot nao monta mensagem: pede a previa pronta ao proxy
-// (/ofertas/mensagem/:id) e aprova pelo mesmo caminho da tela. Se o template
-// mudar, o card muda junto.
+// O bot nao monta mensagem: pede a previa pronta ao proxy e aprova pelo mesmo
+// caminho da tela. A edicao segue o modelo que o gestor ja usa — os campos
+// corrigidos viajam como `edits` na hora de aprovar, em vez de reescreverem a
+// fila a cada toque. Um commit no GitHub por campo editado deixaria a edicao
+// lenta no celular e encheria o historico do repo de ruido.
 //
 // Env:
 //   TELEGRAM_BOT_OFERTAS_TOKEN    token do @BotFather (ausente = bot off)
@@ -45,6 +47,20 @@ let ARQUIVO_VISTOS = './sessao/ofertas-cardadas.json';
 // reinicia sozinho e, sem isso, a fila inteira viraria card de novo a cada
 // boot — sessenta itens repetidos no chat.
 let vistos = new Set();
+
+// Campos corrigidos no celular, por oferta, ate a aprovacao. Em memoria de
+// proposito (ver cabecalho). Redeploy no meio da edicao perde os campos; o
+// card avisa quando ha edicao pendente para o caso nao passar despercebido.
+const edicoes = new Map();          // ofertaId -> { campo: valor }
+
+// "Estou esperando um valor" — uma sessao por chat.
+const sessoes = new Map();          // chatId -> { campo, ofertaId, msgId, expiraEm }
+const SESSAO_TTL_MS = 15 * 60 * 1000;
+
+setInterval(() => {
+  const agora = Date.now();
+  for (const [k, s] of sessoes) if (s.expiraEm < agora) sessoes.delete(k);
+}, 5 * 60 * 1000).unref?.();
 
 function carregarVistos() {
   try {
@@ -87,6 +103,24 @@ const CATEGORIA_ROTULO = {
   geral:             'Oferta',
 };
 
+// Campos que fazem diferenca na mensagem que vai ao grupo. Categoria, programa
+// e origem/destino ficam de fora: mexer neles muda o roteamento e o historico
+// de transferencias, e isso e decisao de tela, nao de celular.
+const CAMPOS = {
+  titulo:     'Título',
+  resumo:     'Resumo',
+  bonus:      'Bônus',
+  prazo:      'Prazo',
+  loja:       'Loja',
+  cupom:      'Cupom',
+  link:       'Link',
+  importante: 'Importante',
+};
+
+function edicoesDe(id) { return edicoes.get(String(id)) || {}; }
+
+function comEdicoes(o) { return { ...o, ...edicoesDe(o.id) }; }
+
 function blocoFatos(o) {
   const l = [];
   const cat = CATEGORIA_ROTULO[o.categoria] || CATEGORIA_ROTULO.geral;
@@ -106,12 +140,21 @@ function blocoFonte(o) {
   return '📥 Radar de conteúdo';
 }
 
+function blocoEdicoes(id) {
+  const ed = edicoesDe(id);
+  const ks = Object.keys(ed);
+  if (!ks.length) return '';
+  return '✏️ <b>Editado (ainda não salvo):</b> ' + e(ks.map(k => CAMPOS[k] || k).join(', '));
+}
+
 function corpoCard(o, mensagem, extra) {
+  const v = comEdicoes(o);
   return [
-    (o.emoji || '📰') + ' <b>' + e(o.titulo || 'Oferta') + '</b>  <code>#' + e(o.id) + '</code>',
-    blocoFatos(o),
-    o.resumo ? e(o.resumo) : '',
-    blocoFonte(o),
+    (v.emoji || '📰') + ' <b>' + e(v.titulo || 'Oferta') + '</b>  <code>#' + e(o.id) + '</code>',
+    blocoFatos(v),
+    v.resumo ? e(v.resumo) : '',
+    blocoFonte(v),
+    blocoEdicoes(o.id),
     citacao('📱 Como sai no WhatsApp', mensagem, LIMITE_PREVIA, false, e),
     o.conteudoOriginal ? citacao('📄 Conteúdo original', o.conteudoOriginal, LIMITE_ORIGINAL, true, e) : '',
     extra ? '<b>' + e(extra) + '</b>' : '',
@@ -124,18 +167,58 @@ function tecladoCard(id) {
   return bot.teclado([
     [['✅ Aprovar e enviar', 'o:enviar:' + id]],
     [['📡 Só Radar', 'o:radar:' + id], ['🗑️ Rejeitar', 'o:rejeitar:' + id]],
-    [['🔄 Atualizar', 'o:ver:' + id], ['📋 Fila', 'o:fila:0']],
+    [['✏️ Editar', 'o:editar:' + id], ['🔄 Atualizar', 'o:ver:' + id], ['📋 Fila', 'o:fila:0']],
   ]);
 }
 
-function recibo(o, prefixo) {
-  return e(prefixo + ' ' + (o.titulo || 'Oferta') + ' (#' + o.id + ')');
+function tecladoEdicao(o) {
+  const v = comEdicoes(o);
+  const id = o.id;
+  const bt = (k) => [CAMPOS[k] + (v[k] ? '' : ' ⚠️'), 'o:campo:' + k + ':' + id];
+  const linhas = [
+    [bt('titulo'), bt('resumo')],
+    [bt('bonus'), bt('prazo')],
+    [bt('loja'), bt('cupom')],
+    [bt('link'), bt('importante')],
+  ];
+  if (Object.keys(edicoesDe(id)).length) linhas.push([['♻️ Descartar edições', 'o:limpar:' + id]]);
+  linhas.push([['↩️ Voltar ao card', 'o:ver:' + id]]);
+  return bot.teclado(linhas);
 }
 
+function telaEdicao(o) {
+  const v = comEdicoes(o);
+  const ed = edicoesDe(o.id);
+  const linhas = Object.keys(CAMPOS).map(k => {
+    const marca = ed[k] !== undefined ? ' ✏️' : '';
+    const val = v[k] ? e(String(v[k]).slice(0, 90)) : '<i>vazio</i>';
+    return '• <b>' + e(CAMPOS[k]) + '</b>' + marca + ': ' + val;
+  });
+  return '✏️ <b>Editar #' + e(o.id) + '</b>\nToque no campo que quer corrigir. '
+    + 'As correções entram na oferta quando você aprovar.\n\n' + linhas.join('\n');
+}
+
+function recibo(o, prefixo) {
+  const v = comEdicoes(o);
+  return e(prefixo + ' ' + (v.titulo || 'Oferta') + ' (#' + o.id + ')');
+}
+
+// Previa sempre com os campos editados aplicados: aprovar um texto diferente
+// do que estava na tela e o tipo de surpresa que faz o operador parar de
+// confiar no bot.
 async function carregarOferta(id) {
-  const r = await proxy('GET', '/ofertas/mensagem/' + encodeURIComponent(id));
+  const ed = edicoesDe(id);
+  const r = Object.keys(ed).length
+    ? await proxy('POST', '/ofertas/mensagem/' + encodeURIComponent(id), { edits: ed })
+    : await proxy('GET',  '/ofertas/mensagem/' + encodeURIComponent(id));
   if (!r.ok) return null;
   return r;
+}
+
+async function redesenhar(chatId, msgId, id, nota) {
+  const det = await carregarOferta(id);
+  if (!det) return bot.falarHtml(chatId, '⚠️ <code>#' + e(id) + '</code> saiu da fila.', null, msgId);
+  return bot.falarHtml(chatId, corpoCard(det.oferta, det.mensagem, nota), tecladoCard(id), msgId);
 }
 
 async function enviarCardOferta(o, mensagem) {
@@ -197,7 +280,8 @@ async function mostrarFila(chatId, msgId) {
 // ── ACOES ────────────────────────────────────────────────────────────────────
 async function tratarAcao(chatId, msgId, partes, callbackId) {
   const acao = partes[1];
-  const id   = partes.slice(2).join(':');
+  const arg  = acao === 'campo' ? partes[2] : null;
+  const id   = arg ? partes.slice(3).join(':') : partes.slice(2).join(':');
 
   if (acao === 'fila') return mostrarFila(chatId, msgId);
 
@@ -205,23 +289,52 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
   // que o card foi desenhado.
   const det = await carregarOferta(id);
   if (!det) {
+    edicoes.delete(String(id));
     return bot.falarHtml(chatId, '⚠️ <code>#' + e(id) + '</code> saiu da fila (resolvida em outro lugar ou expirada).', null, msgId);
   }
   const o = det.oferta;
 
-  if (acao === 'ver') return bot.falarHtml(chatId, corpoCard(o, det.mensagem), tecladoCard(id), msgId);
+  if (acao === 'ver') {
+    sessoes.delete(String(chatId));
+    return bot.falarHtml(chatId, corpoCard(o, det.mensagem), tecladoCard(id), msgId);
+  }
+
+  if (acao === 'editar') {
+    sessoes.delete(String(chatId));
+    return bot.falarHtml(chatId, telaEdicao(o), tecladoEdicao(o), msgId);
+  }
+
+  if (acao === 'limpar') {
+    edicoes.delete(String(id));
+    return redesenhar(chatId, msgId, id, '♻️ Edições descartadas.');
+  }
+
+  if (acao === 'campo') {
+    const campo = arg;
+    if (!CAMPOS[campo]) return bot.toast(callbackId, 'Campo desconhecido.');
+    sessoes.set(String(chatId), { campo, ofertaId: id, msgId, expiraEm: Date.now() + SESSAO_TTL_MS });
+    const atualVal = comEdicoes(o)[campo];
+    return bot.falarHtml(chatId,
+      '✏️ <b>' + e(CAMPOS[campo]) + '</b> de #' + e(id)
+      + '\nHoje: ' + (atualVal ? e(String(atualVal)) : '<i>vazio</i>')
+      + '\n\nMande o novo valor por mensagem. Para deixar o campo vazio, mande <code>-</code>.',
+      bot.teclado([[['↩️ Cancelar', 'o:editar:' + id]]]), msgId);
+  }
 
   if (acao === 'enviar' || acao === 'radar') {
     const soRadar = acao === 'radar';
+    const ed = edicoesDe(id);
+    const temEd = Object.keys(ed).length ? ed : undefined;
     // Botoes saem ANTES do await: aprovar leva segundos (commit no GitHub +
     // fila do WhatsApp) e um segundo toque duplicaria a publicacao.
     await bot.falarHtml(chatId, corpoCard(o, det.mensagem, soRadar ? '⏳ Publicando no Radar...' : '⏳ Aprovando e enfileirando...'), null, msgId);
     const r = soRadar
-      ? await proxy('POST', '/ofertas/aprovar', { id })
-      : await proxy('POST', '/ofertas/aprovar-e-enviar', { id });
+      ? await proxy('POST', '/ofertas/aprovar', { id, edits: temEd })
+      : await proxy('POST', '/ofertas/aprovar-e-enviar', { id, edits: temEd });
     if (!r.ok) {
       return bot.falarHtml(chatId, corpoCard(o, det.mensagem, '❌ Falha: ' + (r.erro || r.http)), tecladoCard(id), msgId);
     }
+    edicoes.delete(String(id));
     if (soRadar) return bot.falarHtml(chatId, recibo(o, '📡 Publicada no Radar (sem WhatsApp):'), null, msgId);
     const pos = r.posicao || 1, min = r.minutos || 0;
     const quando = (pos === 1 && min === 0) ? 'saindo agora' : 'na fila (pos. ' + pos + ', ~' + min + ' min)';
@@ -233,10 +346,29 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
     if (!r.ok) {
       return bot.falarHtml(chatId, corpoCard(o, det.mensagem, '❌ Falha ao rejeitar: ' + (r.erro || r.http)), tecladoCard(id), msgId);
     }
+    edicoes.delete(String(id));
     return bot.falarHtml(chatId, recibo(o, '🗑️ Rejeitada e bloqueada:'), null, msgId);
   }
 
   return bot.toast(callbackId, 'Ação desconhecida.');
+}
+
+// Texto digitado com um campo aberto: guarda a correcao, redesenha o CARD com a
+// previa ja atualizada e apaga o que foi digitado, para o chat nao virar um
+// rastro de valores soltos.
+async function tratarTexto(chatId, texto, msgIdDigitado) {
+  const s = sessoes.get(String(chatId));
+  if (!s) return false;
+  sessoes.delete(String(chatId));
+
+  const valor = String(texto).trim() === '-' ? '' : String(texto).trim();
+  const atual = edicoes.get(String(s.ofertaId)) || {};
+  atual[s.campo] = valor;
+  edicoes.set(String(s.ofertaId), atual);
+
+  await redesenhar(chatId, s.msgId, s.ofertaId, '✏️ ' + CAMPOS[s.campo] + ' atualizado — aprove para salvar.');
+  if (msgIdDigitado) await bot.tg('deleteMessage', { chat_id: chatId, message_id: msgIdDigitado });
+  return true;
 }
 
 // ── WEBHOOK ──────────────────────────────────────────────────────────────────
@@ -260,9 +392,18 @@ export async function tratarUpdateBotOfertas(update) {
       console.warn(bot.TAG + ' mensagem de chat nao autorizado: ' + chatId);
       return void await bot.falarPlano(chatId, 'Sem permissão. Seu ID: ' + chatId);
     }
-    const texto = String(m.text || '').trim().toLowerCase().split('@')[0];
-    if (texto === '/fila' || texto === '/start' || texto === '/menu') return void await mostrarFila(chatId, null);
-    if (texto) {
+    const bruto = String(m.text || '').trim();
+    const texto = bruto.toLowerCase().split('@')[0];
+    if (texto === '/cancelar') {
+      sessoes.delete(String(chatId));
+      return void await bot.falarPlano(chatId, 'Edição cancelada.');
+    }
+    if (texto === '/fila' || texto === '/start' || texto === '/menu') {
+      sessoes.delete(String(chatId));
+      return void await mostrarFila(chatId, null);
+    }
+    if (await tratarTexto(chatId, bruto, m.message_id)) return;
+    if (bruto) {
       await bot.falarPlano(chatId, 'Este bot só mostra ofertas de pontos esperando decisão. Use /fila.',
         bot.teclado([[['📋 Fila', 'o:fila:0']]]));
     }
@@ -276,7 +417,8 @@ export async function bootBotOfertas(deps) {
   if (dep.sessaoDir) ARQUIVO_VISTOS = dep.sessaoDir.replace(/\/$/, '') + '/ofertas-cardadas.json';
   carregarVistos();
   const ok = await bot.bootWebhook([
-    { command: 'fila', description: 'Ofertas de pontos esperando decisão' },
+    { command: 'fila',     description: 'Ofertas de pontos esperando decisão' },
+    { command: 'cancelar', description: 'Cancelar a edição em andamento' },
   ]);
   if (!ok) return;
   // Atraso no primeiro tiro: o boot ja tem trabalho demais (WhatsApp, Telegram,
