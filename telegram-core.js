@@ -85,6 +85,25 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
 
   const autorizado = (chatId) => ADMINS.has(String(chatId));
 
+  // Baixa uma foto ou documento enviado no chat e devolve em base64. A Bot API
+  // entrega so o file_id no update; o conteudo exige getFile e depois um GET no
+  // host de arquivos, que e outro dominio e leva o token no path.
+  // Teto de 20 MB: e o limite de download da propria Bot API.
+  const LIMITE_ARQUIVO = 20 * 1024 * 1024;
+  async function baixarArquivo(fileId) {
+    const info = await tg('getFile', { file_id: fileId });
+    if (!info.ok || !info.result?.file_path) {
+      throw new Error('getFile falhou: ' + (info.description || 'sem file_path'));
+    }
+    if (info.result.file_size && info.result.file_size > LIMITE_ARQUIVO) {
+      throw new Error('arquivo acima de 20 MB — a Bot API nao entrega');
+    }
+    const r = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${info.result.file_path}`);
+    if (!r.ok) throw new Error('download falhou: status ' + r.status);
+    const buf = Buffer.from(await r.arrayBuffer());
+    return { base64: buf.toString('base64'), caminho: info.result.file_path, bytes: buf.length };
+  }
+
   // Manda o mesmo card para todos os admins. Um chat que falha nao pode
   // impedir a entrega nos outros.
   async function paraCadaAdmin(fn) {
@@ -114,6 +133,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   return {
     nome, TAG, ativo: !!TOKEN, path: PATH, admins: ADMINS,
     tg, esc, teclado, falarHtml, falarPlano, toast, autorizado, paraCadaAdmin, bootWebhook,
+    baixarArquivo,
   };
 }
 
