@@ -12870,7 +12870,14 @@ app.post('/painel/reformatar/:id', async (req, res) => {
   try {
     const de = aplicarDadosEditados(oferta, req.body && req.body.dados);
     if (!de.origem || !de.destino || !de.programa) {
-      return res.status(400).json({ ok:false, erro:'Origem, destino e programa sao obrigatorios.' });
+      // O campo editado JA entrou em dadosExtraidos (aplicarDadosEditados muta
+      // a oferta). Antes isso se perdia num restart, porque so havia
+      // salvarFila() no caminho de sucesso — e quem edita campo a campo pelo
+      // bot passa por aqui em toda correcao de card incompleto, justamente o
+      // caso em que os tres obrigatorios ainda nao estao todos preenchidos.
+      salvarFila();
+      return res.status(400).json({ ok:false, erro:'Origem, destino e programa sao obrigatorios.',
+                                    parcial:true, dadosExtraidos:de });
     }
     const hist180 = await registrarPassagemProxy({
       origem:      de.origem,
@@ -12885,6 +12892,10 @@ app.post('/painel/reformatar/:id', async (req, res) => {
       apenasConsulta: true,
     });
     oferta.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV(de), hist180);
+    // Corrigir a cabine muda a chave do historico 180d, e o card do bot le
+    // hist180 da oferta. Sem atualizar aqui, o card seguiria mostrando a media
+    // da cabine errada depois da correcao.
+    if (hist180) oferta.hist180 = hist180;
     salvarFila();
     res.json({ ok:true, mensagemFormatada: oferta.mensagemFormatada, dadosExtraidos: de });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
