@@ -14293,7 +14293,7 @@ app.delete('/monitor/:jid', (req, res) => {
 
 // Monta e envia UM produto. Isolada porque e usada pelo worker e pelo disparo
 // avulso, e o preco tem de ser sempre consultado no instante do envio.
-async function dispararProdutoDaLista(asin, codigoCupom) {
+async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
   const item = itemVitrine(asin);
   if (!item) return { ok:false, motivo:'produto nao esta mais na vitrine' };
 
@@ -14337,7 +14337,34 @@ async function dispararProdutoDaLista(asin, codigoCupom) {
     if (img) oferta.imagens = [img];
   } catch (e) {}
 
-  const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta);
+  // ── NICHO CURADO NO DISPARO MANUAL ──
+  // Sem isto a oferta sai sem categoria, e oferta sem categoria so entra nas
+  // trilhas GERAIS (destinosDaOferta cai em trilhasGerais quando nao ha fonte
+  // nem categoria confiavel): o grupo do nicho nunca recebia lista nenhuma.
+  // 'geral' como curadoria significa "bom produto, mas nao e de nicho", entao
+  // vale como ausencia de nicho — nao existe trilha de categoria 'geral'.
+  const _nichoItem = String(item.nicho || '').trim();
+  const _nicho = _nichoItem && _nichoItem !== 'geral' ? _nichoItem : '';
+  const _opcoesEnvio = {};
+  if (roteamento === 'nicho_e_geral' || roteamento === 'so_nicho') {
+    if (!_nicho) {
+      // Pulado, nao enviado no geral por engano: a lista pediu nicho e este
+      // item nao tem. Aparece no painel com o motivo, da para curar e refazer.
+      return { ok:false, motivo: roteamento === 'so_nicho'
+        ? 'sem nicho curado e a lista esta em "somente no grupo do nicho"'
+        : 'sem nicho curado e a lista esta em "nicho + geral"' };
+    }
+    // Curadoria vence o classificador, mesma regra do monitor de precos:
+    // confianca 1 e o passaporte que a trilha de nicho exige.
+    oferta.dadosExtraidos.categoria = _nicho;
+    oferta.dadosExtraidos.categoriaConfianca = 1;
+    if (roteamento === 'so_nicho') {
+      _opcoesEnvio.somenteNicho   = true;
+      _opcoesEnvio.categoriaNicho = _nicho;
+    }
+  }
+
+  const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta, _opcoesEnvio);
   marcarDisparo(asin);
   // O historico durvel e o unico ponto por onde toda oferta enviada deve
   // passar: alem da contagem, e la que rodam registrarVisto (dedup) e
@@ -14509,7 +14536,7 @@ setInterval(async () => {
     }
 
     try {
-      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista));
+      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista), lista.roteamento);
       // Bloqueio do antibot e da infra, nao do item: adia 10 min em vez de
       // consumir a fila (25/08: uma lista inteira virou "pulado" em sequencia).
       // Depois de 3 tentativas (30 min) desiste deste item e segue: o bloqueio
@@ -14696,6 +14723,7 @@ app.post('/listas/disparo-unico', async (req, res) => {
     intervaloMin: req.body?.intervaloMin,
     cupomModo: req.body?.cupomModo,
     cupomCodigo: req.body?.cupomCodigo,
+    roteamento: req.body?.roteamento,
     efemera: true,
     agenda: { ativo:false },
     janelas: req.body?.janelas,
