@@ -109,6 +109,7 @@ import {
   gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
   entradaCdv, gruposEntradaCdv,
+  CATEGORIAS_OFERTA_CDV, categoriasBloqueadasCdv, ehCategoriaOfertaBloqueadaCdv,
 } from './config-cdv.js';
 
 // ── AGENDA DE WORKFLOWS DO GITHUB ACTIONS ────────────────────────────────────
@@ -7942,14 +7943,6 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 // caminho. O que a IA erra, a tela conserta antes de sair.
 const OFERTA_MILHAS_JANELA_MS = 45000;   // debounce: plantao posta texto e print separados
 const OFERTA_MILHAS_MAX_IMGS  = 3;       // teto de imagens por extracao (custo/tempo)
-// Categorias que NAO devem virar card na aba de aprovacao: ja existe pipeline
-// paralelo cuidando delas (compra bonificada e coberta pelo radar de compras
-// bonificadas do painel). Editavel por env no Railway, sem novo deploy de
-// codigo: CDV_OFERTA_CATEGORIAS_BLOQUEADAS="compra_bonificada,clube".
-const OFERTA_MILHAS_CATEGORIAS_BLOQUEADAS = new Set(
-  String(process.env.CDV_OFERTA_CATEGORIAS_BLOQUEADAS ?? 'compra_bonificada')
-    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-);
 const bufferOfertaMilhas = new Map();    // jid -> { itens, timer }
 
 const OFERTA_MILHAS_EMOJI = {
@@ -8105,14 +8098,17 @@ async function processarBufferOfertaMilhas(jid) {
     return;
   }
 
-  const CATEGORIAS = ['transferencia', 'compra', 'compra_bonificada', 'clube', 'cartao', 'geral'];
+  // Lista unica, vinda do config-cdv: a tela do gestor monta as caixas do
+  // filtro a partir dela, entao uma segunda copia aqui sairia do ar em silencio.
+  const CATEGORIAS = CATEGORIAS_OFERTA_CDV.map(c => c.id);
   const categoria = CATEGORIAS.includes(ia.categoria) ? ia.categoria : 'geral';
 
-  // Portao de categoria: chega DEPOIS da IA porque so ela sabe distinguir
+  // Portao de categoria (aba Config -> Categorias de oferta). Chega DEPOIS da
+  // IA porque so ela sabe distinguir
   // "transferencia bonificada" (que queremos) de "compra bonificada em
   // parceiro" (que ja temos em paralelo) — a palavra "bonificada" aparece nas
   // duas, entao filtro por texto bruto derrubaria transferencia junto.
-  if (OFERTA_MILHAS_CATEGORIAS_BLOQUEADAS.has(categoria)) {
+  if (ehCategoriaOfertaBloqueadaCdv(categoria)) {
     console.log('[CDV-OFERTA] Categoria "' + categoria + '" bloqueada — nao vai para aprovacao: '
       + String(ia.titulo || '').slice(0, 80));
     registrarDescarteCdv({ jid, motivo: 'categoria bloqueada',
@@ -13441,6 +13437,10 @@ app.get('/config-cdv', async (req, res) => {
     ok: true,
     config: cfg,
     papeis: PAPEIS_CDV,
+    // Lista de categorias que a tela usa para montar as caixas do filtro da
+    // fila de ofertas. Vem do servidor para nao existir uma segunda copia da
+    // lista dentro do HTML, que envelheceria em silencio.
+    categoriasOferta: CATEGORIAS_OFERTA_CDV,
     // Nome atual de cada grupo monitorado, direto do WhatsApp: o cadastro
     // guarda o nome do dia em que foi salvo, e grupo renomeado ficaria com um
     // rotulo velho na tela para sempre.
@@ -13474,7 +13474,8 @@ app.post('/config-cdv', (req, res) => {
       + ' tsp=' + (contaLeitoraTsp() || 'principal') + '.');
     console.log('[CFG-CDV] Config gravada pelo painel — ofertas=' + novo.grupos.ofertas
       + ' emissao=' + novo.grupos.emissao + ' monitorados=' + ativos + '/' + novo.monitorados.length
-      + ' admins=' + novo.admins.length + ' conta=' + (novo.envio.conta || 'principal') + '.');
+      + ' admins=' + novo.admins.length + ' conta=' + (novo.envio.conta || 'principal')
+      + ' categoriasBloqueadas=' + (novo.ofertas.categoriasBloqueadas.join('|') || 'nenhuma') + '.');
     res.json({ ok: true, config: novo });
   } catch (e) {
     res.status(400).json({ ok: false, erro: e.message });
