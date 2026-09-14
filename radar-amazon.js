@@ -3657,6 +3657,17 @@ export function salvarLista(dados = {}) {
   const modo = ['auto', 'fixo', 'nenhum'].includes(dados.cupomModo)
     ? dados.cupomModo : (ant.cupomModo || 'auto');
 
+  // ── ROTEAMENTO DA LISTA ──
+  // O nicho curado da base de produtos so era lido pelo monitor de precos. A
+  // lista montava a oferta SEM categoria, e oferta sem categoria cai nas
+  // trilhas GERAIS: o grupo do nicho nunca recebia nada vindo de disparo
+  // manual. Aqui a lista escolhe o que fazer com a curadoria do item.
+  //   geral          ignora o nicho — comportamento historico, e o padrao
+  //   nicho_e_geral  usa o nicho curado e tambem sai nas trilhas gerais
+  //   so_nicho       sai apenas nos grupos da trilha daquele nicho
+  const roteamento = ['geral', 'nicho_e_geral', 'so_nicho'].includes(dados.roteamento)
+    ? dados.roteamento : (ant.roteamento || 'geral');
+
   // Envio unico: a lista existe apenas para carregar a fila deste disparo e some
   // sozinha quando a fila termina. Nao aceita agendamento — nao ha o que
   // reagendar numa lista que nao vai existir amanha.
@@ -3690,6 +3701,7 @@ export function salvarLista(dados = {}) {
     cupomModo: modo,
     cupomCodigo: modo === 'fixo'
       ? String(dados.cupomCodigo || ant.cupomCodigo || '').trim().toUpperCase() : null,
+    roteamento,
     agenda,
     janelas: janelas.length ? janelas : null,
     ativo: dados.ativo !== undefined ? !!dados.ativo : (ant.ativo !== false),
