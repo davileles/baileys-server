@@ -80,6 +80,12 @@ const CFG_CDV_PADRAO = {
   { jid: '120363428522283420@g.us', nome: 'TSM - ALERTAS JOÃO PESSOA/CAMPINA GRANDE', ativo: true },
   { jid: '120363284038160631@g.us', nome: 'TSM - ALERTAS SÃO LUÍS', ativo: true },
   ],
+  // Grupos de REENTRADA: onde um ex-aluno volta a ser colocado quando renova.
+  // Lista separada dos destinos e dos monitorados de proposito — reentrada nao
+  // e captura nem disparo, e misturar as tres faria um grupo desligado no radar
+  // sumir tambem da reentrada. `ativo:false` tira da reentrada sem perder o
+  // cadastro, igual aos monitorados.
+  entrada: [],
   // Quem administra. `telefone` so importa para o papel 'avisos'; `email` so
   // importa para os papeis de permissao no gerador.
   admins: [],
@@ -121,6 +127,7 @@ function estruturar(bruto) {
     }
   }
   out.monitorados = normalizarMonitorados(out.monitorados);
+  out.entrada     = normalizarEntrada(out.entrada);
   out.admins      = normalizarAdmins(out.admins);
   out.grupos.ofertas  = String(out.grupos.ofertas  || '').trim();
   out.grupos.emissao  = String(out.grupos.emissao  || '').trim();
@@ -153,6 +160,27 @@ function normalizarMonitorados(bruto) {
       // desta versao era. Tipo desconhecido tambem vira 'emissao' — mudar o
       // destino de um grupo por erro de digitacao seria pior que ignorar.
       tipo:  TIPOS_MONITORADO.includes(o.tipo) ? o.tipo : 'emissao',
+    });
+  }
+  return [...porJid.values()];
+}
+
+// Mesma regra dos monitorados: JID torto e DESCARTADO, duplicata fica com a
+// ultima ocorrencia (a tela manda a lista inteira a cada gravacao).
+function normalizarEntrada(bruto) {
+  const lista = Array.isArray(bruto) ? bruto : [];
+  const porJid = new Map();
+  for (const item of lista) {
+    const o = (item && typeof item === 'object') ? item : { jid: item };
+    const jid = String(o.jid || '').trim();
+    if (!RE_JID_GRUPO.test(jid)) {
+      if (jid) console.log('[CFG-CDV] Grupo de reentrada ignorado (JID invalido): ' + jid);
+      continue;
+    }
+    porJid.set(jid, {
+      jid,
+      nome:  String(o.nome || '').trim(),
+      ativo: o.ativo !== false,
     });
   }
   return [...porJid.values()];
@@ -199,7 +227,8 @@ export function carregarConfigCdv() {
   const deOferta = ativos.filter(m => m.tipo === 'oferta').length;
   console.log('[CFG-CDV] Config carregada — ' + ativos.length + '/' + _cfg.monitorados.length
     + ' grupo(s) monitorado(s) ativo(s) (' + (ativos.length - deOferta) + ' de emissao, '
-    + deOferta + ' de oferta), ' + _cfg.admins.length + ' admin(s).');
+    + deOferta + ' de oferta), ' + _cfg.entrada.filter(g => g.ativo).length
+    + ' de reentrada, ' + _cfg.admins.length + ' admin(s).');
   return _cfg;
 }
 
@@ -220,6 +249,7 @@ export function salvarConfigCdv(parcial = {}) {
     envio:       { ...atual.envio,   ...(parcial.envio   || {}) },
     leitura:     { ...atual.leitura, ...(parcial.leitura || {}) },
     monitorados: parcial.monitorados !== undefined ? parcial.monitorados : atual.monitorados,
+    entrada:     parcial.entrada     !== undefined ? parcial.entrada     : atual.entrada,
     admins:      parcial.admins      !== undefined ? parcial.admins      : atual.admins,
   });
 
@@ -318,6 +348,16 @@ export function ehGrupoCdv(jid) {
   if (!j) return false;
   const g = configCdv().grupos;
   return j === g.ofertas || j === g.emissao;
+}
+
+/** Cadastro completo dos grupos de reentrada, ligados e desligados — para a tela. */
+export function entradaCdv() {
+  return configCdv().entrada.map(g => ({ ...g }));
+}
+
+/** JIDs onde um ex-aluno deve ser recolocado AGORA. Grupo desligado nao entra. */
+export function gruposEntradaCdv() {
+  return configCdv().entrada.filter(g => g.ativo).map(g => g.jid);
 }
 
 export function adminsCdv() { return configCdv().admins.map(a => ({ ...a })); }

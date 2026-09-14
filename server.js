@@ -108,6 +108,7 @@ import {
   grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv,
   gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
+  entradaCdv, gruposEntradaCdv,
 } from './config-cdv.js';
 
 // ── AGENDA DE WORKFLOWS DO GITHUB ACTIONS ────────────────────────────────────
@@ -11312,6 +11313,250 @@ app.post('/contas/:id/grupos-acao', async (req, res) => {
     + pulados + ' pulado(s), ' + falhas + ' falha(s) em ' + pedidos.length + ' grupo(s).');
 
   res.json({ ok:true, conta:apel, acao, pausaMs, total:pedidos.length, feitos, pulados, falhas, resultados });
+});
+
+// ── REENTRADA DE EX-ALUNO NOS GRUPOS DO CDV ──────────────────────────────────
+// Quem foi REMOVIDO de um grupo nao volta pelo link de convite: o WhatsApp
+// recusa a entrada por link de quem um admin tirou. So volta se um admin
+// ADICIONAR. Os numeros do Tico sao admin dos grupos do clube, entao a
+// reentrada roda por eles, em lote, a partir do telefone do ex-aluno.
+//
+// Mesmo cuidado do grupos-acao acima: em serie e com pausa entre grupos. Uma
+// rajada de alteracoes de participante e o caminho mais curto para o numero
+// levar bloqueio — e aqui o numero bloqueado seria o que dispara a operacao.
+const RE_PAUSA_PADRAO = 6000;
+
+// Variantes do mesmo telefone brasileiro. Contas antigas (tipico em DDD >= 31)
+// estao nos grupos SEM o nono digito, e o numero digitado quase sempre vem COM
+// ele. Comparar so a string exata diria "nao esta no grupo" para quem esta, e a
+// adicao gastaria uma chamada ao WhatsApp para voltar 409.
+function _reVariantes(bruto) {
+  const d = String(bruto || '').replace(/\D/g, '');
+  const v = new Set();
+  if (!d) return v;
+  v.add(d);
+  const m = /^55(\d{2})(\d{8,9})$/.exec(d);
+  if (m) {
+    const ddd = m[1], resto = m[2];
+    if (resto.length === 9 && resto[0] === '9') v.add('55' + ddd + resto.slice(1));
+    if (resto.length === 8) v.add('55' + ddd + '9' + resto);
+  }
+  return v;
+}
+
+// Retrato de UMA conta sobre os grupos da lista: se ela e admin ali e quem ja
+// esta dentro. Uma chamada por conta (groupFetchAllParticipating), nunca uma
+// por grupo — mesmo motivo do _gaMapaParticipacao.
+async function _reRetrato(s, jids) {
+  const alvo = new Set(jids);
+  const todos = await s.groupFetchAllParticipating();
+  const meus = new Set();
+  for (const v of [s?.user?.id, s?.user?.lid]) {
+    const n = String(v || '').split(':')[0].split('@')[0].trim();
+    if (n) meus.add(n);
+  }
+  const mapa = new Map();
+  for (const [jid, md] of Object.entries(todos || {})) {
+    if (!alvo.has(jid)) continue;
+    if (md.subject) NOMES_GRUPOS.set(jid, md.subject);
+    const eu = (md.participants || []).find(p => _ggIdsDoParticipante(p).some(n => meus.has(n)));
+    const ids = new Set();
+    for (const p of (md.participants || [])) for (const n of _ggIdsDoParticipante(p)) ids.add(n);
+    mapa.set(jid, { nome: md.subject || null, membro: !!eu, admin: !!(eu && eu.admin), ids });
+  }
+  return mapa;
+}
+
+function _reExecutores(req) {
+  return _gaCandidatosExecutor(req.tenantId, '__reentrada__');
+}
+
+function _reNome(jid, cadastro, retratos) {
+  for (const r of retratos) { const m = r.mapa.get(jid); if (m?.nome) return m.nome; }
+  const c = cadastro.find(g => g.jid === jid);
+  return (c && c.nome) || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+}
+
+// Retrato para a tela: os grupos cadastrados, quem pode agir em cada um e — se
+// vier ?telefone= — em quais a pessoa JA esta. Sem esse "ja esta", a tela
+// mandaria adicionar em tudo e metade das chamadas voltaria 409.
+app.get('/cdv/entrada/grupos', async (req, res) => {
+  const cadastro = entradaCdv();
+  const executores = _reExecutores(req);
+  if (!executores.length) {
+    return res.status(503).json({ ok:false, erro:'nenhum numero conectado para executar a reentrada.' });
+  }
+  const jids = cadastro.filter(g => g.ativo).map(g => g.jid);
+  const variantes = _reVariantes(req.query.telefone);
+
+  const retratos = [];
+  for (const e of executores) {
+    try { retratos.push({ id: e.id, mapa: await _reRetrato(e.sock, jids) }); }
+    catch (err) { console.warn('[REENTRADA] ' + e.id + ' ficou fora do retrato: ' + err.message); }
+  }
+
+  const grupos = cadastro.map(g => {
+    const aptos = retratos.filter(r => r.mapa.get(g.jid)?.admin).map(r => r.id);
+    let jaEsta = null;
+    if (variantes.size && g.ativo) {
+      const visto = retratos.some(r => {
+        const m = r.mapa.get(g.jid);
+        return !!m && [...variantes].some(n => m.ids.has(n));
+      });
+      // So afirma "nao esta" quando alguem conseguiu ler o grupo: sem retrato
+      // nenhum, null mantem o grupo marcavel em vez de sumir da selecao.
+      const leu = retratos.some(r => r.mapa.has(g.jid));
+      jaEsta = leu ? visto : null;
+    }
+    return {
+      jid: g.jid,
+      nome: _reNome(g.jid, cadastro, retratos),
+      ativo: g.ativo,
+      executores: aptos,
+      bloqueado: g.ativo && aptos.length === 0,
+      jaEsta,
+    };
+  });
+
+  res.json({
+    ok: true,
+    telefone: String(req.query.telefone || '').replace(/\D/g, '') || null,
+    executores: executores.map(e => e.id),
+    total: grupos.length,
+    ativos: grupos.filter(g => g.ativo).length,
+    grupos,
+  });
+});
+
+// Adiciona o telefone nos grupos pedidos (ou em todos os cadastrados ativos).
+// Body: { telefone, jids?, pausaMs?, avisar? }
+app.post('/cdv/entrada/adicionar', async (req, res) => {
+  const digitos = String(req.body?.telefone || '').replace(/\D/g, '');
+  if (digitos.length < 10 || digitos.length > 15) {
+    return res.status(400).json({ ok:false, erro:'telefone invalido — informe com DDI e DDD (ex.: 5531999998888).' });
+  }
+  const executores = _reExecutores(req);
+  if (!executores.length) {
+    return res.status(503).json({ ok:false, erro:'nenhum numero conectado para executar a reentrada.' });
+  }
+
+  // JID canonico, nunca telefone + '@s.whatsapp.net': conta antiga responde por
+  // outro identificador e a adicao pelo JID montado na mao falha em silencio.
+  let alvo;
+  try { alvo = await resolverJidWhatsApp(digitos); }
+  catch (e) { return res.status(503).json({ ok:false, erro:'nao consegui validar o numero: ' + e.message }); }
+  if (!alvo.existe) {
+    return res.status(404).json({ ok:false, erro:'este numero nao tem WhatsApp — confira DDI, DDD e o nono digito.' });
+  }
+  const alvoJid = alvo.jid;
+  const variantes = _reVariantes(digitos);
+  for (const v of _reVariantes(String(alvoJid).split('@')[0])) variantes.add(v);
+
+  const cadastro = entradaCdv();
+  const ativos = gruposEntradaCdv();
+  const pedidos = Array.isArray(req.body?.jids) && req.body.jids.length
+    ? req.body.jids.map(j => String(j).trim()).filter(j => ativos.includes(j))
+    : ativos;
+  if (!pedidos.length) {
+    return res.status(400).json({ ok:false, erro:'nenhum grupo de reentrada valido — cadastre os grupos na aba Config.' });
+  }
+
+  const pausaMs = Math.min(Math.max(parseInt(req.body?.pausaMs ?? RE_PAUSA_PADRAO, 10) || RE_PAUSA_PADRAO, 2000), 60000);
+
+  const retratos = [];
+  for (const e of executores) {
+    try { retratos.push({ id: e.id, sock: e.sock, mapa: await _reRetrato(e.sock, pedidos) }); }
+    catch (err) { console.warn('[REENTRADA] ' + e.id + ' ficou fora do retrato: ' + err.message); }
+  }
+  if (!retratos.length) {
+    return res.status(503).json({ ok:false, erro:'nenhum numero conseguiu ler os grupos agora — tente de novo em instantes.' });
+  }
+
+  const resultados = [];
+  let feitos = 0, pulados = 0, falhas = 0;
+  const convites = [];
+
+  for (let i = 0; i < pedidos.length; i++) {
+    const jid = pedidos[i];
+    const nome = _reNome(jid, cadastro, retratos);
+
+    const jaDentro = retratos.some(r => {
+      const m = r.mapa.get(jid);
+      return !!m && [...variantes].some(n => m.ids.has(n));
+    });
+    if (jaDentro) {
+      pulados++;
+      resultados.push({ jid, nome, estado:'pulado', detalhe:'ja esta no grupo' });
+      continue;
+    }
+
+    const exec = retratos.find(r => r.mapa.get(jid)?.admin);
+    if (!exec) {
+      falhas++;
+      resultados.push({ jid, nome, estado:'bloqueado',
+        detalhe:'nenhum numero conectado e admin deste grupo — promova um deles pelo celular' });
+      continue;
+    }
+
+    try {
+      const r = await exec.sock.groupParticipantsUpdate(jid, [alvoJid], 'add');
+      const st = String(r?.[0]?.status || '');
+      if (st === '200') {
+        feitos++;
+        resultados.push({ jid, nome, estado:'ok', por: exec.id, detalhe:'adicionado ao grupo' });
+      } else if (st === '409') {
+        pulados++;
+        resultados.push({ jid, nome, estado:'pulado', por: exec.id, detalhe:'o WhatsApp respondeu que ja estava dentro' });
+      } else if (st === '403' || st === '408' || st === '401') {
+        // 403: privacidade do destinatario barra a adicao direta. 408/401: numero
+        // saiu ha pouco ou bloqueou quem esta adicionando. Nos tres casos o que
+        // resta e o convite — que so o admin do grupo consegue gerar.
+        let link = null, erroLink = null;
+        try { link = 'https://chat.whatsapp.com/' + await exec.sock.groupInviteCode(jid); }
+        catch (e2) { erroLink = e2.message; }
+        if (link) convites.push({ nome, link });
+        falhas++;
+        resultados.push({ jid, nome, estado:'convite', por: exec.id, link,
+          detalhe: link
+            ? 'o WhatsApp nao deixou adicionar direto (status ' + st + ') — mande o link para a pessoa entrar'
+            : 'status ' + st + ' e o convite tambem falhou: ' + erroLink });
+      } else {
+        falhas++;
+        resultados.push({ jid, nome, estado:'falha', por: exec.id, detalhe:'WhatsApp retornou status ' + (st || '?') });
+      }
+    } catch (e) {
+      falhas++;
+      resultados.push({ jid, nome, estado:'falha', detalhe: e.message });
+    }
+
+    // Pausa so ENTRE chamadas de verdade: grupo pulado nao consumiu cota, e
+    // esperar ali seria tempo de tela perdido. Jitter porque rajada com
+    // intervalo exato tem cara de robo.
+    const ultimo = i === pedidos.length - 1;
+    const agiu = ['ok','convite','falha'].includes(resultados[resultados.length - 1].estado);
+    if (agiu && !ultimo) {
+      await new Promise(r => setTimeout(r, Math.round(pausaMs * (0.8 + Math.random() * 0.4))));
+    }
+  }
+
+  // Aviso opcional no privado com os grupos que ficaram no convite. Best-effort:
+  // falhar aqui nao pode derrubar um lote que ja foi executado.
+  let avisado = false, erroAviso = null;
+  if (req.body?.avisar && convites.length) {
+    try {
+      const texto = 'Oi! Voce voltou para os grupos do Clube do Viajante 🎉\n\n'
+        + 'Nestes aqui o WhatsApp nao deixou te adicionar direto, entao entre pelo link:\n\n'
+        + convites.map(c => '• ' + c.nome + '\n' + c.link).join('\n\n');
+      await enviarMensagem(alvoJid, { text: texto });
+      avisado = true;
+    } catch (e) { erroAviso = e.message; }
+  }
+
+  console.log('[REENTRADA] ' + digitos + ' — ' + feitos + ' adicionado(s), ' + pulados
+    + ' pulado(s), ' + falhas + ' pendente(s) em ' + pedidos.length + ' grupo(s).');
+
+  res.json({ ok:true, telefone:digitos, jid:alvoJid, pausaMs, total:pedidos.length,
+             feitos, pulados, falhas, convites, avisado, erroAviso, resultados });
 });
 
 // Nucleo da reconexao soft: usado pelo endpoint manual e pela autocura do
