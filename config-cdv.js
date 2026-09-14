@@ -40,6 +40,20 @@ const RE_CONTA     = /^[a-z0-9_-]{2,24}$/i;
 // fila de aprovacao do radar, o mesmo lugar onde cai o coletor de RSS.
 const TIPOS_MONITORADO = ['emissao', 'oferta'];
 
+// Categorias que a IA atribui a uma oferta de pontos/milhas. E a MESMA lista do
+// server.js (processarBufferOfertaMilhas) e do coletor de RSS do painel — mora
+// aqui porque a tela monta as caixas do filtro a partir dela: categoria nova
+// entra nesta lista e aparece na aba Config sozinha, sem mexer no HTML.
+export const CATEGORIAS_OFERTA_CDV = [
+  { id: 'transferencia',     emoji: '🔄',  rotulo: 'Transferência bonificada' },
+  { id: 'compra',            emoji: '💰',  rotulo: 'Compra de pontos' },
+  { id: 'compra_bonificada', emoji: '🛍️', rotulo: 'Compra bonificada em parceiro' },
+  { id: 'clube',             emoji: '🎁',  rotulo: 'Clube de assinatura' },
+  { id: 'cartao',            emoji: '💳',  rotulo: 'Cartão de crédito' },
+  { id: 'geral',             emoji: '📰',  rotulo: 'Geral / não classificada' },
+];
+const IDS_CATEGORIA_OFERTA = CATEGORIAS_OFERTA_CDV.map(c => c.id);
+
 // Padrao = exatamente o que estava hardcoded no server.js ate esta versao. Um
 // deploy sem config gravada se comporta como o sistema se comportava antes
 // desta camada existir — nenhum grupo entra, nenhum grupo sai.
@@ -86,6 +100,19 @@ const CFG_CDV_PADRAO = {
   // sumir tambem da reentrada. `ativo:false` tira da reentrada sem perder o
   // cadastro, igual aos monitorados.
   entrada: [],
+  // Filtro da fila de aprovacao: categorias que NAO viram card, mesmo quando a
+  // IA reconhece a promocao como valida. Serve para conteudo ja coberto por
+  // outro pipeline (compra bonificada tem radar proprio no painel) — bloquear
+  // aqui evita pagar aprovacao humana duas vezes pela mesma coisa.
+  //
+  // Vazio = tudo passa, que e como o sistema se comportava antes deste campo
+  // existir. O filtro age DEPOIS da IA de proposito: so ela distingue
+  // "transferencia bonificada" de "compra bonificada", e a palavra
+  // "bonificada" aparece nas duas — filtro por texto bruto derrubaria a
+  // transferencia junto.
+  ofertas: {
+    categoriasBloqueadas: [],
+  },
   // Quem administra. `telefone` so importa para o papel 'avisos'; `email` so
   // importa para os papeis de permissao no gerador.
   admins: [],
@@ -127,6 +154,7 @@ function estruturar(bruto) {
     }
   }
   out.monitorados = normalizarMonitorados(out.monitorados);
+  out.ofertas.categoriasBloqueadas = normalizarCategoriasOferta(out.ofertas.categoriasBloqueadas);
   out.entrada     = normalizarEntrada(out.entrada);
   out.admins      = normalizarAdmins(out.admins);
   out.grupos.ofertas  = String(out.grupos.ofertas  || '').trim();
@@ -135,6 +163,24 @@ function estruturar(bruto) {
   out.envio.conta     = String(out.envio.conta     || '').trim();
   out.leitura.conta   = String(out.leitura.conta   || '').trim();
   return out;
+}
+
+// Categoria desconhecida e DESCARTADA em vez de gravada: id torto viraria um
+// filtro que nunca casa — bloqueio que o operador ve marcado na tela e que na
+// pratica deixa tudo passar. Duplicata cai fora pelo Set.
+function normalizarCategoriasOferta(bruto) {
+  const lista = Array.isArray(bruto) ? bruto : [];
+  const out = new Set();
+  for (const item of lista) {
+    const c = String(item || '').trim().toLowerCase();
+    if (!c) continue;
+    if (!IDS_CATEGORIA_OFERTA.includes(c)) {
+      console.log('[CFG-CDV] Categoria de oferta ignorada (desconhecida): ' + c);
+      continue;
+    }
+    out.add(c);
+  }
+  return [...out];
 }
 
 // Entrada torta e entrada DESCARTADA, nunca excecao no meio de uma captura.
@@ -229,6 +275,9 @@ export function carregarConfigCdv() {
     + ' grupo(s) monitorado(s) ativo(s) (' + (ativos.length - deOferta) + ' de emissao, '
     + deOferta + ' de oferta), ' + _cfg.entrada.filter(g => g.ativo).length
     + ' de reentrada, ' + _cfg.admins.length + ' admin(s).');
+  const bloq = _cfg.ofertas.categoriasBloqueadas;
+  console.log('[CFG-CDV] Categorias bloqueadas na fila de ofertas: '
+    + (bloq.length ? bloq.join(', ') : 'nenhuma (tudo passa).'));
   return _cfg;
 }
 
@@ -250,6 +299,7 @@ export function salvarConfigCdv(parcial = {}) {
     leitura:     { ...atual.leitura, ...(parcial.leitura || {}) },
     monitorados: parcial.monitorados !== undefined ? parcial.monitorados : atual.monitorados,
     entrada:     parcial.entrada     !== undefined ? parcial.entrada     : atual.entrada,
+    ofertas:     { ...atual.ofertas, ...(parcial.ofertas || {}) },
     admins:      parcial.admins      !== undefined ? parcial.admins      : atual.admins,
   });
 
@@ -358,6 +408,19 @@ export function entradaCdv() {
 /** JIDs onde um ex-aluno deve ser recolocado AGORA. Grupo desligado nao entra. */
 export function gruposEntradaCdv() {
   return configCdv().entrada.filter(g => g.ativo).map(g => g.jid);
+}
+
+/** Categorias que NAO entram na fila de aprovacao de ofertas. */
+export function categoriasBloqueadasCdv() {
+  return [...configCdv().ofertas.categoriasBloqueadas];
+}
+
+/** Esta categoria esta bloqueada AGORA? Leitura por chamada: gravar na tela
+ *  passa a valer na proxima captura, sem restart. */
+export function ehCategoriaOfertaBloqueadaCdv(categoria) {
+  const c = String(categoria || '').trim().toLowerCase();
+  if (!c) return false;
+  return configCdv().ofertas.categoriasBloqueadas.includes(c);
 }
 
 export function adminsCdv() { return configCdv().admins.map(a => ({ ...a })); }
