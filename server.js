@@ -149,6 +149,12 @@ import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
 import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram,
          enviarCardRevisaoTelegram } from './bot-tsp.js';
+// Bots de revisao por fluxo. Cada um tem token, chat e fila proprios: o que
+// decide passagem nao e a mesma cabeca (nem o mesmo momento) do que decide
+// oferta de pontos, e misturar os dois num chat so faz um esconder o outro.
+import { bootBotPassagens, tratarUpdateBotPassagens, BOT_PASSAGENS_PATH,
+         enviarCardPassagem } from './bot-cdv-passagens.js';
+import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH } from './bot-cdv-ofertas.js';
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
@@ -3253,6 +3259,10 @@ function avaliarAutoEnvioAlerta(oferta, hist180) {
 // aprovação manual.
 function entregarOfertaAlerta(oferta, hist180) {
   filaPendentes.unshift(oferta);
+  // Guardado na oferta porque o card do Telegram precisa mostrar o numero que
+  // o gate usou. Sem isso o operador ve "acima do teto" sem saber de que teto
+  // se fala, e a decisao no celular vira chute.
+  if (hist180) oferta.hist180 = hist180;
   try {
     if (!ehConteudoTsp(oferta.tipoConteudo) && AUTO_ENVIO_ALERTA_MODO !== 'off') {
       const v    = avaliarAutoEnvioAlerta(oferta, hist180);
@@ -3285,6 +3295,15 @@ function entregarOfertaAlerta(oferta, hist180) {
     oferta.motivoFila = 'falha na avaliação do auto-envio: ' + e.message;
   }
   salvarFila();
+
+  // Tudo que NAO foi auto-enviado vira card no bot de passagens — inclusive o
+  // que parou por campo incompleto, que e justamente o caso em que a extracao
+  // precisa de olho humano. Fire-and-forget de proposito: bot fora do ar nunca
+  // pode segurar a captura.
+  if (!ehConteudoTsp(oferta.tipoConteudo) && oferta.status === 'pendente') {
+    enviarCardPassagem(oferta).catch(e =>
+      console.warn('[BOT-PASSAGENS] Card da passagem #' + oferta.id + ' falhou: ' + e.message));
+  }
 }
 
 // ── LINKS AFILIADOS TSP ───────────────────────────────────────────────────────
@@ -10555,6 +10574,19 @@ app.post(BOT_TSP_PATH, (req, res) => {
   tratarUpdateBotTsp(req.body).catch(e => console.error('[BOT-TSP] Erro:', e.message));
 });
 
+// ── BOTS DE REVISAO CDV (passagens e ofertas de pontos) ──────────────────────
+// Mesmo contrato do bot TSP: responde 200 na hora e processa depois, porque a
+// Bot API reenvia o update se a resposta demorar.
+app.post(BOT_PASSAGENS_PATH, (req, res) => {
+  res.sendStatus(200);
+  tratarUpdateBotPassagens(req.body).catch(e => console.error('[BOT-PASSAGENS] Erro:', e.message));
+});
+
+app.post(BOT_OFERTAS_PATH, (req, res) => {
+  res.sendStatus(200);
+  tratarUpdateBotOfertas(req.body).catch(e => console.error('[BOT-OFERTAS] Erro:', e.message));
+});
+
 // ── CANAIS DO TELEGRAM (aba Grupos do painel) ────────────────────────────────
 // Lista os canais/grupos que a conta conectada segue, no formato que a trilha
 // grava como fonte ('tg:<channelId>'). getDialogs e lento, entao a resposta sai
@@ -16502,6 +16534,58 @@ function ofertaDaFilaPara(req, id) {
   return o;
 }
 
+// ── FILA DE PASSAGENS PARA O BOT DO TELEGRAM ─────────────────────────────────
+// Espelho do /mkt/fila para o outro lado da fila: emissoes que nao passaram no
+// gate de auto-envio. Somente leitura — aprovar e rejeitar seguem em
+// /painel/aprovar e /painel/rejeitar, os mesmos que a tela usa.
+function textoOriginalDe(o) {
+  if (typeof o.conteudoOriginal === 'string') return o.conteudoOriginal;
+  if (Array.isArray(o.conteudoOriginal)) return o.conteudoOriginal.join('\n');
+  return '';
+}
+
+app.get('/cdv/fila', (req, res) => {
+  const n = Math.min(Math.max(parseInt(req.query.n) || 8, 1), 20);
+  const pendentes = filaPendentes.filter(o =>
+       o.status === 'pendente'
+    && !ehConteudoTsp(o.tipoConteudo)
+    && (o.tenant || TENANT_PADRAO) === req.tenantId);
+  const itens = pendentes.slice(0, n).map(o => {
+    const d = o.dadosExtraidos || {};
+    return {
+      id: o.id,
+      origem: d.origem || '', destino: d.destino || '',
+      programa: d.programa || '', cabine: d.cabine || '', cia: d.cia || '',
+      pontos: Number(d.pontos) || 0,
+      motivo: o.motivoFila || null,
+      timestamp: o.timestamp || null,
+    };
+  });
+  res.json({ ok:true, total: pendentes.length, itens });
+});
+
+app.get('/cdv/oferta/:id', (req, res) => {
+  const o = ofertaDaFilaPara(req, req.params.id);
+  if (!o) return res.status(404).json({ ok:false, erro:'Passagem nao encontrada na fila.' });
+  const d = o.dadosExtraidos || {};
+  res.json({ ok:true, oferta: {
+    id: o.id,
+    status: o.status,
+    motivoFila: o.motivoFila || null,
+    hist180: o.hist180 || null,
+    captura: capturaDaOferta(o),
+    grupoOrigemNome: o.grupoOrigemNome || null,
+    mensagemFormatada: o.mensagemFinal || o.mensagemFormatada || '',
+    conteudoOriginal: textoOriginalDe(o),
+    dados: {
+      origem: d.origem || '', destino: d.destino || '',
+      cia: d.cia || '', programa: d.programa || '', cabine: d.cabine || '',
+      pontos: Number(d.pontos) || 0,
+      datasIda: d.datasIda || '', datasVolta: d.datasVolta || '',
+    },
+  }});
+});
+
 // Pendentes de marketplace para o comando /fila do bot. So o resumo: a lista
 // vira teclado no Telegram e nao aguenta mensagem inteira por item.
 app.get('/mkt/fila', (req, res) => {
@@ -18296,6 +18380,11 @@ bootBotTsp({
     uptimeMin: Math.round((Date.now() - _bootEm) / 60000),
   }),
 }).catch(e => console.warn('[BOT-TSP] Falha no boot:', e.message));
+
+// Bots de revisao CDV. Nao recebem funcao do servidor: falam pelas mesmas rotas
+// HTTP que o painel usa, entao nao ha regra de negocio duplicada neles.
+bootBotPassagens({ PORT }).catch(e => console.warn('[BOT-PASSAGENS] Falha no boot:', e.message));
+bootBotOfertas({ sessaoDir: SESSAO_DIR }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
 
 // Monitor de queda de preco. As funcoes de montagem e envio sao injetadas em
 // vez de importadas: o modulo precisa do caminho REAL de envio (template, cupom,
