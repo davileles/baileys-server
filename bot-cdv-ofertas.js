@@ -75,6 +75,23 @@ function salvarVistos() {
   } catch (e) { console.warn(bot.TAG + ' nao consegui gravar ' + ARQUIVO_VISTOS + ': ' + e.message); }
 }
 
+// Duas rotas diferentes: a fila de ofertas vive no proxy CDV, mas a analise por
+// IA roda neste servidor (e quem tem a chave da API e o pipeline de captura).
+async function proxyLocal(metodo, caminho, body) {
+  try {
+    const r = await fetch('http://127.0.0.1:' + (dep?.PORT || process.env.PORT || 3000) + caminho, {
+      method: metodo,
+      headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(120000),
+    });
+    const d = await r.json().catch(() => ({}));
+    return { ...d, http: r.status };
+  } catch (err) {
+    return { ok: false, erro: 'servidor não respondeu: ' + err.message, http: 0 };
+  }
+}
+
 async function proxy(metodo, caminho, body) {
   try {
     const r = await fetch(PROXY + caminho, {
@@ -225,6 +242,32 @@ async function enviarCardOferta(o, mensagem) {
   await bot.paraCadaAdmin(async (chatId) => {
     await bot.falarHtml(chatId, corpoCard(o, mensagem), tecladoCard(o.id));
   });
+}
+
+// ── CRIAR OFERTA A PARTIR DE LINK, TEXTO OU ARQUIVO ──────────────────────────
+// Toda a analise mora no servidor (/cdv/oferta-ia), no mesmo pipeline das
+// capturas de grupo: mesmo prompt, mesma dedup, mesma fila. O bot so entrega o
+// material e mostra o card que voltou.
+async function criarOferta(chatId, payload, rotulo) {
+  const aviso = await bot.falarPlano(chatId, '⏳ Analisando ' + rotulo + '...');
+  const r = await proxyLocal('POST', '/cdv/oferta-ia', payload);
+  if (!r.ok) {
+    return bot.falarPlano(chatId, '❌ ' + (r.erro || 'não consegui montar a oferta'), null, aviso?.message_id);
+  }
+  if (r.duplicada) {
+    return bot.falarPlano(chatId, '♻️ Essa oferta já passou pela fila antes — não criei outra.', null, aviso?.message_id);
+  }
+
+  // Marca como vista para o poller nao mandar o mesmo card de novo daqui a
+  // pouco, e desenha na hora: quem acabou de colar o link quer ver o resultado
+  // agora, nao no proximo ciclo de 10 min.
+  vistos.add(String(r.id));
+  salvarVistos();
+  if (aviso?.message_id) await bot.tg('deleteMessage', { chat_id: chatId, message_id: aviso.message_id });
+
+  const det = await carregarOferta(r.id);
+  if (!det) return bot.falarPlano(chatId, '✅ Oferta criada (#' + r.id + '), mas não consegui desenhar o card. Use /fila.');
+  return bot.falarHtml(chatId, corpoCard(det.oferta, det.mensagem, '🆕 Criada agora a partir de ' + rotulo + '.'), tecladoCard(r.id));
 }
 
 // ── POLLER ───────────────────────────────────────────────────────────────────
@@ -392,6 +435,29 @@ export async function tratarUpdateBotOfertas(update) {
       console.warn(bot.TAG + ' mensagem de chat nao autorizado: ' + chatId);
       return void await bot.falarPlano(chatId, 'Sem permissão. Seu ID: ' + chatId);
     }
+    // Arquivo vira oferta nova. Vem antes do texto porque a legenda chega no
+    // mesmo update, em m.caption.
+    const legenda = String(m.caption || '').trim();
+    const doc = m.document;
+    const ehImagemDoc = doc && /^image\//i.test(doc.mime_type || '');
+    const ehPdf = doc && /pdf/i.test(doc.mime_type || doc.file_name || '');
+    if (m.photo?.length || ehImagemDoc || ehPdf) {
+      sessoes.delete(String(chatId));
+      const fileId = (m.photo?.length && !doc) ? m.photo[m.photo.length - 1].file_id : doc.file_id;
+      try {
+        const arq = await bot.baixarArquivo(fileId);
+        const payload = ehPdf
+          ? { texto: legenda, pdfs: [arq.base64] }
+          : { texto: legenda, imagens: [arq.base64] };
+        return void await criarOferta(chatId, payload, ehPdf ? 'o PDF' : 'a imagem');
+      } catch (err) {
+        return void await bot.falarPlano(chatId, '❌ Não consegui baixar o arquivo: ' + err.message);
+      }
+    }
+    if (doc) {
+      return void await bot.falarPlano(chatId, 'Esse tipo de arquivo eu não leio. Mande imagem, PDF, um link ou o texto.');
+    }
+
     const bruto = String(m.text || '').trim();
     const texto = bruto.toLowerCase().split('@')[0];
     if (texto === '/cancelar') {
@@ -402,9 +468,20 @@ export async function tratarUpdateBotOfertas(update) {
       sessoes.delete(String(chatId));
       return void await mostrarFila(chatId, null);
     }
+    if (texto === '/nova') {
+      sessoes.delete(String(chatId));
+      return void await bot.falarPlano(chatId,
+        'Mande o link da promoção, o texto, um print ou o PDF. Eu leio, monto a oferta e devolvo o card aqui.');
+    }
     if (await tratarTexto(chatId, bruto, m.message_id)) return;
+
+    // Mensagem que e so um link vai pelo caminho de link (o servidor busca a
+    // pagina); qualquer outro texto com corpo vai como conteudo bruto.
+    const soLink = bruto.match(/^https?:\/\/\S+$/i);
+    if (soLink) return void await criarOferta(chatId, { link: bruto }, 'o link');
+    if (bruto.length >= 15) return void await criarOferta(chatId, { texto: bruto }, 'o texto');
     if (bruto) {
-      await bot.falarPlano(chatId, 'Este bot só mostra ofertas de pontos esperando decisão. Use /fila.',
+      await bot.falarPlano(chatId, 'Mande um link, texto, print ou PDF da promoção — ou use /fila para ver o que está esperando decisão.',
         bot.teclado([[['📋 Fila', 'o:fila:0']]]));
     }
   } catch (err) {
@@ -418,6 +495,7 @@ export async function bootBotOfertas(deps) {
   carregarVistos();
   const ok = await bot.bootWebhook([
     { command: 'fila',     description: 'Ofertas de pontos esperando decisão' },
+    { command: 'nova',     description: 'Criar oferta a partir de link, texto ou arquivo' },
     { command: 'cancelar', description: 'Cancelar a edição em andamento' },
   ]);
   if (!ok) return;
