@@ -3580,7 +3580,7 @@ reformatarCupomsTSPPendentes();
 // POR QUE a mensagem foi descartada, em vez de um generico "falhou".
 let _ultimoMotivoClaude = null;
 
-async function chamarClaude(system, userContent, maxTokens) {
+async function chamarClaude(system, userContent, maxTokens, modelo) {
   _ultimoMotivoClaude = null;
   // 3 tentativas com backoff — antes uma falha momentânea da API/parse fazia
   // a classificação retornar null e o item sumia silenciosamente do buffer.
@@ -3596,7 +3596,7 @@ async function chamarClaude(system, userContent, maxTokens) {
           'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-          model: 'claude-haiku-4-5',
+          model: modelo || 'claude-haiku-4-5',
           max_tokens: maxTokens || 1024,
           system,
           messages: [{ role: 'user', content: userContent }],
@@ -8078,23 +8078,31 @@ function chaveDedupOfertaMilhas(itens) {
   return txt.length >= 40 ? txt.slice(0, 400) : ('img:' + Date.now());
 }
 
-async function processarBufferOfertaMilhas(jid) {
+// opts.rotulo / opts.fonte: quando a origem NAO e um grupo monitorado (criacao
+// manual pelo bot do Telegram, por exemplo), o jid e sintetico e nao resolve
+// para nome nenhum. Sem isso o card mostraria 'oferta_manual_1757...' como se
+// fosse o nome de um grupo.
+// Devolve o resultado da fila ({ok, id, duplicada}) para quem criou sob demanda
+// poder responder na hora. Os chamadores antigos ignoram o retorno.
+async function processarBufferOfertaMilhas(jid, opts = {}) {
   const entrada = bufferOfertaMilhas.get(jid);
-  if (!entrada) return;
+  if (!entrada) return { ok:false, erro:'buffer vazio' };
   bufferOfertaMilhas.delete(jid);
   const itens = entrada.itens || [];
-  if (!itens.length) return;
+  if (!itens.length) return { ok:false, erro:'buffer vazio' };
 
-  const nomeGrupo = nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+  const nomeGrupo = opts.rotulo || nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
   const textoBruto = itens.map(i => i.texto).filter(Boolean).join('\n').trim();
   const imagens = itens.map(i => i.imagemBase64).filter(Boolean).slice(0, OFERTA_MILHAS_MAX_IMGS);
   console.log('[CDV-OFERTA] Janela fechada em "' + nomeGrupo + '" — ' + itens.length
     + ' item(ns), ' + imagens.length + ' imagem(ns).');
 
-  if (!textoBruto && !imagens.length) return;
+  const pdfs = itens.map(i => i.pdfBase64).filter(Boolean).slice(0, 2);
+  if (!textoBruto && !imagens.length && !pdfs.length) return { ok:false, erro:'nada para analisar' };
 
   const conteudo = [
     ...imagens.map(b64 => ({ type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: b64 } })),
+    ...pdfs.map(b64 => ({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } })),
     { type: 'text', text:
         (imagens.length
           ? 'Conteúdo publicado em um grupo de plantão de milhas. Há ' + imagens.length
@@ -8104,17 +8112,20 @@ async function processarBufferOfertaMilhas(jid) {
     },
   ];
 
-  const ia = await chamarClaude(OFERTA_MILHAS_SYSTEM, conteudo, 1800);
+  // PDF so e lido por modelo com suporte a documento; o haiku padrao cobre o
+  // resto e e mais barato, entao a troca acontece apenas quando ha PDF.
+  const ia = await chamarClaude(OFERTA_MILHAS_SYSTEM, conteudo, 1800,
+    pdfs.length ? 'claude-sonnet-4-5-20250929' : undefined);
   if (!ia) {
     registrarDescarteCdv({ jid, motivo: 'extracao de oferta falhou',
       detalhe: _ultimoMotivoClaude || 'IA nao respondeu', texto: textoBruto });
-    return;
+    return { ok:false, erro: _ultimoMotivoClaude || 'a IA nao respondeu' };
   }
   if (ia.valido === false || !ia.titulo) {
     console.log('[CDV-OFERTA] Descartada: ' + (ia.motivo || 'sem titulo'));
     registrarDescarteCdv({ jid, motivo: 'nao reconhecido como oferta',
       detalhe: ia.motivo || 'a extracao nao identificou promocao de pontos', texto: textoBruto });
-    return;
+    return { ok:false, erro: ia.motivo || 'nao reconhecido como oferta de pontos' };
   }
 
   // Lista unica, vinda do config-cdv: a tela do gestor monta as caixas do
@@ -8132,7 +8143,7 @@ async function processarBufferOfertaMilhas(jid) {
       + String(ia.titulo || '').slice(0, 80));
     registrarDescarteCdv({ jid, motivo: 'categoria bloqueada',
       detalhe: categoria + ' — ja tratada por pipeline paralelo', texto: textoBruto });
-    return;
+    return { ok:false, erro:'categoria "' + categoria + '" esta bloqueada na configuracao' };
   }
   // Link de convite de grupo e encurtador de afiliado nunca entram: o card vai
   // para o radar publico e para o WhatsApp dos assinantes.
@@ -8163,8 +8174,8 @@ async function processarBufferOfertaMilhas(jid) {
       body: JSON.stringify({
         item,
         chaveDedup: chaveDedupOfertaMilhas(itens),
-        fonte: 'whatsapp',
-        grupoOrigem: jid,
+        fonte: opts.fonte || 'whatsapp',
+        grupoOrigem: opts.fonte ? '' : jid,
         grupoNome: nomeGrupo,
         conteudoOriginal: textoBruto.slice(0, 1500),
       }),
@@ -8175,16 +8186,82 @@ async function processarBufferOfertaMilhas(jid) {
       console.warn('[CDV-OFERTA] Proxy recusou: ' + (d.erro || 'status ' + r.status));
       registrarDescarteCdv({ jid, motivo: 'fila de ofertas recusou',
         detalhe: d.erro || 'status ' + r.status, texto: textoBruto });
-      return;
+      return { ok:false, erro: d.erro || 'a fila recusou (status ' + r.status + ')' };
     }
     if (d.duplicada) console.log('[CDV-OFERTA] Ja estava na fila/histórico (#' + d.id + ') — ignorada.');
     else console.log('[CDV-OFERTA] Na fila de aprovacao #' + d.id + ' — ' + item.titulo);
+    return { ok:true, id: d.id, duplicada: !!d.duplicada, titulo: item.titulo };
   } catch (e) {
     console.error('[CDV-OFERTA] Falha ao enfileirar: ' + e.message);
     registrarDescarteCdv({ jid, motivo: 'fila de ofertas inacessivel',
       detalhe: e.message, texto: textoBruto });
+    return { ok:false, erro: 'fila de ofertas inacessivel: ' + e.message };
   }
 }
+
+// ── CRIAR OFERTA DE PONTOS SOB DEMANDA (link / texto / arquivo) ──────────────
+// Mesmo pipeline da captura de grupo: mesmo prompt, mesma dedup, mesma fila de
+// aprovacao. O que muda e so a porta de entrada. Reaproveitar o buffer em vez
+// de montar um caminho proprio garante que um ajuste no prompt valha para as
+// duas origens.
+function textoDeHtml(html) {
+  return String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+app.post('/cdv/oferta-ia', async (req, res) => {
+  const { texto, link, imagens, pdfs } = req.body || {};
+  const imgs = Array.isArray(imagens) ? imagens.filter(Boolean).slice(0, 3) : [];
+  const docs = Array.isArray(pdfs) ? pdfs.filter(Boolean).slice(0, 2) : [];
+  let corpo = String(texto || '').trim();
+
+  if (link) {
+    if (!/^https?:\/\//i.test(link)) return res.status(400).json({ ok:false, erro:'Link invalido.' });
+    try {
+      const r = await fetch(CDV_PROXY_URL + '/fetch-oferta?url=' + encodeURIComponent(link),
+        { signal: AbortSignal.timeout(25000) });
+      const html = await r.text();
+      const limpo = textoDeHtml(html).slice(0, 12000);
+      // Pagina que volta vazia ou so com menu costuma ser bloqueio de bot. Dizer
+      // isso e melhor do que mandar 200 caracteres de rodape para a IA e
+      // devolver uma oferta inventada.
+      if (limpo.length < 400) {
+        return res.status(422).json({ ok:false, erro:'A pagina nao devolveu conteudo legivel (pode estar bloqueando leitura). Mande o texto ou um print.' });
+      }
+      corpo = (corpo ? corpo + '\n\n' : '') + 'Conteudo da pagina ' + link + ':\n' + limpo;
+    } catch (e) {
+      return res.status(502).json({ ok:false, erro:'Nao consegui abrir o link: ' + e.message });
+    }
+  }
+
+  if (!corpo && !imgs.length && !docs.length) {
+    return res.status(400).json({ ok:false, erro:'Mande texto, link, imagem ou PDF.' });
+  }
+
+  const jidFake = 'oferta_manual_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '@manual';
+  const itens = [];
+  if (imgs.length) imgs.forEach((b64, i) => itens.push({ texto: i === 0 ? corpo : '', imagemBase64: b64, em: Date.now() }));
+  else itens.push({ texto: corpo, imagemBase64: null, em: Date.now() });
+  docs.forEach(b64 => itens.push({ texto: '', pdfBase64: b64, em: Date.now() }));
+  bufferOfertaMilhas.set(jidFake, { itens, timer: null });
+
+  try {
+    const r = await processarBufferOfertaMilhas(jidFake, {
+      rotulo: link ? 'Link enviado no bot' : 'Criada no bot',
+      fonte:  'manual',
+    });
+    if (!r || !r.ok) return res.status(422).json({ ok:false, erro: (r && r.erro) || 'nao deu para montar a oferta' });
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ ok:false, erro: e.message });
+  }
+});
 
 // ctx = { contaId, sock } da conta que RECEBEU a mensagem. Importa para a
 // midia: o reupload precisa do socket que tem a sessao daquela mensagem —
@@ -12970,8 +13047,12 @@ app.post('/injetar', async (req, res) => {
   // isso o padrao e 'coleta' — nenhuma mudanca e necessaria do lado da
   // automacao. Injecao feita a mao deve mandar origem:'manual' para nao ser
   // contabilizada como achado da varredura.
-  const { texto, origem } = req.body;
-  if (!texto?.trim()) return res.status(400).json({ ok:false, erro:'Texto vazio.' });
+  // imagens: base64 (sem prefixo data:), na mesma lista que o pipeline de grupo
+  // consome. Existe porque a aba Emissao do gestor le print, e quem opera pelo
+  // celular so tem o print — sem isto o bot do Telegram so aceitaria texto.
+  const { texto, origem, imagens } = req.body;
+  const imgs = Array.isArray(imagens) ? imagens.filter(Boolean).slice(0, 4) : [];
+  if (!texto?.trim() && !imgs.length) return res.status(400).json({ ok:false, erro:'Sem texto nem imagem.' });
   // Cada injeção manual recebe seu PRÓPRIO grupo (id único) e é processada
   // isoladamente. Assim 1 injeção = 1 oferta: não há janela de 3 min
   // compartilhada (que quebrava as injeções em lotes conforme o tempo) nem
@@ -12983,7 +13064,16 @@ app.post('/injetar', async (req, res) => {
   const grupoFake = prefixo + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
   const entrada = { itens: [], timer: null };
   bufferAgrupamento.set(grupoFake, entrada);
-  entrada.itens.push({ texto: texto.trim(), imagemBase64: null, timestamp: Date.now() });
+  // Uma imagem por item, com o texto grudado na PRIMEIRA: e assim que a captura
+  // de grupo entrega legenda + print, e o classificador ja sabe ler esse par.
+  if (imgs.length) {
+    imgs.forEach((b64, i) => entrada.itens.push({
+      texto: i === 0 ? String(texto || '').trim() : '',
+      imagemBase64: b64, timestamp: Date.now(),
+    }));
+  } else {
+    entrada.itens.push({ texto: texto.trim(), imagemBase64: null, timestamp: Date.now() });
+  }
   // Pequeno atraso só para a resposta HTTP retornar antes do processamento.
   entrada.timer = setTimeout(() => processarBuffer(grupoFake), 1500);
   res.json({ ok: true, grupo: grupoFake, bufferItens: entrada.itens.length });
@@ -18395,7 +18485,7 @@ bootBotTsp({
 // Bots de revisao CDV. Nao recebem funcao do servidor: falam pelas mesmas rotas
 // HTTP que o painel usa, entao nao ha regra de negocio duplicada neles.
 bootBotPassagens({ PORT }).catch(e => console.warn('[BOT-PASSAGENS] Falha no boot:', e.message));
-bootBotOfertas({ sessaoDir: SESSAO_DIR }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
+bootBotOfertas({ sessaoDir: SESSAO_DIR, PORT }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
 
 // Monitor de queda de preco. As funcoes de montagem e envio sao injetadas em
 // vez de importadas: o modulo precisa do caminho REAL de envio (template, cupom,
