@@ -454,7 +454,14 @@ const CHAVES_ESTRUTURADAS_AFILIADOS = new Set([
   'tagsPorGrupo', 'linksPorGrupo', 'linksLiteraisPorGrupo', 'regrasPorNome',
 ]);
 
-const RE_JID_GRUPO = /^\d{5,}@g\.us$/;
+// Dois formatos de JID de grupo convivem no WhatsApp: o atual, so digitos
+// (120363...@g.us), e o LEGADO de grupos criados ha anos, que carrega o numero
+// de quem criou mais o timestamp da criacao (14077809110-1570099076@g.us).
+// A regex antiga so aceitava o primeiro — e como entrada invalida e DESCARTADA
+// em silencio no normalizador, cadastrar um grupo antigo pela tela devolvia
+// 200 OK e o grupo sumia da lista no proximo carregamento. Foi exatamente o
+// que aconteceu com o "Plantao Informativo das Milhas".
+const RE_JID_GRUPO = /^\d{5,}(?:-\d{5,})?@g\.us$/;
 
 export function salvarConfigTsp(parcial = {}, tenantId) {
   tenantId = resolver(tenantId);
