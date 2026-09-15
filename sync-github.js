@@ -93,8 +93,14 @@ const RE_NOME_HISTORICO = /^historico_envios_\d{4}-\d{2}\.json$/;
 // meses — e acima disso a Contents API para de devolver o conteudo na leitura,
 // matando a restauracao pos-deploy em silencio.
 const RE_NOME_PRECOS = /^precos_hist_\d{4}-\d{2}\.json$/;
+// Shards diarios do mapa de links rastreados (links_rastreio_2026-09-15.json).
+// Diario, e nao mensal, porque o proxy le o shard no clique quando o servidor
+// esta fora: arquivo pequeno = fallback rapido. Sobem por agendarPush e sao
+// restaurados sob demanda por baixarArquivoDoGitHub (links-rastreio.js).
+const RE_NOME_LINKS = /^links_rastreio_\d{4}-\d{2}-\d{2}\.json$/;
 function nomeSincronizavel(nome) {
-  return NOMES_SINCRONIZAVEIS.has(nome) || RE_NOME_HISTORICO.test(nome) || RE_NOME_PRECOS.test(nome);
+  return NOMES_SINCRONIZAVEIS.has(nome) || RE_NOME_HISTORICO.test(nome) || RE_NOME_PRECOS.test(nome)
+      || RE_NOME_LINKS.test(nome);
 }
 
 // Caminho relativo valido: nome permitido na raiz, ou tenants/<id>/<nome>.

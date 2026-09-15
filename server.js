@@ -159,6 +159,8 @@ import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH,
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
+// ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
+import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
 // Espalha os prazos da config para os modulos que os usam. Chamado no boot e
 // depois de cada gravacao, para valer sem redeploy.
@@ -2562,7 +2564,10 @@ async function despacharAgendamento(ag, grupoId) {
   // para um grupo com tag propria precisa sair com ela. Grupo fora do mapa
   // recebe a mensagem original. O caminho multi-grupo nao passa por aqui — ele
   // cai em enviarManualParaGrupos, que ja faz a troca destino a destino.
-  const msg = comTagDoGrupo(ag.mensagem || '', grupoId);
+  let msg = comTagDoGrupo(ag.mensagem || '', grupoId);
+  const _rastCtx = { execId: 'ag-' + ag.id + '@' + Date.now(), tipo: ag.tipo || 'agendamento',
+                     dados: ag.preview || null, categoria: ag.categoria || null };
+  msg = (await comLinksRastreados(msg, null, grupoId, _rastCtx)).texto;
 
   // Anexo agendado: os bytes viajam dentro do proprio agendamento (o painel
   // manda em base64), entao o disparo nao depende de nenhum arquivo em disco
@@ -2584,7 +2589,12 @@ async function despacharAgendamento(ag, grupoId) {
 
   let lp = null;
   if (ag.preview?.link) {
-    try { lp = previewComTagDoGrupo(await montarLinkPreviewManual(ag.preview, msg), grupoId); }
+    // O preview e montado sobre a mensagem ja rastreada; o card aponta para a
+    // URL original da loja, entao a troca e refeita no card pelo mesmo execId.
+    try {
+      lp = previewComTagDoGrupo(await montarLinkPreviewManual(ag.preview, comTagDoGrupo(ag.mensagem || '', grupoId)), grupoId);
+      if (lp) lp = (await comLinksRastreados(comTagDoGrupo(ag.mensagem || '', grupoId), lp, grupoId, _rastCtx)).preview;
+    }
     catch (e) { console.warn('[AGEND] Nao montou o preview de #' + ag.id + ':', e.message); }
   }
   return enviarMensagem(grupoId, lp ? { text: msg, linkPreview: lp } : { text: msg }, 0, op);
@@ -3969,6 +3979,9 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   // e o remetente DENTRO de um grupo — entre grupos diferentes, variar e o
   // proprio objetivo de dividir a carga.
   const _execId = oferta?.id ? String(oferta.id) : ('c_' + Date.now());
+  // Rastreio: um codigo por disparo (a mesma oferta reenviada outro dia ganha
+  // codigo novo, com o preco daquele dia).
+  const _rastExec = _execId + '@' + Date.now();
   // Sentinela do modo so-admins: detecta o descarte silencioso antes do despacho.
   await verificarAdminGruposCupons();
   // Cupom e de LOJA, nao de produto: nao tem categoria para casar com nicho.
@@ -3988,7 +4001,9 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
     // Tag de afiliado do destino: grupo com tag propria recebe o link com ela,
     // os demais seguem com a tag do pool. Sem grupo no mapa, `texto` e a
     // mensagem original, byte a byte.
-    const texto = comTagDoGrupo(comRodapeExtra(mensagem, { jid, tipo: 'cupom' }), jid);
+    const { texto } = await comLinksRastreados(
+      comTagDoGrupo(comRodapeExtra(mensagem, { jid, tipo: 'cupom' }), jid), null, jid,
+      { execId: _rastExec, tipo: 'cupom', oferta });
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
@@ -4093,6 +4108,22 @@ function ehGrupoTsp(jid) {
     console.warn('[MARCA] Nao consegui classificar o grupo ' + jid + ':', e.message);
   }
   return false;   // duvida nao marca
+}
+
+// Links rastreados: so em grupo do TSP e so no operador padrao. Ultima etapa
+// antes do enviarMensagem, DEPOIS do comTagDoGrupo — o destino gravado precisa
+// carregar a tag de afiliado daquele grupo. Nunca lanca: falha = link original.
+async function comLinksRastreados(texto, preview, jid, ctx = {}) {
+  try {
+    if (!ehGrupoTsp(jid)) return { texto, preview };
+    const t = tenantContexto();
+    if (t && t !== 'tsp') return { texto, preview };
+    const r = await rastrearParaGrupo(texto, preview, { ...ctx, jid, nomeGrupo: NOMES_GRUPOS.get(jid) || '' });
+    return { texto: r.texto, preview: r.preview };
+  } catch (e) {
+    console.warn('[RASTREIO] ' + jid + ': ' + e.message);
+    return { texto, preview };
+  }
 }
 
 let _sharp = null, _sharpTentado = false;
@@ -4544,6 +4575,7 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   // Um id por despacho: todos os destinos desta execucao compartilham a chave
   // de idempotencia da outbox (id, jid).
   const _execId = oferta?.id ? String(oferta.id) : ('o_' + Date.now());
+  const _rastExec = _execId + '@' + Date.now();
 
   for (const jid of alvos) {
     if (soCupons.has(jid)) continue;
@@ -4559,15 +4591,17 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
     }), jid);
     // O card e clicavel e carrega a propria URL: sem reescrever o preview, o
     // texto sairia com a tag do grupo e o card levaria o clique para a antiga.
-    const lpDoGrupo = previewComTagDoGrupo(preview, jid);
+    const _rast = await comLinksRastreados(texto, previewComTagDoGrupo(preview, jid), jid,
+      { execId: _rastExec, tipo: 'oferta', oferta });
+    const lpDoGrupo = _rast.preview;
     try {
-      await enviarMensagem(jid, lpDoGrupo ? { text: texto, linkPreview: lpDoGrupo } : { text: texto }, 0, op);
+      await enviarMensagem(jid, lpDoGrupo ? { text: _rast.texto, linkPreview: lpDoGrupo } : { text: _rast.texto }, 0, op);
       enviados.push(jid);
       if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
     } catch (e) {
       console.error('[MKT] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
-      outboxEnfileirar({ id: _execId, jid, texto, conta: op.conta, origem: 'oferta', erro: e.message });
+      outboxEnfileirar({ id: _execId, jid, texto: _rast.texto, conta: op.conta, origem: 'oferta', erro: e.message });
     }
   }
   if (!enviados.length) throw new Error('Nenhum grupo recebeu a oferta.');
@@ -4629,6 +4663,7 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
   // se o painel mandar explicitamente. Sem ela, casam apenas as regras de
   // rodape que nao filtram por categoria.
   const catManual = String(categoria || '').trim();
+  const _rastExec = 'm_' + Date.now();
   for (const jid of alvos) {
     // Remetente do grupo: fixo se atribuido, senao o do turno.
     const op = { conta: contaDoGrupo(jid) };
@@ -4638,16 +4673,19 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
       categoria: catManual || null,
       categoriaConfiavel: !!catManual,
     }), jid);
-    const lpGrupo = previewComTagDoGrupo(lp, jid);
+    const _rast = await comLinksRastreados(texto, previewComTagDoGrupo(lp, jid), jid, {
+      execId: _rastExec, tipo: ehCupom ? 'cupom' : 'manual', dados: preview || null, categoria: catManual || null,
+    });
+    const lpGrupo = _rast.preview;
     try {
       if (imagem?.imagemBase64) {
         await enviarMensagem(jid, {
           image:    Buffer.from(imagem.imagemBase64, 'base64'),
-          caption:  texto || '',
+          caption:  _rast.texto || '',
           mimetype: imagem.mime || 'image/jpeg',
         }, 0, op);
       } else {
-        await enviarMensagem(jid, lpGrupo ? { text: texto, linkPreview: lpGrupo } : { text: texto }, 0, op);
+        await enviarMensagem(jid, lpGrupo ? { text: _rast.texto, linkPreview: lpGrupo } : { text: _rast.texto }, 0, op);
       }
       enviados.push(jid);
       // Espacamento entre grupos: mesmo padrao do radar. Disparo simultaneo em
@@ -12407,6 +12445,20 @@ app.post('/api/claude', async (req, res) => {
     const resp = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-api-key':process.env.ANTHROPIC_API_KEY, 'anthropic-version':'2023-06-01' }, body:JSON.stringify(req.body) });
     res.json(await resp.json());
   } catch(e) { res.status(500).json({ error:{ message:e.message } }); }
+});
+
+// ── LINKS RASTREADOS ─────────────────────────────────────────────────────────
+// Consultado pelo proxy (painel-cdv) no clique: codigo base -> destino. So
+// devolve o necessario para o redirect e a contagem.
+app.get('/links-rastreio/estado', (req, res) => res.json({ ok: true, ...estadoRastreio() }));
+app.get('/links-rastreio/:codigo', async (req, res) => {
+  try {
+    const reg = await resolverCodigo(req.params.codigo);
+    if (!reg) return res.status(404).json({ ok: false, erro: 'codigo desconhecido' });
+    const grupos = {};
+    for (const [suf, g] of Object.entries(reg.grupos || {})) grupos[suf] = { destino: g.destino || null };
+    res.json({ ok: true, base: reg.base, dia: reg.dia, url: reg.url, enviadoEm: reg.enviadoEm, grupos });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 app.get('/grupos/nomes', (req, res) => {

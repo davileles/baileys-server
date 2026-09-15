@@ -44,6 +44,8 @@
         "app.get('/historico-seats'",
         "app.get('/historico-seats/rotas'",
         "app.get('/interno/wa-leitura/comparacao'",
+        "app.get('/links-rastreio/:codigo'",
+        "app.get('/links-rastreio/estado'",
         "app.get('/listas'",
         "app.get('/magalu/converter'",
         "app.get('/mkt/avista'",
@@ -140,6 +142,7 @@
         "app.post('/webhook/hubla'",
         "async function campanhaCiclo",
         "async function campanhaMarcarResposta",
+        "async function comLinksRastreados",
         "async function verificarPulsoLojas",
         "campanhaMarcarResposta(msg)",
         "const CAMPANHAS_KEY",
@@ -345,7 +348,8 @@
         "export async function testarAcesso",
         "export function agendarPush",
         "export function estadoSync",
-        "export function sincronizacaoAtiva"
+        "export function sincronizacaoAtiva",
+        "const RE_NOME_LINKS"
       ]
     },
     "tenants.js": {
@@ -388,6 +392,17 @@
         "export function retirarCandidatos",
         "export function usoDeHoje",
         "export function vagasAgora"
+      ]
+    },
+    "links-rastreio.js": {
+      "minLinhas": 242,
+      "obrigatorio": [
+        "export async function rastrearParaGrupo",
+        "export async function resolverCodigo",
+        "export function estadoRastreio",
+        "export function rastreioAtivo",
+        "export function slugLoja",
+        "export function sufixoDoGrupo"
       ]
     }
   }
