@@ -130,6 +130,18 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
 
   const autorizado = (chatId) => ADMINS.has(String(chatId));
 
+  // Trava de acao em andamento. Tirar os botoes antes do await nao basta: entre
+  // o toque e a edicao do card chegar ao celular ha um ou dois segundos, e um
+  // segundo toque nessa janela disparava a publicacao de novo. Devolve false
+  // quando a mesma chave ja esta rodando — quem chama avisa o operador.
+  const travas = new Set();
+  async function comTrava(chave, fn) {
+    if (travas.has(chave)) return false;
+    travas.add(chave);
+    try { await fn(); } finally { travas.delete(chave); }
+    return true;
+  }
+
   // Baixa uma foto ou documento enviado no chat e devolve em base64. A Bot API
   // entrega so o file_id no update; o conteudo exige getFile e depois um GET no
   // host de arquivos, que e outro dominio e leva o token no path.
@@ -179,7 +191,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   return {
     nome, TAG, ativo: !!TOKEN, path: PATH, admins: ADMINS,
     tg, esc, teclado, falarHtml, falarPlano, toast, autorizado, paraCadaAdmin, bootWebhook,
-    baixarArquivo, diagnostico, anotarUpdate,
+    baixarArquivo, diagnostico, anotarUpdate, comTrava,
   };
 }
 

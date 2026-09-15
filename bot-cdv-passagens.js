@@ -406,9 +406,19 @@ export async function tratarUpdateBotPassagens(update) {
       const chatId = cb.message?.chat?.id;
       const msgId  = cb.message?.message_id;
       if (!bot.autorizado(chatId)) return void await bot.toast(cb.id, 'Sem permissão.');
-      await bot.toast(cb.id);
       const partes = String(cb.data || '').split(':');
-      if (partes[0] === 'p') await tratarAcao(chatId, msgId, partes, cb.id);
+      if (partes[0] !== 'p') return void await bot.toast(cb.id);
+      // Enviar e descartar sao os toques que nao podem rodar duas vezes.
+      if (partes[1] === 'enviar' || partes[1] === 'descartar') {
+        const rodou = await bot.comTrava(chatId + ':' + partes[2], async () => {
+          await bot.toast(cb.id);
+          await tratarAcao(chatId, msgId, partes, cb.id);
+        });
+        if (!rodou) await bot.toast(cb.id, '⏳ Já estou processando esse card — aguarde.');
+        return;
+      }
+      await bot.toast(cb.id);
+      await tratarAcao(chatId, msgId, partes, cb.id);
       return;
     }
 

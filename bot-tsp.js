@@ -365,14 +365,123 @@ async function previewOferta(chatId, s, editar) {
 }
 
 // ── FLUXO MENSAGEM LIVRE ─────────────────────────────────────────────────────
-async function previewMsg(chatId, s, editar) {
-  s.passo = 'preview';
-  return falar(chatId,
-    '*Prévia* 👇\n\n- - - - - - - - - -\n' + s.dados.mensagem + '\n- - - - - - - - - -',
-    teclado([
-      [['🚀 Enviar agora', 'a:enviar']],
-      [['🔁 Refazer', 'a:refazer'], ['❌ Cancelar', 'a:cancelar']],
-    ]), editar);
+// Mesmos campos e mesma montagem da aba "Mensagem livre" do Gestão Tica Promos
+// (gerarLivre em tudo-sobre-promos/index.html). Se o template mudar la, mude
+// aqui junto — senao a mesma mensagem sai diferente pelo celular.
+//
+// Um card so, editado no lugar: previa em cima, um botao por campo embaixo.
+// Tocar num campo abre a pergunta; o valor digitado volta para o card e a
+// bolha digitada some. Sem parse_mode: o template usa * e ` do WhatsApp, e
+// texto livre com Markdown quebrado faria o Telegram recusar o card inteiro.
+const CAMPOS_LIVRE = {
+  gatilho:    '🚨 Gatilho',
+  titulo:     '📝 Título',
+  corpo:      '💬 Conteúdo',
+  cupom:      '🏷️ Cupom',
+  loja:       '🛒 Loja',
+  importante: '⚠️ Importante',
+  link:       '🔗 Link',
+};
+const LOJAS_LIVRE = ['Amazon', 'Mercado Livre', 'Shopee'];   // as do select do painel
+
+function montarLivre(d) {
+  let msg = '';
+  if (d.gatilho)    msg += '`🚨 ' + d.gatilho + '`\n\n';
+  if (d.titulo)     msg += '*' + d.titulo + '*\n\n';
+  if (d.corpo)      msg += d.corpo + '\n\n';
+  if (d.cupom)      msg += '🏷️ *CUPOM* ' + d.cupom.toUpperCase() + '\n\n';
+  if (d.loja)       msg += '🛒 *LOJA* ' + d.loja.toUpperCase() + '\n\n';
+  if (d.importante) msg += '⚠️ *IMPORTANTE* ' + d.importante + '\n\n';
+  if (d.link)       msg += '🔗 *LINK* ' + d.link + '\n\n';
+  return msg.trimEnd();
+}
+
+function abrirLivre(chatId, editar) {
+  const s = abrir(chatId, 'msg');
+  // Caminho mais comum primeiro: o que for digitado ja vira o conteudo.
+  s.passo = 'campo:corpo';
+  return telaLivre(chatId, s, 'Mande o conteúdo da mensagem — ou toque num campo.', editar);
+}
+
+async function telaLivre(chatId, s, nota, editar) {
+  const d = s.dados;
+  const msg = montarLivre(d);
+  const bt = (k) => [CAMPOS_LIVRE[k] + (d[k] ? ' ✅' : ''), 'l:campo:' + k];
+  const linhas = [
+    [bt('gatilho'), bt('titulo')],
+    [bt('corpo'), bt('cupom')],
+    [bt('loja'), bt('importante')],
+    [bt('link')],
+  ];
+  if (msg) linhas.push([['🚀 Enviar agora', 'a:enviar']]);
+  linhas.push([['❌ Cancelar', 'a:cancelar']]);
+  const texto = '📢 MENSAGEM LIVRE\n\n'
+    + (msg ? '- - - - - - - - - -\n' + msg + '\n- - - - - - - - - -' : '(vazia — preencha ao menos um campo)')
+    + (nota ? '\n\n' + nota : '');
+  const r = await falarPlano(chatId, texto, teclado(linhas), editar || s.msgId);
+  if (r?.message_id) s.msgId = r.message_id;
+  return r;
+}
+
+async function perguntarCampoLivre(chatId, s, campo, msgId) {
+  const d = s.dados;
+  s.passo = 'campo:' + campo;
+  const atual = String(d[campo] || '').trim();
+  const hoje = atual ? (atual.length > 300 ? atual.slice(0, 300) + ' [...]' : atual) : 'vazio';
+  const linhas = [];
+  let dica = 'Mande o novo texto.';
+  if (campo === 'loja') {
+    linhas.push(LOJAS_LIVRE.map(l => [(l === atual ? '✅ ' : '') + l, 'l:loja:' + LOJAS_LIVRE.indexOf(l)]));
+    dica = 'Toque numa loja ou digite o nome de outra.';
+  }
+  if (campo === 'importante') {
+    linhas.push(...linhasImportantesProntos(atual, 'l:imp:'));
+    dica = 'Toque num texto pronto ou digite o seu.\n\nProntos:\n' + listaImportantesProntos();
+  }
+  if (campo === 'link') dica = 'Mande a URL completa (https://...).';
+  if (atual) linhas.push([['🧹 Deixar vazio', 'l:vazio:' + campo]]);
+  linhas.push([['⬅️ Voltar', 'l:voltar']]);
+  const r = await falarPlano(chatId, CAMPOS_LIVRE[campo] + '\nHoje: ' + hoje + '\n\n' + dica, teclado(linhas), msgId);
+  if (r?.message_id) s.msgId = r.message_id;
+  return r;
+}
+
+async function tratarBotaoLivre(chatId, msgId, s, partes) {
+  if (!s || s.fluxo !== 'msg') return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
+  s.msgId = msgId;
+  const [, acao, arg] = partes;
+  const d = s.dados;
+  if (acao === 'campo' && CAMPOS_LIVRE[arg]) return perguntarCampoLivre(chatId, s, arg, msgId);
+  if (acao === 'loja') {
+    const loja = LOJAS_LIVRE[Number(arg)];
+    if (loja) d.loja = loja;
+  } else if (acao === 'imp') {
+    const pronto = IMPORTANTES_PRONTOS[Number(arg)];
+    if (pronto) d.importante = pronto.texto;
+  } else if (acao === 'vazio' && CAMPOS_LIVRE[arg]) {
+    d[arg] = '';
+  }
+  s.passo = 'editor';
+  return telaLivre(chatId, s, null, msgId);
+}
+
+// Texto digitado com a mensagem livre aberta. Devolve true quando consumiu.
+async function textoLivre(chatId, s, t, msgEntrada) {
+  if (s.passo === 'texto') s.passo = 'campo:corpo';          // sessao aberta antes deste deploy
+  if (!String(s.passo || '').startsWith('campo:')) {
+    await apagarEntrada(chatId, msgEntrada);
+    return telaLivre(chatId, s, '👆 Toque no campo que quer preencher antes de digitar.');
+  }
+  const campo = s.passo.slice(6);
+  if (!CAMPOS_LIVRE[campo]) return;
+  const valor = campo === 'corpo' ? t : t.replace(/\s+/g, ' ').trim();
+  if (campo === 'link' && !/^https?:\/\/\S+$/i.test(valor)) {
+    return falarPlano(chatId, 'Isso não parece um link. Mande a URL completa, começando com https://');
+  }
+  s.dados[campo] = campo === 'cupom' ? valor.toUpperCase().replace(/\s+/g, '') : valor;
+  s.passo = 'editor';
+  await apagarEntrada(chatId, msgEntrada);
+  return telaLivre(chatId, s, '✏️ ' + CAMPOS_LIVRE[campo] + ' atualizado.');
 }
 
 // ── ENVIO ────────────────────────────────────────────────────────────────────
@@ -433,7 +542,11 @@ async function confirmarEnvio(chatId, s, acao, editar) {
     return falar(chatId, `✅ Cupom enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, editar);
   }
 
-  // Oferta e mensagem livre vao direto para os destinos do radar.
+  // Oferta e mensagem livre vao direto para os destinos do radar. O envio passa
+  // grupo a grupo e leva segundos: sem trocar o card ANTES, o toque parecia nao
+  // ter pegado e o segundo toque publicava de novo.
+  const nAlvos = (dep.radarDestinos() || []).length;
+  await falarPlano(chatId, '⏳ Enviando para ' + nAlvos + ' grupo(s)... não toque de novo.', null, editar);
   const res = await enviarParaDestinos(d.mensagem);
   sessoes.delete(String(chatId));
   return falar(chatId, `✅ Enviado em *${res.ok}/${res.total}* grupo(s).`, null, editar);
@@ -1049,9 +1162,7 @@ async function tratarTexto(chatId, texto, msgEntrada) {
   if (/^\/oferta/i.test(t)) { const s = abrir(chatId, 'oferta'); s.passo = 'link';
     return falar(chatId, '*Nova oferta* 🛍️\n\nMande o *link do produto* (Amazon, Mercado Livre, Shopee ou Magalu).',
       teclado([[['❌ Cancelar', 'a:cancelar']]])); }
-  if (/^\/msg/i.test(t))    { const s = abrir(chatId, 'msg'); s.passo = 'texto';
-    return falar(chatId, '*Mensagem livre* 📢\n\nEscreva o texto que vai para os grupos.',
-      teclado([[['❌ Cancelar', 'a:cancelar']]])); }
+  if (/^\/msg/i.test(t))    return abrirLivre(chatId);
 
   if (/^\/fila/i.test(t)) { sessoes.delete(String(chatId)); return mostrarFila(chatId); }
 
@@ -1111,7 +1222,7 @@ async function tratarTexto(chatId, texto, msgEntrada) {
     return aplicarAjuste(chatId, msgId, ofertaId, ov);
   }
 
-  if (s.fluxo === 'msg' && s.passo === 'texto') { s.dados.mensagem = t; return previewMsg(chatId, s); }
+  if (s.fluxo === 'msg') return textoLivre(chatId, s, t, msgEntrada);
 
   if (s.fluxo === 'oferta') {
     if (s.passo === 'link') {
@@ -1168,12 +1279,14 @@ async function tratarBotao(chatId, msgId, data, ctx) {
   const s = sessao(chatId);
   const [ns, chave, valor] = partes;
 
+  if (ns === 'l') return tratarBotaoLivre(chatId, msgId, s, partes);
+
   if (ns === 'a') {
     if (chave === 'novo') {
       const s2 = abrir(chatId, valor);
       if (valor === 'cupom')  { s2.passo = 'loja'; return pedirPassoCupom(chatId, s2, msgId); }
       if (valor === 'oferta') { s2.passo = 'link'; return falar(chatId, '*Nova oferta* 🛍️\n\nMande o *link do produto*.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId); }
-      s2.passo = 'texto';     return falar(chatId, '*Mensagem livre* 📢\n\nEscreva o texto.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
+      return abrirLivre(chatId, msgId);
     }
     if (chave === 'cancelar') { sessoes.delete(String(chatId)); return falar(chatId, 'Cancelado.', MENU_KB(), msgId); }
     if (chave === 'limpar' && valor === 'go') return limparChat(chatId, msgId, ctx);
@@ -1184,9 +1297,14 @@ async function tratarBotao(chatId, msgId, data, ctx) {
     }
     if (!s) return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
     if (chave === 'refazer') {
+      if (s.fluxo === 'msg') return abrirLivre(chatId, msgId);
       if (s.fluxo === 'cupom') { const s2 = abrir(chatId, 'cupom'); s2.passo = 'loja'; return pedirPassoCupom(chatId, s2, msgId); }
       s.passo = s.fluxo === 'oferta' ? 'link' : 'texto';
       return falar(chatId, 'Manda de novo.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
+    }
+    if (chave === 'enviar' && s.fluxo === 'msg') {
+      s.dados.mensagem = montarLivre(s.dados);
+      if (!s.dados.mensagem) return telaLivre(chatId, s, '⚠️ Mensagem vazia — preencha ao menos um campo.', msgId);
     }
     if (chave === 'enviar' || chave === 'fila' || chave === 'base') return confirmarEnvio(chatId, s, chave, msgId);
     if (chave === 'forcar') {
@@ -1268,6 +1386,15 @@ async function tratarBotao(chatId, msgId, data, ctx) {
 }
 
 // ── ENTRADA DO WEBHOOK ───────────────────────────────────────────────────────
+// ── TRAVA DE TOQUE REPETIDO ──────────────────────────────────────────────────
+const travas = new Set();
+function chaveTrava(chatId, data) {
+  const r = /^r:(enviar|descartar):(.+)$/.exec(data);
+  if (r) return chatId + ':r:' + r[2];
+  if (/^a:(enviar|fila|base|forcar)$/.test(data)) return chatId + ':a:envio';
+  return null;
+}
+
 export async function tratarUpdateBotTsp(update) {
   if (!TOKEN) return;
   try {
@@ -1277,13 +1404,20 @@ export async function tratarUpdateBotTsp(update) {
       const ctx = contextoCallback(cq.id);
       const chatId = cq.message?.chat?.id;
       if (!autorizado(chatId)) return void await ctx.toast();
+      // Segundo toque com o primeiro ainda rodando: avisa e sai. Sessao e por
+      // chat, entao os envios do assistente dividem uma trava so; card da fila
+      // trava pelo id do item.
+      const trava = chaveTrava(chatId, cq.data || '');
+      if (trava && travas.has(trava)) return void await ctx.toast('⏳ Já estou processando — aguarde.');
       // Toque que resolve o item guarda a resposta para o fim: e nela que vai o
       // desfecho. Os demais respondem ja, senao o botao fica girando enquanto o
       // servidor remonta a mensagem.
       if (!/^(r:(enviar|descartar):|a:limpar:go)/.test(cq.data || '')) await ctx.toast();
+      if (trava) travas.add(trava);
       try {
         return await tratarBotao(chatId, cq.message.message_id, cq.data || '', ctx);
       } finally {
+        if (trava) travas.delete(trava);
         // Rede de seguranca: caminho que nao encerrou card nenhum ainda precisa
         // desligar o relogio do botao.
         await ctx.toast();

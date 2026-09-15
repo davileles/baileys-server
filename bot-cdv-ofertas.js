@@ -424,9 +424,19 @@ export async function tratarUpdateBotOfertas(update) {
       const chatId = cb.message?.chat?.id;
       const msgId  = cb.message?.message_id;
       if (!bot.autorizado(chatId)) return void await bot.toast(cb.id, 'Sem permissão.');
-      await bot.toast(cb.id);
       const partes = String(cb.data || '').split(':');
-      if (partes[0] === 'o') await tratarAcao(chatId, msgId, partes, cb.id);
+      if (partes[0] !== 'o') return void await bot.toast(cb.id);
+      // Aprovar, publicar no Radar e rejeitar nao podem rodar duas vezes.
+      if (partes[1] === 'enviar' || partes[1] === 'radar' || partes[1] === 'rejeitar') {
+        const rodou = await bot.comTrava(chatId + ':' + partes.slice(2).join(':'), async () => {
+          await bot.toast(cb.id);
+          await tratarAcao(chatId, msgId, partes, cb.id);
+        });
+        if (!rodou) await bot.toast(cb.id, '⏳ Já estou processando esse card — aguarde.');
+        return;
+      }
+      await bot.toast(cb.id);
+      await tratarAcao(chatId, msgId, partes, cb.id);
       return;
     }
 
