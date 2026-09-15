@@ -396,8 +396,11 @@ async function tratarTexto(chatId, texto, msgIdDigitado) {
 }
 
 // ── WEBHOOK ──────────────────────────────────────────────────────────────────
+// Todo update entra na faxina da virada do dia (telegram-faxina.js) antes de
+// qualquer filtro: ate o comando recusado ocupa espaco no chat.
 export async function tratarUpdateBotPassagens(update) {
   try {
+    bot.anotarUpdate(update);
     const cb = update?.callback_query;
     if (cb) {
       const chatId = cb.message?.chat?.id;

@@ -10,6 +10,8 @@
 // funcionando, e migra-lo agora misturaria uma mudanca de comportamento com
 // uma de estrutura. Os bots NOVOS nascem aqui.
 
+import { criarFaxina } from './telegram-faxina.js';
+
 export function criarBot({ nome, token, secret, admins, urlBase }) {
   const TOKEN  = String(token || '');
   const TAG    = '[' + nome + ']';
@@ -36,6 +38,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
         body: JSON.stringify(body),
       });
       const d = await r.json().catch(() => ({}));
+      faxina.anotarResultado(d);
       if (!d.ok) {
         console.warn(`${TAG} ${metodo} falhou:`, d.description || r.status);
         if (!/not modified/i.test(d.description || '')) registrarErro(metodo, d.description || r.status);
@@ -47,6 +50,10 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
       return { ok: false, description: e.message };
     }
   }
+
+  // Faxina da virada do dia: anota os ids que passam por tg() e pelo webhook.
+  const faxina = criarFaxina({ nome, tg });
+  const anotarUpdate = (update) => faxina.anotarUpdate(update);
 
   // Diagnostico sem expor token: quem e o bot, para onde o webhook aponta e o
   // ultimo erro de entrega que o proprio Telegram registrou. Dois modulos com o
@@ -69,6 +76,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
       ultimoErroEntrega: info.last_error_message
         ? { em: new Date(info.last_error_date * 1000).toISOString(), msg: info.last_error_message } : null,
       ultimosErros: ultimosErros.slice(),
+      faxina: faxina.estado(),
     };
   }
 
@@ -152,6 +160,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
 
   async function bootWebhook(comandos) {
     if (!TOKEN) { console.log(`${TAG} token ausente — bot desligado.`); return false; }
+    faxina.iniciar();
     if (!ADMINS.size) console.warn(`${TAG} lista de admins vazia — o bot vai recusar todo mundo.`);
 
     const base = urlBase
@@ -170,7 +179,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   return {
     nome, TAG, ativo: !!TOKEN, path: PATH, admins: ADMINS,
     tg, esc, teclado, falarHtml, falarPlano, toast, autorizado, paraCadaAdmin, bootWebhook,
-    baixarArquivo, diagnostico,
+    baixarArquivo, diagnostico, anotarUpdate,
   };
 }
 

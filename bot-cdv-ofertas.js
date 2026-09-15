@@ -418,6 +418,7 @@ async function tratarTexto(chatId, texto, msgIdDigitado) {
 // ── WEBHOOK ──────────────────────────────────────────────────────────────────
 export async function tratarUpdateBotOfertas(update) {
   try {
+    bot.anotarUpdate(update);
     const cb = update?.callback_query;
     if (cb) {
       const chatId = cb.message?.chat?.id;

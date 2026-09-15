@@ -148,7 +148,7 @@ import {
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
 import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram,
-         enviarCardRevisaoTelegram } from './bot-tsp.js';
+         enviarCardRevisaoTelegram, estadoFaxinaTsp } from './bot-tsp.js';
 // Bots de revisao por fluxo. Cada um tem token, chat e fila proprios: o que
 // decide passagem nao e a mesma cabeca (nem o mesmo momento) do que decide
 // oferta de pontos, e misturar os dois num chat so faz um esconder o outro.
@@ -10692,7 +10692,7 @@ app.post(BOT_OFERTAS_PATH, (req, res) => {
 app.get('/bots/diag', async (req, res) => {
   try {
     const [passagens, ofertas] = await Promise.all([diagBotPassagens(), diagBotOfertas()]);
-    let tsp = { ativo: !!process.env.TELEGRAM_BOT_TOKEN };
+    let tsp = { ativo: !!process.env.TELEGRAM_BOT_TOKEN, faxina: estadoFaxinaTsp() };
     if (tsp.ativo) {
       const r = await fetch('https://api.telegram.org/bot' + process.env.TELEGRAM_BOT_TOKEN + '/getMe')
         .then(x => x.json()).catch(() => ({}));

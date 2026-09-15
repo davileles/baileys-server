@@ -7,6 +7,9 @@
 //
 // Sem dependencia nova: fala com a Bot API por fetch puro.
 //
+// Faxina da virada do dia: telegram-faxina.js, a mesma dos bots de revisao.
+// Aqui ela e ligada a mao porque este bot tem transporte proprio.
+//
 // Env:
 //   TELEGRAM_BOT_TOKEN   token do @BotFather (obrigatorio; ausente = bot off)
 //   TELEGRAM_BOT_ADMINS  ids numericos autorizados, separados por virgula
@@ -22,6 +25,10 @@ const ADMINS = new Set(
 
 export const BOT_TSP_ATIVO = !!TOKEN;
 export const BOT_TSP_PATH  = `/bot-tsp/webhook/${SECRET}`;
+
+import { criarFaxina } from './telegram-faxina.js';
+const faxina = criarFaxina({ nome: 'BOT-TSP', tg: (m, b) => tg(m, b) });
+export const estadoFaxinaTsp = () => faxina.estado();
 
 // Injetado pelo server.js no boot. Manter o bot ignorante das entranhas do
 // servidor evita import circular e deixa claro qual e a superficie usada.
@@ -59,6 +66,7 @@ async function tg(metodo, body) {
     body: JSON.stringify(body),
   });
   const d = await r.json().catch(() => ({}));
+  faxina.anotarResultado(d);
   if (!d.ok) console.warn(`[BOT-TSP] ${metodo} falhou:`, d.description || r.status);
   return d;
 }
@@ -1263,6 +1271,7 @@ async function tratarBotao(chatId, msgId, data, ctx) {
 export async function tratarUpdateBotTsp(update) {
   if (!TOKEN) return;
   try {
+    faxina.anotarUpdate(update);
     if (update.callback_query) {
       const cq = update.callback_query;
       const ctx = contextoCallback(cq.id);
@@ -1298,6 +1307,7 @@ export async function tratarUpdateBotTsp(update) {
 export async function bootBotTsp(deps) {
   dep = deps;
   if (!TOKEN) { console.log('[BOT-TSP] TELEGRAM_BOT_TOKEN ausente — bot desligado.'); return; }
+  faxina.iniciar();
   if (!ADMINS.size) console.warn('[BOT-TSP] TELEGRAM_BOT_ADMINS vazio — o bot vai recusar todo mundo.');
 
   const base = process.env.BOT_TSP_URL
