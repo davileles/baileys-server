@@ -18,7 +18,7 @@
 //   TELEGRAM_BOT_PASSAGENS_SECRET   segredo do path do webhook (default: cdv-passagens)
 //   BOT_TSP_URL                     URL publica do servico (default: RAILWAY_PUBLIC_DOMAIN)
 
-import { criarBot, citacao } from './telegram-core.js';
+import { criarBot, citacao, valorCopiavel } from './telegram-core.js';
 
 const bot = criarBot({
   nome:    'BOT-PASSAGENS',
@@ -333,6 +333,20 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
     }
     abrirSessao(chatId, campo, id, msgId);
     const atualVal = (o.dados || {})[campo];
+    // Datas quase sempre pedem so um dia a mais ou a menos: o valor atual vai
+    // para a caixa de texto (ou para um bloco de copiar, se nao couber).
+    if (campo === 'datasIda' || campo === 'datasVolta') {
+      const btn = await bot.botaoPreencher('✏️ Editar texto atual', atualVal);
+      const linhas = btn ? [[btn], [['↩️ Cancelar', 'p:editar:' + id]]] : [[['↩️ Cancelar', 'p:editar:' + id]]];
+      const como = btn
+        ? 'Toque em <b>✏️ Editar texto atual</b>, ajuste e envie — ou mande as datas de novo.'
+        : (atualVal ? 'Copie o texto acima, ajuste e envie — ou mande as datas de novo.' : 'Mande o novo valor por mensagem.');
+      return bot.falarHtml(chatId,
+        '✏️ <b>' + e(CAMPOS[campo]) + '</b> de #' + e(id)
+        + '\nHoje:' + (atualVal ? '\n' + valorCopiavel(atualVal, e) : ' <i>vazio</i>')
+        + '\n<i>Ex: Out/26: 08; Jan/27: 22, 29</i>\n\n' + como,
+        bot.teclado(linhas), msgId);
+    }
     const dica = campo === 'pontos' ? '\n<i>Só o número, ex: 75000</i>'
       : (campo === 'datasIda' || campo === 'datasVolta')
         ? '\n<i>Ex: Out/26: 08; Jan/27: 22, 29</i>' : '';
@@ -401,6 +415,7 @@ async function tratarTexto(chatId, texto, msgIdDigitado) {
 export async function tratarUpdateBotPassagens(update) {
   try {
     bot.anotarUpdate(update);
+    if (await bot.responderInline(update)) return;
     const cb = update?.callback_query;
     if (cb) {
       const chatId = cb.message?.chat?.id;
@@ -450,7 +465,7 @@ export async function tratarUpdateBotPassagens(update) {
         'Para emissão eu leio texto e print. Esse arquivo não — mande um print da tela ou cole o texto.');
     }
 
-    const bruto = String(m.text || '').trim();
+    const bruto = bot.tirarMencao(m.text || '').trim();
     const texto = bruto.toLowerCase().split('@')[0];
     if (texto === '/cancelar') {
       sessoes.delete(String(chatId));

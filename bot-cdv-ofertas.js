@@ -24,7 +24,7 @@
 //   BOT_TSP_URL                   URL publica do servico (default: RAILWAY_PUBLIC_DOMAIN)
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { criarBot, citacao } from './telegram-core.js';
+import { criarBot, citacao, valorCopiavel } from './telegram-core.js';
 
 const bot = criarBot({
   nome:    'BOT-OFERTAS',
@@ -124,6 +124,9 @@ const CATEGORIA_ROTULO = {
 // Campos que fazem diferenca na mensagem que vai ao grupo. Categoria, programa
 // e origem/destino ficam de fora: mexer neles muda o roteamento e o historico
 // de transferencias, e isso e decisao de tela, nao de celular.
+// Campos em que a edicao abre com o texto atual pre-preenchido.
+const CAMPOS_PREENCHER = new Set(['resumo', 'importante']);
+
 const CAMPOS = {
   titulo:     'Título',
   resumo:     'Resumo',
@@ -358,6 +361,20 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
     if (!CAMPOS[campo]) return bot.toast(callbackId, 'Campo desconhecido.');
     sessoes.set(String(chatId), { campo, ofertaId: id, msgId, expiraEm: Date.now() + SESSAO_TTL_MS });
     const atualVal = comEdicoes(o)[campo];
+    // Resumo e Importante costumam precisar de ajuste pequeno: o valor atual
+    // vai para a caixa de texto (ou para um bloco de copiar, se nao couber).
+    if (CAMPOS_PREENCHER.has(campo)) {
+      const btn = await bot.botaoPreencher('✏️ Editar texto atual', atualVal);
+      const linhas = btn ? [[btn], [['↩️ Cancelar', 'o:editar:' + id]]] : [[['↩️ Cancelar', 'o:editar:' + id]]];
+      const como = btn
+        ? 'Toque em <b>✏️ Editar texto atual</b>, ajuste e envie — ou mande um texto novo.'
+        : (atualVal ? 'Copie o texto acima, ajuste e envie — ou mande um texto novo.' : 'Mande o novo valor por mensagem.');
+      return bot.falarHtml(chatId,
+        '✏️ <b>' + e(CAMPOS[campo]) + '</b> de #' + e(id)
+        + '\nHoje:' + (atualVal ? '\n' + valorCopiavel(atualVal, e) : ' <i>vazio</i>')
+        + '\n\n' + como + ' Para deixar o campo vazio, mande <code>-</code>.',
+        bot.teclado(linhas), msgId);
+    }
     return bot.falarHtml(chatId,
       '✏️ <b>' + e(CAMPOS[campo]) + '</b> de #' + e(id)
       + '\nHoje: ' + (atualVal ? e(String(atualVal)) : '<i>vazio</i>')
@@ -419,6 +436,7 @@ async function tratarTexto(chatId, texto, msgIdDigitado) {
 export async function tratarUpdateBotOfertas(update) {
   try {
     bot.anotarUpdate(update);
+    if (await bot.responderInline(update)) return;
     const cb = update?.callback_query;
     if (cb) {
       const chatId = cb.message?.chat?.id;
@@ -470,7 +488,7 @@ export async function tratarUpdateBotOfertas(update) {
       return void await bot.falarPlano(chatId, 'Esse tipo de arquivo eu não leio. Mande imagem, PDF, um link ou o texto.');
     }
 
-    const bruto = String(m.text || '').trim();
+    const bruto = bot.tirarMencao(m.text || '').trim();
     const texto = bruto.toLowerCase().split('@')[0];
     if (texto === '/cancelar') {
       sessoes.delete(String(chatId));

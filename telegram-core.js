@@ -68,6 +68,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
     return {
       nome, ativo: true, admins: ADMINS.size,
       username: me.result?.username || null,
+      modoInline: !!me.result?.supports_inline_queries,
       botId: me.result?.id || null,
       webhookEsperado: PATH,
       webhookPath,
@@ -86,10 +87,64 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   const esc = (s) => String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+  // Botao comum e [texto, callback_data]. Quando o segundo item e um objeto,
+  // ele vai como os campos do botao (ex.: switch_inline_query_current_chat).
   function teclado(linhas) {
     return {
-      inline_keyboard: linhas.map(l => l.map(([texto, data]) => ({ text: texto, callback_data: data }))),
+      inline_keyboard: linhas.map(l => l.map(([texto, data]) =>
+        (data && typeof data === 'object') ? { text: texto, ...data } : { text: texto, callback_data: data })),
     };
+  }
+
+  // ── PRE-PREENCHER A CAIXA DE TEXTO ──────────────────────────────────────────
+  // A Bot API nao escreve no campo de digitacao do operador. O unico caminho e
+  // o botao switch_inline_query_current_chat: ao tocar, o app coloca
+  // "@bot <valor>" na caixa, o operador corrige so o pedaco errado e envia.
+  // Exige o modo inline ligado no @BotFather (/setinline) — sem ele o botao nao
+  // e desenhado. O perfil e relido a cada 10 min: ligar o modo inline passa a
+  // valer sem redeploy.
+  const LIMITE_PREENCHER = 256;           // teto da inline query
+  const perfil = { username: null, inline: false, lidoEm: 0 };
+  async function atualizarPerfil(forcar) {
+    if (!TOKEN) return perfil;
+    if (!forcar && Date.now() - perfil.lidoEm < 10 * 60 * 1000) return perfil;
+    const me = await tg('getMe', {});
+    if (me.ok && me.result) {
+      perfil.username = me.result.username || null;
+      perfil.inline   = !!me.result.supports_inline_queries;
+      perfil.lidoEm   = Date.now();
+    }
+    return perfil;
+  }
+
+  // Devolve o botao pronto ou null quando nao da para pre-preencher: modo inline
+  // desligado, valor vazio, com quebra de linha (a inline query e uma linha so)
+  // ou acima do teto. Quem chama cai no bloco de copiar nesses casos.
+  async function botaoPreencher(rotulo, valor) {
+    const v = String(valor == null ? '' : valor);
+    if (!v.trim() || /\n/.test(v) || v.length > LIMITE_PREENCHER) return null;
+    const p = await atualizarPerfil(false);
+    if (!p.inline || !p.username) return null;
+    return [rotulo, { switch_inline_query_current_chat: v }];
+  }
+
+  // Texto que veio do botao chega como "@bot valor": tira a mencao antes de
+  // qualquer outra leitura.
+  function tirarMencao(texto) {
+    const t = String(texto == null ? '' : texto);
+    if (!perfil.username) return t;
+    // Username de bot so tem letras, numeros e _ — nada a escapar na regex.
+    const re = new RegExp('^\\s*@' + perfil.username + '\\b\\s*', 'i');
+    return t.replace(re, '');
+  }
+
+  // Com o modo inline ligado, o app consulta o bot enquanto o operador edita.
+  // Resposta vazia na hora encerra o "carregando" sem mostrar lista nenhuma.
+  async function responderInline(update) {
+    const iq = update?.inline_query;
+    if (!iq) return false;
+    await tg('answerInlineQuery', { inline_query_id: iq.id, results: [], cache_time: 0, is_personal: true });
+    return true;
   }
 
   // Uma unica funcao de saida: vindo de um botao, EDITA a mensagem em vez de
@@ -173,6 +228,8 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   async function bootWebhook(comandos) {
     if (!TOKEN) { console.log(`${TAG} token ausente — bot desligado.`); return false; }
     faxina.iniciar();
+    await atualizarPerfil(true);
+    console.log(`${TAG} modo inline ${perfil.inline ? 'ligado — botao de editar texto atual ativo' : 'desligado — /setinline no @BotFather para pre-preencher'}.`);
     if (!ADMINS.size) console.warn(`${TAG} lista de admins vazia — o bot vai recusar todo mundo.`);
 
     const base = urlBase
@@ -181,7 +238,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
 
     const url = base.replace(/\/$/, '') + PATH;
     const d = await tg('setWebhook', {
-      url, allowed_updates: ['message', 'callback_query'], drop_pending_updates: true,
+      url, allowed_updates: ['message', 'callback_query', 'inline_query'], drop_pending_updates: true,
     });
     console.log(d.ok ? `${TAG} webhook registrado em ${url}` : `${TAG} falha no webhook: ${d.description}`);
     if (comandos?.length) await tg('setMyCommands', { commands: comandos });
@@ -192,11 +249,19 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
     nome, TAG, ativo: !!TOKEN, path: PATH, admins: ADMINS,
     tg, esc, teclado, falarHtml, falarPlano, toast, autorizado, paraCadaAdmin, bootWebhook,
     baixarArquivo, diagnostico, anotarUpdate, comTrava,
+    botaoPreencher, tirarMencao, responderInline,
   };
 }
 
 // Corta texto longo sem partir uma entidade HTML ao meio: o corte e feito no
 // texto CRU e o escape vem depois.
+// Valor atual mostrado para edicao. <pre> ganha botao de copiar no app — e o
+// caminho quando o pre-preenchimento nao cabe (texto longo ou com quebra).
+export function valorCopiavel(valor, esc) {
+  const v = String(valor == null ? '' : valor);
+  return v.trim() ? '<pre>' + esc(v) + '</pre>' : '<i>vazio</i>';
+}
+
 export function citacao(rotulo, texto, limite, compacto, esc) {
   let t = String(texto || '').trim();
   if (compacto) t = t.split('\n').filter(l => l.trim()).join('\n');
