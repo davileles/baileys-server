@@ -5518,7 +5518,7 @@ const TG_CANAIS_MONITORADOS = (process.env.TG_GRUPO || '@juaocupons,@canaldetest
 // TG_CANAIS_IGNORADOS_BASE fica no código para canais que nunca devem ser capturados,
 // independente do que esteja configurado no Railway. O modo de captura é GERAL
 // (aceita qualquer chat da conta), então só a blacklist impede a captura.
-const TG_CANAIS_IGNORADOS_BASE = ['bugmundodasmilhas'];
+const TG_CANAIS_IGNORADOS_BASE = ['bugmundodasmilhas', 'ticopromosbot'];
 // Funcao (nao const) para a lista da aba Configuracoes valer na hora, sem
 // restart. Env e base do codigo continuam somando — nunca substituindo.
 function TG_CANAIS_IGNORADOS_RAW() {
@@ -5733,6 +5733,17 @@ async function iniciarTelegram() {
       const username = (entity?.username || '').toLowerCase();
       const title    = (entity?.title    || '').toLowerCase();
 
+      // Mensagem de BOT nunca e fonte. Os bots de revisao (@ticopromosbot e os
+      // do CDV) mandam para esta mesma conta cards que citam cupom e preco: a
+      // captura geral lia o card como post de canal, a IA extraia o cupom e ele
+      // entrava na base e na fila com origem telegram:@<bot> — um loop que
+      // gravou dezenas de cupons falsos (ex.: PROVAR, tirado do card de uma
+      // oferta Amazon retida por "cupom fora da base").
+      if (entity?.bot === true) {
+        console.log(`[TG] IGNORADO (bot) userId=${peerChannelId} username="${username}"`);
+        return;
+      }
+
       // Verificar blacklist: por channelId numérico OU substring de title/username
       const bloqueadoPorId   = peerChannelId && _ignoradosIds.has(peerChannelId);
       const bloqueadoPorNome = TG_CANAIS_IGNORADOS_RAW().some(t => username.includes(t) || title.includes(t));
@@ -5844,6 +5855,9 @@ async function iniciarTelegramTenant(tenantId) {
         const peerId = msg.peerId;
         const cid = (peerId?.channelId ?? peerId?.chatId ?? peerId?.userId)?.toString();
         const ent = await client.getEntity(peerId).catch(() => null);
+        // Bot nunca e fonte (mesmo motivo do handler principal: card de revisao
+        // lido como post de canal realimentava a base de cupons).
+        if (ent?.bot === true) return;
         const username = (ent?.username || '').toLowerCase();
         const title    = (ent?.title    || '').toLowerCase();
         // Blacklist do OPERADOR (config dele) + base do codigo.
