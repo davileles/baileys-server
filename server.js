@@ -153,8 +153,9 @@ import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram,
 // decide passagem nao e a mesma cabeca (nem o mesmo momento) do que decide
 // oferta de pontos, e misturar os dois num chat so faz um esconder o outro.
 import { bootBotPassagens, tratarUpdateBotPassagens, BOT_PASSAGENS_PATH,
-         enviarCardPassagem } from './bot-cdv-passagens.js';
-import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH } from './bot-cdv-ofertas.js';
+         enviarCardPassagem, diagBotPassagens } from './bot-cdv-passagens.js';
+import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH,
+         diagBotOfertas } from './bot-cdv-ofertas.js';
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
@@ -10683,6 +10684,24 @@ app.post(BOT_PASSAGENS_PATH, (req, res) => {
 app.post(BOT_OFERTAS_PATH, (req, res) => {
   res.sendStatus(200);
   tratarUpdateBotOfertas(req.body).catch(e => console.error('[BOT-OFERTAS] Erro:', e.message));
+});
+
+// Diagnostico dos bots de revisao: username, destino do webhook e ultimas
+// recusas da Bot API. O bot TSP entra so com o username (tem transporte
+// proprio) — basta para flagrar dois bots rodando com o mesmo token.
+app.get('/bots/diag', async (req, res) => {
+  try {
+    const [passagens, ofertas] = await Promise.all([diagBotPassagens(), diagBotOfertas()]);
+    let tsp = { ativo: !!process.env.TELEGRAM_BOT_TOKEN };
+    if (tsp.ativo) {
+      const r = await fetch('https://api.telegram.org/bot' + process.env.TELEGRAM_BOT_TOKEN + '/getMe')
+        .then(x => x.json()).catch(() => ({}));
+      tsp.username = r.result?.username || null;
+    }
+    const nomes = [passagens.username, ofertas.username, tsp.username].filter(Boolean);
+    const tokenRepetido = new Set(nomes).size !== nomes.length;
+    res.json({ ok: true, tokenRepetido, passagens, ofertas, tsp });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 // ── CANAIS DO TELEGRAM (aba Grupos do painel) ────────────────────────────────

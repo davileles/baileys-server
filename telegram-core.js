@@ -18,6 +18,15 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   );
   const PATH = '/bot/' + secret;
 
+  // Ultimas falhas da Bot API, em memoria. Existe porque botao que "nao faz
+  // nada" quase sempre e o Telegram recusando a edicao — e isso so aparecia
+  // no log do Railway. O /bots/diag expoe esta lista.
+  const ultimosErros = [];
+  function registrarErro(metodo, descricao) {
+    ultimosErros.unshift({ em: new Date().toISOString(), metodo, descricao: String(descricao || '') });
+    if (ultimosErros.length > 15) ultimosErros.length = 15;
+  }
+
   async function tg(metodo, body) {
     if (!TOKEN) return { ok: false, description: 'sem token' };
     try {
@@ -27,12 +36,40 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
         body: JSON.stringify(body),
       });
       const d = await r.json().catch(() => ({}));
-      if (!d.ok) console.warn(`${TAG} ${metodo} falhou:`, d.description || r.status);
+      if (!d.ok) {
+        console.warn(`${TAG} ${metodo} falhou:`, d.description || r.status);
+        if (!/not modified/i.test(d.description || '')) registrarErro(metodo, d.description || r.status);
+      }
       return d;
     } catch (e) {
       console.warn(`${TAG} ${metodo} erro de rede:`, e.message);
+      registrarErro(metodo, 'rede: ' + e.message);
       return { ok: false, description: e.message };
     }
+  }
+
+  // Diagnostico sem expor token: quem e o bot, para onde o webhook aponta e o
+  // ultimo erro de entrega que o proprio Telegram registrou. Dois modulos com o
+  // MESMO token brigam pelo webhook (vence o ultimo setWebhook) e os botoes do
+  // perdedor passam a ir para o handler errado — aqui isso fica visivel.
+  async function diagnostico() {
+    if (!TOKEN) return { nome, ativo: false };
+    const [me, wh] = await Promise.all([tg('getMe', {}), tg('getWebhookInfo', {})]);
+    const info = wh.result || {};
+    let webhookPath = null;
+    try { webhookPath = info.url ? new URL(info.url).pathname : null; } catch { webhookPath = null; }
+    return {
+      nome, ativo: true, admins: ADMINS.size,
+      username: me.result?.username || null,
+      botId: me.result?.id || null,
+      webhookEsperado: PATH,
+      webhookPath,
+      webhookConfere: webhookPath === PATH,
+      pendentes: info.pending_update_count ?? null,
+      ultimoErroEntrega: info.last_error_message
+        ? { em: new Date(info.last_error_date * 1000).toISOString(), msg: info.last_error_message } : null,
+      ultimosErros: ultimosErros.slice(),
+    };
   }
 
   // Escapa so o que o parse_mode HTML do Telegram trata como marcacao. Titulo
@@ -133,7 +170,7 @@ export function criarBot({ nome, token, secret, admins, urlBase }) {
   return {
     nome, TAG, ativo: !!TOKEN, path: PATH, admins: ADMINS,
     tg, esc, teclado, falarHtml, falarPlano, toast, autorizado, paraCadaAdmin, bootWebhook,
-    baixarArquivo,
+    baixarArquivo, diagnostico,
   };
 }
 

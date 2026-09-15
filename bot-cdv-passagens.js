@@ -30,6 +30,7 @@ const bot = criarBot({
 
 export const BOT_PASSAGENS_PATH  = bot.path;
 export const BOT_PASSAGENS_ATIVO = bot.ativo;
+export const diagBotPassagens    = () => bot.diagnostico();
 
 let dep = null;
 

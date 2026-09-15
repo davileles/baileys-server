@@ -39,6 +39,7 @@ const POLL_MS = Math.max(2, Number(process.env.OFERTAS_POLL_MIN) || 10) * 60 * 1
 
 export const BOT_OFERTAS_PATH  = bot.path;
 export const BOT_OFERTAS_ATIVO = bot.ativo;
+export const diagBotOfertas    = () => bot.diagnostico();
 
 let dep = null;
 let ARQUIVO_VISTOS = './sessao/ofertas-cardadas.json';
