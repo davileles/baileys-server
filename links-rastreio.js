@@ -21,6 +21,15 @@
 // Regra de ouro: rastreio NUNCA derruba envio. Qualquer falha aqui devolve a
 // mensagem original, com o link original.
 //
+// LINKS FIXOS: link que se repete em toda mensagem (resgate de cupons diarios
+// da Shopee, 30 dias gratis de Prime...) nao ganha codigo novo a cada envio.
+// Recebe um codigo permanente com prefixo 'z' (ex: /shopee/zK3a9-15), guardado
+// em links_fixos.json, e os cliques somam por dia. Regra: o link PRINCIPAL da
+// mensagem (o da oferta/cupom/preview; sem ele, o primeiro link de loja) e por
+// envio; qualquer outro link de loja da mesma mensagem e fixo. Link ja
+// cadastrado como fixo continua fixo em qualquer mensagem.
+// O 'z' nunca colide com codigo por envio: esse prefixo so apareceria em 2036.
+//
 // Desligar sem deploy: RASTREIO_LINKS=0 no Railway.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -141,6 +150,54 @@ function salvarShard(doc) {
   agendarPush(nome);
 }
 
+// ── Links fixos ──────────────────────────────────────────────────────────────
+const ARQ_FIXOS = 'links_fixos.json';
+let _fixos = null;
+function fixos() {
+  if (_fixos) return _fixos;
+  try { _fixos = JSON.parse(readFileSync(SESSAO_DIR + '/' + ARQ_FIXOS, 'utf-8')); } catch { _fixos = null; }
+  if (!_fixos || typeof _fixos !== 'object' || !_fixos.links) _fixos = { links: {}, porChave: {} };
+  _fixos.porChave = _fixos.porChave || {};
+  return _fixos;
+}
+function salvarFixos() {
+  const destino = SESSAO_DIR + '/' + ARQ_FIXOS;
+  if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
+  writeFileSync(destino + '.tmp', JSON.stringify(_fixos), 'utf-8');
+  renameSync(destino + '.tmp', destino);
+  agendarPush(ARQ_FIXOS);
+}
+// Identidade do link fixo: sem o parametro tag (a tag pode variar por grupo).
+function chaveFixo(u) {
+  try {
+    const x = new URL(u);
+    x.searchParams.delete('tag');
+    return (x.hostname.replace(/^www\./, '') + x.pathname.replace(/\/+$/, '') + (x.search || '')).toLowerCase();
+  } catch { return String(u).toLowerCase(); }
+}
+// Identidade do link principal: host + caminho. A Amazon troca a tag a cada
+// disparo (ref de rastreio), entao a query nao pode entrar na comparacao.
+function chaveCaminho(u) {
+  try { const x = new URL(u); return (x.hostname.replace(/^www\./, '') + x.pathname.replace(/\/+$/, '')).toLowerCase(); }
+  catch { return String(u).toLowerCase(); }
+}
+// Texto da linha onde o link aparece (sem emoji/markdown); vazio -> linha anterior.
+function rotuloDoLink(texto, url) {
+  const linhas = String(texto).split('\n');
+  const i = linhas.findIndex(l => l.includes(url));
+  const limpar = (l) => String(l || '').replace(RE_URL, '').replace(/[*_~`>]/g, '')
+    .replace(/[\p{Extended_Pictographic}\uFE0F\u200D]/gu, '').replace(/[:\-–—|•]+\s*$/, '').trim();
+  let r = i >= 0 ? limpar(linhas[i]) : '';
+  for (let j = i - 1; !r && j >= 0 && j >= i - 2; j--) r = limpar(linhas[j]);
+  return r.slice(0, 80) || null;
+}
+function codigoFixoNovo() {
+  const f = fixos();
+  let c;
+  do { c = 'z' + aleatorio(4); } while (f.links[c]);
+  return c;
+}
+
 function num(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
 
 function metaDoContexto(ctx) {
@@ -187,7 +244,23 @@ export async function rastrearParaGrupo(texto, preview, ctx = {}) {
     const sufixo = sufixoDoGrupo(ctx.jid, ctx.nomeGrupo);
     const meta = metaDoContexto(ctx);
     const trocas = new Map();
-    let mudou = false, n = 0;
+    let mudou = false, n = 0, fixosMudou = false;
+
+    // Link principal: o declarado pela oferta/cupom/preview, se estiver mesmo na
+    // mensagem; senao o primeiro link de loja.
+    const rastreaveis = [];
+    for (const u of urls) {
+      const limpa = u.replace(/[).,;!?*_~]+$/, '');
+      try {
+        const x = new URL(limpa);
+        if ((x.protocol === 'https:' || x.protocol === 'http:') && !HOST_NAO_RASTREAR.test(x.hostname)) rastreaveis.push(limpa);
+      } catch { /* ignora */ }
+    }
+    const dd = ctx.oferta?.dadosExtraidos || ctx.dados || {};
+    const declarados = [dd.link, ctx.oferta?.link, preview?.['matched-text'], preview?.['canonical-url']]
+      .filter(Boolean).map(chaveCaminho);
+    const principal = rastreaveis.find(u => declarados.includes(chaveCaminho(u))) || rastreaveis[0] || null;
+    const F = fixos();
 
     const novo = String(texto).replace(RE_URL, (u) => {
       const m = u.match(/[).,;!?*_~]+$/);
@@ -200,6 +273,42 @@ export async function rastrearParaGrupo(texto, preview, ctx = {}) {
         host = x.hostname;
       } catch { return u; }
       if (HOST_NAO_RASTREAR.test(host)) return u;
+
+      // Link fixo: ja cadastrado, ou link de loja que nao e o principal.
+      const kf = chaveFixo(limpa);
+      if (F.porChave[kf] || (principal && limpa !== principal)) {
+        let cod = F.porChave[kf];
+        if (!cod || !F.links[cod]) {
+          cod = codigoFixoNovo();
+          F.porChave[kf] = cod;
+          F.links[cod] = { url: limpa, slugLoja: slugLoja(host), loja: meta.loja || null,
+                           rotulo: rotuloDoLink(texto, u), criadoEm: agora.toISOString(), usos: {}, grupos: {} };
+        }
+        const rf = F.links[cod];
+        if (!rf.rotulo) rf.rotulo = rotuloDoLink(texto, u);
+        // Um uso por disparo, nao por grupo. Guarda os ultimos execIds porque
+        // retomada/outbox pode intercalar disparos.
+        rf.execs = Array.isArray(rf.execs) ? rf.execs : [];
+        delete rf.ultimoExec;
+        if (!rf.execs.includes(String(ctx.execId))) {
+          rf.execs.push(String(ctx.execId));
+          if (rf.execs.length > 30) rf.execs.shift();
+          rf.usos[dia] = (rf.usos[dia] || 0) + 1;
+          rf.ultimoUso = agora.toISOString();
+          // mantem 120 dias de uso
+          const ds = Object.keys(rf.usos).sort();
+          while (ds.length > 120) delete rf.usos[ds.shift()];
+        }
+        const gf = rf.grupos[sufixo] || (rf.grupos[sufixo] = {});
+        gf.jid = ctx.jid;
+        if (ctx.nomeGrupo) gf.nome = String(ctx.nomeGrupo).slice(0, 80);
+        if (limpa !== rf.url) gf.destino = limpa; else delete gf.destino;
+        fixosMudou = true;
+        const rastreadoF = basePublica() + '/' + rf.slugLoja + '/' + cod + '-' + sufixo;
+        trocas.set(limpa, rastreadoF);
+        mudou = true;
+        return rastreadoF + sufixoPont;
+      }
 
       // Chave estavel por execucao + posicao do link: todos os grupos do mesmo
       // disparo compartilham o codigo base, e uma retomada (outbox, restart)
@@ -232,7 +341,8 @@ export async function rastrearParaGrupo(texto, preview, ctx = {}) {
     });
 
     if (!mudou) return original;
-    salvarShard(doc);
+    if (Object.keys(doc.links).length) salvarShard(doc);
+    if (fixosMudou) salvarFixos();
 
     let lp = preview;
     if (preview) {
@@ -251,6 +361,10 @@ export async function rastrearParaGrupo(texto, preview, ctx = {}) {
 export async function resolverCodigo(base) {
   const b = String(base || '');
   if (!/^[0-9A-Za-z]{5}$/.test(b)) return null;
+  if (b[0] === 'z') {
+    const rf = fixos().links[b];
+    return rf ? { dia: null, base: b, fixo: true, enviadoEm: rf.criadoEm, ...rf } : null;
+  }
   const idx = B62.indexOf(b[0]) * 62 + B62.indexOf(b[1]);
   const dia = new Date(EPOCA_UTC + idx * 86400000).toISOString().slice(0, 10);
   const doc = _dias.get(dia) || (() => {

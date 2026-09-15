@@ -75,6 +75,9 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // cada boot dispara sonda nova. Em 28/08 o Railway reiniciou sozinho no meio
   // do dia e a "uma consulta por dia" virou duas.
   'ml_sonda_pagina.json',
+  // Links fixos rastreados (resgate de cupons, Prime...): codigo permanente por
+  // link. Perdido, cada link ganharia codigo novo e os cliques se partiriam.
+  'links_fixos.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
