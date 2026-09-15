@@ -14487,6 +14487,20 @@ app.delete('/monitor/:jid', (req, res) => {
 
 // Monta e envia UM produto. Isolada porque e usada pelo worker e pelo disparo
 // avulso, e o preco tem de ser sempre consultado no instante do envio.
+// Nicho efetivo de um item de lista. Usado no envio e no GET /listas (previa do
+// painel), para os dois nunca divergirem. Titulo da API tem prioridade sobre o
+// nome gravado na base, que pode ser so "Produto B0XXXXXXXX".
+function nichoDoItemLista(item, titulo) {
+  const cur = String(item?.nicho || '').trim();
+  if (cur === 'geral') return { nicho:null, origem:'curado' };
+  if (cur) return { nicho:cur, origem:'curado' };
+  try {
+    const cls = classificarProduto({ titulo: titulo || item?.nome || '', asin: item?.asin, loja: item?.loja });
+    if (categoriaConfiavel(cls)) return { nicho:cls.categoria, origem:'classificador', confianca:cls.confianca };
+  } catch (e) { /* classificador nunca derruba o envio */ }
+  return { nicho:null, origem:null };
+}
+
 async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
   const item = itemVitrine(asin);
   if (!item) return { ok:false, motivo:'produto nao esta mais na vitrine' };
@@ -14537,26 +14551,29 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
   // nem categoria confiavel): o grupo do nicho nunca recebia lista nenhuma.
   // 'geral' como curadoria significa "bom produto, mas nao e de nicho", entao
   // vale como ausencia de nicho — nao existe trilha de categoria 'geral'.
-  const _nichoItem = String(item.nicho || '').trim();
-  const _nicho = _nichoItem && _nichoItem !== 'geral' ? _nichoItem : '';
+  // Lista mista (bebidas + produtos sem nicho) decide ITEM A ITEM, como o radar:
+  //   1. nicho curado na base vence tudo ('geral' curado = decisao de nao ser nicho)
+  //   2. sem curadoria, o classificador decide — so quando esta confiante
+  //   3. sem nicho nenhum: 'nicho + geral' manda so nos gerais; 'so nicho' pula
   const _opcoesEnvio = {};
+  let _nicho = null, _origemNicho = null;
   if (roteamento === 'nicho_e_geral' || roteamento === 'so_nicho') {
+    const _ne = nichoDoItemLista(item, o.produto?.titulo);
+    _nicho = _ne.nicho; _origemNicho = _ne.origem;
     if (!_nicho) {
-      // Pulado, nao enviado no geral por engano: a lista pediu nicho e este
-      // item nao tem. Aparece no painel com o motivo, da para curar e refazer.
-      return { ok:false, motivo: roteamento === 'so_nicho'
-        ? 'sem nicho curado e a lista esta em "somente no grupo do nicho"'
-        : 'sem nicho curado e a lista esta em "nicho + geral"' };
+      if (roteamento === 'so_nicho') {
+        return { ok:false, motivo: 'sem nicho (nem curado nem reconhecido pelo classificador) e a lista esta em "somente no grupo do nicho"' };
+      }
+      // nicho + geral sem nicho: oferta segue sem categoria e cai nas trilhas gerais.
+    } else {
+      // categoriaNicho e o que traz os destinos da trilha do nicho para os alvos
+      // (oferta de lista nao tem fonte, destinosDaOferta so ve as gerais).
+      oferta.dadosExtraidos.categoria = _nicho;
+      oferta.dadosExtraidos.categoriaConfianca = _ne.origem === 'curado' ? 1 : (_ne.confianca || 1);
+      _opcoesEnvio.categoriaNicho = _nicho;
+      if (roteamento === 'so_nicho') _opcoesEnvio.somenteNicho = true;
+      console.log('[LISTA] ' + asin + ' nicho ' + _nicho + ' (' + _origemNicho + ')');
     }
-    // Curadoria vence o classificador, mesma regra do monitor de precos:
-    // confianca 1 e o passaporte que a trilha de nicho exige.
-    oferta.dadosExtraidos.categoria = _nicho;
-    oferta.dadosExtraidos.categoriaConfianca = 1;
-    // categoriaNicho vai nos dois modos: e ela que traz os destinos da trilha do
-    // nicho para a lista de alvos. 'somenteNicho' e o que corta os gerais — sem
-    // ele, nicho + geral.
-    _opcoesEnvio.categoriaNicho = _nicho;
-    if (roteamento === 'so_nicho') _opcoesEnvio.somenteNicho = true;
   }
 
   const r = await enviarOfertaParaDestinos(o.mensagem, null, oferta, _opcoesEnvio);
@@ -14571,6 +14588,7 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
   oferta.falhas         = r.falhas;
   registrarEnvioHistorico(oferta);
   return { ok:true, nome:o.nome, grupos:r.enviados.length, cupom:o.cupom?.codigo || null,
+           nicho:_nicho, origemNicho:_origemNicho,
            aviso:o.avisoCupom || null, preco:o.produto.preco };
 }
 
@@ -14747,7 +14765,8 @@ setInterval(async () => {
         return;
       }
       ex.bloqueios = 0;
-      if (r.ok) ex.enviados.push({ asin, nome:r.nome, cupom:r.cupom, em:new Date().toISOString() });
+      if (r.ok) ex.enviados.push({ asin, nome:r.nome, cupom:r.cupom, grupos:r.grupos, nicho:r.nicho || null,
+                                   origemNicho:r.origemNicho || null, em:new Date().toISOString() });
       else      ex.pulados.push({ asin, motivo:r.motivo, em:new Date().toISOString() });
     } catch (e) {
       ex.falhas.push({ asin, erro:e.message, em:new Date().toISOString() });
@@ -14792,6 +14811,10 @@ app.get('/listas', (req, res) => {
     ...l,
     // Nome do produto resolvido aqui: o painel nao deve ter que cruzar com a vitrine.
     itens: (l.produtos || []).map(a => ({ asin:a, nome: itemVitrine(a)?.nome || a,
+                                          // curado cru ('' | 'geral' | id) e o nicho que o envio usaria agora
+                                          nicho: itemVitrine(a)?.nicho || null,
+                                          ...(() => { const it = itemVitrine(a); if (!it) return { nichoPrevisto:null, origemNicho:null };
+                                                      const n = nichoDoItemLista(it); return { nichoPrevisto:n.nicho, origemNicho:n.origem }; })(),
                                           loja: itemVitrine(a)?.loja || null,
                                           sumiu: !itemVitrine(a) })),
     restantes: l.execucao ? Math.max(0, l.produtos.length - l.execucao.indice) : null,
