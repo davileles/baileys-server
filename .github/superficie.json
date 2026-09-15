@@ -157,7 +157,10 @@
         "function rotaDeRoteamento",
         "function saidaSerializada",
         "function silencioUtilMs",
-        "saidaSerializada(() => enviarMensagem(item.destino"
+        "saidaSerializada(() => enviarMensagem(item.destino",
+        "function estadoLeitorWhatsmeow",
+        "const WM_LEITOR",
+        "function despacharParaPipeline"
       ]
     },
     "radar-awin.js": {

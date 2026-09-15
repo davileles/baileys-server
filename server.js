@@ -6869,10 +6869,26 @@ async function atualizarNomesGrupos() {
 function _idDaConta(apelido) {
   const a = String(apelido || '').trim();
   if (!a || a === 'principal') return 'principal';
+  if (a === 'whatsmeow') return 'whatsmeow';
   return contaIdDe(TENANT_PADRAO, a);
 }
 
+// ── LEITURA PELO WHATSMEOW: MODO ATIVO ──────────────────────────────────────
+// O wa-envio ja repassa as mensagens dos grupos lidos (ver modo sombra). Com
+// leitura.conta = 'whatsmeow' na config da operacao, esse repasse passa a
+// ALIMENTAR o pipeline, e o socket Baileys correspondente vira reserva: se o
+// repasse parar de dar sinal, contaLeitoraDe() devolve a leitura para a
+// principal sozinho, pelo mesmo caminho que ja cobre uma conta caida.
+const WM_LEITOR = 'whatsmeow';
+const WM_CONTATO_MAX_MS = 5 * 60e3;   // o wa-envio busca a lista de grupos a cada minuto
+let _wmUltimoContato = 0;
+function _wmVivo() { return (Date.now() - _wmUltimoContato) < WM_CONTATO_MAX_MS; }
+// sock null de proposito: a imagem ja vem baixada do wa-envio, entao nao ha
+// reupload a pedir. processarMensagem cai no socket da principal se precisar.
+const CTX_WHATSMEOW = { contaId: WM_LEITOR, sock: null };
+
 function _leitorVivo(id) {
+  if (id === WM_LEITOR) return _wmVivo();
   if (id === 'principal') return !!(conectado && sock);
   const ct = contasExtras.get(id);
   return !!(ct?.conectado && ct.sock);
@@ -6908,6 +6924,17 @@ function contasLeitorasAtivas() {
 // que parece saude e a pior falha possivel aqui.
 const _pulsoLeitores = new Map();   // contaId -> timestamp do ultimo inbound
 function registrarPulsoLeitor(id) { _pulsoLeitores.set(id, Date.now()); }
+
+// Estado do leitor whatsmeow, para /status e para conferir a virada de modo.
+function estadoLeitorWhatsmeow() {
+  return {
+    vivo: _wmVivo(),
+    ultimoContatoEm: _wmUltimoContato ? new Date(_wmUltimoContato).toISOString() : null,
+    operacoes: { cdv: contaLeitoraCdv() || 'principal', tsp: contaLeitoraTsp() || 'principal' },
+    recebidas: _sombraContadores.recebidasWm,
+    entreguesAoPipeline: _sombraContadores.ativasWm || 0,
+  };
+}
 
 // Ponto unico de entrada no pipeline, para principal e secundarias. A guarda de
 // dono fica AQUI e nao dentro de processarMensagem, porque o dedup por key.id e
@@ -8351,7 +8378,11 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
     }
     else if (tipo === 'imageMessage') {
       texto = m.imageMessage.caption || '';
-      try {
+      // Veio pelo wa-envio: a imagem ja foi baixada la, com a sessao que
+      // decifrou a mensagem. Baixar de novo aqui falharia (o Baileys pode nem
+      // ter a chave) e gastaria uma volta a toa.
+      if (msg._imagemBase64) { imagemB64 = msg._imagemBase64; }
+      else try {
         const sockMidia = ctx?.sock || sock;
         const buffer = await downloadMediaMessage(msg,'buffer',{},{ logger:pino({level:'silent'}), reuploadRequest:sockMidia.updateMediaMessage });
         imagemB64 = buffer.toString('base64');
@@ -11909,6 +11940,7 @@ app.get('/debug-fila', (req, res) => {
 // ── LEITURA PELO WHATSMEOW: rotas internas (wa-envio) e comparacao ───────────
 app.get('/interno/wa-leitura/grupos', (req, res) => {
   if (!_authWaLeitura(req, res)) return;
+  _wmUltimoContato = Date.now();   // batida de um em um minuto: e o sinal de vida do leitor
   res.json({ ok: true, grupos: [..._gruposLidosAgora()] });
 });
 
@@ -11920,11 +11952,25 @@ app.post('/interno/wa-leitura/mensagens', (req, res) => {
       _sombraContadores.invalidasWm++;
       return res.status(400).json({ ok: false, erro: 'id e chat de grupo obrigatorios' });
     }
+    _wmUltimoContato = Date.now();
     _sombraContadores.recebidasWm++;
     if (item.imagemBase64) _sombraContadores.imagensWm++;
     if (item.imagemErro) _sombraContadores.imagensErroWm++;
-    registrarSombra('whatsmeow:' + String(item.conta || '?'), mensagemWmParaBaileys(item));
-    res.json({ ok: true, modo: 'sombra' });
+    const convertida = mensagemWmParaBaileys(item);
+    registrarSombra('whatsmeow:' + String(item.conta || '?'), convertida);
+
+    // Modo ativo: so entra no pipeline se ESTE grupo tem o whatsmeow como
+    // leitor configurado. despacharParaPipeline confere o dono e o dedup por
+    // id, entao a mensagem que o Baileys tambem recebeu nao processa duas vezes.
+    let modo = 'sombra';
+    if (!item.indecifravel && contaLeitoraDe(item.chat) === WM_LEITOR) {
+      modo = 'ativo';
+      registrarPulsoLeitor(WM_LEITOR);
+      _sombraContadores.ativasWm = (_sombraContadores.ativasWm || 0) + 1;
+      despacharParaPipeline(convertida, CTX_WHATSMEOW)
+        .catch(e => console.error('[WA-LEITURA] falha ao processar:', e.message));
+    }
+    res.json({ ok: true, modo });
   } catch (e) {
     res.status(500).json({ ok: false, erro: e.message });
   }
@@ -12050,7 +12096,7 @@ app.get('/entrega/grupos', async (req, res) => {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), leitorWhatsmeow:estadoLeitorWhatsmeow(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
