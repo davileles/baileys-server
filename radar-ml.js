@@ -1732,8 +1732,43 @@ export async function produtoDePerfilSocial(urlSocial) {
  * redirect ja entrega a URL canonica.
  */
 function urlCanonicaMl(u) {
+  // Link de anuncio patrocinado (click1.mercadolivre.com.br/mclics/clicks/...)
+  // leva o MLB so na query. Cortar a query deixava ".../MLB/count" como URL do
+  // produto: o cadastro gravava isso e o createLink respondia "URL not allowed
+  // in affiliates program" para produto que tem comissao (16/09, MLB46108035).
+  if (RE_RASTREADOR_ML.test(String(u || ''))) {
+    const destino = urlProdutoDeRastreadorMl(u);
+    if (destino) return destino;
+  }
   try { const x = new URL(u); return x.origin + x.pathname; }
   catch (e) { return String(u).split('#')[0].split('?')[0]; }
+}
+
+/** Contador de clique de anuncio patrocinado: nao e pagina de produto. */
+const RE_RASTREADOR_ML = /^https?:\/\/click\d*\.mercadoli[vb]re\.com(\.br)?\/|\/mclics\//i;
+
+/**
+ * URL do produto a partir do link de rastreio. Primeiro procura um destino
+ * completo embutido na query; sem ele, monta pelo MLB. Id de catalogo tem ate
+ * 8 digitos (/p/MLB46108035); anuncio classico tem 9 ou mais (/MLB-5205063617).
+ */
+function urlProdutoDeRastreadorMl(u) {
+  let texto = String(u || '');
+  for (let i = 0; i < 3; i++) {
+    try { const d = decodeURIComponent(texto); if (d === texto) break; texto = d; }
+    catch (e) { break; }
+  }
+  const embutida = texto.slice(1).match(/https?:\/\/(?:www\.|produto\.)?mercadolivre\.com\.br\/[^\s&"'<>]+/i);
+  if (embutida && idProdutoMl(embutida[0]) && !RE_RASTREADOR_ML.test(embutida[0])) {
+    try { const x = new URL(embutida[0]); return x.origin + x.pathname; } catch (e) { /* segue pelo id */ }
+  }
+  const id = idProdutoMl(texto);
+  if (!id) return null;
+  if (/^MLBU/i.test(id)) return 'https://www.mercadolivre.com.br/up/' + id;
+  const digitos = id.replace(/^MLB/i, '');
+  return digitos.length <= 8
+    ? 'https://www.mercadolivre.com.br/p/MLB' + digitos
+    : 'https://produto.mercadolivre.com.br/MLB-' + digitos;
 }
 
 /**
@@ -2445,7 +2480,11 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
   const prontos = [], descartados = [];
 
   for (const salvo of itens) {
-    const bruta = salvo.url || ('https://www.mercadolivre.com.br/p/' + salvo.asin);
+    // Item cadastrado antes da correcao do link patrocinado ficou com a URL do
+    // contador gravada (sem query, sem MLB). Nesse caso vale o asin salvo.
+    const urlSalva = (salvo.url && !RE_RASTREADOR_ML.test(salvo.url)) ? salvo.url : '';
+    const bruta = urlSalva || urlProdutoDeRastreadorMl(salvo.asin)
+               || ('https://www.mercadolivre.com.br/p/' + salvo.asin);
     let url = urlCanonicaMl(bruta);
 
     // Dados ANTES do createLink, pelas mesmas razoes do radar (processarTextoMl):
