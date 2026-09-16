@@ -1246,10 +1246,16 @@ function limparFila() {
     if (agora - ts > limite) filaPendentes.splice(i, 1);
   }
 
-  // 2. Garante no máximo 20 aprovadas/rejeitadas (remove as mais antigas)
+  // 2. Garante no máximo 20 processadas (remove as mais antigas).
+  //    'aprovado' fica FORA do teto: ainda nao foi publicada e so existe na
+  //    filaEnvio (memoria). Se o teto a despejasse daqui, o proximo restart
+  //    apagava a filaEnvio e requeueAprovadas nao tinha mais de onde recupera-la
+  //    — a oferta sumia sem enviar. Foi o que aconteceu em 16/09: 17 rejeicoes
+  //    da madrugada empurraram 5 aprovadas para fora e um deploy as perdeu.
+  //    Aprovadas continuam expirando pelo limite de 24h do passo 1.
   const processadas = filaPendentes
     .map((o, i) => ({ o, i }))
-    .filter(({ o }) => o.status !== 'pendente')
+    .filter(({ o }) => o.status !== 'pendente' && o.status !== 'aprovado')
     .sort((a, b) => new Date(a.o.timestamp) - new Date(b.o.timestamp));
   const excesso = processadas.length - LIMITE_PROCESSADAS;
   if (excesso > 0) {
