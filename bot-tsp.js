@@ -792,6 +792,7 @@ function blocoTrilha(o) {
     ? 'fonte ' + esc(o.grupoOrigemNome || r.fonte)
     : 'sem fonte (feed ou painel)';
   linhas.push('     ' + cat + ' · ' + fonte);
+  if (r.curadoriaNicho) linhas.push('     ✋ fora do grupo de nicho: ' + esc(r.curadoriaNicho));
   return linhas.join('\n');
 }
 

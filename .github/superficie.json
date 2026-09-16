@@ -407,6 +407,21 @@
         "export function slugLoja",
         "export function sufixoDoGrupo"
       ]
+    },
+    "categorizador.js": {
+      "minLinhas": 320,
+      "obrigatorio": [
+        "export async function trilhaDaPaginaAmazon",
+        "export function avaliarCuradoriaNicho",
+        "export function carregarCategorias",
+        "export function categoriaConfiavel",
+        "export function categoriasConfig",
+        "export function classificarProduto",
+        "export function espelhaNoOperador",
+        "export function explicarClassificacao",
+        "export function salvarCategorias",
+        "export function semearCacheTrilhas"
+      ]
     }
   }
 }

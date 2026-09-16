@@ -383,8 +383,10 @@ function fonteDedicadaA(fonte, categoria) {
 }
 
 /** Esta trilha entrega esta oferta? Regra unica, usada tambem no diagnostico. */
-function trilhaEntrega(t, { fonte, categoria, categoriaConfiavel }) {
+function trilhaEntrega(t, { fonte, categoria, categoriaConfiavel, nichoBarrado }) {
   if (!t.categoria) return true;
+  // Curadoria do nicho reprovou o produto: esta trilha recusa, venha de onde vier.
+  if (nichoBarrado && t.categoria === nichoBarrado) return false;
   if (categoriaConfiavel && t.categoria === categoria) return true;
   // Fonte dedicada cobre o buraco do classificador: entrega quando ele nao tem
   // opiniao, e SO quando nao tem — categoria confirmada e diferente continua
@@ -395,12 +397,12 @@ function trilhaEntrega(t, { fonte, categoria, categoriaConfiavel }) {
   return false;
 }
 
-export function destinosDaOferta({ fonte, categoria, categoriaConfiavel } = {}) {
+export function destinosDaOferta({ fonte, categoria, categoriaConfiavel, nichoBarrado } = {}) {
   const cat = String(categoria || '').trim();
   const f = String(fonte || '').trim();
   const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
   const alvos = candidatas
-    .filter(t => trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel }))
+    .filter(t => trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel, nichoBarrado }))
     .flatMap(t => t.destinos);
   return [...new Set(alvos)];
 }
@@ -413,12 +415,12 @@ export function destinosDaOferta({ fonte, categoria, categoriaConfiavel } = {}) 
  * gerais quando a oferta nao tem fonte conhecida.
  * @returns {Array<{id:string,nome:string,categoria:string|null,entrega:boolean,porFonte:boolean,destinos:number}>}
  */
-export function detalharRoteamento({ fonte, categoria, categoriaConfiavel } = {}) {
+export function detalharRoteamento({ fonte, categoria, categoriaConfiavel, nichoBarrado } = {}) {
   const cat = String(categoria || '').trim();
   const f = String(fonte || '').trim();
   const candidatas = f ? trilhas().filter(t => t.fontes.includes(f)) : trilhasGerais();
   return candidatas.map(t => {
-    const entrega = trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel });
+    const entrega = trilhaEntrega(t, { fonte: f, categoria: cat, categoriaConfiavel, nichoBarrado });
     // Entregou sem a categoria confirmada bater: foi a fonte dedicada que abriu.
     const porFonte = !!(entrega && t.categoria && !(categoriaConfiavel && t.categoria === cat));
     return { id: t.id, nome: t.nome, categoria: t.categoria || null, entrega, porFonte, destinos: t.destinos.length };

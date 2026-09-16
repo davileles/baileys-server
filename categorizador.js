@@ -260,6 +260,68 @@ export function classificarProduto({ titulo, asin, loja, trilha } = {}) {
   }
 }
 
+// ── Curadoria do grupo de nicho ──────────────────────────────────────────────
+// Classificar diz em que prateleira o produto cai; curadoria diz se ele merece
+// o GRUPO daquele nicho. Sao perguntas diferentes: a parafusadeira "48V" sem
+// marca e ferramenta (classificacao certa), mas quem entra num grupo de
+// ferramentas desconfia dela na hora. O filtro vale SO para a trilha do nicho —
+// os grupos gerais recebem a oferta exatamente como antes.
+//
+// Configuracao por categoria em tsp/categorias.json, campo curadoriaNicho:
+//   marcas[]                       marca reconhecida passa direto
+//   semMarca.voltagemMaxima        barra "48V", "88V" (bateria inflada); tensao
+//                                  de tomada (110/127/220) nunca conta
+//   semMarca.quedaMinimaVsMediana  % minimo abaixo da mediana de 30 dias
+//   semMarca.semSerie              'barra' (padrao) ou 'libera' quando o produto
+//                                  ainda nao tem historico de preco suficiente
+// Categoria sem curadoriaNicho: nada muda.
+const DIAS_MATURIDADE_SERIE = 5;   // mesmo corte do veredito em sombra do server.js
+
+export function avaliarCuradoriaNicho(categoria, { titulo, stats } = {}) {
+  try {
+    const cur = categoria ? _taxo.categorias?.[categoria]?.curadoriaNicho : null;
+    if (!cur || cur.ativo === false) return { ok: true, regra: 'sem-curadoria' };
+
+    const t = normSing(titulo);
+    const marca = (cur.marcas || []).find(m => contemTermo(t, m));
+    if (marca) return { ok: true, regra: 'marca:' + normSing(marca) };
+
+    const sm = cur.semMarca || {};
+    const vMax = Number(sm.voltagemMaxima);
+    if (vMax > 0) {
+      // norm() junta "48V" num token so ("48v"); "48 V" vira dois. Os dois casam.
+      const volts = [...norm(titulo).matchAll(/(?:^| )(\d{2,3}) ?v(?= |$)/g)]
+        .map(m => Number(m[1])).filter(v => v < 100);
+      const inflada = volts.find(v => v > vMax);
+      if (inflada) {
+        return { ok: false, regra: 'voltagem',
+          motivo: 'sem marca reconhecida e ' + inflada + 'V no titulo (limite ' + vMax + 'V)' };
+      }
+    }
+
+    const qMin = Number(sm.quedaMinimaVsMediana);
+    if (qMin > 0) {
+      const maduro = !!(stats && Number(stats.dias) >= DIAS_MATURIDADE_SERIE
+                        && Number.isFinite(Number(stats.quedaVsMediana)));
+      if (!maduro) {
+        if (sm.semSerie === 'libera') return { ok: true, regra: 'sem-serie-liberado' };
+        return { ok: false, regra: 'sem-serie',
+          motivo: 'sem marca reconhecida e sem historico de preco para provar a queda' };
+      }
+      const q = Number(stats.quedaVsMediana);
+      if (q < qMin) {
+        return { ok: false, regra: 'queda',
+          motivo: 'sem marca reconhecida e so ' + q + '% abaixo da mediana de 30 dias (minimo ' + qMin + '%)' };
+      }
+    }
+    return { ok: true, regra: 'sem-marca-aprovado' };
+  } catch (e) {
+    // Falha de curadoria nunca segura oferta: sem veredito, o nicho segue como era.
+    console.warn('[CAT] Curadoria de nicho falhou:', e.message);
+    return { ok: true, regra: 'erro' };
+  }
+}
+
 /** A categoria e confiavel o bastante para decidir roteamento sozinha? */
 export function categoriaConfiavel(cls) {
   return !!(cls && cls.categoria && cls.confianca >= (_taxo.limiarConfianca ?? 0.7));

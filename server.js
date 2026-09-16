@@ -64,7 +64,7 @@ import {
 import {
   carregarCategorias, categoriasConfig, salvarCategorias,
   classificarProduto, categoriaConfiavel, espelhaNoOperador,
-  explicarClassificacao, semearCacheTrilhas,
+  explicarClassificacao, semearCacheTrilhas, avaliarCuradoriaNicho,
 } from './categorizador.js';
 
 // ── MONITOR DE QUEDA DE PRECO (Shopee / Mercado Livre) ────────────────────────
@@ -4477,13 +4477,18 @@ function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
 // montam a rota por aqui: se cada um lesse os campos por conta propria, o card
 // poderia anunciar uma trilha e o envio seguir outra.
 function rotaDeRoteamento(oferta) {
+  const cat = oferta?.dadosExtraidos?.categoria || null;
+  const cur = oferta?.dadosExtraidos?.curadoriaNicho;
   return {
     fonte: oferta?.grupoOrigem || null,
-    categoria: oferta?.dadosExtraidos?.categoria || null,
+    categoria: cat,
     categoriaConfiavel: categoriaConfiavel({
-      categoria: oferta?.dadosExtraidos?.categoria || null,
+      categoria: cat,
       confianca: oferta?.dadosExtraidos?.categoriaConfianca || 0,
     }),
+    // Curadoria reprovou: a trilha DESTE nicho recusa, inclusive por fonte
+    // dedicada. So vale enquanto a categoria for a mesma que foi avaliada.
+    nichoBarrado: (cur && cur.ok === false && cur.categoria === cat) ? cat : null,
   };
 }
 
@@ -4504,6 +4509,7 @@ function resumoRotaOferta(o) {
       confiavel: !!r.categoriaConfiavel,
       grupos: destinosDaOferta(r).filter(j => !soCupons.has(j)).length,
       trilhas: detalharRoteamento(r),
+      curadoriaNicho: r.nichoBarrado ? (d.curadoriaNicho?.motivo || 'reprovada') : null,
     };
   } catch (e) {
     console.warn('[MKT] Rota da oferta #' + (o?.id || '?') + ' indisponivel para o card: ' + e.message);
@@ -7908,6 +7914,19 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
     oferta.dadosExtraidos.categoriaSinal     = _cls.sinal;
     console.log('[CAT] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' -> ' + explicarClassificacao(_cls));
+
+    // ── CURADORIA DO GRUPO DE NICHO ────────────────────────────────────────
+    // Depois da categoria e do veredito de preco (usa stats.quedaVsMediana).
+    // Reprovar aqui tira a oferta SO da trilha do nicho: grupos gerais seguem
+    // iguais. Categoria sem curadoriaNicho na taxonomia devolve ok e nada muda.
+    if (categoriaConfiavel(_cls)) {
+      const _cur = avaliarCuradoriaNicho(_cls.categoria, { titulo: p.titulo, stats: oferta.dadosExtraidos.stats });
+      oferta.dadosExtraidos.curadoriaNicho = { categoria: _cls.categoria, ..._cur };
+      if (!_cur.ok) {
+        console.log('[CURADORIA] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' fora do grupo de nicho '
+          + _cls.categoria + ' — ' + _cur.motivo);
+      }
+    }
 
     // ── PRECO DO POST NA MENSAGEM ──────────────────────────────────────────
     // Depois da categoria (o ref de rastreio do ML sai dela) e antes do espelho
@@ -13961,6 +13980,10 @@ app.post('/tsp/categorias', (req, res) => {
       marcas:            def.marcas !== undefined ? lista(def.marcas) : lista(atual.marcas),
       keywords:          lista(def.keywords),
       bloqueio:          lista(def.bloqueio),
+      // Curadoria do grupo do nicho: o painel ainda nao edita este campo, entao
+      // ausente no corpo preserva o atual (senao cada salvamento a apagaria).
+      ...((def.curadoriaNicho ?? atual.curadoriaNicho)
+          ? { curadoriaNicho: def.curadoriaNicho ?? atual.curadoriaNicho } : {}),
     };
   }
 
