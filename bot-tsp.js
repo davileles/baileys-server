@@ -1168,7 +1168,9 @@ function ehCupomMl(r) { return /mercado\s*livre/i.test(String(r && r.loja || '')
 function pendentesInsercaoMl() {
   if (!dep || !dep.listarCuponsBase) return [];
   return dep.listarCuponsBase()
-    .filter(r => ehCupomMl(r) && r.codigo && r.ativo !== false && r.confirmadoNoMl !== true && !r.insercaoMl)
+    .filter(r => ehCupomMl(r) && r.codigo && r.ativo !== false
+      // So o que da para digitar em "Inserir codigo": card sem codigo ("30% OFF em X") fica fora.
+      && /^[A-Za-z0-9._-]{2,40}$/.test(String(r.codigo)) && r.confirmadoNoMl !== true && !r.insercaoMl)
     // Quem vence primeiro vem primeiro.
     .sort((a, b) => (Date.parse(a.validadeAte) || 0) - (Date.parse(b.validadeAte) || 0));
 }
