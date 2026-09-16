@@ -2030,6 +2030,17 @@ export async function processarTextoMl(texto, opcoes = {}) {
 
 const URL_CUPONS_ML = 'https://www.mercadolivre.com.br/cupons/active';
 
+// ── PAUSA DOS CUPONS DO ML (set/2026) ──────────────────────────────────────
+// A conta passou a receber HTTP 403 no input-code, inclusive digitando o codigo
+// a mao no site e no app, enquanto outras contas ativam o mesmo cupom. A
+// hipotese e restricao antifraude pelo volume de acessos automatizados. Com a
+// pausa ligada NENHUMA chamada toca /cupons: nem ativacao (input-code), nem
+// leitura de "Meus cupons", nem o sync de campanhas. Padrao: PAUSADO.
+// Para religar: variavel CUPONS_ML_PAUSADO=0 no Railway.
+const CUPONS_ML_PAUSADO = String(process.env.CUPONS_ML_PAUSADO ?? '1') !== '0';
+const ERRO_CUPONS_PAUSADO = 'acesso aos cupons do ML pausado (CUPONS_ML_PAUSADO)';
+if (CUPONS_ML_PAUSADO) console.warn('[CUPONS-ML] ' + ERRO_CUPONS_PAUSADO + ' — nenhuma chamada a /cupons sera feita.');
+
 /**
  * Converte dinheiro escrito no padrao BR para numero.
  * "1.000" -> 1000 | "1.234,56" -> 1234.56 | "9,90" -> 9.9
@@ -2048,6 +2059,7 @@ function numeroBr(txt) {
  * Cupom capturado num grupo so vale nas suas compras depois de ativado.
  */
 export async function ativarCupomMl(codigo) {
+  if (CUPONS_ML_PAUSADO) throw new Error(ERRO_CUPONS_PAUSADO);
   const r = await chamarAff('https://www.mercadolivre.com.br/cupons/api/input-code', {
     method: 'POST',
     // A chave e coupon_input_code, capturada do proprio botao "Adicionar cupom".
@@ -2097,6 +2109,7 @@ export async function ativarCupomMl(codigo) {
 
 /** Le a pagina e devolve os cupons ativos do Mercado Livre. */
 export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
+  if (CUPONS_ML_PAUSADO) throw new Error(ERRO_CUPONS_PAUSADO);
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
   const res = await fetch(url, {
@@ -2199,6 +2212,7 @@ const FILTROS_CUPONS_ML = [
 ];
 
 export async function lerTodosCuponsMl() {
+  if (CUPONS_ML_PAUSADO) throw new Error(ERRO_CUPONS_PAUSADO);
   const porCodigo = new Map();
   let totalDeclarado = null;
   // Cards sem codigo digitavel nao entram na base, mas contam para saber se a
@@ -3098,6 +3112,7 @@ export function extrairCuponsCardMl(html) {
  * para o operador decidir o que fazer.
  */
 export async function sincronizarCuponsContaMl() {
+  if (CUPONS_ML_PAUSADO) throw new Error(ERRO_CUPONS_PAUSADO);
   const cookie = cookieAff();
   if (!cookie) throw new Error('ML_AFF_TOKEN nao configurado');
 
