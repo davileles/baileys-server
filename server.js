@@ -1726,6 +1726,7 @@ async function conectarConta(id) {
       const ctx = { contaId: id, sock: c.sock };
       for (const msg of (messages || [])) {
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
+        if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
         if (!msg.message) continue;
         try { await despacharParaPipeline(msg, ctx); }
         catch (e) { console.error('[CONTA:' + id + '] Falha ao processar mensagem:', e.message); }
@@ -10346,6 +10347,7 @@ async function conectar() {
           });
           if (_debugUpserts.length > 60) _debugUpserts.shift();
           registrarSombra('baileys:principal', mm);
+          registrarContatoPrivado('principal', sock, mm);
           if (mm.messageStubType === 2) {
             _stub2Total++;
             const jid2 = mm.key?.remoteJid || '(sem jid)';
@@ -11582,6 +11584,525 @@ app.post('/contas/:id/grupos-acao', async (req, res) => {
   res.json({ ok:true, conta:apel, acao, pausaMs, total:pedidos.length, feitos, pulados, falhas, resultados });
 });
 
+// ── GESTAO DE GRUPOS (gestor-cdv e painel Tica Promos) ───────────────────────
+// Administrar, admin a admin, os grupos da operacao: promover e rebaixar admin,
+// incluir e excluir numero, trocar nome e descricao. As duas telas carregam a
+// MESMA interface, servida em GET /grupos-gestao/ui.js — uma implementacao so.
+//
+// Contexto (16/09/2026): a conta principal foi BLOQUEADA depois de a reentrada
+// adicionar ex-aluno em grupos. Por isso a inclusao agora tem trava dura no
+// servidor, que a tela nao consegue pular:
+//   - a pessoa precisa ter mandado mensagem no privado para a conta que vai
+//     adicionar, nas ultimas GM_CONTATO_JANELA_MS. Quem escreve primeiro deixa
+//     de ser "desconhecido" para o WhatsApp — e o sinal mais forte contra spam;
+//   - so essa conta executa a inclusao, e so onde ela for admin;
+//   - teto de numeros incluidos por conta por dia;
+//   - nada de link de grupo no privado: convite aparece so na tela.
+// Todas as acoes rodam como TAREFA em segundo plano, uma de cada vez no servidor
+// inteiro, em serie e com pausa longa entre grupos. Rajada de alteracao de
+// participante e o caminho mais curto para outro bloqueio.
+const GM_CONTATO_JANELA_MS = 24 * 3600e3;
+const GM_ADD_MAX_DIA       = 10;                 // numeros distintos por conta/dia
+const GM_RETRATO_TTL_MS    = 2 * 60e3;
+const GM_PAUSA = {                               // [min, max] entre grupos
+  add:     [45000, 90000],
+  remove:  [20000, 40000],
+  promote: [20000, 40000],
+  demote:  [20000, 40000],
+  info:    [30000, 60000],
+};
+const GM_MAX_GRUPOS_POR_TAREFA = 60;
+const GM_ACOES = new Set(['add', 'remove', 'promote', 'demote']);
+
+// Estado em propriedade de funcao, e nao em const de modulo: os handlers de
+// mensagem chamam isto e nao podem cair em TDZ se um evento chegar cedo.
+function _gm() {
+  if (!_gm.s) _gm.s = { contatos: [], retratos: new WeakMap(), jobs: new Map(), ativo: null, seq: 0 };
+  return _gm.s;
+}
+
+function _gmDigitos(v) { return String(v || '').split(':')[0].split('@')[0].replace(/\D/g, ''); }
+
+function _gmTsMsg(msg) {
+  const t = msg?.messageTimestamp;
+  const n = (t && typeof t === 'object' && typeof t.toNumber === 'function') ? t.toNumber() : Number(t);
+  return Number.isFinite(n) && n > 0 ? n * 1000 : Date.now();
+}
+
+// Mensagem PRIVADA recebida por uma conta nossa. So memoria: a janela e curta e
+// o fluxo e "a pessoa manda, a gente adiciona em seguida".
+function registrarContatoPrivado(apelido, s, msg) {
+  try {
+    const k = msg?.key;
+    if (!k || k.fromMe || !msg.message) return;
+    const rj = String(k.remoteJid || '');
+    if (!rj || rj.endsWith('@g.us') || rj.endsWith('@broadcast') || rj.endsWith('@newsletter')) return;
+    const em = _gmTsMsg(msg);
+    if (Date.now() - em > GM_CONTATO_JANELA_MS) return;
+    const ids = new Set();
+    for (const v of [rj, k.remoteJidAlt, k.senderPn]) { const d = _gmDigitos(v); if (d) ids.add(d); }
+    const reg = { conta: apelido, em, ids };
+    const st = _gm();
+    st.contatos.push(reg);
+    const corte = Date.now() - GM_CONTATO_JANELA_MS;
+    st.contatos = st.contatos.filter(c => c.em >= corte).slice(-800);
+    // Conversa por LID sem o telefone junto: o mapa local do Baileys costuma ter.
+    const lids = [rj, k.remoteJidAlt].filter(v => String(v || '').endsWith('@lid'));
+    for (const l of lids) {
+      Promise.resolve(s?.signalRepository?.lidMapping?.getPNForLID?.(l))
+        .then(pn => { const d = _gmDigitos(pn); if (d) reg.ids.add(d); })
+        .catch(() => {});
+    }
+  } catch (e) {}
+}
+
+function _gmContas() {
+  return _gaCandidatosExecutor(TENANT_PADRAO, '__gestao__')
+    .map(c => ({ id: c.id, sock: c.sock, numero: telefoneDaConta(c.sock) }));
+}
+
+// Mensagem recente desse telefone para alguma conta nossa. Compara variantes do
+// numero (nono digito) e, se preciso, o LID que o WhatsApp associa ao telefone.
+async function _gmContatoRecente(telefone) {
+  const variantes = _reVariantes(telefone);
+  if (!variantes.size) return null;
+  const corte = Date.now() - GM_CONTATO_JANELA_MS;
+  const achar = (ids) => {
+    let melhor = null;
+    for (const c of _gm().contatos) {
+      if (c.em < corte) continue;
+      if (![...ids].some(n => c.ids.has(n))) continue;
+      if (!melhor || c.em > melhor.em) melhor = c;
+    }
+    return melhor;
+  };
+  let r = achar(variantes);
+  if (r) return r;
+  const ids = new Set(variantes);
+  for (const c of _gmContas()) {
+    for (const v of variantes) {
+      try {
+        const lid = await c.sock?.signalRepository?.lidMapping?.getLIDForPN?.(v + '@s.whatsapp.net');
+        const d = _gmDigitos(lid);
+        if (d) ids.add(d);
+      } catch (e) {}
+    }
+    if (ids.size > variantes.size) break;
+  }
+  return ids.size > variantes.size ? achar(ids) : null;
+}
+
+function _gmHoje() { return _fmtDataSP(new Date()); }
+function _fmtDataSP(d) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+}
+function _gmAdicoesHoje(conta) {
+  const reg = _health.gestaoAdicoes;
+  if (!reg || reg.data !== _gmHoje()) return [];
+  return Array.isArray(reg.contas?.[conta]) ? reg.contas[conta] : [];
+}
+function _gmContarAdicao(conta, telefone) {
+  const hoje = _gmHoje();
+  if (!_health.gestaoAdicoes || _health.gestaoAdicoes.data !== hoje) _health.gestaoAdicoes = { data: hoje, contas: {} };
+  const lista = _health.gestaoAdicoes.contas[conta] || (_health.gestaoAdicoes.contas[conta] = []);
+  if (!lista.includes(telefone)) lista.push(telefone);
+  _healthGravadoEm = 0;
+  _salvarHealth();
+}
+
+// Retrato de UMA conta: todos os grupos em que participa, com participantes.
+// Uma chamada por conta, com cache curto — abrir a tela varias vezes nao pode
+// virar uma rajada de consultas.
+async function _gmRetrato(s, forcar) {
+  const st = _gm();
+  const c = st.retratos.get(s);
+  if (!forcar && c && Date.now() - c.em < GM_RETRATO_TTL_MS) return c.dados;
+  const dados = await s.groupFetchAllParticipating();
+  st.retratos.set(s, { em: Date.now(), dados: dados || {} });
+  for (const [jid, md] of Object.entries(dados || {})) if (md?.subject) NOMES_GRUPOS.set(jid, md.subject);
+  return dados || {};
+}
+function _gmInvalidarRetratos() { _gm().retratos = new WeakMap(); }
+
+function _gmEuNoGrupo(s, md) {
+  const meus = _idsDaContaSock(s);
+  return (md?.participants || []).find(p => _ggIdsDoParticipante(p).some(n => meus.has(n))) || null;
+}
+
+function _gmIdsParticipante(p) {
+  return [p?.id, p?.lid, p?.jid, p?.phoneNumber].map(_gmDigitos).filter(Boolean);
+}
+
+function _gmTelefoneDe(p) {
+  for (const v of [p?.phoneNumber, p?.jid, p?.id]) {
+    if (String(v || '').endsWith('@s.whatsapp.net')) return _gmDigitos(v);
+  }
+  return null;
+}
+
+function _gmGruposOperacao(op) {
+  const lista = [];
+  try {
+    if (op === 'cdv') {
+      lista.push(grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv());
+      for (const g of entradaCdv()) lista.push(g.jid);
+    } else if (op === 'tsp') {
+      lista.push(grupoOperadorTsp(), ...(gruposTspCupons() || []), ...(radarDestinos() || []));
+      for (const t of trilhas()) lista.push(...(t.destinos || []));
+    }
+  } catch (e) { console.warn('[GESTAO] Falha ao montar grupos de ' + op + ': ' + e.message); }
+  return [...new Set(lista.filter(j => String(j || '').endsWith('@g.us')))];
+}
+
+async function _gmRetratos(forcar) {
+  const out = [];
+  for (const c of _gmContas()) {
+    try { out.push({ ...c, mapa: await _gmRetrato(c.sock, forcar) }); }
+    catch (e) { console.warn('[GESTAO] ' + c.id + ' ficou fora do retrato: ' + e.message); }
+  }
+  return out;
+}
+
+function _gmMeta(retratos, jid) {
+  for (const r of retratos) { const md = r.mapa[jid]; if (md) return md; }
+  return null;
+}
+
+function _gmSoPadrao(req, res) {
+  if (req.tenantId !== TENANT_PADRAO) { res.status(403).json({ ok: false, erro: 'gestao de grupos disponivel so na operacao padrao' }); return false; }
+  return true;
+}
+
+function _gmResumoJob(j) {
+  return { id: j.id, tipo: j.tipo, acao: j.acao, alvo: j.alvo, origem: j.origem, estado: j.estado,
+    total: j.total, feitos: j.feitos, pulados: j.pulados, falhas: j.falhas, atual: j.atual,
+    proximaEm: j.proximaEm, iniciadoEm: j.iniciadoEm, terminadoEm: j.terminadoEm, erro: j.erro,
+    resultados: j.resultados };
+}
+
+function _gmNovoJob(dados) {
+  const st = _gm();
+  const id = 'gm-' + Date.now().toString(36) + '-' + (++st.seq);
+  const j = { id, estado: 'rodando', feitos: 0, pulados: 0, falhas: 0, atual: null, proximaEm: null,
+    iniciadoEm: new Date().toISOString(), terminadoEm: null, erro: null, resultados: [], ...dados };
+  st.jobs.set(id, j);
+  st.ativo = id;
+  // Guarda so as ultimas 20 tarefas.
+  if (st.jobs.size > 20) for (const k of [...st.jobs.keys()].slice(0, st.jobs.size - 20)) st.jobs.delete(k);
+  return j;
+}
+
+async function _gmPausa(j, faixa) {
+  const ms = Math.round(faixa[0] + Math.random() * (faixa[1] - faixa[0]));
+  j.proximaEm = new Date(Date.now() + ms).toISOString();
+  await new Promise(r => setTimeout(r, ms));
+  j.proximaEm = null;
+}
+
+function _gmFimJob(j, erro) {
+  j.estado = erro ? 'erro' : 'concluido';
+  j.erro = erro || null;
+  j.atual = null;
+  j.terminadoEm = new Date().toISOString();
+  const st = _gm();
+  if (st.ativo === j.id) st.ativo = null;
+  _gmInvalidarRetratos();
+  console.log('[GESTAO] ' + j.tipo + '/' + (j.acao || '-') + ' ' + (j.alvo || '') + ' — ' + j.feitos + ' feito(s), '
+    + j.pulados + ' pulado(s), ' + j.falhas + ' falha(s) em ' + j.total + ' grupo(s).' + (erro ? ' ERRO: ' + erro : ''));
+}
+
+// Cria (e dispara) a tarefa de participante. Devolve { status, body } para o
+// endpoint responder — a reentrada do CDV usa o mesmo caminho.
+async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, origem }) {
+  acao = String(acao || '').trim();
+  if (!GM_ACOES.has(acao)) return { status: 400, body: { ok: false, erro: 'acao invalida — use add, remove, promote ou demote' } };
+  const st = _gm();
+  if (st.ativo) return { status: 409, body: { ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo } };
+  const pedidos = [...new Set((Array.isArray(jids) ? jids : []).map(j => String(j || '').trim()).filter(j => j.endsWith('@g.us')))];
+  if (!pedidos.length) return { status: 400, body: { ok: false, erro: 'escolha ao menos um grupo' } };
+  if (pedidos.length > GM_MAX_GRUPOS_POR_TAREFA) return { status: 400, body: { ok: false, erro: 'no maximo ' + GM_MAX_GRUPOS_POR_TAREFA + ' grupos por tarefa' } };
+  if (!_gmContas().length) return { status: 503, body: { ok: false, erro: 'nenhuma conta do WhatsApp conectada' } };
+
+  const digitos = String(telefone || '').replace(/\D/g, '');
+  const partId = String(participante || '').trim();
+  if (!digitos && !partId) return { status: 400, body: { ok: false, erro: 'informe o telefone' } };
+  if (digitos && (digitos.length < 12 || digitos.length > 15)) {
+    return { status: 400, body: { ok: false, erro: 'telefone invalido — informe com DDI e DDD (ex.: 5531999998888)' } };
+  }
+
+  let contato = null;
+  if (acao === 'add') {
+    if (!digitos) return { status: 400, body: { ok: false, erro: 'para incluir, informe o telefone' } };
+    contato = await _gmContatoRecente(digitos);
+    if (!contato) {
+      return { status: 412, body: { ok: false, codigo: 'sem-mensagem',
+        erro: 'a pessoa ainda nao mandou mensagem para nenhum numero nosso nas ultimas '
+          + Math.round(GM_CONTATO_JANELA_MS / 3600e3) + 'h. Peca para ela salvar o contato e mandar um "oi".',
+        contas: _gmContas().map(c => ({ id: c.id, numero: c.numero })) } };
+    }
+    if (!_gmContas().some(c => c.id === contato.conta)) {
+      return { status: 503, body: { ok: false, erro: 'a conta que recebeu a mensagem (' + contato.conta + ') nao esta conectada agora' } };
+    }
+    const hoje = _gmAdicoesHoje(contato.conta);
+    if (!hoje.includes(digitos) && hoje.length >= GM_ADD_MAX_DIA) {
+      return { status: 429, body: { ok: false, erro: 'limite de ' + GM_ADD_MAX_DIA + ' numeros incluidos hoje pela conta ' + contato.conta + ' atingido — continue amanha.' } };
+    }
+  }
+
+  const j = _gmNovoJob({ tipo: 'participante', acao, alvo: digitos || partId, origem: origem || 'painel',
+    total: pedidos.length, executorFixo: contato ? contato.conta : null });
+  _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato })
+    .catch(e => _gmFimJob(j, e.message));
+  return { status: 202, body: { ok: true, jobId: j.id, total: pedidos.length, executor: j.executorFixo,
+    contatoEm: contato ? new Date(contato.em).toISOString() : null } };
+}
+
+async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato }) {
+  const variantes = digitos ? _reVariantes(digitos) : new Set();
+  let retratos = await _gmRetratos(true);
+  if (!retratos.length) return _gmFimJob(j, 'nenhuma conta conseguiu ler os grupos agora');
+
+  // IDs do alvo: variantes do telefone + o LID que o WhatsApp associa a ele.
+  const idsAlvo = new Set(variantes);
+  if (partId) { const d = _gmDigitos(partId); if (d) idsAlvo.add(d); }
+  if (digitos) {
+    for (const r of retratos) {
+      for (const v of variantes) {
+        try { const d = _gmDigitos(await r.sock?.signalRepository?.lidMapping?.getLIDForPN?.(v + '@s.whatsapp.net')); if (d) idsAlvo.add(d); }
+        catch (e) {}
+      }
+      break;
+    }
+  }
+
+  let jidAdd = null;
+  const fixo = contato ? retratos.find(r => r.id === contato.conta) : null;
+  if (acao === 'add') {
+    if (!fixo) return _gmFimJob(j, 'a conta ' + contato.conta + ' nao conseguiu ler os grupos');
+    try {
+      const w = await fixo.sock.onWhatsApp(digitos);
+      const achado = Array.isArray(w) ? w.find(x => x && x.exists && x.jid) : null;
+      if (!achado) return _gmFimJob(j, 'este numero nao tem WhatsApp — confira DDI, DDD e o nono digito');
+      jidAdd = achado.jid;
+    } catch (e) { return _gmFimJob(j, 'nao consegui validar o numero: ' + e.message); }
+  }
+
+  for (let i = 0; i < pedidos.length; i++) {
+    const jid = pedidos[i];
+    const md = _gmMeta(retratos, jid);
+    const nome = md?.subject || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+    j.atual = nome;
+    const push = (x) => { j.resultados.push({ jid, nome, ...x }); };
+
+    if (!md) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada participa deste grupo' }); continue; }
+    const alvoP = (md.participants || []).find(p => _gmIdsParticipante(p).some(n => idsAlvo.has(n))) || null;
+
+    // Estado desejado ja vale: nao gasta chamada nenhuma.
+    if (acao === 'add' && alvoP)                 { j.pulados++; push({ estado: 'pulado', detalhe: 'ja esta no grupo' }); continue; }
+    if (acao === 'remove' && !alvoP)             { j.pulados++; push({ estado: 'pulado', detalhe: 'nao esta no grupo' }); continue; }
+    if ((acao === 'promote' || acao === 'demote') && !alvoP) { j.falhas++; push({ estado: 'falha', detalhe: 'o numero nao esta neste grupo' }); continue; }
+    if (acao === 'promote' && alvoP.admin)       { j.pulados++; push({ estado: 'pulado', detalhe: 'ja e admin' }); continue; }
+    if (acao === 'demote' && !alvoP.admin)       { j.pulados++; push({ estado: 'pulado', detalhe: 'ja nao e admin' }); continue; }
+    if ((acao === 'demote' || acao === 'remove') && alvoP.admin === 'superadmin') {
+      j.falhas++; push({ estado: 'falha', detalhe: 'e o criador do grupo — o WhatsApp nao deixa tirar' }); continue;
+    }
+
+    // Executor: na inclusao, SO a conta que recebeu a mensagem. Nas demais,
+    // qualquer conta admin ali que nao seja o proprio alvo.
+    let exec = null;
+    if (acao === 'add') {
+      exec = _gmEuNoGrupo(fixo.sock, fixo.mapa[jid])?.admin ? fixo : null;
+      if (!exec) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'a conta ' + fixo.id + ' (que recebeu a mensagem) nao e admin deste grupo' }); continue; }
+    } else {
+      exec = retratos.find(r => {
+        const eu = _gmEuNoGrupo(r.sock, r.mapa[jid]);
+        if (!eu?.admin) return false;
+        return !_gmIdsParticipante(eu).some(n => idsAlvo.has(n));
+      }) || null;
+      if (!exec) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada e admin deste grupo' }); continue; }
+    }
+
+    try {
+      const r = await exec.sock.groupParticipantsUpdate(jid, [acao === 'add' ? jidAdd : alvoP.id], acao);
+      const stt = String(r?.[0]?.status || '');
+      if (stt === '200') {
+        j.feitos++;
+        push({ estado: 'ok', por: exec.id, detalhe: { add: 'incluido', remove: 'removido', promote: 'agora e admin', demote: 'deixou de ser admin' }[acao] });
+        if (acao === 'add') _gmContarAdicao(exec.id, digitos);
+      } else if (stt === '409') {
+        j.pulados++; push({ estado: 'pulado', por: exec.id, detalhe: 'o WhatsApp respondeu que ja estava assim' });
+      } else if (acao === 'add' && (stt === '403' || stt === '408' || stt === '401')) {
+        let link = null, erroLink = null;
+        try { link = 'https://chat.whatsapp.com/' + await exec.sock.groupInviteCode(jid); }
+        catch (e2) { erroLink = e2.message; }
+        j.falhas++;
+        push({ estado: 'convite', por: exec.id, link,
+          detalhe: link ? 'o WhatsApp nao deixou incluir direto (status ' + stt + ') — mande o link pelo seu celular'
+                        : 'status ' + stt + ' e o convite tambem falhou: ' + erroLink });
+      } else {
+        j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: 'WhatsApp retornou status ' + (stt || '?') });
+      }
+    } catch (e) {
+      j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: e.message });
+    }
+
+    if (i < pedidos.length - 1) await _gmPausa(j, GM_PAUSA[acao]);
+  }
+  _gmFimJob(j);
+}
+
+async function _gmRodarInfo(j, { pedidos, nome, descricao }) {
+  const retratos = await _gmRetratos(true);
+  if (!retratos.length) return _gmFimJob(j, 'nenhuma conta conseguiu ler os grupos agora');
+  for (let i = 0; i < pedidos.length; i++) {
+    const jid = pedidos[i];
+    const md = _gmMeta(retratos, jid);
+    const rotulo = md?.subject || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+    j.atual = rotulo;
+    const push = (x) => { j.resultados.push({ jid, nome: rotulo, ...x }); };
+    if (!md) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada participa deste grupo' }); continue; }
+    const exec = retratos.find(r => _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin);
+    if (!exec) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada e admin deste grupo' }); continue; }
+
+    const mudaNome = nome != null && nome !== (md.subject || '');
+    const mudaDesc = descricao != null && descricao !== (md.desc || '');
+    if (!mudaNome && !mudaDesc) { j.pulados++; push({ estado: 'pulado', detalhe: 'ja estava igual' }); continue; }
+    try {
+      if (mudaNome) await exec.sock.groupUpdateSubject(jid, nome);
+      if (mudaNome && mudaDesc) await new Promise(r => setTimeout(r, 4000 + Math.random() * 4000));
+      if (mudaDesc) await exec.sock.groupUpdateDescription(jid, descricao);
+      if (mudaNome) NOMES_GRUPOS.set(jid, nome);
+      j.feitos++;
+      push({ estado: 'ok', por: exec.id, detalhe: [mudaNome ? 'nome atualizado' : null, mudaDesc ? 'descricao atualizada' : null].filter(Boolean).join(' e ') });
+    } catch (e) {
+      j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: e.message });
+    }
+    if (i < pedidos.length - 1) await _gmPausa(j, GM_PAUSA.info);
+  }
+  _gmFimJob(j);
+}
+
+// Interface compartilhada pelos dois paineis.
+app.get('/grupos-gestao/ui.js', (req, res) => {
+  try {
+    const js = readFileSync(new URL('./grupos-gestao-ui.js', import.meta.url), 'utf-8');
+    res.set('Content-Type', 'application/javascript; charset=utf-8');
+    res.set('Cache-Control', 'no-cache');
+    res.send(js);
+  } catch (e) { res.status(500).type('text/plain').send('// falha ao ler a interface: ' + e.message); }
+});
+
+// Grupos da operacao (ou todos em que alguma conta nossa e admin, com ?todos=1).
+app.get('/grupos-gestao/grupos', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const op = String(req.query.operacao || '').toLowerCase();
+  if (op !== 'cdv' && op !== 'tsp') return res.status(400).json({ ok: false, erro: 'operacao deve ser cdv ou tsp' });
+  const contas = _gmContas();
+  if (!contas.length) return res.status(503).json({ ok: false, erro: 'nenhuma conta do WhatsApp conectada' });
+  try {
+    const retratos = await _gmRetratos(String(req.query.forcar || '') === '1');
+    const todos = String(req.query.todos || '') === '1';
+    let lista = _gmGruposOperacao(op);
+    if (todos) {
+      const s = new Set(lista);
+      for (const r of retratos) for (const [jid, md] of Object.entries(r.mapa)) if (_gmEuNoGrupo(r.sock, md)?.admin) s.add(jid);
+      lista = [...s];
+    }
+    const grupos = lista.map(jid => {
+      const md = _gmMeta(retratos, jid);
+      const admins = retratos.filter(r => _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin).map(r => r.id);
+      const membroEm = retratos.filter(r => _gmEuNoGrupo(r.sock, r.mapa[jid])).map(r => r.id);
+      return { jid, nome: md?.subject || NOMES_GRUPOS.get(jid) || null, descricao: md?.desc || '',
+        membros: (md?.participants || []).length, executores: admins, contasNoGrupo: membroEm,
+        lido: !!md, bloqueado: admins.length === 0, soAdminsEnviam: !!md?.announce, soAdminsEditam: !!md?.restrict };
+    }).sort((a, b) => String(a.nome || a.jid).localeCompare(String(b.nome || b.jid), 'pt-BR'));
+    const st = _gm();
+    res.json({ ok: true, operacao: op, contas: contas.map(c => ({ id: c.id, numero: c.numero })),
+      tarefaAtiva: st.ativo, limiteInclusoesDia: GM_ADD_MAX_DIA, total: grupos.length, grupos });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+// Participantes de um grupo.
+app.get('/grupos-gestao/membros', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const jid = String(req.query.jid || '').trim();
+  if (!jid.endsWith('@g.us')) return res.status(400).json({ ok: false, erro: 'jid de grupo invalido' });
+  try {
+    const retratos = await _gmRetratos(String(req.query.forcar || '') === '1');
+    const md = _gmMeta(retratos, jid);
+    if (!md) return res.status(404).json({ ok: false, erro: 'nenhuma conta conectada participa deste grupo' });
+    const nossas = retratos.map(r => ({ id: r.id, ids: _idsDaContaSock(r.sock) }));
+    const ref = retratos.find(r => r.mapa[jid]) || retratos[0];
+    const membros = [];
+    for (const p of (md.participants || [])) {
+      let telefone = _gmTelefoneDe(p);
+      const lidJ = [p.lid, p.id].find(v => String(v || '').endsWith('@lid')) || null;
+      if (!telefone && lidJ) {
+        try { telefone = _gmDigitos(await ref.sock?.signalRepository?.lidMapping?.getPNForLID?.(lidJ)) || null; } catch (e) {}
+      }
+      const ids = _gmIdsParticipante(p);
+      const nossa = nossas.find(n => ids.some(x => n.ids.has(x)));
+      membros.push({ id: p.id, telefone, lid: lidJ ? _gmDigitos(lidJ) : null, admin: p.admin || null, conta: nossa ? nossa.id : null });
+    }
+    membros.sort((a, b) => (a.admin ? 0 : 1) - (b.admin ? 0 : 1) || String(a.telefone || a.lid).localeCompare(String(b.telefone || b.lid)));
+    res.json({ ok: true, jid, nome: md.subject || null, total: membros.length, membros });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+// A pessoa ja mandou mensagem? Libera (ou nao) a inclusao na tela.
+app.get('/grupos-gestao/contato', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const digitos = String(req.query.telefone || '').replace(/\D/g, '');
+  if (digitos.length < 12) return res.status(400).json({ ok: false, erro: 'informe o telefone com DDI e DDD' });
+  const c = await _gmContatoRecente(digitos);
+  const contas = _gmContas().map(x => ({ id: x.id, numero: x.numero, inclusoesHoje: _gmAdicoesHoje(x.id).length }));
+  res.json({ ok: true, telefone: digitos, recebida: !!c, conta: c ? c.conta : null,
+    em: c ? new Date(c.em).toISOString() : null, janelaHoras: Math.round(GM_CONTATO_JANELA_MS / 3600e3),
+    limiteInclusoesDia: GM_ADD_MAX_DIA, contas });
+});
+
+// Body: { acao: add|remove|promote|demote, telefone? , participante?, jids: [] }
+app.post('/grupos-gestao/participante', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const b = req.body || {};
+  const r = await _gmCriarTarefaParticipante({ acao: b.acao, telefone: b.telefone, participante: b.participante, jids: b.jids, origem: 'painel-' + (b.operacao || '?') });
+  res.status(r.status).json(r.body);
+});
+
+// Body: { jids: [], nome?, descricao? } — nome so com um grupo.
+app.post('/grupos-gestao/info', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const st = _gm();
+  if (st.ativo) return res.status(409).json({ ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo });
+  const b = req.body || {};
+  const pedidos = [...new Set((Array.isArray(b.jids) ? b.jids : []).map(j => String(j || '').trim()).filter(j => j.endsWith('@g.us')))];
+  if (!pedidos.length) return res.status(400).json({ ok: false, erro: 'escolha ao menos um grupo' });
+  if (pedidos.length > GM_MAX_GRUPOS_POR_TAREFA) return res.status(400).json({ ok: false, erro: 'no maximo ' + GM_MAX_GRUPOS_POR_TAREFA + ' grupos por tarefa' });
+  const nome = b.nome == null ? null : String(b.nome).trim();
+  const descricao = b.descricao == null ? null : String(b.descricao);
+  if (nome == null && descricao == null) return res.status(400).json({ ok: false, erro: 'nada para alterar' });
+  if (nome != null && pedidos.length !== 1) return res.status(400).json({ ok: false, erro: 'o nome so pode ser trocado em um grupo por vez' });
+  if (nome != null && (!nome || nome.length > 100)) return res.status(400).json({ ok: false, erro: 'o nome precisa ter entre 1 e 100 caracteres' });
+  if (descricao != null && descricao.length > 2048) return res.status(400).json({ ok: false, erro: 'a descricao passa de 2048 caracteres' });
+  if (!_gmContas().length) return res.status(503).json({ ok: false, erro: 'nenhuma conta do WhatsApp conectada' });
+  const j = _gmNovoJob({ tipo: 'info', acao: nome != null ? (descricao != null ? 'nome+descricao' : 'nome') : 'descricao',
+    alvo: null, origem: 'painel-' + (b.operacao || '?'), total: pedidos.length });
+  _gmRodarInfo(j, { pedidos, nome, descricao }).catch(e => _gmFimJob(j, e.message));
+  res.status(202).json({ ok: true, jobId: j.id, total: pedidos.length });
+});
+
+app.get('/grupos-gestao/tarefa/:id', (req, res) => {
+  const j = _gm().jobs.get(String(req.params.id || ''));
+  if (!j) return res.status(404).json({ ok: false, erro: 'tarefa nao encontrada (o servidor pode ter reiniciado)' });
+  res.json({ ok: true, tarefa: _gmResumoJob(j) });
+});
+
+app.get('/grupos-gestao/tarefa-ativa', (req, res) => {
+  const st = _gm();
+  const j = st.ativo ? st.jobs.get(st.ativo) : null;
+  res.json({ ok: true, tarefa: j ? _gmResumoJob(j) : null });
+});
+
 // ── REENTRADA DE EX-ALUNO NOS GRUPOS DO CDV ──────────────────────────────────
 // Quem foi REMOVIDO de um grupo nao volta pelo link de convite: o WhatsApp
 // recusa a entrada por link de quem um admin tirou. So volta se um admin
@@ -11616,7 +12137,9 @@ function _reVariantes(bruto) {
 // por grupo — mesmo motivo do _gaMapaParticipacao.
 async function _reRetrato(s, jids) {
   const alvo = new Set(jids);
-  const todos = await s.groupFetchAllParticipating();
+  // Cache compartilhado com a gestao de grupos: abrir a aba varias vezes nao
+  // pode virar uma consulta pesada por clique.
+  const todos = await _gmRetrato(s);
   const meus = new Set();
   for (const v of [s?.user?.id, s?.user?.lid]) {
     const n = String(v || '').split(':')[0].split('@')[0].trim();
@@ -11698,28 +12221,13 @@ app.get('/cdv/entrada/grupos', async (req, res) => {
 // Adiciona o telefone nos grupos pedidos (ou em todos os cadastrados ativos).
 // Body: { telefone, jids?, pausaMs?, avisar? }
 app.post('/cdv/entrada/adicionar', async (req, res) => {
-  const digitos = String(req.body?.telefone || '').replace(/\D/g, '');
-  if (digitos.length < 10 || digitos.length > 15) {
-    return res.status(400).json({ ok:false, erro:'telefone invalido — informe com DDI e DDD (ex.: 5531999998888).' });
-  }
-  const executores = _reExecutores(req);
-  if (!executores.length) {
-    return res.status(503).json({ ok:false, erro:'nenhum numero conectado para executar a reentrada.' });
-  }
-
-  // JID canonico, nunca telefone + '@s.whatsapp.net': conta antiga responde por
-  // outro identificador e a adicao pelo JID montado na mao falha em silencio.
-  let alvo;
-  try { alvo = await resolverJidWhatsApp(digitos); }
-  catch (e) { return res.status(503).json({ ok:false, erro:'nao consegui validar o numero: ' + e.message }); }
-  if (!alvo.existe) {
-    return res.status(404).json({ ok:false, erro:'este numero nao tem WhatsApp — confira DDI, DDD e o nono digito.' });
-  }
-  const alvoJid = alvo.jid;
-  const variantes = _reVariantes(digitos);
-  for (const v of _reVariantes(String(alvoJid).split('@')[0])) variantes.add(v);
-
-  const cadastro = entradaCdv();
+  // 16/09/2026: a versao anterior adicionava direto, com 6s de pausa, e mandava
+  // links de grupo no privado de quem nao tinha o numero salvo — a conta
+  // principal foi bloqueada logo depois. Agora a reentrada passa pela gestao de
+  // grupos: exige que a pessoa tenha mandado mensagem antes, sai so pela conta
+  // que recebeu essa mensagem, roda como tarefa com pausa longa e nao manda
+  // nada no privado. Resposta: { ok, jobId } — acompanhar em
+  // GET /grupos-gestao/tarefa/:id.
   const ativos = gruposEntradaCdv();
   const pedidos = Array.isArray(req.body?.jids) && req.body.jids.length
     ? req.body.jids.map(j => String(j).trim()).filter(j => ativos.includes(j))
@@ -11727,103 +12235,8 @@ app.post('/cdv/entrada/adicionar', async (req, res) => {
   if (!pedidos.length) {
     return res.status(400).json({ ok:false, erro:'nenhum grupo de reentrada valido — cadastre os grupos na aba Config.' });
   }
-
-  const pausaMs = Math.min(Math.max(parseInt(req.body?.pausaMs ?? RE_PAUSA_PADRAO, 10) || RE_PAUSA_PADRAO, 2000), 60000);
-
-  const retratos = [];
-  for (const e of executores) {
-    try { retratos.push({ id: e.id, sock: e.sock, mapa: await _reRetrato(e.sock, pedidos) }); }
-    catch (err) { console.warn('[REENTRADA] ' + e.id + ' ficou fora do retrato: ' + err.message); }
-  }
-  if (!retratos.length) {
-    return res.status(503).json({ ok:false, erro:'nenhum numero conseguiu ler os grupos agora — tente de novo em instantes.' });
-  }
-
-  const resultados = [];
-  let feitos = 0, pulados = 0, falhas = 0;
-  const convites = [];
-
-  for (let i = 0; i < pedidos.length; i++) {
-    const jid = pedidos[i];
-    const nome = _reNome(jid, cadastro, retratos);
-
-    const jaDentro = retratos.some(r => {
-      const m = r.mapa.get(jid);
-      return !!m && [...variantes].some(n => m.ids.has(n));
-    });
-    if (jaDentro) {
-      pulados++;
-      resultados.push({ jid, nome, estado:'pulado', detalhe:'ja esta no grupo' });
-      continue;
-    }
-
-    const exec = retratos.find(r => r.mapa.get(jid)?.admin);
-    if (!exec) {
-      falhas++;
-      resultados.push({ jid, nome, estado:'bloqueado',
-        detalhe:'nenhum numero conectado e admin deste grupo — promova um deles pelo celular' });
-      continue;
-    }
-
-    try {
-      const r = await exec.sock.groupParticipantsUpdate(jid, [alvoJid], 'add');
-      const st = String(r?.[0]?.status || '');
-      if (st === '200') {
-        feitos++;
-        resultados.push({ jid, nome, estado:'ok', por: exec.id, detalhe:'adicionado ao grupo' });
-      } else if (st === '409') {
-        pulados++;
-        resultados.push({ jid, nome, estado:'pulado', por: exec.id, detalhe:'o WhatsApp respondeu que ja estava dentro' });
-      } else if (st === '403' || st === '408' || st === '401') {
-        // 403: privacidade do destinatario barra a adicao direta. 408/401: numero
-        // saiu ha pouco ou bloqueou quem esta adicionando. Nos tres casos o que
-        // resta e o convite — que so o admin do grupo consegue gerar.
-        let link = null, erroLink = null;
-        try { link = 'https://chat.whatsapp.com/' + await exec.sock.groupInviteCode(jid); }
-        catch (e2) { erroLink = e2.message; }
-        if (link) convites.push({ nome, link });
-        falhas++;
-        resultados.push({ jid, nome, estado:'convite', por: exec.id, link,
-          detalhe: link
-            ? 'o WhatsApp nao deixou adicionar direto (status ' + st + ') — mande o link para a pessoa entrar'
-            : 'status ' + st + ' e o convite tambem falhou: ' + erroLink });
-      } else {
-        falhas++;
-        resultados.push({ jid, nome, estado:'falha', por: exec.id, detalhe:'WhatsApp retornou status ' + (st || '?') });
-      }
-    } catch (e) {
-      falhas++;
-      resultados.push({ jid, nome, estado:'falha', detalhe: e.message });
-    }
-
-    // Pausa so ENTRE chamadas de verdade: grupo pulado nao consumiu cota, e
-    // esperar ali seria tempo de tela perdido. Jitter porque rajada com
-    // intervalo exato tem cara de robo.
-    const ultimo = i === pedidos.length - 1;
-    const agiu = ['ok','convite','falha'].includes(resultados[resultados.length - 1].estado);
-    if (agiu && !ultimo) {
-      await new Promise(r => setTimeout(r, Math.round(pausaMs * (0.8 + Math.random() * 0.4))));
-    }
-  }
-
-  // Aviso opcional no privado com os grupos que ficaram no convite. Best-effort:
-  // falhar aqui nao pode derrubar um lote que ja foi executado.
-  let avisado = false, erroAviso = null;
-  if (req.body?.avisar && convites.length) {
-    try {
-      const texto = 'Oi! Voce voltou para os grupos do Clube do Viajante 🎉\n\n'
-        + 'Nestes aqui o WhatsApp nao deixou te adicionar direto, entao entre pelo link:\n\n'
-        + convites.map(c => '• ' + c.nome + '\n' + c.link).join('\n\n');
-      await enviarMensagem(alvoJid, { text: texto });
-      avisado = true;
-    } catch (e) { erroAviso = e.message; }
-  }
-
-  console.log('[REENTRADA] ' + digitos + ' — ' + feitos + ' adicionado(s), ' + pulados
-    + ' pulado(s), ' + falhas + ' pendente(s) em ' + pedidos.length + ' grupo(s).');
-
-  res.json({ ok:true, telefone:digitos, jid:alvoJid, pausaMs, total:pedidos.length,
-             feitos, pulados, falhas, convites, avisado, erroAviso, resultados });
+  const r = await _gmCriarTarefaParticipante({ acao:'add', telefone: req.body?.telefone, jids: pedidos, origem:'reentrada-cdv' });
+  res.status(r.status).json(r.body);
 });
 
 // Nucleo da reconexao soft: usado pelo endpoint manual e pela autocura do

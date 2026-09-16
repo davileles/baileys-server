@@ -34,6 +34,12 @@
         "app.get('/entrega/grupos'",
         "app.get('/fila-envio'",
         "app.get('/grupos'",
+        "app.get('/grupos-gestao/contato'",
+        "app.get('/grupos-gestao/grupos'",
+        "app.get('/grupos-gestao/membros'",
+        "app.get('/grupos-gestao/tarefa-ativa'",
+        "app.get('/grupos-gestao/tarefa/:id'",
+        "app.get('/grupos-gestao/ui.js'",
         "app.get('/grupos/censo'",
         "app.get('/grupos/censo/historico'",
         "app.get('/grupos/convite'",
@@ -97,6 +103,8 @@
         "app.post('/enviar-imagem'",
         "app.post('/fila-envio/marcar-enviado/:ofertaId'",
         "app.post('/fila-envio/marcar-todas-enviado'",
+        "app.post('/grupos-gestao/info'",
+        "app.post('/grupos-gestao/participante'",
         "app.post('/grupos/censo/atualizar'",
         "app.post('/grupos/censo/importar'",
         "app.post('/historico-seats'",
@@ -140,16 +148,21 @@
         "app.post('/vitrine/:asin'",
         "app.post('/vitrine/disparar'",
         "app.post('/webhook/hubla'",
+        "async function _gmCriarTarefaParticipante(",
         "async function campanhaCiclo",
         "async function campanhaMarcarResposta",
         "async function comLinksRastreados",
         "async function verificarPulsoLojas",
         "campanhaMarcarResposta(msg)",
         "const CAMPANHAS_KEY",
+        "const WM_LEITOR",
         "function _sombraCaso",
         "function _sombraConsolidar",
         "function conteudoParaWhatsmeow",
+        "function despacharParaPipeline",
         "function enviarPeloWhatsmeow",
+        "function estadoLeitorWhatsmeow",
+        "function registrarContatoPrivado(",
         "function registrarEnvioTelemetria",
         "function registrarEventoEntrega",
         "function registrarRetryTelemetria",
@@ -157,10 +170,7 @@
         "function rotaDeRoteamento",
         "function saidaSerializada",
         "function silencioUtilMs",
-        "saidaSerializada(() => enviarMensagem(item.destino",
-        "function estadoLeitorWhatsmeow",
-        "const WM_LEITOR",
-        "function despacharParaPipeline"
+        "saidaSerializada(() => enviarMensagem(item.destino"
       ]
     },
     "radar-awin.js": {
@@ -421,6 +431,14 @@
         "export function explicarClassificacao",
         "export function salvarCategorias",
         "export function semearCacheTrilhas"
+      ]
+    },
+    "grupos-gestao-ui.js": {
+      "minLinhas": 300,
+      "obrigatorio": [
+        "window.GG = {",
+        "Tela.prototype.porNumero",
+        "Tela.prototype.salvarDesc"
       ]
     }
   }
