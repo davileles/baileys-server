@@ -4616,11 +4616,44 @@ function rotaDeRoteamento(oferta) {
 // ficaram de fora e quantos grupos recebem de fato (grupo so-cupons sai da
 // conta, como no despacho). Falha aqui nunca derruba o card — sem rota, o bot
 // so omite o bloco.
+// ── TRILHAS ESCOLHIDAS A MAO (bot / revisao) ──
+// O operador pode trocar, item a item, as trilhas que o roteamento automatico
+// escolheu. A escolha fica gravada NO ITEM da fila (sobrevive a redeploy) e
+// vence a regra fonte+categoria no despacho: ele viu o produto. Ids que sumiram
+// da configuracao sao ignorados; se nao sobrar nenhum, volta o automatico.
+function trilhasManuaisDe(oferta) {
+  const ids = Array.isArray(oferta?.trilhasManuais) ? oferta.trilhasManuais.map(String) : [];
+  if (!ids.length) return null;
+  const existentes = new Set(trilhas().map(t => t.id));
+  const validas = ids.filter(id => existentes.has(id));
+  return validas.length ? validas : null;
+}
+
 function resumoRotaOferta(o) {
   try {
     const r = rotaDeRoteamento(o);
     const d = o?.dadosExtraidos || {};
     const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
+    // Catalogo inteiro: e dele que o bot monta os botoes de troca de trilha.
+    const todas = trilhas().map(t => ({ id: t.id, nome: t.nome, categoria: t.categoria || null,
+      destinos: t.destinos.filter(j => !soCupons.has(j)).length }));
+    const automaticas = detalharRoteamento(r).filter(t => t.entrega).map(t => t.id);
+    const manuais = trilhasManuaisDe(o);
+    if (manuais) {
+      const sel = new Set(manuais);
+      return {
+        fonte: r.fonte,
+        categoria: r.categoria,
+        categoriaNome: d.categoriaNome || r.categoria || null,
+        confianca: typeof d.categoriaConfianca === 'number' ? d.categoriaConfianca : null,
+        confiavel: !!r.categoriaConfiavel,
+        grupos: destinosDasTrilhas(manuais).filter(j => !soCupons.has(j)).length,
+        trilhas: trilhas().map(t => ({ id: t.id, nome: t.nome, categoria: t.categoria || null,
+          entrega: sel.has(t.id), porFonte: false, destinos: t.destinos.length })),
+        manual: true, automaticas, todas,
+        curadoriaNicho: null,
+      };
+    }
     return {
       fonte: r.fonte,
       categoria: r.categoria,
@@ -4629,6 +4662,7 @@ function resumoRotaOferta(o) {
       confiavel: !!r.categoriaConfiavel,
       grupos: destinosDaOferta(r).filter(j => !soCupons.has(j)).length,
       trilhas: detalharRoteamento(r),
+      manual: false, automaticas, todas,
       curadoriaNicho: r.nichoBarrado ? (d.curadoriaNicho?.motivo || 'reprovada') : null,
     };
   } catch (e) {
@@ -4648,8 +4682,19 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   // bebidas receberia "produto que talvez seja bebida".
   const _rota = rotaDeRoteamento(oferta);
   let alvos = destinosDaOferta(_rota);
+  // Trilhas trocadas a mao no bot vencem o automatico. Os recortes de nicho
+  // abaixo (monitor de precos / listas) nao se aplicam a itens da fila, entao
+  // a escolha manual so e usada quando nenhum deles foi pedido.
+  const _manuais = (!opcoes.categoriaNicho && !opcoes.somenteNicho) ? trilhasManuaisDe(oferta) : null;
+  if (_manuais) {
+    alvos = destinosDasTrilhas(_manuais);
+    console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' trilhas escolhidas a mao: ' + _manuais.join(', ')
+      + ' (automatico seria: ' + explicarRoteamento(_rota) + ') -> ' + alvos.length + ' grupo(s).');
+    if (!alvos.length) throw new Error('As trilhas escolhidas nao tem grupo de destino cadastrado.');
+  } else {
   console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' roteamento: ' + explicarRoteamento(_rota)
     + ' -> ' + alvos.length + ' grupo(s).');
+  }
 
   // ── RECORTE POR TIPO DE DESTINO ──
   // Usado pelo monitor de precos quando o produto e curado e o desconto nao foi
@@ -17568,6 +17613,59 @@ app.post('/mkt/remontar/:id', (req, res) => {
     res.json({ ok:true, mensagem:r.mensagem, aviso:r.aviso, oferta: resumoOfertaFila(o),
       cupons: cuponsDoCard(o) });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Troca as trilhas de UMA oferta pendente (bot do Telegram). Tres formas:
+//   { alternar: 'bebidas' }   marca/desmarca uma trilha partindo do que vale hoje
+//   { trilhas: ['geral'] }    define a lista inteira
+//   { automatico: true }      apaga a escolha e volta ao roteamento fonte+categoria
+// O alternar e calculado aqui, de forma sincrona: dois toques rapidos no bot
+// nao se sobrescrevem. Lista vazia e recusada — para nao enviar, descarta-se.
+app.post('/mkt/trilhas/:id', (req, res) => {
+  const o = ofertaDaFilaPara(req, req.params.id);
+  if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  if (!ehOfertaMarketplace(o.tipoConteudo)) {
+    return res.status(400).json({ ok:false, erro:'So oferta de marketplace troca trilha por aqui.' });
+  }
+  if (o.status !== 'pendente') {
+    return res.status(409).json({ ok:false, erro:'Oferta com status ' + o.status + ' — nao da para trocar a trilha.' });
+  }
+  const b = req.body || {};
+  const existentes = new Set(trilhas().map(t => t.id));
+  const limparMarca = () => {
+    if (o.ajustes) { delete o.ajustes.trilhas; if (!Object.keys(o.ajustes).length) delete o.ajustes; }
+  };
+
+  if (b.automatico === true) {
+    delete o.trilhasManuais;
+    limparMarca();
+    salvarFila();
+    return res.json({ ok:true, oferta: resumoOfertaFila(o), cupons: cuponsDoCard(o) });
+  }
+
+  let nova;
+  if (typeof b.alternar === 'string' && b.alternar) {
+    if (!existentes.has(b.alternar)) return res.status(400).json({ ok:false, erro:'Trilha nao existe mais: ' + b.alternar });
+    const atual = new Set(trilhasManuaisDe(o) || (resumoRotaOferta(o)?.automaticas || []));
+    if (atual.has(b.alternar)) atual.delete(b.alternar); else atual.add(b.alternar);
+    nova = [...atual];
+  } else if (Array.isArray(b.trilhas)) {
+    nova = [...new Set(b.trilhas.map(x => String(x || '').trim()).filter(Boolean))];
+    const invalidas = nova.filter(id => !existentes.has(id));
+    if (invalidas.length) return res.status(400).json({ ok:false, erro:'Trilha(s) inexistente(s): ' + invalidas.join(', ') });
+  } else {
+    return res.status(400).json({ ok:false, erro:'passe alternar, trilhas ou automatico' });
+  }
+  if (!nova.length) {
+    return res.status(400).json({ ok:false, vazia:true, erro:'Mantenha ao menos uma trilha — para não enviar, use Descartar.' });
+  }
+  // Ordem da configuracao, para o card ler sempre igual.
+  const ordem = trilhas().map(t => t.id);
+  o.trilhasManuais = nova.sort((a, z) => ordem.indexOf(a) - ordem.indexOf(z));
+  o.ajustes = { ...(o.ajustes || {}), trilhas: true };
+  o.ajustadoEm = new Date().toISOString();
+  salvarFila();
+  res.json({ ok:true, oferta: resumoOfertaFila(o), cupons: cuponsDoCard(o) });
 });
 
 // Cola um link Shopee e ve a mensagem que sairia, sem enfileirar nem publicar.

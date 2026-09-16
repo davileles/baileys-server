@@ -726,7 +726,7 @@ function horaCurta(iso) {
     : dt.toLocaleDateString('pt-BR', { timeZone: tz, day: '2-digit', month: '2-digit' }) + ' ' + hora;
 }
 
-const ROTULO_AJUSTE = { preco: 'preço', precoDe: 'preço de', titulo: 'título', cupom: 'cupom', gatilho: 'topo', importante: 'importante' };
+const ROTULO_AJUSTE = { preco: 'preço', precoDe: 'preço de', titulo: 'título', cupom: 'cupom', gatilho: 'topo', importante: 'importante', trilhas: 'trilhas' };
 
 // Topo do card: o que e, onde, quando. Titulo em negrito numa linha propria —
 // e por ele que o operador reconhece o item antes de ler qualquer numero.
@@ -777,13 +777,21 @@ function blocoTrilha(o) {
   const entregam = lista.filter(t => t.entrega);
   const fora = lista.filter(t => !t.entrega);
   const linhas = [];
-  if (!entregam.length) {
+  if (r.manual) {
+    // Escolha do operador: a linha diz que foi a mao e o que o automatico faria,
+    // para ele perceber de relance se desviou do roteamento de sempre.
+    const nomeDe = new Map((r.todas || []).map(t => [t.id, t.nome]));
+    const auto = (r.automaticas || []).map(id => nomeDe.get(id) || id);
+    linhas.push('🧭 ' + entregam.map(t => '<b>' + esc(t.nome) + '</b>').join(' + ')
+      + ' → ' + r.grupos + ' grupo' + (r.grupos === 1 ? '' : 's') + '  ✋ escolha manual');
+    linhas.push('     automático seria: ' + esc(auto.length ? auto.join(' + ') : 'nenhuma'));
+  } else if (!entregam.length) {
     linhas.push('🧭 <b>Nenhuma trilha entrega</b> — confira fontes e destinos na aba Grupos');
   } else {
     linhas.push('🧭 ' + entregam.map(t => '<b>' + esc(t.nome) + '</b>' + (t.porFonte ? ' (pela fonte)' : '')).join(' + ')
       + ' → ' + r.grupos + ' grupo' + (r.grupos === 1 ? '' : 's'));
   }
-  if (fora.length) linhas.push('     fora: ' + esc(fora.map(t => t.nome).join(' · ')));
+  if (fora.length && !r.manual) linhas.push('     fora: ' + esc(fora.map(t => t.nome).join(' · ')));
   const cat = r.categoria
     ? 'categoria ' + esc(r.categoriaNome || r.categoria)
       + (r.confianca != null ? ' (' + Math.round(r.confianca * 100) + '%' + (r.confiavel ? '' : ', abaixo do limiar') + ')' : '')
@@ -866,8 +874,33 @@ function tecladoCard(id) {
     [['🚀 Enviar agora', 'r:enviar:' + id]],
     [['💲 Por', 'r:preco:' + id], ['🔖 De', 'r:precode:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
     [['✏️ Título', 'r:titulo:' + id], ['🔝 Topo', 'r:topo:' + id], ['⚠️ Importante', 'r:importante:' + id]],
+    [['🧭 Trilhas', 'r:trilhas:' + id]],
     [['🔄 Atualizar', 'r:ver:' + id], ['📋 Fila', 'r:fila:0'], ['🗑️ Descartar', 'r:descartar:' + id]],
   ]);
+}
+
+// Tela de troca de trilha: um botao por trilha configurada, marcado com o que
+// vale hoje (a escolha manual ou, sem ela, o que o automatico entrega). Cada
+// toque grava na hora no item da fila e redesenha esta mesma tela, entao da
+// para marcar varias em sequencia e voltar ao card no fim.
+// callback_data tem teto de 64 bytes: id de trilha comprido vai pela posicao.
+function telaTrilhas(o, extra) {
+  const r = o.rota || {};
+  const todas = Array.isArray(r.todas) ? r.todas : [];
+  const marcadas = new Set((r.trilhas || []).filter(t => t.entrega).map(t => t.id));
+  const linhas = todas.map((t, i) => {
+    let cb = 'r:tri:' + o.id + ':' + t.id;
+    if (Buffer.byteLength(cb, 'utf8') > 64) cb = 'r:tri:' + o.id + ':#' + i;
+    const rotulo = (marcadas.has(t.id) ? '✅ ' : '⬜ ') + t.nome + ' · ' + t.destinos + ' grupo' + (t.destinos === 1 ? '' : 's');
+    return [[rotulo, cb]];
+  });
+  if (r.manual) linhas.push([['↩️ Voltar ao automático', 'r:triauto:' + o.id]]);
+  linhas.push([['✔️ Concluir', 'r:ver:' + o.id]]);
+  const texto = cabecalhoCard(o)
+    + '\n\n<b>Trilhas desta oferta</b>\nToque para marcar ou desmarcar. Vale só para este item — a configuração da aba Grupos não muda.'
+    + (todas.length ? '' : '\n\n⚠️ Nenhuma trilha configurada na aba Grupos.')
+    + (extra ? '\n\n<b>' + esc(extra) + '</b>' : '');
+  return { texto, teclado: teclado(linhas) };
 }
 
 function brlCurto(v) {
@@ -1063,6 +1096,32 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     if (acao === 'precode') linhas.push([['Sem preço de', 'r:sempde:' + id]]);
     linhas.push([['⬅️ Voltar', 'r:ver:' + id]]);
     return falarHtml(chatId, cabecalhoCard(o) + '\n\n' + esc(pergunta), teclado(linhas), msgId);
+  }
+
+  if (acao === 'trilhas') {
+    registrarCard(chatId, msgId, id);
+    const t = telaTrilhas(o);
+    return falarHtml(chatId, t.texto, t.teclado, msgId);
+  }
+
+  if (acao === 'tri' || acao === 'triauto') {
+    registrarCard(chatId, msgId, id);
+    let corpo;
+    if (acao === 'triauto') corpo = { automatico: true };
+    else {
+      let alvo = partes.slice(3).join(':');
+      if (alvo.startsWith('#')) alvo = (o.rota?.todas || [])[Number(alvo.slice(1))]?.id || '';
+      corpo = { alternar: alvo };
+    }
+    const tr = await apiLocal('POST', '/mkt/trilhas/' + id, corpo);
+    if (!tr.ok) {
+      const t = telaTrilhas(o, (tr.vazia ? '⚠️ ' : '❌ ') + (tr.erro || 'falha ao trocar a trilha'));
+      return falarHtml(chatId, t.texto, t.teclado, msgId);
+    }
+    // Voltar ao automatico devolve o card; marcar/desmarcar fica na tela.
+    if (acao === 'triauto') return falarHtml(chatId, corpoCard(tr.oferta, '↩️ Trilhas de volta ao automático'), tecladoCard(id), msgId);
+    const t = telaTrilhas(tr.oferta);
+    return falarHtml(chatId, t.texto, t.teclado, msgId);
   }
 
   if (acao === 'semtopo') {
@@ -1548,6 +1607,10 @@ const travas = new Set();
 function chaveTrava(chatId, data) {
   const r = /^r:(enviar|descartar):(.+)$/.exec(data);
   if (r) return chatId + ':r:' + r[2];
+  // Troca de trilha: um toque por vez por item, senao o segundo redesenha a
+  // tela com o estado de antes do primeiro.
+  const tr = /^r:(tri|triauto):([^:]+)/.exec(data);
+  if (tr) return chatId + ':t:' + tr[2];
   const mi = /^m:(ok|venc|pular):(.+)$/.exec(data);
   if (mi) return chatId + ':m:' + mi[2];
   if (/^a:(enviar|fila|base|forcar)$/.test(data)) return chatId + ':a:envio';
