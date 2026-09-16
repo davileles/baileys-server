@@ -88,7 +88,7 @@ produtor específico, não do servidor.
 
 | Sintoma | Onde olhar | Ação |
 |---|---|---|
-| Ofertas aprovadas não saem | `GET /fila-envio` (`workerAtivo`, `total`) | fora da janela **8h–21h SP** é normal esperar. Presas em `aprovado` após restart: `POST /fila-envio/reenfileirar`. |
+| Ofertas aprovadas não saem | `GET /fila-envio` (`dentroJanela`, `previsaoHorario`, `workerAtivo`, `total`) | fora da janela **8h–21h SP** é normal esperar: a oferta fica em `aprovado` na fila até o worker publicar. Presas em `aprovado` após restart: `POST /fila-envio/reenfileirar` — `reenfileiradas:0` com a oferta em `aprovadasNaFila` é normal; o campo `resumo` já diz se há algo a fazer. |
 | Grupo recebeu, outro não | logs `[OUTBOX]` | a outbox retenta sozinha por até 6 h. Se desistiu (aviso "desisti de entregar"), o bot provavelmente foi **removido do grupo**: ajuste os destinos na aba Grupos. |
 | Radar CDV não envia | `GET /radar/fila` | fila persistida em `/sessao/fila_radar.json`; retenta com backoff, desiste após 12 com aviso. |
 | Nenhum cupom do Telegram | `telegramConectado` em `/status` | `false` → `GET /tg-auth` para refazer o login do GramJS. |

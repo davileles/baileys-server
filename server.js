@@ -12218,9 +12218,63 @@ app.delete('/fila-envio', (req, res) => {
 // Forca o reenfileiramento de tudo que esta 'aprovado' e nao esta na fila.
 // A automacao (Cowork) pode chamar como ultimo passo, depois de injetar, para
 // nao depender da varredura de 5 min.
+// A resposta tambem explica o estado da janela e onde cada oferta 'aprovado'
+// esta: 'reenfileiradas:0' fora da janela 8h–21h NAO e worker travado — a
+// oferta normalmente ja esta na fila esperando o horario (status so vira
+// 'enviado' quando o worker publica). Sem esse contexto a automacao concluia
+// "disparo nao confirmado" em toda coleta feita de madrugada.
 app.post('/fila-envio/reenfileirar', (req, res) => {
   const n = requeueAprovadas('por chamada manual');
-  res.json({ ok: true, reenfileiradas: n, total: filaEnvio.length, workerAtivo: workerRodando });
+  const espera = msAteJanela();
+  const posNaFila = new Map(filaEnvio.map((i, idx) => [String(i.ofertaId), idx]));
+  const aprovadasNaFila = [];
+  const aprovadasForaDaFila = [];
+  for (const o of filaPendentes) {
+    if (o.status !== 'aprovado') continue;
+    const idx = posNaFila.get(String(o.id));
+    if (idx !== undefined) {
+      const prev = calcularPosicaoFila(idx);
+      aprovadasNaFila.push({ ofertaId: o.id, posicao: idx + 1,
+                             previsaoMin: prev.tempoMin, previsaoHorario: prev.horario });
+    } else {
+      // Mesmos filtros de requeueAprovadas: o que sobrou aqui nunca entra na
+      // fila de emissoes do CDV e precisa de outro caminho (ou de mensagem).
+      const motivo = ehConteudoTsp(o.tipoConteudo) ? 'conteudo TSP (fila propria)'
+                   : ehOfertaMarketplace(o.tipoConteudo) ? 'oferta de marketplace (fila propria)'
+                   : !(o.mensagemFinal || o.mensagemFormatada) ? 'sem mensagem formatada'
+                   : 'desconhecido';
+      aprovadasForaDaFila.push({ ofertaId: o.id, motivo });
+    }
+  }
+  aprovadasNaFila.sort((a, b) => a.posicao - b.posicao);
+  let resumo;
+  if (espera > 0 && aprovadasNaFila.length) {
+    resumo = 'Fora da janela ' + HORA_INICIO_ENVIO + 'h–' + HORA_FIM_ENVIO + 'h SP: '
+           + aprovadasNaFila.length + ' aprovada(s) aguardando na fila, a primeira sai às '
+           + aprovadasNaFila[0].previsaoHorario + '. Situação normal, nada a fazer.';
+  } else if (espera > 0) {
+    resumo = 'Fora da janela ' + HORA_INICIO_ENVIO + 'h–' + HORA_FIM_ENVIO + 'h SP; nenhuma aprovada na fila.';
+  } else if (aprovadasNaFila.length) {
+    resumo = 'Dentro da janela: ' + aprovadasNaFila.length + ' aprovada(s) na fila, próxima prevista para '
+           + aprovadasNaFila[0].previsaoHorario + ' (intervalo de ' + (INTERVALO_ENVIO_MS / 60000) + ' min).';
+  } else {
+    resumo = 'Dentro da janela; nenhuma aprovada na fila.';
+  }
+  if (aprovadasForaDaFila.length) resumo += ' ' + aprovadasForaDaFila.length + ' aprovada(s) fora da fila (ver aprovadasForaDaFila).';
+  res.json({
+    ok: true,
+    reenfileiradas: n,
+    total: filaEnvio.length,
+    workerAtivo: workerRodando,
+    dentroJanela: espera === 0,
+    horaSP: horaSP(),
+    janelaEnvio: `${HORA_INICIO_ENVIO}h–${HORA_FIM_ENVIO}h SP`,
+    msAteJanela: espera,
+    intervaloMinutos: INTERVALO_ENVIO_MS / 60000,
+    aprovadasNaFila,
+    aprovadasForaDaFila,
+    resumo,
+  });
 });
 
 app.post('/fila-envio/marcar-enviado/:ofertaId', (req, res) => {
