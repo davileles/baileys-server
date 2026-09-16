@@ -2198,6 +2198,78 @@ async function enviarPelaConta(id, destino, conteudo) {
   return r;
 }
 
+// ── CONTA SUBSTITUTA NO DISPARO ─────────────────────────────────────────────
+// Grupo com numero atribuido (numerosGrupo / envioCdv) cuja conta caiu ou falhou
+// ANTES do envio: em vez de ir direto para a principal, tenta outra conta de
+// disparo da operacao padrao que esteja conectada, seja membro do grupo e — se o
+// grupo for "somente admins" — seja admin nele. Sem isso o WhatsApp descartaria
+// a mensagem em silencio. So quando nenhuma substituta serve e que cai na
+// principal (regra antiga, mantida). A troca e temporaria: assim que a conta
+// original volta, contaDisponivel() a devolve e o grupo retoma o remetente fixo.
+// Ordem das candidatas estavel (por apelido) para que o mesmo grupo nao fique
+// alternando de remetente enquanto a titular estiver fora.
+const _aptidaoSubstituta = new Map();          // contaId|jid -> { ok, em }
+const APTIDAO_SUBSTITUTA_TTL_MS = 10 * 60 * 1000;
+const _logSubstituicao = new Map();            // contaOriginal|substituta|jid -> em
+const LOG_SUBSTITUICAO_INTERVALO_MS = 30 * 60 * 1000;
+
+async function contaAptaParaGrupo(contaId, jid) {
+  const chave = contaId + '|' + jid;
+  const cache = _aptidaoSubstituta.get(chave);
+  if (cache && Date.now() - cache.em < APTIDAO_SUBSTITUTA_TTL_MS) return cache.ok;
+  const c = contasExtras.get(contaId);
+  // Sem socket nao da para conferir membro/admin — melhor nao arriscar um
+  // descarte silencioso; a principal continua como ultima rede.
+  if (!c?.conectado || !c.sock) return false;
+  try {
+    const md = await c.sock.groupMetadata(jid);
+    const meus = _idsDaContaSock(c.sock);
+    const eu = (md?.participants || []).find(p =>
+      _ggIdsDoParticipante(p).some(n => meus.has(n)));
+    const ok = !!eu && (!md?.announce || !!eu.admin);
+    _aptidaoSubstituta.set(chave, { ok, em: Date.now() });
+    return ok;
+  } catch (e) {
+    // Erro de metadados nao entra no cache: pode ser passageiro.
+    console.warn('[WA] Nao deu para conferir ' + apelidoDaConta(contaId) + ' em '
+      + (NOMES_GRUPOS.get(jid) || jid) + ': ' + e.message);
+    return false;
+  }
+}
+
+async function enviarPorContaSubstituta(contaOriginal, destino, conteudo, motivo) {
+  if (!String(destino || '').endsWith('@g.us')) return null;
+  const candidatas = [...contasExtras.keys()]
+    .filter(id => id !== contaOriginal
+      && tenantDaConta(id) === TENANT_PADRAO
+      && contaDisponivel(id))
+    .sort((a, b) => apelidoDaConta(a).localeCompare(apelidoDaConta(b)));
+  const nome = NOMES_GRUPOS.get(destino) || destino;
+  for (const id of candidatas) {
+    if (!(await contaAptaParaGrupo(id, destino))) continue;
+    try {
+      const r = await enviarPelaConta(id, destino, conteudo);
+      registrarPublicacaoHealth(destino);
+      const chaveLog = contaOriginal + '|' + id + '|' + destino;
+      const agora = Date.now();
+      if (agora - (_logSubstituicao.get(chaveLog) || 0) > LOG_SUBSTITUICAO_INTERVALO_MS) {
+        _logSubstituicao.set(chaveLog, agora);
+        console.warn('[WA] Conta ' + apelidoDaConta(contaOriginal) + ' ' + motivo
+          + ' — "' + nome + '" saiu pela substituta ' + apelidoDaConta(id) + '.');
+      }
+      return { resultado: r, conta: id };
+    } catch (e) {
+      const cf = contasExtras.get(id); if (cf) cf.ultimoErro = e.message;
+      // Falha ambigua: a mensagem pode ter saido — nao tenta mais ninguem.
+      if (e.semFallback) throw e;
+      _aptidaoSubstituta.delete(id + '|' + destino);
+      console.warn('[WA] Substituta ' + apelidoDaConta(id) + ' falhou em "' + nome + '" ('
+        + e.message + ') — tentando a proxima.');
+    }
+  }
+  return null;
+}
+
 async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
   // Marca d'agua: so na primeira passada. O retry mais abaixo se rechama com
   // `tentativa + 1` e o conteudo JA marcado — remarcar empilharia uma faixa
@@ -2228,10 +2300,12 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
     if (apelidoCdv) contaId = contaIdDe(TENANT_PADRAO, apelidoCdv);
   }
 
-  // Conta escolhida pela escala de turnos. Falha ou indisponibilidade cai na
-  // principal em vez de abortar: a mensagem sair pelo numero "errado" e menos
-  // grave do que nao sair.
+  // Conta escolhida pela escala de turnos / numero do grupo. Falha ou
+  // indisponibilidade tenta primeiro outra conta de disparo apta no mesmo grupo
+  // (enviarPorContaSubstituta) e, so sem nenhuma, cai na principal: a mensagem
+  // sair pelo numero "errado" e menos grave do que nao sair.
   if (contaId && contaId !== 'principal' && tentativa === 0) {
+    let motivoFalha = null;
     if (contaDisponivel(contaId)) {
       try {
         const _r = await enviarPelaConta(contaId, destino, conteudo);
@@ -2239,18 +2313,22 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
         return _r;
       }
       catch (e) {
-        // Falha ambigua do wa-envio: a oferta pode ter saido. Cair na principal
-        // agora dobraria a mensagem no grupo — sobe para a outbox.
+        // Falha ambigua do wa-envio: a oferta pode ter saido. Cair em outra
+        // conta agora dobraria a mensagem no grupo — sobe para a outbox.
         if (e.semFallback) {
           const cf = contasExtras.get(contaId); if (cf) cf.ultimoErro = e.message;
           throw e;
         }
-        console.warn('[WA] Envio pela conta ' + contaId + ' falhou (' + e.message + ') em ' + (NOMES_GRUPOS.get(destino) || destino) + ' — indo pela principal.');
         const c = contasExtras.get(contaId); if (c) c.ultimoErro = e.message;
+        motivoFalha = 'falhou (' + e.message + ')';
       }
     } else {
-      console.warn('[WA] Conta ' + contaId + ' indisponivel — enviando pela principal.');
+      motivoFalha = 'indisponivel';
     }
+    const _sub = await enviarPorContaSubstituta(contaId, destino, conteudo, motivoFalha);
+    if (_sub) return _sub.resultado;
+    console.warn('[WA] Conta ' + contaId + ' ' + motivoFalha + ' em '
+      + (NOMES_GRUPOS.get(destino) || destino) + ' e nenhuma substituta apta — indo pela principal.');
   }
 
   if (usaWhatsmeow('principal', destino)) {
