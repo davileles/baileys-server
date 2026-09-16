@@ -1085,6 +1085,37 @@ async function aguardarSock(ms = 20000) {
   return _sockEstavel();
 }
 
+// ── HA CONTA PARA DISPARAR EM GRUPO? ────────────────────────────────────────
+// As rotas e workers de disparo exigiam a PRINCIPAL conectada, de quando ela era
+// o unico numero. Hoje o envio para grupo sai pela conta atribuida a cada grupo
+// (numerosGrupo / envioCdv) com substituta entre as contas de disparo — exigir a
+// principal travava vitrine, listas, aprovacao, cupons e outbox enquanto os
+// ticos estavam no ar. Vale SO para envio a grupo: DM (campanhas, Hubla,
+// resolver JID) e leitura/configuracao de grupos continuam na principal.
+function haContaDeDisparo() {
+  const tid = tenantContexto() || TENANT_PADRAO;
+  if (tid !== TENANT_PADRAO) return !!contaConectadaDoTenant(tid);
+  if (conectado && sock) return true;
+  if (WA_ENVIO_CONTAS.has('principal') && waEnvioContaConectada('principal')) return true;
+  for (const id of contasExtras.keys()) {
+    if (tenantDaConta(id) === TENANT_PADRAO && contaDisponivel(id)) return true;
+  }
+  return false;
+}
+
+// Mesmo contrato do aguardarSock (true/false), mas satisfeito por qualquer
+// conta de disparo. Com a principal caida ainda pede a reconexao dela.
+async function aguardarContaDeDisparo(ms = 20000) {
+  if (haContaDeDisparo()) return true;
+  if (!(conectado && sock) && !isConnecting && !sock) conectar();
+  const inicio = Date.now();
+  while (Date.now() - inicio < ms) {
+    await new Promise(r => setTimeout(r, 500));
+    if (haContaDeDisparo()) return true;
+  }
+  return haContaDeDisparo();
+}
+
 // Alias mantido para compatibilidade com /qr route
 function iniciarConexao() {
   if (!isConnecting && !sock) conectar();
@@ -1372,11 +1403,11 @@ async function outboxWorker() {
     }
     if (mudou) salvarOutbox();
     if (!outboxFalhas.length) return;
-    if (!conectado || !sock) return;   // socket caido: os itens esperam o proximo ciclo
+    if (!haContaDeDisparo()) return;   // nenhuma conta de disparo: os itens esperam o proximo ciclo
 
     const prontos = outboxFalhas.filter(x => (x.proximaEm || 0) <= agora);
     for (const item of prontos) {
-      if (!conectado || !sock) break;  // caiu no meio: para e volta no proximo ciclo
+      if (!haContaDeDisparo()) break;  // caiu no meio: para e volta no proximo ciclo
       try {
         await enviarMensagem(item.jid, { text: item.texto }, 0, item.conta ? { conta: item.conta } : {});
         const idx = outboxFalhas.indexOf(item);
@@ -2331,6 +2362,16 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
       + (NOMES_GRUPOS.get(destino) || destino) + ' e nenhuma substituta apta — indo pela principal.');
   }
 
+  // Grupo sem conta atribuida (ex.: grupo do operador) com a principal fora do
+  // ar: tenta uma conta de disparo apta antes de esperar a principal. 'principal'
+  // pedida explicitamente (contaPedida) nao entra aqui, nem DM.
+  if (!contaId && tentativa === 0 && !(conectado && sock)
+      && String(destino || '').endsWith('@g.us')
+      && !(usaWhatsmeow('principal', destino) && waEnvioContaConectada('principal'))) {
+    const _subP = await enviarPorContaSubstituta('principal', destino, conteudo, 'fora do ar');
+    if (_subP) return _subP.resultado;
+  }
+
   if (usaWhatsmeow('principal', destino)) {
     const payload = conteudoParaWhatsmeow(conteudo);
     if (payload && waEnvioContaConectada('principal')) {
@@ -2501,9 +2542,9 @@ async function workerFila() {
       await new Promise(r => setTimeout(r, aguardar));
     }
 
-    // 3. Verificar conexão
+    // 3. Verificar conexão (qualquer conta de disparo serve — destino e grupo)
     try {
-      await aguardarConectado();
+      if (!haContaDeDisparo()) await aguardarConectado();
     } catch(e) {
       console.error('[FILA] ' + e.message + '. Recolocando item na fila e aguardando 60s.');
       await new Promise(r => setTimeout(r, 60000));
@@ -5052,7 +5093,7 @@ setInterval(async () => {
     // 2. Condicoes temporais para enviar o proximo da fila
     if (!dentroDaJanelaCupom().ok) return;
     if (agora - _ultimoAutoEnvio < intervaloAutoEnvioMs()) return;
-    if (!conectado || !sock) return;
+    if (!haContaDeDisparo()) return;
 
     // 3. Mais antigo primeiro (ordem de captura)
     const candidatos = filaPendentes
@@ -12876,7 +12917,7 @@ async function radarWorker() {
       await new Promise(r => setTimeout(r, espera));
     }
     try {
-      await aguardarConectado();
+      if (!haContaDeDisparo()) await aguardarConectado();
     } catch(e) {
       console.error('[RADAR] ' + e.message + '. Aguardando 30s.');
       await new Promise(r => setTimeout(r, 30000));
@@ -13454,8 +13495,8 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   // ser aprovado de novo — duplicaria a mensagem nos grupos.
   if (oferta.status === 'enviando') return res.status(409).json({ ok:false, erro:'Este item ja esta sendo enviado agora.' });
   if (oferta.status === 'enviado')  return res.status(409).json({ ok:false, erro:'Este item ja foi enviado.' });
-  if (!conectado || !sock) {
-    const ok = await aguardarSock();
+  if (!haContaDeDisparo()) {
+    const ok = await aguardarContaDeDisparo();
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
   const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
@@ -13833,9 +13874,10 @@ app.post('/enviar', async (req, res) => {
   const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio, conta } = req.body;
   const contaEnvio = contaPedida(conta);
 
-  // Se sock nulo mas server está tentando reconectar, aguarda até 15s
-  if (!conectado || !sock) {
-    const ok = await aguardarSock(15000);
+  // Destino e sempre grupo (resolverGrupo nao aceita DM): qualquer conta de
+  // disparo conectada serve. Sem nenhuma, aguarda ate 15s.
+  if (!haContaDeDisparo()) {
+    const ok = await aguardarContaDeDisparo(15000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado. Acesse /qr para reconectar.' });
   }
   // Apelido multi ('tsp') nao resolve para um JID: a mensagem sai em todos os
@@ -13946,8 +13988,8 @@ async function enviarAnexoHandler(req, res, padraoImagem) {
 
   if (!file && !base64) return res.status(400).json({ ok:false, erro:'Arquivo obrigatorio (campo: imagem/arquivo ou base64).' });
 
-  if (!conectado || !sock) {
-    const ok = await aguardarSock(15000);
+  if (!haContaDeDisparo()) {
+    const ok = await aguardarContaDeDisparo(15000);
     if (!ok) { limpar(); return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' }); }
   }
   // Apelido multi ('tsp'): a mesma imagem sai em todos os grupos da aba Grupos.
@@ -15428,7 +15470,7 @@ setInterval(async () => {
       return;
     }
 
-    if (!conectado || !sock) {
+    if (!haContaDeDisparo()) {
       // Sem WhatsApp nao adianta consumir a fila: adia sem gastar o item.
       ex.proximoEm = Date.now() + 60000;
       atualizarExecucaoLista(lista.id, ex);
@@ -15583,8 +15625,8 @@ app.post('/listas/:id/disparar', async (req, res) => {
 
   // Fila que so comeca daqui a horas nao precisa do WhatsApp ligado agora: o
   // worker adia sozinho enquanto a sessao nao volta.
-  if (!aguardando && (!conectado || !sock)) {
-    const ok = await aguardarSock(10000);
+  if (!aguardando && !haContaDeDisparo()) {
+    const ok = await aguardarContaDeDisparo(10000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
   const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
@@ -15625,8 +15667,8 @@ app.post('/listas/disparo-unico', async (req, res) => {
   const inicio     = tsHojeSP(req.body?.iniciarHora);
   const aguardando = inicio !== null && inicio > Date.now();
 
-  if (!aguardando && (!conectado || !sock)) {
-    const ok = await aguardarSock(10000);
+  if (!aguardando && !haContaDeDisparo()) {
+    const ok = await aguardarContaDeDisparo(10000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
 
@@ -16167,8 +16209,8 @@ app.post('/vitrine', async (req, res) => {
 app.post('/vitrine/disparar', async (req, res) => {
   const asins = Array.isArray(req.body?.asins) ? req.body.asins.filter(Boolean) : [];
   if (!asins.length) return res.status(400).json({ ok:false, erro:'selecione ao menos um produto' });
-  if (!conectado || !sock) {
-    const ok = await aguardarSock();
+  if (!haContaDeDisparo()) {
+    const ok = await aguardarContaDeDisparo();
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp não conectado.' });
   }
 
