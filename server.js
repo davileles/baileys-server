@@ -148,7 +148,7 @@ import {
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
 import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram,
-         enviarCardRevisaoTelegram, estadoFaxinaTsp } from './bot-tsp.js';
+         enviarCardRevisaoTelegram, estadoFaxinaTsp, avisarInsercaoMlTelegram } from './bot-tsp.js';
 // Bots de revisao por fluxo. Cada um tem token, chat e fila proprios: o que
 // decide passagem nao e a mesma cabeca (nem o mesmo momento) do que decide
 // oferta de pontos, e misturar os dois num chat so faz um esconder o outro.
@@ -5055,8 +5055,26 @@ async function avisarExtracaoFalhou(texto, canal) {
 // Recusa NAO desativa o cupom aqui. Essa decisao continua com o sync horario,
 // que tem a pagina inteira como contexto — uma resposta isolada pode ser rate
 // limit ou cupom segmentado, e desativar na captura derrubaria oferta valida.
+//
+// INSERCAO ASSISTIDA (padrao desde set/2026): a conta TSP tomou restricao no
+// input-code depois de meses de insercao automatizada a partir do Railway. Agora
+// o servidor NAO insere nada: o cupom entra na lista /inserir do bot do Telegram
+// e o operador insere do proprio celular, marcando o desfecho ali. O caminho
+// automatico abaixo so volta com CUPONS_ML_INSERCAO_AUTO=1 (e exige tambem
+// CUPONS_ML_PAUSADO=0 no radar-ml.js).
+const INSERCAO_ML_AUTO = String(process.env.CUPONS_ML_INSERCAO_AUTO || '0') === '1';
+
 function ativarCupomCapturadoMl(c, reg) {
   if (!c || c.loja !== 'Mercado Livre' || !c.codigo) return;
+  if (!INSERCAO_ML_AUTO) {
+    // O bot e da TSP: cupom capturado no contexto de outro tenant nao entra
+    // na lista (ela le a base do tenant raiz).
+    const tenant = tenantContexto() || TENANT_PADRAO;
+    if (tenant === TENANT_PADRAO && reg && reg.confirmadoNoMl !== true && !reg.insercaoMl) {
+      try { avisarInsercaoMlTelegram(); } catch (e) { console.warn('[CUPONS-ML] Aviso de insercao falhou:', e.message); }
+    }
+    return;
+  }
   if (!tokenAffOk()) return;
   ativarCupomMl(c.codigo).then(r => {
     if (r.ok || r.jaTinha) {
@@ -19131,6 +19149,9 @@ bootBotTsp({
   enviarMensagem,
   radarDestinos,
   salvarFila,
+  // Lista /inserir (insercao manual de cupons na conta do ML).
+  listarCuponsBase,
+  atualizarCupomBase,
   // Operacao pelo celular: /reconectar (com confirmacao) e /status no proprio bot.
   forcarReconexao,
   status: () => ({

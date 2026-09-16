@@ -924,6 +924,8 @@ async function limparChat(chatId, msgId, ctx) {
   const preservar = new Set();
   const daFila = msgDaFila.get(String(chatId));
   if (daFila) preservar.add(Number(daFila));
+  const daInsercao = msgInsercao.get(String(chatId));
+  if (daInsercao) preservar.add(Number(daInsercao));
   for (const [chave, ofertaId] of cardsAbertos) {
     const corte = chave.lastIndexOf(':');
     if (chave.slice(0, corte) !== String(chatId)) continue;
@@ -1142,6 +1144,154 @@ function formatarStatusBot(st) {
   return partes.join('\n');
 }
 
+// ── INSERCAO ASSISTIDA DE CUPONS NO ML (/inserir) ────────────────────────────
+// O servidor nao insere mais cupom na conta do Mercado Livre: a insercao
+// automatizada a partir do Railway rendeu restricao antifraude no input-code.
+// Todo cupom do ML que entra na base sem confirmacao na conta cai nesta lista;
+// o operador copia o codigo (toque no <code>), insere pelo proprio celular e
+// marca o desfecho. Nada aqui chama o ML.
+//
+// A lista e UMA mensagem por chat. Captura nova agrupa por 20s e reenvia a
+// lista no fim do chat (apagando a anterior), para notificar sem empilhar.
+const URL_CUPONS_ML = 'https://www.mercadolivre.com.br/cupons';
+const MAX_INSERCAO = 15;
+const AVISO_INSERCAO_MS = 20 * 1000;
+const RITMO_JANELA_MS = 60 * 60 * 1000;
+const RITMO_ALERTA = 10;           // insercoes marcadas na ultima hora
+
+const msgInsercao = new Map();     // chatId -> message_id da lista
+const _insercoesMarcadas = [];     // timestamps de "inseri" (memoria; so p/ ritmo)
+let _timerInsercao = null;
+
+function ehCupomMl(r) { return /mercado\s*livre/i.test(String(r && r.loja || '')); }
+
+function pendentesInsercaoMl() {
+  if (!dep || !dep.listarCuponsBase) return [];
+  return dep.listarCuponsBase()
+    .filter(r => ehCupomMl(r) && r.codigo && r.ativo !== false && r.confirmadoNoMl !== true && !r.insercaoMl)
+    // Quem vence primeiro vem primeiro.
+    .sort((a, b) => (Date.parse(a.validadeAte) || 0) - (Date.parse(b.validadeAte) || 0));
+}
+
+function insercoesUltimaHora() {
+  const corte = Date.now() - RITMO_JANELA_MS;
+  while (_insercoesMarcadas.length && _insercoesMarcadas[0] < corte) _insercoesMarcadas.shift();
+  return _insercoesMarcadas.length;
+}
+
+function linhaInsercao(r, i) {
+  const partes = [valorCupomTxt(r)];
+  if (r.minimo != null) partes.push('mín ' + brlCurto(r.minimo));
+  if (r.limite != null) partes.push('teto ' + brlCurto(r.limite));
+  if (r.maximo != null) partes.push('produtos até ' + brlCurto(r.maximo));
+  const capt = horaCurta(r.capturadoEm);
+  return (i + 1) + '. <code>' + esc(r.codigo) + '</code>' + (r.restrito ? ' 🎯' : '') + '\n'
+    + '    ' + esc(partes.join(' · ')) + (capt ? ' · capturado ' + esc(capt) : '');
+}
+
+async function mostrarInsercao(chatId, msgId) {
+  let todos;
+  try { todos = pendentesInsercaoMl(); }
+  catch (e) { return falarPlano(chatId, '❌ Não consegui ler a base de cupons: ' + e.message, null, msgId); }
+
+  const abrirMl = [{ text: '🛒 Abrir cupons do ML', url: URL_CUPONS_ML }];
+  const atualizar = [{ text: '🔄 Atualizar', callback_data: 'm:lista' }];
+  let html, kb;
+
+  if (!todos.length) {
+    html = '✅ <b>Nenhum cupom do Mercado Livre esperando inserção.</b>';
+    kb = { inline_keyboard: [atualizar] };
+  } else {
+    const mostrados = todos.slice(0, MAX_INSERCAO);
+    const ritmo = insercoesUltimaHora();
+    html = '➕ <b>Cupons para inserir no Mercado Livre</b> (' + todos.length + ')\n\n'
+      + mostrados.map(linhaInsercao).join('\n\n')
+      + (todos.length > mostrados.length ? '\n\n<i>+' + (todos.length - mostrados.length) + ' na sequência — aparecem conforme você resolve estes.</i>' : '')
+      + '\n\nToque no código para copiar e cole em <b>Inserir código</b>.'
+      + '\n✅ inseri · 🗑 vencido/esgotado (desativa) · ⏭ pular (sai da lista, segue ativo)'
+      + '\n<i>Deu erro de conta ao inserir? Não marque nada e pare de inserir por 24–48h.</i>'
+      + (ritmo >= RITMO_ALERTA ? '\n\n⚠️ ' + ritmo + ' inserções marcadas na última hora — espace as próximas.' : '');
+    kb = { inline_keyboard: [
+      abrirMl,
+      ...mostrados.map(r => [
+        { text: '✅ ' + r.codigo, callback_data: ('m:ok:' + r.chave).slice(0, 64) },
+        { text: '🗑', callback_data: ('m:venc:' + r.chave).slice(0, 64) },
+        { text: '⏭', callback_data: ('m:pular:' + r.chave).slice(0, 64) },
+      ]),
+      atualizar,
+    ]};
+  }
+
+  const res = await falarHtml(chatId, html, kb, msgId);
+  const alvo = res?.message_id || msgId;
+  if (alvo) msgInsercao.set(String(chatId), alvo);
+  return res;
+}
+
+async function tratarInsercao(chatId, msgId, data, ctx) {
+  const m = /^m:(ok|venc|pular|lista)(?::(.+))?$/.exec(data);
+  if (!m) return;
+  const [, acao, chave] = m;
+  if (acao === 'lista') return mostrarInsercao(chatId, msgId);
+
+  // Chave com mais de 64 bytes chega truncada no callback; casa por prefixo.
+  const reg = (dep.listarCuponsBase() || []).find(r => r.chave === chave)
+    || (chave && chave.length >= 50 ? (dep.listarCuponsBase() || []).find(r => String(r.chave).startsWith(chave)) : null);
+  if (!reg) {
+    if (ctx) await ctx.toast('Esse cupom não está mais na base.');
+    return mostrarInsercao(chatId, msgId);
+  }
+
+  let nota;
+  try {
+    if (acao === 'ok') {
+      dep.atualizarCupomBase(reg.chave, { confirmadoNoMl: true, insercaoMl: 'inserido' });
+      _insercoesMarcadas.push(Date.now());
+      const ritmo = insercoesUltimaHora();
+      nota = '✅ ' + reg.codigo + ' marcado como inserido.'
+        + (ritmo >= RITMO_ALERTA ? ' ⚠️ ' + ritmo + ' na última hora — espace as próximas.' : '');
+    } else if (acao === 'venc') {
+      const campos = { ativo: false, insercaoMl: 'recusado' };
+      if (!reg.observacao) campos.observacao = 'Não entrou no ML (vencido/esgotado) — marcado no bot';
+      dep.atualizarCupomBase(reg.chave, campos);
+      nota = '🗑 ' + reg.codigo + ' desativado — não entra mais nas ofertas.';
+    } else {
+      dep.atualizarCupomBase(reg.chave, { insercaoMl: 'ignorado' });
+      nota = '⏭ ' + reg.codigo + ' saiu da lista (continua ativo na base).';
+    }
+  } catch (e) {
+    nota = '❌ ' + reg.codigo + ': ' + e.message;
+  }
+  if (ctx) await ctx.toast(nota);
+  return mostrarInsercao(chatId, msgId);
+}
+
+/**
+ * Chamado pelo server.js quando um cupom do ML entra na base sem confirmacao
+ * na conta. Agrupa capturas proximas (lote do Telegram) numa unica notificacao.
+ */
+export function avisarInsercaoMlTelegram() {
+  if (!TOKEN || !ADMINS.size || !dep || !dep.listarCuponsBase) return;
+  if (_timerInsercao) return;
+  _timerInsercao = setTimeout(async () => {
+    _timerInsercao = null;
+    for (const chatId of ADMINS) {
+      try {
+        // Lista nova no fim do chat (com notificacao); a anterior sai para nao
+        // haver duas listas com estados diferentes.
+        const anterior = msgInsercao.get(String(chatId));
+        if (anterior) {
+          await tg('deleteMessage', { chat_id: chatId, message_id: anterior });
+          msgInsercao.delete(String(chatId));
+        }
+        if (!pendentesInsercaoMl().length) continue;
+        await mostrarInsercao(chatId);
+      } catch (e) { console.warn('[BOT-TSP] Aviso de insercao ML para ' + chatId + ' falhou:', e.message); }
+    }
+  }, AVISO_INSERCAO_MS);
+  _timerInsercao.unref?.();
+}
+
 // ── ROTEADOR ─────────────────────────────────────────────────────────────────
 function autorizado(chatId) {
   return ADMINS.size === 0 ? false : ADMINS.has(String(chatId));
@@ -1152,6 +1302,7 @@ const MENU_KB = () => teclado([
   [['🏷️ Cupom', 'a:novo:cupom'], ['🛍️ Oferta', 'a:novo:oferta']],
   [['📢 Mensagem livre', 'a:novo:msg']],
   [['📋 Fila de aprovação', 'r:fila:0']],
+  [['➕ Inserir cupons no ML', 'm:lista']],
 ]);
 
 async function tratarTexto(chatId, texto, msgEntrada) {
@@ -1166,6 +1317,7 @@ async function tratarTexto(chatId, texto, msgEntrada) {
   if (/^\/msg/i.test(t))    return abrirLivre(chatId);
 
   if (/^\/fila/i.test(t)) { sessoes.delete(String(chatId)); return mostrarFila(chatId); }
+  if (/^\/inserir/i.test(t)) { sessoes.delete(String(chatId)); return mostrarInsercao(chatId); }
 
   if (/^\/limpar/i.test(t)) {
     sessoes.delete(String(chatId));
@@ -1276,6 +1428,8 @@ async function tratarBotao(chatId, msgId, data, ctx) {
   // Revisao de oferta da fila: ancorada no id do item, nao na sessao — o card
   // continua funcionando depois de um redeploy ou dias depois.
   if (partes[0] === 'r') return tratarRevisao(chatId, msgId, partes, ctx);
+  // Lista de insercao no ML: ancorada na chave do cupom, sem sessao.
+  if (partes[0] === 'm') return tratarInsercao(chatId, msgId, data, ctx);
 
   const s = sessao(chatId);
   const [ns, chave, valor] = partes;
@@ -1392,6 +1546,8 @@ const travas = new Set();
 function chaveTrava(chatId, data) {
   const r = /^r:(enviar|descartar):(.+)$/.exec(data);
   if (r) return chatId + ':r:' + r[2];
+  const mi = /^m:(ok|venc|pular):(.+)$/.exec(data);
+  if (mi) return chatId + ':m:' + mi[2];
   if (/^a:(enviar|fila|base|forcar)$/.test(data)) return chatId + ':a:envio';
   return null;
 }
@@ -1413,7 +1569,7 @@ export async function tratarUpdateBotTsp(update) {
       // Toque que resolve o item guarda a resposta para o fim: e nela que vai o
       // desfecho. Os demais respondem ja, senao o botao fica girando enquanto o
       // servidor remonta a mensagem.
-      if (!/^(r:(enviar|descartar):|a:limpar:go)/.test(cq.data || '')) await ctx.toast();
+      if (!/^(r:(enviar|descartar):|a:limpar:go|m:(ok|venc|pular):)/.test(cq.data || '')) await ctx.toast();
       if (trava) travas.add(trava);
       try {
         return await tratarBotao(chatId, cq.message.message_id, cq.data || '', ctx);
@@ -1459,6 +1615,7 @@ export async function bootBotTsp(deps) {
     { command: 'oferta',   description: 'Criar uma oferta a partir de um link' },
     { command: 'msg',      description: 'Mensagem livre para os grupos' },
     { command: 'fila',     description: 'Ofertas de produto esperando decisão' },
+    { command: 'inserir',  description: 'Cupons do ML para inserir na conta' },
     { command: 'limpar',   description: 'Apagar do chat o que já foi aprovado ou descartado' },
     { command: 'status',   description: 'Ver a saúde do servidor (WhatsApp, fila, publicações)' },
     { command: 'reconectar', description: 'Reconectar o WhatsApp (com confirmação)' },

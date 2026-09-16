@@ -1284,6 +1284,11 @@ export function registrarCupomBase(c) {
     // sobreviver a recaptura: sem isso o sync do ML trata todo cupom conhecido
     // como "nunca ativado" e nunca desativa nada.
     confirmadoNoMl: c.confirmadoNoMl === true || anterior?.confirmadoNoMl === true,
+    // Desfecho da insercao MANUAL na conta do ML, marcado pelo operador no bot
+    // (/inserir): 'inserido' | 'recusado' (vencido/esgotado) | 'ignorado'
+    // (pulado). Sobrevive a recaptura: um cupom ja resolvido nao pode voltar
+    // para a lista de insercao so porque reapareceu num canal.
+    insercaoMl: c.insercaoMl !== undefined ? c.insercaoMl : (anterior?.insercaoMl ?? null),
     // Cupom que so vale numa selecao fechada de produtos (linha especifica,
     // marca, itens escolhidos pelo vendedor). Nao pode entrar em oferta
     // generica: o desconto anunciado simplesmente nao existiria no checkout do
@@ -1349,7 +1354,7 @@ export function atualizarCupomBase(chave, campos = {}) {
   if (campos.ativo === true && cupomExpirado(reg) && !esticaValidade) {
     throw new Error('cupom ' + (reg.codigo || chave) + ' esta expirado — ajuste a validade antes de ativar');
   }
-  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja', 'confirmadoNoMl', 'restrito']) {
+  for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja', 'confirmadoNoMl', 'restrito', 'insercaoMl']) {
     if (campos[k] !== undefined) reg[k] = campos[k];
   }
   // Mexer na validade nao pode deixar um vencido ligado por descuido.
