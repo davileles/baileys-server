@@ -7120,6 +7120,87 @@ function contasLeitorasAtivas() {
   return [...new Set([_idDaConta(contaLeitoraCdv()), _idDaConta(contaLeitoraTsp())])];
 }
 
+// ── RESERVA DE LEITURA (principal fora -> contas de disparo leem) ───────────
+// contaLeitoraDe() so devolve a leitura PARA a principal. Com a principal
+// lendo CDV e TSP, uma queda dela deixava os dois conjuntos cegos: ofertas e
+// alertas que passam enquanto ela esta fora se perdem para sempre.
+//
+// Agora, quando a leitora efetiva e a principal e ela NAO esta lendo
+// (desconectada, sem socket ou em escada de surdez — o zumbi conectado e mudo
+// de 22/08), qualquer conta secundaria do tenant padrao conectada vira leitora
+// daquele grupo. Nao ha escolha de "qual tico": quem receber primeiro processa
+// e o dedup por key.id descarta a copia das outras. Assim o grupo so fica cego
+// se NENHUMA conta estiver nele.
+//
+// Os ids lidos em reserva ficam guardados por 24h: quando a principal volta,
+// o sync entrega o backlog como 'append', e sem isto mensagem ja processada
+// por um tico (fora da janela de 15 min do dedup) viraria oferta/alerta dobrado.
+function _principalLendo() {
+  return !!(conectado && sock && _surdezEstado === 'ok');
+}
+
+function leituraEmReserva(jid) {
+  return contaLeitoraDe(jid) === 'principal' && !_principalLendo();
+}
+
+function _contaPodeSerReservaLeitura(contaId) {
+  if (!contaId || contaId === 'principal' || contaId === WM_LEITOR) return false;
+  if (tenantDaConta(contaId) !== TENANT_PADRAO) return false;
+  return _leitorVivo(contaId);
+}
+
+const _idsLidosEmReserva = new Map();   // key.id -> timestamp
+const IDS_RESERVA_TTL_MS = 24 * 3600e3;
+const IDS_RESERVA_MAX    = 5000;
+function _marcarLidoEmReserva(msg) {
+  const id = msg?.key?.id; if (!id) return;
+  const agora = Date.now();
+  _idsLidosEmReserva.set(id, agora);
+  if (_idsLidosEmReserva.size > IDS_RESERVA_MAX) {
+    for (const [k, t] of _idsLidosEmReserva) if (agora - t > IDS_RESERVA_TTL_MS) _idsLidosEmReserva.delete(k);
+    while (_idsLidosEmReserva.size > IDS_RESERVA_MAX) _idsLidosEmReserva.delete(_idsLidosEmReserva.keys().next().value);
+  }
+}
+function _jaLidoEmReserva(msg) {
+  const id = msg?.key?.id; if (!id) return false;
+  const t = _idsLidosEmReserva.get(id);
+  return !!t && (Date.now() - t) < IDS_RESERVA_TTL_MS;
+}
+
+function contasReservaLeitura() {
+  return [...contasExtras.keys()].filter(_contaPodeSerReservaLeitura).map(apelidoDaConta).sort();
+}
+
+// Transicao entrou/saiu da reserva: log + alerta uma vez por episodio.
+let _reservaLeituraDesde = 0;
+setInterval(() => {
+  // Leitora efetiva de cada operacao (ignora as fontes: basta saber se alguma
+  // operacao depende da principal agora).
+  const dependePrincipal = [contaLeitoraCdv(), contaLeitoraTsp()].some(a => {
+    const id = _idDaConta(a);
+    return id === 'principal' || !_leitorVivo(id);
+  });
+  const emReserva = dependePrincipal && !_principalLendo();
+  if (emReserva && !_reservaLeituraDesde) {
+    _reservaLeituraDesde = Date.now();
+    const reservas = contasReservaLeitura();
+    const motivo = (!conectado || !sock) ? 'desconectada' : 'surda (' + _surdezEstado + ')';
+    console.warn('[LEITURA] Principal ' + motivo + ' — leitura em RESERVA por: '
+      + (reservas.join(', ') || 'nenhuma conta conectada') + '.');
+    registrarAlerta({
+      nivel: 'critico', origem: 'whatsapp', chave: 'leitura-reserva',
+      titulo: 'Principal fora da leitura — contas de disparo assumiram',
+      corpo: 'A conta principal esta ' + motivo + '. Os grupos do CDV e as fontes do TSP passam a ser lidos por: '
+           + (reservas.join(', ') || 'NENHUMA conta conectada — captura parada') + '. '
+           + 'So sao cobertos os grupos em que essas contas estao. A leitura volta para a principal sozinha quando ela reconectar.',
+    }).catch(() => {});
+  } else if (!emReserva && _reservaLeituraDesde) {
+    const min = Math.round((Date.now() - _reservaLeituraDesde) / 60000);
+    _reservaLeituraDesde = 0;
+    console.log('[LEITURA] Principal voltou a ler — reserva encerrada apos ' + min + ' min.');
+  }
+}, 60 * 1000);
+
 // Pulso de inbound POR conta leitora. O watchdog historico vigia um unico
 // _health.ultimoUpsertEm: com leitura separada, o numero do CDV poderia ficar
 // surdo por horas enquanto o do TSP recebe normalmente — e a escada de
@@ -7146,8 +7227,17 @@ function estadoLeitorWhatsmeow() {
 // outra e o grupo ficaria sem processamento nenhum.
 async function despacharParaPipeline(msg, ctx) {
   const jid = msg.key?.remoteJid;
-  if (contaLeitoraDe(jid) !== ctx.contaId) return false;
+  const dona = contaLeitoraDe(jid);
+  // Principal fora da leitura: secundaria conectada assume (ver RESERVA DE
+  // LEITURA). So vale para grupos com operacao dona (CDV/TSP) — conversa
+  // direta, bot e campanha continuam exclusivos da principal.
+  const reserva = dona === 'principal' && ctx.contaId !== 'principal'
+    && (ehMonitoradoCdv(jid) || ehFonteRadar(jid))
+    && !_principalLendo() && _contaPodeSerReservaLeitura(ctx.contaId);
+  if (dona !== ctx.contaId && !reserva) return false;
+  if (_jaLidoEmReserva(msg)) return false;
   if (_jaProcessado(msg)) return false;
+  if (reserva) _marcarLidoEmReserva(msg);
   if (jid) enfileirarPorGrupo(jid, () => processarMensagem(msg, ctx));
   else await processarMensagem(msg, ctx);
   return true;
@@ -14337,10 +14427,16 @@ function estadoLeitores() {
   const montar = (apelidoCfg, rotulo) => {
     const id = _idDaConta(apelidoCfg);
     const vivo = _leitorVivo(id);
+    const efetiva = (id === 'principal' || vivo) ? apelidoDaConta(id) : 'principal';
+    const emReserva = efetiva === 'principal' && !_principalLendo();
     return {
       operacao: rotulo,
       configurada: apelidoCfg || 'principal',
-      efetiva: (id === 'principal' || vivo) ? apelidoDaConta(id) : 'principal',
+      // Texto legivel nos paineis ("quem le agora e ..."), sem quebrar quem
+      // compara efetiva com o id da conta.
+      efetiva: emReserva ? ('reserva: ' + (contasReservaLeitura().join(', ') || 'nenhuma conta')) : efetiva,
+      // Contas que estao lendo no lugar da principal (vazio fora da reserva).
+      reserva: emReserva ? contasReservaLeitura() : [],
       conectada: vivo,
       ultimoInboundEm: _pulsoLeitores.get(id) ? new Date(_pulsoLeitores.get(id)).toISOString() : null,
     };
