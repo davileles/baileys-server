@@ -2917,14 +2917,36 @@ const IATA_CIDADES = {
   'OPO':'Porto','FNC':'Madeira','LPA':'Las Palmas','EDI':'Edimburgo',
   'BRU':'Bruxelas','GVA':'Genebra','NCE':'Nice','VCE':'Veneza','ZAG':'Zagreb',
   'IST':'Istambul','TPE':'Taipei','NGO':'Nagoia','HNL':'Honolulu',
+  'VVI':'Santa Cruz de la Sierra',
 };
 
-// Grafias alternativas que a IA as vezes devolve em ingles ou sem acento.
+// Grafias alternativas que a IA as vezes devolve em ingles, sem acento ou com
+// erro de digitacao. Aplicado em resolverCidade(), ou seja na SAIDA da extracao:
+// o nome canonico nasce na captura e desce igual para mensagem, link de
+// afiliado e registro em passagens.json. Espelha ALIAS_CIDADE de
+// painel-cdv/index.js, que segue sendo a rede de seguranca do historico 180d.
 const CIDADE_ALIAS = {
-  'amsterdam':'Amsterdã', 'cape town':'Cidade do Cabo', 'sao francisco':'São Francisco',
-  'san jose':'San José', 'uberlandia':'Uberlândia', 'mexico city':'Cidade do México',
-  'new york':'Nova York', 'lisbon':'Lisboa', 'rome':'Roma', 'milan':'Milão',
-  'panama city':'Cidade do Panamá', 'shangai':'Xangai', 'singapora':'Singapura',
+  'amsterdam':'Amsterdã', 'amsterda':'Amsterdã',
+  'cape town':'Cidade do Cabo', 'capetown':'Cidade do Cabo',
+  'panama':'Cidade do Panamá', 'panama city':'Cidade do Panamá', 'ciudad de panama':'Cidade do Panamá',
+  'sao francisco':'São Francisco', 'san francisco':'São Francisco',
+  'san jose':'San José', 'uberlandia':'Uberlândia',
+  'mexico city':'Cidade do México',
+  'new york':'Nova York', 'nova iorque':'Nova York',
+  'lisbon':'Lisboa', 'rome':'Roma', 'milan':'Milão',
+  'bangkok':'Bangcoc',
+  'shangai':'Xangai', 'shanghai':'Xangai',
+  'singapora':'Singapura', 'singapore':'Singapura',
+  'sidney':'Sydney',
+  'caixias do sul':'Caxias do Sul',
+  'santiago do chile':'Santiago', 'santiago de chile':'Santiago',
+  'st maarten':'St. Maarten', 'st marteen':'St. Maarten', 'sint maarten':'St. Maarten',
+  'mauricio':'Ilhas Maurício', 'ilhas mauricio':'Ilhas Maurício',
+  'vvi':'Santa Cruz de la Sierra', 'santa cruz de la sierra':'Santa Cruz de la Sierra',
+  'iguazu':'Foz do Iguaçu',
+  'taiwan':'Taipei',
+  'copenhagen':'Copenhague',
+  'brigetown':'Bridgetown',
 };
 
 // Reverso de IATA_CIDADES: cidade → aeroporto principal. Como o objeto acima
@@ -2941,7 +2963,8 @@ const CIDADE_IATA = (function () {
 })();
 
 function normalizarCidade(s) {
-  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[.]/g, '').replace(/\s+/g, ' ').trim();
 }
 
 function iataDaCidade(nome) {
@@ -3007,9 +3030,14 @@ function extrairDatasISO(str, ref) {
   return [...out].sort();
 }
 
+// Funil unico de nome de cidade: toda emissao passa por aqui (classificacao e
+// agrupamento) antes de virar mensagem. Com o codigo IATA conhecido a tabela ja
+// entrega o nome canonico; sem codigo, o alias evita que "Amsterdam" e
+// "Amsterdã" saiam como duas rotas diferentes.
 function resolverCidade(codigo, nomeIA) {
   if (codigo && IATA_CIDADES[codigo.toUpperCase()]) return IATA_CIDADES[codigo.toUpperCase()];
-  return nomeIA || codigo || '-';
+  const bruto = nomeIA || codigo || '-';
+  return CIDADE_ALIAS[normalizarCidade(bruto)] || bruto;
 }
 
 // ── CONSTANTES CDV ────────────────────────────────────────────────────────────
