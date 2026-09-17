@@ -5128,11 +5128,7 @@ setInterval(async () => {
       if (o.autoAvaliacao) o.autoAvaliacao.motivo += ' — prazo de auto-envio expirado, requer aprovacao manual';
       salvarFila();
       console.log(`[AUTO-FILA] Cupom #${o.id} expirou o prazo de auto-envio — caindo para aprovacao manual.`);
-      try {
-        await enviarMensagem(GRUPOS.operador, {
-          text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
-        });
-      } catch(e) { console.warn('[AUTO-FILA] Falha ao avisar operador:', e.message); }
+      // Aviso "Novo cupom capturado" no grupo do operador removido a pedido (set/2026).
     }
 
     // 2. Condicoes temporais para enviar o proximo da fila
@@ -5163,11 +5159,7 @@ setInterval(async () => {
       await despacharCupomAuto(oferta);
       salvarFila();
       console.log(`[AUTO-FILA] Cupom #${oferta.id} ENVIADO automaticamente (espacamento) — ${rotulo}`);
-      try {
-        await enviarMensagem(GRUPOS.operador, {
-          text: `*Cupom enviado automaticamente* 🤖\n\n${rotulo}\n\nOrigem: ${oferta.grupoOrigem || '?'}`
-        });
-      } catch(e) { console.warn('[AUTO-FILA] Falha ao avisar operador:', e.message); }
+      // Aviso "Cupom enviado automaticamente" no grupo do operador removido a pedido (set/2026).
     } catch(err) {
       oferta.status = 'pendente';
       delete oferta.autoAgendado;
@@ -5175,11 +5167,6 @@ setInterval(async () => {
       if (oferta.autoAvaliacao) oferta.autoAvaliacao.motivo += ' — falha no envio automatico, requer aprovacao manual';
       salvarFila();
       console.error(`[AUTO-FILA] Falha no envio do cupom #${oferta.id}: ${err.message} — caindo para aprovacao manual`);
-      try {
-        await enviarMensagem(GRUPOS.operador, {
-          text: '*Novo cupom capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
-        });
-      } catch(e) { console.warn('[AUTO-FILA] Falha ao avisar operador:', e.message); }
     }
   } finally { _workerAutoRodando = false; }
 }, 15 * 1000);
@@ -5360,11 +5347,7 @@ async function enfileirarCupomTSP(c, ctx = {}) {
       await despacharCupomAuto(oferta);
       salvarFila();
       console.log(`[AUTO] Cupom #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
-      try {
-        await enviarMensagem(GRUPOS.operador, {
-          text: `*Cupom enviado automaticamente* 🤖\n\n${rotulo}\n\nOrigem: ${origem}`
-        });
-      } catch(e) { console.warn('[AUTO] Falha ao avisar operador:', e.message); }
+      // Aviso "Cupom enviado automaticamente" no grupo do operador removido a pedido (set/2026).
       return { oferta, veredito, enviado: true };
     } catch(err) {
       // Falha no envio: cai para a fila manual em vez de perder o cupom.
@@ -5386,15 +5369,16 @@ async function enfileirarCupomTSP(c, ctx = {}) {
     return { oferta, veredito, agendado: true };
   }
 
-  // Alerta de novo cupom no grupo do operador
-  try {
-    await enviarMensagem(GRUPOS.operador, {
-      text: (oferta.retidoPorIdade
-              ? `*Cupom retido (mensagem antiga)* ⏸️\n\n${rotulo}\n${oferta.autoAvaliacao.motivo}\n\n`
-              : '*Novo cupom capturado* ✅\n\n')
-            + 'Aprove aqui: https://davileles.github.io/tudo-sobre-promos/'
-    });
-  } catch(e) { console.warn('[FILA] Falha ao enviar alerta de cupom:', e.message); }
+  // "Novo cupom capturado" no grupo do operador removido a pedido (set/2026).
+  // Continua so o aviso de cupom retido por mensagem antiga.
+  if (oferta.retidoPorIdade) {
+    try {
+      await enviarMensagem(GRUPOS.operador, {
+        text: `*Cupom retido (mensagem antiga)* ⏸️\n\n${rotulo}\n${oferta.autoAvaliacao.motivo}\n\n`
+              + 'Aprove aqui: https://davileles.github.io/tudo-sobre-promos/'
+      });
+    } catch(e) { console.warn('[FILA] Falha ao enviar alerta de cupom:', e.message); }
+  }
 
   return { oferta, veredito, enviado: false };
 }
@@ -5475,13 +5459,7 @@ async function despacharBlocoCupons(bloco, ctx = {}) {
     await despacharCupomAuto(oferta);
     salvarFila();
     console.log(`[AUTO] Lote #${oferta.id} ENVIADO automaticamente — ${rotulo}`);
-    try {
-      await enviarMensagem(GRUPOS.operador, {
-        text: `*Lote de cupons enviado automaticamente* 🤖\n\n${rotulo}\n`
-          + bloco.map(c => `· ${c.codigo || 'sem código'} — ${c.valor}${c.tipo === 'pct' ? '%' : ' R$'}`).join('\n')
-          + `\n\nOrigem: ${origem}`
-      });
-    } catch(e) { console.warn('[AUTO] Falha ao avisar operador:', e.message); }
+    // Aviso "Lote de cupons enviado automaticamente" no grupo do operador removido a pedido (set/2026).
     return { oferta, enviado: true };
   } catch(err) {
     // Falha no envio: vira aprovacao manual em vez de perder a lista.
@@ -5489,11 +5467,6 @@ async function despacharBlocoCupons(bloco, ctx = {}) {
     delete oferta.enviandoDesde;
     salvarFila();
     console.error(`[AUTO] Falha no envio do lote #${oferta.id}: ${err.message} — caindo para fila`);
-    try {
-      await enviarMensagem(GRUPOS.operador, {
-        text: '*Novo lote de cupons capturado* ✅\n\nAprove aqui: https://davileles.github.io/tudo-sobre-promos/'
-      });
-    } catch(e) { console.warn('[FILA] Falha ao enviar alerta de lote:', e.message); }
     return { oferta, enviado: false };
   }
 }
