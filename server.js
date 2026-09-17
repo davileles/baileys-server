@@ -105,7 +105,7 @@ import {
 // CDV eram hardcode aqui embaixo; agora sao cadastro em tela, como no TSP.
 import {
   carregarConfigCdv, configCdv, salvarConfigCdv, PAPEIS_CDV,
-  grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv,
+  grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv, grupoExecutivaCdv,
   gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
   entradaCdv, gruposEntradaCdv,
@@ -624,6 +624,9 @@ const GRUPOS = {
   get tsp_cupons() { return gruposTspCupons(); },
   get cdv_ofertas() { return grupoOfertasCdv(); },
   get cdv_emissao() { return grupoEmissaoCdv(); },
+  // Copia das emissoes em executiva (grupo dos clientes do Concierge). Vazio =
+  // sem copia; resolverGrupo devolve '' e o envio direto para o apelido falha.
+  get cdv_executiva() { return grupoExecutivaCdv() || null; },
   // Grupo interno do operador — avisos operacionais que NAO vao para clientes
   // (novo cupom capturado, falha de coleta, etc).
   get operador()   { return grupoOperadorTsp(); },
@@ -2522,6 +2525,46 @@ async function aguardarContaDeEnvio(destino) {
     .catch(() => {});
 }
 
+// ── COPIA DAS EMISSOES EM EXECUTIVA ─────────────────────────────────────────
+// Toda emissao que sai no grupo de emissoes do CDV com cabine Executiva (ou
+// Primeira Classe) e repetida no grupo "Emissões em executiva - CDV", onde
+// ficam os clientes do Concierge. A copia nasce AQUI, no ponto de saida, e nao
+// em cada rota de entrada: radar aprovado, auto-envio, aba Emissao do gestor e
+// agendamento passam todos pela fila — um gancho so cobre todos.
+//
+// A cabine vem dos dados estruturados. So quando eles faltam (envio antigo
+// pela aba Emissao sem snapshot) o texto e consultado.
+function ehCabineExecutiva(dados, mensagem) {
+  const cab = String(dados?.cabine || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  if (cab) return /execut|business|primeira|first/.test(cab);
+  const txt = String(mensagem || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return /\b(executiva|business|primeira classe)\b/i.test(txt);
+}
+
+const PAUSA_COPIA_EXECUTIVA_MS = 8 * 1000;
+
+async function copiarEmissaoExecutiva(destinoOriginal, mensagem, dados, rotulo) {
+  try {
+    const grupoExec = grupoExecutivaCdv();
+    if (!grupoExec) return false;
+    if (destinoOriginal !== grupoEmissaoCdv()) return false;
+    if (grupoExec === destinoOriginal) return false;
+    if (!ehCabineExecutiva(dados, mensagem)) return false;
+    // Pequeno respiro para as duas mensagens nao sairem coladas pelo mesmo numero.
+    await new Promise(r => setTimeout(r, PAUSA_COPIA_EXECUTIVA_MS));
+    await saidaSerializada(() => enviarMensagem(grupoExec, { text: mensagem }));
+    console.log('[EXEC] ✓ Copia da emissao ' + (rotulo || '') + ' enviada ao grupo de executiva.');
+    return true;
+  } catch (e) {
+    // Falha na copia NUNCA desfaz nem repete o envio principal: a emissao ja
+    // saiu no grupo de emissoes. So avisa.
+    console.error('[EXEC] ✗ Falha ao copiar emissao ' + (rotulo || '') + ' para o grupo de executiva:', e.message);
+    avisarAdminsCdv('⚠️ CDV — a emissão ' + (rotulo || '') + ' saiu no grupo de emissões, mas a cópia para o grupo de executiva falhou.\n\nErro: ' + e.message)
+      .catch(() => {});
+    return false;
+  }
+}
+
 async function workerFila() {
   if (workerRodando) return;
   workerRodando = true;
@@ -2597,6 +2640,12 @@ async function workerFila() {
       }
 
       console.log('[FILA] ✓ Oferta #' + item.ofertaId + ' enviada.');
+
+      // Copia para o grupo de executiva (so emissao em executiva no grupo de
+      // emissoes). Conteudo TSP nunca cai aqui: o destino tem que ser o CDV.
+      if (ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
+        await copiarEmissaoExecutiva(item.destino, item.mensagem, de, '#' + item.ofertaId);
+      }
     } catch(e) {
       item.tentativas = (item.tentativas || 0) + 1;
       console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId
@@ -11573,7 +11622,7 @@ app.get('/contas/:id/grupos', async (req, res) => {
       // Destinos do CDV: quem dispara oferta/emissao precisa estar nesses tres
       // grupos, e ate agora nada conferia isso em lugar nenhum.
       const gc = configCdv().grupos || {};
-      const destinosCdv = [gc.ofertas, gc.emissao, gc.operador].filter(Boolean);
+      const destinosCdv = [gc.ofertas, gc.emissao, gc.operador, gc.executiva].filter(Boolean);
       resposta.destinosCdv = { conferidos: destinosCdv.length, faltando: ausentes(destinosCdv) };
       resposta.leitura.aptaAPrincipal =
         resposta.leitura.monitorados.faltando.length === 0 &&
@@ -12036,7 +12085,7 @@ function _gmGruposOperacao(op) {
   const lista = [];
   try {
     if (op === 'cdv') {
-      lista.push(grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv());
+      lista.push(grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv(), grupoExecutivaCdv());
       for (const g of entradaCdv()) lista.push(g.jid);
     } else if (op === 'tsp') {
       lista.push(grupoOperadorTsp(), ...(gruposTspCupons() || []), ...(radarDestinos() || []));
@@ -14109,6 +14158,9 @@ app.post('/enviar', async (req, res) => {
       const lp = preview?.link ? await montarLinkPreviewManual(preview, mensagem) : null;
       await enviarMensagem(grupoId, lp ? { text:mensagem, linkPreview:lp } : { text:mensagem }, 0, { conta: contaEnvio });
       res.json({ ok:true, comPreview: !!lp });
+      // Emissao direta (direto:true) nao passa pela fila: copia aqui, depois de
+      // responder, para o cliente HTTP nao esperar a pausa entre as mensagens.
+      if (isEmissao) copiarEmissaoExecutiva(grupoId, mensagem, dados || null, 'direta').catch(() => {});
     }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
   }
@@ -14588,7 +14640,7 @@ app.get('/config-cdv/conta/:id/grupos', async (req, res) => {
     .filter(j => !noGrupo.has(j))
     .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
 
-  const destinos = [grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv()].filter(Boolean);
+  const destinos = [grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv(), grupoExecutivaCdv()].filter(Boolean);
   const monitorados = gruposMonitoradosCdv();
   res.json({
     ok: true,

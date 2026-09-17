@@ -70,6 +70,14 @@ const CFG_CDV_PADRAO = {
     ofertas: '120363170138704529@g.us',
     // Destino das emissoes (apelido 'cdv_emissao').
     emissao: '120363172490263905@g.us',
+    // Copia das emissoes em EXECUTIVA (apelido 'cdv_executiva'). Toda emissao
+    // que sai no grupo de emissao com cabine Executiva/Primeira Classe tambem
+    // sai aqui — grupo dos clientes do Concierge, para acompanharem as
+    // oportunidades premium sem precisar de atendimento a cada uma.
+    // Vazio = sem copia. O padrao ja aponta para "Emissões em executiva - CDV"
+    // porque a config gravada antes deste campo nao o tem, e o merge por secao
+    // faz o padrao valer ate alguem salvar a aba Config.
+    executiva: '120363413180833130@g.us',
     // Grupo interno de avisos do CDV. Vazio = os avisos vao so para os
     // telefones dos admins com papel 'avisos'. NAO herda o grupo do operador
     // do TSP: sao duas operacoes, e misturar os avisos foi justamente o que
@@ -166,6 +174,7 @@ function estruturar(bruto) {
   out.admins      = normalizarAdmins(out.admins);
   out.grupos.ofertas  = String(out.grupos.ofertas  || '').trim();
   out.grupos.emissao  = String(out.grupos.emissao  || '').trim();
+  out.grupos.executiva = String(out.grupos.executiva || '').trim();
   out.grupos.operador = String(out.grupos.operador || '').trim();
   out.envio.conta     = String(out.envio.conta     || '').trim();
   out.leitura.conta   = String(out.leitura.conta   || '').trim();
@@ -319,6 +328,14 @@ export function salvarConfigCdv(parcial = {}) {
       throw new Error('Grupo de ' + rotulo + ' invalido: informe um JID de grupo (…@g.us).');
     }
   }
+  if (novo.grupos.executiva && !RE_JID_GRUPO.test(novo.grupos.executiva)) {
+    throw new Error('Grupo de emissoes em executiva invalido: informe um JID de grupo (…@g.us) ou deixe vazio.');
+  }
+  // Mesmo grupo nos dois campos = toda emissao em executiva sairia DUAS vezes
+  // no grupo de emissoes.
+  if (novo.grupos.executiva && novo.grupos.executiva === novo.grupos.emissao) {
+    throw new Error('O grupo de emissoes em executiva nao pode ser o mesmo grupo de emissoes.');
+  }
   if (novo.grupos.operador && !RE_JID_GRUPO.test(novo.grupos.operador)) {
     throw new Error('Grupo de avisos invalido: informe um JID de grupo (…@g.us) ou deixe vazio.');
   }
@@ -350,6 +367,7 @@ export function salvarConfigCdv(parcial = {}) {
 
 export function grupoOfertasCdv()  { return configCdv().grupos.ofertas; }
 export function grupoEmissaoCdv()  { return configCdv().grupos.emissao; }
+export function grupoExecutivaCdv() { return configCdv().grupos.executiva; }
 export function grupoAvisosCdv()   { return configCdv().grupos.operador; }
 
 /** JIDs que o radar de milhas le AGORA. Grupo desligado nao entra. */
@@ -404,7 +422,9 @@ export function ehGrupoCdv(jid) {
   const j = String(jid || '').trim();
   if (!j) return false;
   const g = configCdv().grupos;
-  return j === g.ofertas || j === g.emissao;
+  // A copia de executiva e destino do CDV como os outros: sai pela conta de
+  // envio do CDV e fica fora da marca d'agua/tag do TSP.
+  return j === g.ofertas || j === g.emissao || (!!g.executiva && j === g.executiva);
 }
 
 /** Cadastro completo dos grupos de reentrada, ligados e desligados — para a tela. */
