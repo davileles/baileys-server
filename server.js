@@ -2617,7 +2617,7 @@ async function workerFila() {
       // só emissões efetivamente enviadas entram no histórico divulgado.
       // Fallback em item.dados cobre agendamentos cuja oferta já saiu da fila.
       const de = ofertaEnviada?.dadosExtraidos || item.dados || {};
-      if (item.registrar !== false && de.origem && de.destino && de.programa && ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
+      if (item.registrar !== false && de.origem && de.destino && de.programa && !ehPagante(de) && ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
         registrarPassagemProxy({
           origem:      de.origem,
           destino:     de.destino,
@@ -3158,7 +3158,15 @@ function formatarDatas(str) {
 // registro em passagens.json (gravado pelo worker de envio a partir de
 // dadosExtraidos). Metadados internos (indices, origemCodigo, tipo, indice)
 // nao sao editaveis e ficam preservados.
-const CAMPOS_EDITAVEIS_ALERTA = ['origem','destino','cia','programa','pontos','cabine','tipoVoo','datasIda','datasVolta'];
+const CAMPOS_EDITAVEIS_ALERTA = ['origem','destino','cia','programa','pontos','cabine','tipoVoo','datasIda','datasVolta','tarifa','valor','link'];
+
+// TARIFA PAGANTE — emissao comprada em dinheiro no site da cia, sem resgate.
+// Nao tem programa nem pontos, entao: nao entra em passagens.json (poluiria a
+// media/piso de 180d, que sao em pontos), nunca auto-envia e usa um formatador
+// proprio. Ausencia do campo = emissao com milhas, comportamento de sempre.
+function ehPagante(d) {
+  return String((d && d.tarifa) || '').trim().toLowerCase() === 'pagante';
+}
 
 function aplicarDadosEditados(oferta, dados) {
   // Sem payload de campos (ex: painel HTML interno do Baileys), nao mexe em nada.
@@ -3195,7 +3203,29 @@ function rotuloCabine(c) {
   return alta ? r.toUpperCase() : r;
 }
 
+// O "valor" e texto livre de proposito: a fonte ora da o preco do trecho, ora o
+// total de ida e volta, ora com/sem taxas. Normalizar isso em numero perderia a
+// informacao que o membro precisa para julgar a oferta.
+function formatarMensagemPaganteCDV(d) {
+  var n = '\n';
+  var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
+  var valor  = String(d.valor || '').trim();
+  var cab    = d.tipoVoo === 'nacional' ? '' : ' em ' + rotuloCabine(d.cabine);
+  var msg = '';
+  msg += '*'+d.origem+' - '+d.destino+cab+(valor ? ' por '+valor : '')+'*'+n+n;
+  msg += rodape+n+n;
+  msg += '💵 *TARIFA PAGANTE* — emissão em dinheiro direto no site da companhia, sem uso de pontos ou milhas.'+n+n;
+  msg += '✈️ *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
+  msg += '🛬 *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
+  msg += '💺 *CABINE* '+rotuloCabine(d.cabine)+n+n;
+  msg += '✈️ *CIA AÉREA* '+(d.cia||'-')+n+n;
+  msg += '🔗 *LINK* '+(String(d.link||'').trim()||'-')+n+n;
+  msg += rodape;
+  return msg;
+}
+
 function formatarMensagemCDV(d) {
+  if (ehPagante(d)) return formatarMensagemPaganteCDV(d);
   var n = '\n';
   var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
   var balcao = '`Faça parte do Balcão clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
@@ -3399,6 +3429,8 @@ function campoAlertaValido(v) {
 
 function avaliarAutoEnvioAlerta(oferta, hist180) {
   const de  = oferta?.dadosExtraidos || {};
+  // Tarifa pagante nao tem teto/piso para comparar — sempre olho humano.
+  if (ehPagante(de)) return { auto: false, motivo: 'tarifa pagante — sempre para aprovação manual' };
   const pts = Number(de.pontos) || 0;
   // Completude: auto-envio só com TODOS os campos identificados de fato —
   // origem, destino, cia, programa, pontos, cabine e datas de ida. Qualquer
@@ -6172,7 +6204,12 @@ const PROGRAMAS_VALIDOS = 'Programa deve ser um destes: Smiles, Azul Fidelidade,
   + '\n- Em um screenshot, o programa e o DONO DO SITE/APP onde a busca foi feita: logo, cores, menus e rodape identificam o emissor. Textos como "A experiencia a bordo em outras companhias aereas pode ser diferente da Qatar Airways" indicam que o site e da Qatar (programa Privilege Club).'
   + '\n- Frases do tipo "voos operados por X", "operado por X", "esta viagem inclui voos operados por X", "voando pela X" identificam APENAS a cia operadora. NUNCA transforme esse X em programa. Exemplo real: um print do site da Qatar mostrando "Esta viagem inclui voos operados por Latam Airlines Group" e um resgate de 22.000 e programa "Privilege Club" com cia "LATAM" — NAO e "LATAM Pass".'
   + '\n- Um mesmo trecho custa quantidades MUITO diferentes de milhas em cada programa. Errar o programa e mais grave que deixa-lo vazio.'
-  + '\n- Se o programa nao estiver identificado com clareza na fonte, deixe "programa" VAZIO. Nunca deduza o programa a partir da cia operadora.';
+  + '\n- Se o programa nao estiver identificado com clareza na fonte, deixe "programa" VAZIO. Nunca deduza o programa a partir da cia operadora.'
+  + '\n\nTARIFA PAGANTE (emissao em DINHEIRO, sem milhas):'
+  + '\n- Marque "tarifa":"pagante" quando a fonte disser "tarifa pagante", "emissao em dinheiro", "compra no site da cia", ou trouxer SOMENTE preco em reais/dolares sem nenhuma mencao a pontos, milhas ou programa de fidelidade.'
+  + '\n- Nesse caso: "programa" e "pontos" ficam VAZIOS. Preencha "valor" com o preco exatamente como aparece na fonte, dizendo se e por trecho ou ida e volta e se inclui taxas (ex: "R$ 9.494 ida e volta com taxas"), e "link" com a URL do site da companhia, se houver.'
+  + '\n- NUNCA invente um programa de fidelidade para uma tarifa pagante, e NUNCA jogue o preco em reais no campo "pontos".'
+  + '\n- Emissao com milhas mantem "tarifa" vazio.';
 
 // ── DE-PARA: programa → CIA operadora (para voos nacionais BR e fallback) ─────
 const CIA_POR_PROGRAMA = {
@@ -6363,7 +6400,7 @@ async function resolverCiaComImagem(r, item) {
   console.log('   [CIA-IMG] Cia recuperada da imagem: '+norm+' ('+rota+')');
   return norm;
 }
-const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23"}]}';
+const JSON_EXEMPLO = (i) => '{"resultados":[{"valido":true,"indice":'+i+',"origem":"São Paulo","destino":"Cancún","origemCodigo":"GRU","destinoCodigo":"CUN","cia":"LATAM","programa":"LATAM Pass","pontos":"31494","cabine":"Economica","tipoVoo":"internacional","direcao":"ida_volta","datasIda":"Jun/26: 16, 19, 22","datasVolta":"Jun/26: 22, 23","tarifa":"","valor":"","link":""}]}';
 const JSON_INVALIDO = (i) => '{"resultados":[{"valido":false,"indice":'+i+'}]}';
 
 // ── PASSO 1: CLASSIFICAR (CDV) ────────────────────────────────────────────────
@@ -6559,7 +6596,7 @@ async function classificarItens(itens, grupoId) {
       +'2. Se houver IMAGEM junto com texto: a imagem e um screenshot de confirmacao da PRIMEIRA emissao do texto. Use o texto como fonte principal dos dados (programa, milhas, datas). A imagem serve apenas para confirmar dados visuais nao presentes no texto.\n'
       +'3. Priorize SEMPRE os dados do texto sobre os dados da imagem quando houver conflito.\n'
       +'4. DESCARTE imagens que sejam apenas screenshots de resultado de busca sem lista de datas explícita. Para uma imagem ser válida como emissão independente ela DEVE conter: origem, destino, programa/milhas E lista de datas. Se a imagem mostrar apenas o resultado de uma busca (ex: tela de seleção de voo sem datas listadas), descarte-a — ela é apenas uma confirmação visual de outra emissão.\n'
-      +'5. Textos válidos como emissão DEVEM conter: programa de fidelidade, origem, destino, cabine E lista de datas. Textos sem lista de datas não são emissões válidas.\n'
+      +'5. Textos válidos como emissão DEVEM conter: programa de fidelidade (ou preço em dinheiro, no caso de tarifa pagante), origem, destino, cabine E lista de datas. Textos sem lista de datas não são emissões válidas.\n'
       +'\nIMPORTANTE sobre datas: Use as datas do TEXTO quando disponiveis. So leia datas da imagem se o texto nao tiver datas. Normalize para o formato "Mês/Ano: dias". Ex: "Jun/26: 16, 19, 22".\n'
       +'\nIMPORTANTE sobre cidades: use o nome completo da cidade, nao o codigo IATA.\n'
       +'CRITICO: use SEMPRE o codigo IATA do texto quando disponivel. Nunca substitua o codigo IATA correto por outro.\n'
@@ -6591,14 +6628,14 @@ async function agruparEFormatar(classificacoes) {
 
   if (validas.length === 1) {
     const v = validas[0];
-    const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+    const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tarifa:v.tarifa||'', valor:v.valor||'', link:v.link||'', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
     return [{ indices:[v.indice], tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) }];
   }
 
   const grupos = new Map();
   for (const v of validas) {
     const cidadeA = [v.origemCodigo||v.origem, v.destinoCodigo||v.destino].sort().join('-');
-    const chave = (v.programa||'') + '|' + (v.cabine||'Economica') + '|' + cidadeA;
+    const chave = (v.tarifa||'') + '|' + (v.programa||'') + '|' + (v.cabine||'Economica') + '|' + cidadeA;
     if (!grupos.has(chave)) grupos.set(chave, []);
     grupos.get(chave).push(v);
   }
@@ -6611,7 +6648,7 @@ async function agruparEFormatar(classificacoes) {
         const dCur  = contarDatas((cur.datasIda||'') + ' ' + (cur.datasVolta||''));
         return dCur > dBest ? cur : best;
       }, items[0]);
-      const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+      const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tarifa:v.tarifa||'', valor:v.valor||'', link:v.link||'', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
       resultado.push({ indices:items.map(i=>i.indice), tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) });
     }
     return resultado;
@@ -6630,7 +6667,7 @@ async function agruparEFormatar(classificacoes) {
 
   if (emissoes.length === 0) {
     return validas.map(v => {
-      const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+      const dados = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tarifa:v.tarifa||'', valor:v.valor||'', link:v.link||'', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
       return { indices:[v.indice], tipo:v.direcao||'ida', ...dados, mensagem:formatarMensagemCDV(dados) };
     });
   }
@@ -6638,7 +6675,7 @@ async function agruparEFormatar(classificacoes) {
   return emissoes.map(e => {
     const origem  = resolverCidade(e.origemCodigo,  e.origem);
     const destino = resolverCidade(e.destinoCodigo, e.destino);
-    const dados   = { origem, destino, pontos:e.pontos, programa:e.programa, cia:e.cia, cabine:e.cabine||'Economica', tipoVoo:e.tipoVoo||'internacional', datasIda:e.datasIda||'', datasVolta:e.datasVolta||'' };
+    const dados   = { origem, destino, pontos:e.pontos, programa:e.programa, cia:e.cia, cabine:e.cabine||'Economica', tipoVoo:e.tipoVoo||'internacional', tarifa:e.tarifa||'', valor:e.valor||'', link:e.link||'', datasIda:e.datasIda||'', datasVolta:e.datasVolta||'' };
     // A Claude AI retorna índices como posições em `validas` (0,1,2...).
     // Remapeia para os índices reais de `itens` (v.indice) antes de retornar.
     const indicesReais = (e.indices||[]).map(pos => validas[pos]?.indice ?? pos);
@@ -6797,8 +6834,8 @@ async function aguardarParIdaVolta(oferta, grupoId) {
       conteudoOriginal: [base.conteudoOriginal, volta.conteudoOriginal].filter(Boolean).join('\n'),
       imagens: [...(base.imagens||[]), ...(volta.imagens||[])],
     };
-    const hist180Par = await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
-    if (precoForaDaCurva(mesclada.dadosExtraidos?.pontos, hist180Par, mesclada.dadosExtraidos?.tipoVoo)) {
+    const hist180Par = ehPagante(mesclada.dadosExtraidos) ? null : await registrarPassagemProxy({ origem:mesclada.dadosExtraidos?.origem||'', destino:mesclada.dadosExtraidos?.destino||'', cia:mesclada.dadosExtraidos?.cia||'', programa:mesclada.dadosExtraidos?.programa||'', pontos:Number(mesclada.dadosExtraidos?.pontos)||0, cabine:mesclada.dadosExtraidos?.cabine||'Economica', datas_ida:mesclada.dadosExtraidos?.datasIda||'', datas_volta:mesclada.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
+    if (!ehPagante(mesclada.dadosExtraidos) && precoForaDaCurva(mesclada.dadosExtraidos?.pontos, hist180Par, mesclada.dadosExtraidos?.tipoVoo)) {
       console.log('[PAR-BUFFER] Par mesclado descartado pelo filtro 180d: ' + (mesclada.dadosExtraidos?.origemCodigo) + '↔' + (mesclada.dadosExtraidos?.destinoCodigo));
       registrarDescarteCdv({ jid: mesclada.grupoOrigem, motivo: 'preço fora da curva',
         detalhe: precoForaDaCurva.ultimoDetalhe, dados: mesclada.dadosExtraidos,
@@ -6817,9 +6854,9 @@ async function aguardarParIdaVolta(oferta, grupoId) {
     if (_esperandoPar.get(chave)?.oferta === oferta) {
       _esperandoPar.delete(chave);
       // Registra no proxy e appenda histórico (fire-and-update antes de entrar na fila)
-      registrarPassagemProxy({ origem:oferta.dadosExtraidos?.origem||'', destino:oferta.dadosExtraidos?.destino||'', cia:oferta.dadosExtraidos?.cia||'', programa:oferta.dadosExtraidos?.programa||'', pontos:Number(oferta.dadosExtraidos?.pontos)||0, cabine:oferta.dadosExtraidos?.cabine||'Economica', datas_ida:oferta.dadosExtraidos?.datasIda||'', datas_volta:oferta.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true })
+      (ehPagante(oferta.dadosExtraidos) ? Promise.resolve(null) : registrarPassagemProxy({ origem:oferta.dadosExtraidos?.origem||'', destino:oferta.dadosExtraidos?.destino||'', cia:oferta.dadosExtraidos?.cia||'', programa:oferta.dadosExtraidos?.programa||'', pontos:Number(oferta.dadosExtraidos?.pontos)||0, cabine:oferta.dadosExtraidos?.cabine||'Economica', datas_ida:oferta.dadosExtraidos?.datasIda||'', datas_volta:oferta.dadosExtraidos?.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true }))
         .then(hist180 => {
-          if (precoForaDaCurva(oferta.dadosExtraidos?.pontos, hist180, oferta.dadosExtraidos?.tipoVoo)) {
+          if (!ehPagante(oferta.dadosExtraidos) && precoForaDaCurva(oferta.dadosExtraidos?.pontos, hist180, oferta.dadosExtraidos?.tipoVoo)) {
             console.log('[PAR-BUFFER] Somente-ida descartada pelo filtro 180d: ' + (oferta.dadosExtraidos?.origemCodigo) + '->' + (oferta.dadosExtraidos?.destinoCodigo));
             registrarDescarteCdv({ jid: oferta.grupoOrigem, motivo: 'preço fora da curva',
               detalhe: precoForaDaCurva.ultimoDetalhe, dados: oferta.dadosExtraidos,
@@ -6946,9 +6983,9 @@ async function processarBuffer(grupoId) {
       for (const v of validas) {
         const indices = v.indices || [v.indice];
         const textos  = indices.map(i => itens[i]?.texto).filter(Boolean).join('\n');
-        const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
-        const hist180Bypass = await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta_pendente', apenasConsulta:true });
-        if (precoForaDaCurva(dados.pontos, hist180Bypass, dados.tipoVoo)) {
+        const dados   = { origem:v.origem, destino:v.destino, pontos:v.pontos, programa:v.programa, cia:v.cia, cabine:v.cabine||'Economica', tipoVoo:v.tipoVoo||'internacional', tarifa:v.tarifa||'', valor:v.valor||'', link:v.link||'', tipo:v.direcao||'ida', datasIda:v.datasIda||'', datasVolta:v.datasVolta||'' };
+        const hist180Bypass = ehPagante(dados) ? null : await registrarPassagemProxy({ origem:dados.origem, destino:dados.destino, cia:dados.cia, programa:dados.programa, pontos:Number(dados.pontos)||0, cabine:dados.cabine, datas_ida:dados.datasIda, datas_volta:dados.datasVolta, fonte:'alerta_pendente', apenasConsulta:true });
+        if (!ehPagante(dados) && precoForaDaCurva(dados.pontos, hist180Bypass, dados.tipoVoo)) {
           console.log('[BYPASS] Emissão descartada pelo filtro 180d: ' + v.origemCodigo + '->' + v.destinoCodigo + ' (' + v.programa + ')');
           registrarDescarteCdv({ jid: grupoId, motivo: 'preço fora da curva',
             detalhe: precoForaDaCurva.ultimoDetalhe, dados, texto: textos });
@@ -6998,8 +7035,8 @@ async function processarBuffer(grupoId) {
         if (txt && !textosFinal) textosFinal = txt;
       }
 
-      const hist180Normal = await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
-      if (precoForaDaCurva(emissao.pontos, hist180Normal, emissao.tipoVoo)) {
+      const hist180Normal = ehPagante(emissao) ? null : await registrarPassagemProxy({ origem:emissao.origem, destino:emissao.destino, cia:emissao.cia, programa:emissao.programa, pontos:Number(emissao.pontos)||0, cabine:emissao.cabine||'Economica', datas_ida:emissao.datasIda||'', datas_volta:emissao.datasVolta||'', fonte:'alerta_pendente', apenasConsulta:true });
+      if (!ehPagante(emissao) && precoForaDaCurva(emissao.pontos, hist180Normal, emissao.tipoVoo)) {
         console.log('[FILTRO-180D] Emissão descartada: ' + emissao.origem + '->' + emissao.destino + ' (' + emissao.programa + ')');
         registrarDescarteCdv({ jid: grupoId, motivo: 'preço fora da curva',
           detalhe: precoForaDaCurva.ultimoDetalhe, dados: emissao, texto: textosFinal });
@@ -13953,17 +13990,26 @@ app.post('/painel/reformatar/:id', async (req, res) => {
   if (oferta.tipoConteudo === 'cupom_tsp') return res.status(400).json({ ok:false, erro:'Cupom TSP nao usa formatacao de emissao.' });
   try {
     const de = aplicarDadosEditados(oferta, req.body && req.body.dados);
-    if (!de.origem || !de.destino || !de.programa) {
+    // Tarifa pagante nao tem programa — exigir os tres obrigatorios travaria a
+    // remontagem justamente no caso em que programa TEM de ficar vazio.
+    const pagante    = ehPagante(de);
+    const incompleto = pagante ? (!de.origem || !de.destino)
+                               : (!de.origem || !de.destino || !de.programa);
+    if (incompleto) {
       // O campo editado JA entrou em dadosExtraidos (aplicarDadosEditados muta
       // a oferta). Antes isso se perdia num restart, porque so havia
       // salvarFila() no caminho de sucesso — e quem edita campo a campo pelo
       // bot passa por aqui em toda correcao de card incompleto, justamente o
       // caso em que os tres obrigatorios ainda nao estao todos preenchidos.
       salvarFila();
-      return res.status(400).json({ ok:false, erro:'Origem, destino e programa sao obrigatorios.',
+      return res.status(400).json({ ok:false,
+                                    erro: pagante ? 'Origem e destino sao obrigatorios.'
+                                                  : 'Origem, destino e programa sao obrigatorios.',
                                     parcial:true, dadosExtraidos:de });
     }
-    const hist180 = await registrarPassagemProxy({
+    // Pagante nao consulta historico: a base 180d e em pontos e nao diz nada
+    // sobre o preco em reais de uma tarifa comprada no site da cia.
+    const hist180 = pagante ? null : await registrarPassagemProxy({
       origem:      de.origem,
       destino:     de.destino,
       cia:         de.cia || '',
@@ -17703,6 +17749,7 @@ app.get('/cdv/fila', (req, res) => {
       origem: d.origem || '', destino: d.destino || '',
       programa: d.programa || '', cabine: d.cabine || '', cia: d.cia || '',
       pontos: Number(d.pontos) || 0,
+      tarifa: d.tarifa || '', valor: d.valor || '',
       motivo: o.motivoFila || null,
       timestamp: o.timestamp || null,
     };
@@ -17727,6 +17774,8 @@ app.get('/cdv/oferta/:id', (req, res) => {
       origem: d.origem || '', destino: d.destino || '',
       cia: d.cia || '', programa: d.programa || '', cabine: d.cabine || '',
       pontos: Number(d.pontos) || 0,
+      tarifa: d.tarifa || '', valor: d.valor || '', link: d.link || '',
+      tipoVoo: d.tipoVoo || '',
       datasIda: d.datasIda || '', datasVolta: d.datasVolta || '',
     },
   }});
