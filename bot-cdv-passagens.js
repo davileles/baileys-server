@@ -80,7 +80,12 @@ function blocoVoo(o) {
   const d = o.dados || {};
   const linhas = [];
   linhas.push('💺 ' + e([d.cia, d.cabine].filter(Boolean).join(' · ') || 'cia/cabine não identificada'));
-  linhas.push('🎯 <b>' + e(nPts(d.pontos)) + ' pts</b>' + (d.programa ? ' · ' + e(d.programa) : ''));
+  if (ehPagante(o)) {
+    linhas.push('💵 <b>' + e(d.valor || 'valor não informado') + '</b> · tarifa pagante');
+    if (d.link) linhas.push('🔗 ' + e(d.link));
+  } else {
+    linhas.push('🎯 <b>' + e(nPts(d.pontos)) + ' pts</b>' + (d.programa ? ' · ' + e(d.programa) : ''));
+  }
   if (d.datasIda)   linhas.push('📅 Ida: ' + e(d.datasIda));
   if (d.datasVolta) linhas.push('📅 Volta: ' + e(d.datasVolta));
   return linhas.join('\n');
@@ -89,6 +94,7 @@ function blocoVoo(o) {
 // O numero que o gate usou. Sem ele o operador nao tem como julgar se 78 mil
 // pontos naquela rota e achado ou erro de extracao.
 function blocoHistorico(o) {
+  if (ehPagante(o)) return '';
   const h = o.hist180;
   if (!h || !h.mediaPts) return '';
   const partes = ['📊 Média 180d: <b>' + e(nPts(h.mediaPts)) + '</b> pts (' + e(h.count || 0) + ' reg.)'];
@@ -135,9 +141,19 @@ const CAMPOS = {
   programa:   'Programa',
   pontos:     'Pontos',
   cabine:     'Cabine',
+  valor:      'Valor',
+  link:       'Link',
   datasIda:   'Datas de ida',
   datasVolta: 'Datas de volta',
 };
+
+// Tarifa pagante (compra em dinheiro no site da cia) nao tem programa nem
+// pontos: mostrar esses dois campos so cria o erro que este modo existe para
+// resolver — preco de passagem gravado como se fosse milha.
+const CAMPOS_MILHAS  = ['origem','destino','cia','programa','pontos','cabine','datasIda','datasVolta'];
+const CAMPOS_PAGANTE = ['origem','destino','cia','cabine','valor','link','datasIda','datasVolta'];
+const ehPagante = (o) => String(((o && o.dados) || {}).tarifa || '').trim().toLowerCase() === 'pagante';
+const camposDoModo = (o) => (ehPagante(o) ? CAMPOS_PAGANTE : CAMPOS_MILHAS);
 
 // Cabine sai por botao, nao por digitacao: e o campo que mais erra na extracao
 // e o unico com valores fechados. O texto tem de bater com o canonico do
@@ -148,22 +164,25 @@ const CABINES = ['Economica', 'Premium Economica', 'Executiva', 'Primeira Classe
 function tecladoEdicao(o) {
   const d = o.dados || {};
   const id = o.id;
+  const pag = ehPagante(o);
+  const lista = camposDoModo(o);
   const bt = (k) => [CAMPOS[k] + (d[k] ? '' : ' ⚠️'), 'p:campo:' + k + ':' + id];
-  return bot.teclado([
-    [bt('origem'), bt('destino')],
-    [bt('cia'), bt('programa')],
-    [bt('pontos'), bt('cabine')],
-    [bt('datasIda'), bt('datasVolta')],
-    [['↩️ Voltar ao card', 'p:ver:' + id]],
-  ]);
+  const linhas = [];
+  for (let i = 0; i < lista.length; i += 2) linhas.push(lista.slice(i, i + 2).map(bt));
+  linhas.push([[pag ? '🎟️ Virar emissão com milhas' : '💵 Virar tarifa pagante',
+                'p:tarifa:' + (pag ? 'milhas' : 'pagante') + ':' + id]]);
+  linhas.push([['↩️ Voltar ao card', 'p:ver:' + id]]);
+  return bot.teclado(linhas);
 }
 
 function telaEdicao(o) {
   const d = o.dados || {};
-  const linhas = Object.keys(CAMPOS).map(k =>
+  const linhas = camposDoModo(o).map(k =>
     '• <b>' + e(CAMPOS[k]) + '</b>: ' + (d[k] ? e(String(d[k])) : '<i>vazio</i>'));
-  return '✏️ <b>Editar #' + e(o.id) + '</b>\nToque no campo que quer corrigir — '
-    + 'a mensagem é remontada na hora.\n\n' + linhas.join('\n');
+  return '✏️ <b>Editar #' + e(o.id) + '</b> · '
+    + (ehPagante(o) ? '💵 tarifa pagante' : '🎟️ emissão com milhas')
+    + '\nToque no campo que quer corrigir — a mensagem é remontada na hora.\n\n'
+    + linhas.join('\n');
 }
 
 function tecladoCabine(id) {
@@ -176,7 +195,11 @@ function tecladoCabine(id) {
 // Aplica um campo e redesenha o card. O servidor devolve a mensagem ja
 // remontada, entao nao ha versao do texto montada aqui.
 async function aplicarCampo(chatId, msgId, id, campo, valor) {
-  const r = await apiLocal('POST', '/painel/reformatar/' + id, { dados: { [campo]: valor } });
+  return aplicarDados(chatId, msgId, id, { [campo]: valor }, '✏️ ' + CAMPOS[campo] + ' atualizado.');
+}
+
+async function aplicarDados(chatId, msgId, id, dados, notaOk) {
+  const r = await apiLocal('POST', '/painel/reformatar/' + id, { dados });
   const atual = await apiLocal('GET', '/cdv/oferta/' + id);
   if (!atual.ok) {
     return bot.falarHtml(chatId, '⚠️ #' + e(id) + ' saiu da fila enquanto você editava.', null, msgId);
@@ -186,17 +209,19 @@ async function aplicarCampo(chatId, msgId, id, campo, valor) {
   // nas primeiras correcoes, e tratar isso como erro faria o operador achar que
   // a edicao nao pegou.
   const nota = r.ok
-    ? '✏️ ' + CAMPOS[campo] + ' atualizado.'
+    ? notaOk
     : r.parcial
-      ? '✏️ ' + CAMPOS[campo] + ' gravado. Faltam origem, destino e programa para remontar a mensagem.'
+      ? '✏️ Gravado. Ainda faltam campos obrigatórios para remontar a mensagem: ' + (r.erro || '')
       : '❌ Não consegui aplicar: ' + (r.erro || r.http);
   return bot.falarHtml(chatId, corpoCard(atual.oferta, nota), tecladoCard(id), msgId);
 }
 
 function recibo(o, prefixo) {
   const d = o.dados || {};
+  const preco = ehPagante(o) ? (d.valor || 'tarifa pagante')
+                             : nPts(d.pontos) + ' pts ' + (d.programa || '');
   return e(prefixo + ' ' + (d.origem || '?') + '→' + (d.destino || '?') + ' · '
-    + nPts(d.pontos) + ' pts ' + (d.programa || '') + ' (#' + o.id + ')');
+    + preco + ' (#' + o.id + ')');
 }
 
 function registrarCard(chatId, msgId, ofertaId) {
@@ -268,8 +293,10 @@ async function criarEmissao(chatId, { texto, imagens }) {
 // ── FILA ─────────────────────────────────────────────────────────────────────
 function rotuloItemFila(i) {
   const rota = (i.origem || '?') + '→' + (i.destino || '?');
-  return ['#' + i.id, rota, nPts(i.pontos) + ' pts', (i.programa || '').slice(0, 12)]
-    .filter(Boolean).join(' · ');
+  const pag  = String(i.tarifa || '').trim().toLowerCase() === 'pagante';
+  const preco = pag ? [String(i.valor || '💵 pagante').slice(0, 24)]
+                    : [nPts(i.pontos) + ' pts', (i.programa || '').slice(0, 12)];
+  return ['#' + i.id, rota].concat(preco).filter(Boolean).join(' · ');
 }
 
 async function mostrarFila(chatId, msgId) {
@@ -296,7 +323,7 @@ async function mostrarFila(chatId, msgId) {
 async function tratarAcao(chatId, msgId, partes, callbackId) {
   const acao = partes[1];
   // 'campo' e 'cab' carregam um argumento a mais antes do id.
-  const arg = (acao === 'campo' || acao === 'cab') ? partes[2] : null;
+  const arg = (acao === 'campo' || acao === 'cab' || acao === 'tarifa') ? partes[2] : null;
   const id  = arg ? partes[3] : partes[2];
 
   if (acao === 'fila') return mostrarFila(chatId, msgId);
@@ -324,6 +351,19 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
 
   if (acao === 'cab') return aplicarCampo(chatId, msgId, id, 'cabine', arg);
 
+  // Virar pagante limpa programa/pontos (e voltar para milhas limpa valor/link):
+  // deixar o valor antigo no campo errado e exatamente o defeito que este modo
+  // conserta. Volta para a tela de edicao porque sempre falta preencher algo.
+  if (acao === 'tarifa') {
+    const dados = arg === 'pagante'
+      ? { tarifa: 'pagante', programa: '', pontos: '' }
+      : { tarifa: '', valor: '', link: '' };
+    await apiLocal('POST', '/painel/reformatar/' + id, { dados });
+    const atual = await apiLocal('GET', '/cdv/oferta/' + id);
+    if (!atual.ok) return encerrarCard(chatId, msgId, '⚠️ #' + e(id) + ' saiu da fila enquanto você editava.');
+    return bot.falarHtml(chatId, telaEdicao(atual.oferta), tecladoEdicao(atual.oferta), msgId);
+  }
+
   if (acao === 'campo') {
     const campo = arg;
     if (!CAMPOS[campo]) return bot.toast(callbackId, 'Campo desconhecido.');
@@ -347,7 +387,9 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
         + '\n<i>Ex: Out/26: 08; Jan/27: 22, 29</i>\n\n' + como,
         bot.teclado(linhas), msgId);
     }
-    const dica = campo === 'pontos' ? '\n<i>Só o número, ex: 75000</i>'
+    const dica = campo === 'valor' ? '\n<i>Como aparece na fonte, ex: R$ 9.494 ida e volta com taxas</i>'
+      : campo === 'link' ? '\n<i>URL do site da companhia</i>'
+      : campo === 'pontos' ? '\n<i>Só o número, ex: 75000</i>'
       : (campo === 'datasIda' || campo === 'datasVolta')
         ? '\n<i>Ex: Out/26: 08; Jan/27: 22, 29</i>' : '';
     return bot.falarHtml(chatId,
