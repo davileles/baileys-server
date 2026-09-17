@@ -6094,7 +6094,7 @@ setTimeout(() => {
 
 // Prefixos dos avisos que o proprio servidor publica no grupo do operador.
 // Ver filtro em processarMensagem: sem isto o sistema le os proprios recados.
-const _EH_AVISO_DO_SISTEMA = /^\s*(\*?(Entrega suspeita|Cupom nao entregue|Envio manual nao entregue|Watchdog)|CRITICO —|OK — Watchdog|\u26a0\ufe0f Watchdog|Heartbeat)/;
+const _EH_AVISO_DO_SISTEMA = /^\s*(\*?(Entrega suspeita|Cupom nao entregue|Envio manual nao entregue|Watchdog|Alerta de bug)|CRITICO —|OK — Watchdog|\u26a0\ufe0f Watchdog|Heartbeat)/;
 
 // ── GRUPOS COM REGRAS ESPECIAIS DE EXTRAÇÃO ───────────────────────────────────
 const GRUPO_APENAS_IMAGEM = '120363430801699326@g.us';
@@ -8656,6 +8656,49 @@ app.post('/cdv/oferta-ia', async (req, res) => {
   }
 });
 
+// ── ALERTA DE PALAVRA "BUG" EM GRUPO MONITORADO ─────────────────────────────
+// Qualquer mencao a bug (bug, bugs, bugou, bugado, bugando...) num grupo
+// monitorado do CDV ou fonte do radar gera aviso no grupo do operador com grupo,
+// hora, autor e trecho. Links sao removidos antes do teste para nao disparar
+// por URL. Throttle de 10 min por grupo: conversa sobre o mesmo bug nao inunda
+// o operador — as repeticoes somam no registro da tela (/alertas).
+const _RE_PALAVRA_BUG = /(^|[^a-z0-9\u00c0-\u024f])bug(s|ou|ado|ada|ados|adas|ando|ar|a|am|zinho)?(?![a-z0-9\u00c0-\u024f])/i;
+const BUG_ALERTA_JANELA_MS = 10 * 60 * 1000;
+
+function avisarPalavraBug(jid, msg, texto, ehEdicao) {
+  try {
+    if (!texto || jid === GRUPOS.operador) return;
+    const semLinks = String(texto).replace(/https?:\/\/\S+|www\.\S+/gi, ' ');
+    if (!_RE_PALAVRA_BUG.test(semLinks)) return;
+
+    let nomeGrupo = jid.split('@')[0];
+    try { nomeGrupo = nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || nomeGrupo; } catch (e) {}
+    const ts = Number(msg.messageTimestamp) ? Number(msg.messageTimestamp) * 1000 : Date.now();
+    const quando = new Date(ts).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    const numero = String(msg.key?.participant || msg.participant || '').split('@')[0].split(':')[0];
+    const autor = msg.key?.fromMe ? 'voce' : ((msg.pushName || '') + (numero ? ' (' + numero + ')' : '')).trim() || 'desconhecido';
+    const trecho = String(texto).replace(/\s+/g, ' ').trim();
+    const corte = trecho.length > 300 ? trecho.slice(0, 300) + '...' : trecho;
+
+    const corpo = '*Alerta de bug* \ud83d\udc1e\n\n'
+      + 'A palavra *bug* foi citada no grupo *' + nomeGrupo + '*' + (ehEdicao ? ' (mensagem editada)' : '') + '.\n\n'
+      + '\ud83d\udd52 ' + quando + '\n'
+      + '\ud83d\udc64 ' + autor + '\n\n'
+      + '_' + corte + '_';
+
+    registrarAlerta({
+      nivel: 'atencao',
+      chave: 'bug:' + jid,
+      origem: 'bug',
+      titulo: 'Palavra "bug" citada em ' + nomeGrupo,
+      corpo,
+      janelaMs: BUG_ALERTA_JANELA_MS,
+    }).catch(e => console.error('[BUG] Falha ao registrar alerta:', e.message));
+  } catch (e) {
+    console.error('[BUG] Erro ao checar palavra bug:', e.message);
+  }
+}
+
 // ctx = { contaId, sock } da conta que RECEBEU a mensagem. Importa para a
 // midia: o reupload precisa do socket que tem a sessao daquela mensagem —
 // pedir pelo principal uma imagem que chegou na secundaria falha.
@@ -8716,6 +8759,10 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
       console.log('[MSG] Aviso do proprio sistema em ' + jid.split('@')[0] + ' — ignorado (nao vai para a IA).');
       return;
     }
+
+    // Palavra "bug" citada em grupo monitorado: avisa no grupo do operador para
+    // o Davi ir ver do que se trata. Nao interrompe o fluxo normal da mensagem.
+    if (texto) avisarPalavraBug(jid, msg, texto, _ehEdicao);
 
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
