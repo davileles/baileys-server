@@ -19753,7 +19753,12 @@ bootBotTsp({
 
 // Bots de revisao CDV. Nao recebem funcao do servidor: falam pelas mesmas rotas
 // HTTP que o painel usa, entao nao ha regra de negocio duplicada neles.
-bootBotPassagens({ PORT }).catch(e => console.warn('[BOT-PASSAGENS] Falha no boot:', e.message));
+bootBotPassagens({
+  PORT,
+  // Listas salvas para os botoes de Programa e Cia no bot de emissoes.
+  programas: Object.keys(PROGRAMAS_SLUG),
+  cias: Object.values(ALIAS_CIA),
+}).catch(e => console.warn('[BOT-PASSAGENS] Falha no boot:', e.message));
 bootBotOfertas({ sessaoDir: SESSAO_DIR, PORT }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
 
 // Monitor de queda de preco. As funcoes de montagem e envio sao injetadas em

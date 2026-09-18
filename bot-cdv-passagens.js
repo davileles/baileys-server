@@ -185,6 +185,30 @@ function telaEdicao(o) {
     + linhas.join('\n');
 }
 
+// Programa e cia saem de lista, nao de digitacao: grafia diferente
+// ("Latam Pass", "Tudo Azul", "Qatar") quebra slug do link, dedup e historico.
+// As listas vem do server.js no boot (PROGRAMAS_SLUG e valores canonicos de
+// ALIAS_CIA) — fonte unica, nada duplicado aqui. O botao carrega o INDICE da
+// opcao (callback_data tem limite de 64 bytes). "Digitar outro" continua
+// valendo para cia fora da lista: basta mandar o nome por mensagem.
+const ordenar = (arr) => [...new Set((arr || []).filter(Boolean))]
+  .sort((a, b) => a.localeCompare(b, 'pt-BR', { sensitivity: 'base' }));
+const opcoesDo = (campo) =>
+  campo === 'programa' ? ordenar(dep && dep.programas)
+  : campo === 'cia'    ? ordenar(dep && dep.cias)
+  : [];
+
+function tecladoOpcoes(campo, id, atual) {
+  const lista = opcoesDo(campo);
+  const bt = (v, i) => [(v === atual ? '✅ ' : '') + v, 'p:opt:' + campo + ':' + i + ':' + id];
+  const linhas = [];
+  for (let i = 0; i < lista.length; i += 2) {
+    linhas.push(lista.slice(i, i + 2).map((v, j) => bt(v, i + j)));
+  }
+  linhas.push([['↩️ Voltar', 'p:editar:' + id]]);
+  return bot.teclado(linhas);
+}
+
 function tecladoCabine(id) {
   return bot.teclado([
     ...CABINES.map(c => [[c === 'Economica' ? 'Econômica' : c, 'p:cab:' + c + ':' + id]]),
@@ -323,8 +347,10 @@ async function mostrarFila(chatId, msgId) {
 async function tratarAcao(chatId, msgId, partes, callbackId) {
   const acao = partes[1];
   // 'campo' e 'cab' carregam um argumento a mais antes do id.
-  const arg = (acao === 'campo' || acao === 'cab' || acao === 'tarifa') ? partes[2] : null;
-  const id  = arg ? partes[3] : partes[2];
+  // 'opt' carrega dois: campo e indice da opcao na lista.
+  const arg = (acao === 'campo' || acao === 'cab' || acao === 'tarifa' || acao === 'opt') ? partes[2] : null;
+  const idxOpt = acao === 'opt' ? partes[3] : null;
+  const id  = acao === 'opt' ? partes[4] : arg ? partes[3] : partes[2];
 
   if (acao === 'fila') return mostrarFila(chatId, msgId);
 
@@ -351,6 +377,13 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
 
   if (acao === 'cab') return aplicarCampo(chatId, msgId, id, 'cabine', arg);
 
+  if (acao === 'opt') {
+    const valor = opcoesDo(arg)[Number(idxOpt)];
+    if (!valor) return bot.toast(callbackId, 'Opção não encontrada — abra o campo de novo.');
+    sessoes.delete(String(chatId));
+    return aplicarCampo(chatId, msgId, id, arg, valor);
+  }
+
   // Virar pagante limpa programa/pontos (e voltar para milhas limpa valor/link):
   // deixar o valor antigo no campo errado e exatamente o defeito que este modo
   // conserta. Volta para a tela de edicao porque sempre falta preencher algo.
@@ -373,6 +406,15 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
     }
     abrirSessao(chatId, campo, id, msgId);
     const atualVal = (o.dados || {})[campo];
+    // Programa/cia: lista salva em botoes. A sessao fica aberta para aceitar
+    // um valor digitado quando a opcao nao estiver na lista.
+    if (opcoesDo(campo).length) {
+      return bot.falarHtml(chatId,
+        (campo === 'cia' ? '💺' : '🎯') + ' <b>' + e(CAMPOS[campo]) + '</b> de #' + e(id)
+        + '\nHoje: ' + (atualVal ? e(String(atualVal)) : '<i>vazio</i>')
+        + '\n\nEscolha na lista' + (campo === 'cia' ? ' — ou mande outro nome por mensagem, se não estiver aqui.' : '.'),
+        tecladoOpcoes(campo, id, atualVal), msgId);
+    }
     // Datas quase sempre pedem so um dia a mais ou a menos: o valor atual vai
     // para a caixa de texto (ou para um bloco de copiar, se nao couber).
     if (campo === 'datasIda' || campo === 'datasVolta') {
