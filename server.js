@@ -7664,6 +7664,7 @@ async function avisarPrecoDivergente(div, p, jid) {
       nivel: 'atencao', origem: 'radar', chave: chave,
       titulo: 'Post anuncia R$ ' + div.declarado + ' e calculamos R$ ' + div.calculado,
       corpo: texto, ofertaId: p?.id || null,
+      soRegistrar: true, // so na tela/bot: nao vai para o grupo operador
     });
     console.log('[PRECO-DIV] ' + (p.asin || '?') + ' — post ' + div.declarado + ' x nosso ' + div.calculado);
   } catch (e) { console.error('[PRECO-DIV] Falha ao avisar operador:', e.message); }
