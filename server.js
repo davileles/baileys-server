@@ -261,8 +261,11 @@ async function avisarAntibotMl(detalhe) {
           + 'Autorize em ' + ML_REDIRECT_URI.replace(/\/ml\/callback$/, '/ml/conectar'))
     + '\n\nAmazon, Shopee e Magalu seguem normalmente.';
   try {
-    await registrarAlerta({ nivel:'critico', origem:'ml', chave:'ml:token-oauth',
-      titulo:'Token do Mercado Livre parou de funcionar', corpo:texto });
+    // Chave e titulo proprios: isto e bloqueio de pagina, nao queda de token.
+    // Antes saia como 'ml:token-oauth' / "Token ... parou de funcionar" e o
+    // painel de alertas misturava os dois problemas.
+    await registrarAlerta({ nivel:'critico', origem:'ml', chave:'ml:antibot',
+      titulo:'Mercado Livre bloqueando leitura de páginas (antibot)', corpo:texto });
     console.error('[ML] Operador avisado: antibot (' + detalhe + ')');
   } catch (e) { console.error('[ML] Falha ao avisar operador sobre antibot:', e.message); }
 }
@@ -17270,10 +17273,14 @@ app.post('/ml/webhook', (req, res) => res.sendStatus(200));
 app.get('/ml/webhook', (req, res) => res.sendStatus(200));
 
 // Estado do token de afiliados + verificacao sob demanda.
+// ?verificar=1 testa SO o token (linkbuilder, pagina logada). A pagina de produto
+// fica de fora de proposito: chamada direta pulava a trava de 24h, o carimbo e o
+// veredito anterior da sonda — em 18/09 isso gerou leitura extra do PDP e um
+// alerta critico para um bloqueio que ja existia. Para forcar a sonda do PDP use
+// /ml/sonda-pagina?forcar=1, que passa pela rotina oficial.
 app.get('/ml/aff/status', async (req, res) => {
   if (req.query.verificar === '1' && tokenAffOk()) {
     await verificarTokenAff(ML_AFF_URL_TESTE, avisarTokenMlCaiu).catch(()=>{});
-    await verificarPaginaProdutoMl(urlSondaProdutoMl(), avisarAntibotMl).catch(()=>{});
   }
   // paginaProduto e independente do token: o linkbuilder pode estar ok com
   // toda pagina de produto bloqueada pelo antibot.
