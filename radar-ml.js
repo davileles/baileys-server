@@ -1345,43 +1345,79 @@ export async function chamarAff(url, opcoes = {}) {
   });
   const texto = await res.text();
   let corpo; try { corpo = JSON.parse(texto); } catch (e) { corpo = texto.slice(0, 400); }
-  return { status: res.status, corpo, ok: res.ok };
+  return { status: res.status, corpo, ok: res.ok, url: res.url, redirecionado: res.redirected };
 }
 
 /**
  * Verifica se o token ainda responde. Chamado no boot e periodicamente.
+ *
+ * Separa falha DEFINITIVA de falha TRANSITORIA para nao gerar alarme falso:
+ *  - definitiva (401/403 ou redirecionou para login): sessao caiu → avisa na hora
+ *  - transitoria (5xx, 429, timeout, rede): instabilidade do ML → repete ate
+ *    AFF_TENTATIVAS vezes, espacado, e so avisa se todas falharem
+ * Em 18/09 um HTTP 500 isolado disparou o aviso com o token perfeitamente valido.
+ *
  * @param {function} aoFalhar  callback para avisar o operador na primeira falha
  */
+const AFF_TENTATIVAS = 3;
+const AFF_ESPERAS_MS = [60 * 1000, 3 * 60 * 1000]; // entre tentativas
+let _verificandoAff = false;
+
+function classificarRespostaAff(r) {
+  const foiParaLogin = /\/(jms\/[^/]+\/lgz|login)/i.test(r.url || '');
+  if (r.status === 401 || r.status === 403 || foiParaLogin) {
+    return { valido: false, definitivo: true,
+             motivo: foiParaLogin ? 'sessao expirada (redirecionou para login)' : ('HTTP ' + r.status) };
+  }
+  if (r.ok) return { valido: true };
+  // 5xx, 429 e afins: problema do lado do ML, nao do cookie.
+  return { valido: false, definitivo: false, motivo: 'HTTP ' + r.status };
+}
+
+async function tentarAff(urlTeste) {
+  try { return classificarRespostaAff(await chamarAff(urlTeste)); }
+  catch (e) { return { valido: false, definitivo: false, motivo: e.message }; }
+}
+
 export async function verificarTokenAff(urlTeste, aoFalhar) {
   if (!tokenAffOk()) {
     _saudeAff = { ok: false, verificadoEm: new Date().toISOString(),
                   erro: 'ML_AFF_TOKEN nao configurado', avisado: _saudeAff.avisado };
     return _saudeAff;
   }
+  // Uma verificacao por vez: com as esperas, a rotina horaria e o
+  // /ml/aff/status?verificar=1 poderiam se sobrepor e duplicar requisicoes.
+  if (_verificandoAff) return _saudeAff;
+  _verificandoAff = true;
   try {
-    const r = await chamarAff(urlTeste);
-    const valido = r.ok && r.status !== 401 && r.status !== 403;
+    let res = await tentarAff(urlTeste);
+    const motivos = [];
+    for (let i = 1; !res.valido && !res.definitivo && i < AFF_TENTATIVAS; i++) {
+      motivos.push(res.motivo);
+      console.warn(`[ML-AFF] Falha transitoria (${res.motivo}) — tentativa ${i + 1}/${AFF_TENTATIVAS} em ${AFF_ESPERAS_MS[i - 1] / 1000}s`);
+      await new Promise(r => setTimeout(r, AFF_ESPERAS_MS[i - 1]));
+      res = await tentarAff(urlTeste);
+    }
+
     const antes = _saudeAff.ok;
+    const erro = res.valido ? null
+      : (res.definitivo ? res.motivo
+         : `instabilidade persistente do ML (${[...motivos, res.motivo].join(', ')} em ${AFF_TENTATIVAS} tentativas)`);
     _saudeAff = {
-      ok: valido,
+      ok: res.valido,
       verificadoEm: new Date().toISOString(),
-      erro: valido ? null : ('HTTP ' + r.status),
+      erro,
       // Avisa uma vez por queda; se voltar a funcionar, rearma o aviso.
-      avisado: valido ? false : _saudeAff.avisado,
+      avisado: res.valido ? false : _saudeAff.avisado,
     };
-    if (!valido && !_saudeAff.avisado && typeof aoFalhar === 'function') {
+    if (!res.valido && !_saudeAff.avisado && typeof aoFalhar === 'function') {
       _saudeAff.avisado = true;
-      await aoFalhar('HTTP ' + r.status);
+      await aoFalhar(erro);
     }
-    if (valido && antes === false) console.log('[ML-AFF] Token voltou a funcionar.');
+    if (res.valido && antes === false) console.log('[ML-AFF] Token voltou a funcionar.');
     return _saudeAff;
-  } catch (e) {
-    _saudeAff = { ok: false, verificadoEm: new Date().toISOString(), erro: e.message, avisado: _saudeAff.avisado };
-    if (!_saudeAff.avisado && typeof aoFalhar === 'function') {
-      _saudeAff.avisado = true;
-      await aoFalhar(e.message);
-    }
-    return _saudeAff;
+  } finally {
+    _verificandoAff = false;
   }
 }
 
