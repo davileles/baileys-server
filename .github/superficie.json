@@ -146,6 +146,7 @@
         "app.post('/tg-auth/submit'",
         "app.post('/vitrine'",
         "app.post('/vitrine/:asin'",
+        "app.post('/vitrine/comparativo'",
         "app.post('/vitrine/disparar'",
         "app.post('/webhook/hubla'",
         "async function _gmCriarTarefaParticipante(",

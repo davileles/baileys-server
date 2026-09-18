@@ -16356,6 +16356,124 @@ app.post('/vitrine/previa', async (req, res) => {
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// Comparativo de preco para a MONTAGEM de listas da vitrine. Responde, para
+// cada produto escolhido, "isto esta mais barato do que da ultima vez que
+// mandamos?" — cruzando o historico de envios (o que ja saiu nos grupos) com a
+// ultima leitura do monitor de precos (o que a loja cobra agora).
+//
+// Casamento so por identidade: ASIN exato e, havendo 'grupo' na vitrine, os
+// outros ASINs do mesmo grupo (mesmo produto em outra loja). Nada de titulo
+// parecido — juntar dois produtos diferentes daria um veredito falso.
+//
+// A comparacao principal e SEM cupom: o cupom do disparo muda e distorceria o
+// veredito. O preco final com cupom vai junto so como referencia.
+const COMP_MESES = 4;          // cobre os 90 dias com folga
+const COMP_TOLERANCIA = 0.02;  // ±2% conta como "igual"
+const COMP_LEITURA_VELHA_MS = 6 * 3600000;
+
+async function _enviosPorAsin(tenantId) {
+  const idx = new Map();
+  const hoje = new Date();
+  for (let i = 0; i < COMP_MESES; i++) {
+    const mes = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year:'numeric', month:'2-digit' })
+      .format(new Date(Date.UTC(hoje.getUTCFullYear(), hoje.getUTCMonth() - i, 15)));
+    const nome = 'historico_envios_' + mes + '.json';
+    const local = (!tenantId || tenantId === TENANT_PADRAO) ? nome : 'tenants/' + tenantId + '/' + nome;
+    let regs = [];
+    try { regs = await _registrosDoShard(local); } catch {}
+    for (const r of regs) {
+      if (!r || !r.asin || !String(r.tipoConteudo || '').startsWith('oferta')) continue;
+      const preco = Number(r.preco);
+      if (!Number.isFinite(preco) || preco <= 0) continue;
+      const a = String(r.asin);
+      if (!idx.has(a)) idx.set(a, []);
+      idx.get(a).push(r);
+    }
+  }
+  for (const lista of idx.values()) lista.sort((x, y) => String(y.enviadoEm).localeCompare(String(x.enviadoEm)));
+  return idx;
+}
+
+function _resumoEnvio(r) {
+  if (!r) return null;
+  const pf = Number(r.precoFinal);
+  return {
+    asin: r.asin, loja: r.loja || null, em: r.enviadoEm || null,
+    preco: Number(r.preco),
+    precoFinal: Number.isFinite(pf) && pf > 0 ? Math.round(pf * 100) / 100 : null,
+    cupom: r.codigo || null,
+    grupos: r.gruposDestino ?? null,
+  };
+}
+
+app.post('/vitrine/comparativo', async (req, res) => {
+  try {
+    const pedidos = (Array.isArray(req.body?.asins) ? req.body.asins : String(req.body?.asins || '').split(','))
+      .map(x => String(x).trim()).filter(Boolean).slice(0, 500);
+    if (!pedidos.length) return res.json({ ok:true, itens:{} });
+
+    const envios = await _enviosPorAsin(req.tenantId);
+    const vitrine = listarVitrine();
+    const porAsin = new Map(vitrine.map(i => [String(i.asin), i]));
+    const porGrupo = new Map();
+    for (const i of vitrine) {
+      const g = String(i.grupo || '').trim();
+      if (!g) continue;
+      if (!porGrupo.has(g)) porGrupo.set(g, []);
+      porGrupo.get(g).push(String(i.asin));
+    }
+    const corte90 = Date.now() - 90 * 86400000;
+    const itens = {};
+
+    for (const asin of pedidos) {
+      const item = porAsin.get(asin) || null;
+      const g = String(item?.grupo || '').trim();
+      const irmaos = g ? (porGrupo.get(g) || []).filter(a => a !== asin) : [];
+
+      const proprios = envios.get(asin) || [];
+      const doGrupo = irmaos.flatMap(a => envios.get(a) || [])
+        .sort((x, y) => String(y.enviadoEm).localeCompare(String(x.enviadoEm)));
+      const todos = [...proprios, ...doGrupo];
+
+      // Preco atual: leitura do monitor; sem ela (Magalu/Awin), o de cadastro.
+      const h = historicoDe(asin);
+      const stats = h?.stats || null;
+      let atual = null;
+      if (h?.ult && Number.isFinite(h.ult.preco) && h.ult.preco > 0) {
+        atual = { preco: h.ult.preco, precoEfetivo: h.ult.precoEfetivo ?? null, em: h.ult.em || null,
+                  disponivel: h.ult.disponivel !== false, fonte: 'monitor',
+                  velho: Date.now() - Date.parse(h.ult.em || 0) > COMP_LEITURA_VELHA_MS };
+      } else if (Number.isFinite(Number(item?.preco)) && Number(item.preco) > 0) {
+        atual = { preco: Number(item.preco), precoEfetivo: null, em: item.precoEm || item.atualizadoEm || null,
+                  disponivel: true, fonte: 'cadastro', velho: true };
+      }
+
+      // Referencia do veredito: ultimo envio do proprio ASIN; sem ele, o do grupo.
+      const ref = proprios[0] || doGrupo[0] || null;
+      let veredito = todos.length ? 'sem_preco' : 'inedito';
+      let variacaoPct = null;
+      if (ref && atual) {
+        variacaoPct = Math.round((atual.preco / Number(ref.preco) - 1) * 1000) / 10;
+        veredito = variacaoPct <= -COMP_TOLERANCIA * 100 ? 'melhor'
+                 : variacaoPct >=  COMP_TOLERANCIA * 100 ? 'pior' : 'igual';
+      }
+      const menor = todos.reduce((m, r) => (!m || Number(r.preco) < Number(m.preco)) ? r : m, null);
+
+      itens[asin] = {
+        veredito, variacaoPct,
+        viaGrupo: !proprios.length && !!doGrupo.length,
+        ultimoEnvio: _resumoEnvio(ref),
+        menorEnviado: _resumoEnvio(menor),
+        envios90d: todos.filter(r => Date.parse(r.enviadoEm || 0) >= corte90).length,
+        atual,
+        min90: stats?.min90 ?? null,
+        mediana30: stats?.mediana30 ?? null,
+      };
+    }
+    res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, itens });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.get('/vitrine', (req, res) => {
   const itens = listarVitrine();
   // O painel precisa do TTL para avisar quando o preco da Magalu venceu — a
