@@ -18506,6 +18506,37 @@ function registrarHistoricoCenso(grupos) {
 
 // Grupo que falhar mantem a ultima contagem conhecida em vez de sumir da lista:
 // um erro pontual de metadata nao pode zerar o historico do grupo.
+// Alvos do censo: destinos das trilhas MAIS os grupos "somente cupons". O
+// grupo de cupons nao e destino de trilha nenhuma (o servidor publica nele por
+// CFG_TSP.grupos.cupons), entao so com radarDestinos() ele nunca era medido e
+// ficava fora da evolucao por nicho.
+function censoAlvos() {
+  return [...new Set([...(radarDestinos() || []), ...(gruposTspCupons() || [])])];
+}
+
+// Agrupa os alvos do censo por nicho para o grafico de evolucao. Um grupo cai
+// em UM nicho so, na mesma precedencia que o servidor aplica: cupons vence,
+// depois trilha de categoria (nicho), depois trilha geral. Ordem de saida:
+// gerais, cupons e os nichos em ordem alfabetica.
+function censoNichos() {
+  const cupons = new Set(gruposTspCupons() || []);
+  const vistos = new Set();
+  const porId = new Map();
+  const add = (id, nome, geral, jid) => {
+    if (!porId.has(id)) porId.set(id, { id, nome, geral, jids: [] });
+    porId.get(id).jids.push(jid);
+    vistos.add(jid);
+  };
+  const ts = trilhas() || [];
+  for (const t of [...ts.filter(t => t.categoria), ...ts.filter(t => !t.categoria)])
+    for (const j of (t.destinos || []))
+      if (!vistos.has(j) && !cupons.has(j)) add(t.id, t.nome || t.id, !t.categoria, j);
+  for (const j of cupons) add('_cupons', 'Cupons', false, j);
+  const peso = n => n.geral ? 0 : (n.id === '_cupons' ? 1 : 2);
+  return [...porId.values()].sort((a, b) =>
+    (peso(a) - peso(b)) || a.nome.localeCompare(b.nome, 'pt-BR'));
+}
+
 async function recensearGrupos() {
   if (_censoRodando) return _censo;
   if (!sock || !conectado) {
@@ -18514,7 +18545,7 @@ async function recensearGrupos() {
   }
   _censoRodando = true;
   try {
-    const destinos = radarDestinos();
+    const destinos = censoAlvos();
     const anteriores = new Map((_censo.grupos || []).map(g => [g.jid, g]));
 
     // Fonte primaria: UMA chamada devolve todos os grupos da conta ja com os
@@ -18629,11 +18660,11 @@ app.get('/grupos/censo', async (req, res) => {
     try { await recensearGrupos(); }
     catch(e) { return res.status(503).json({ ok:false, erro:e.message, atualizadoEm:_censo.atualizadoEm, grupos:_censo.grupos, total:_censo.grupos.reduce((s,g)=>s+(g.membros||0),0) }); }
   }
-  const destinos = new Set(radarDestinos());
+  const destinos = new Set(censoAlvos());
   // So grupos que continuam marcados como destino: se o papel foi retirado, o
   // grupo sai da lista sem precisar de um novo censo.
   const grupos = (_censo.grupos || []).filter(g => destinos.has(g.jid));
-  const faltando = radarDestinos().filter(j => !grupos.some(g => g.jid === j))
+  const faltando = censoAlvos().filter(j => !grupos.some(g => g.jid === j))
     .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null, membros:null, variacao:null, medidoEm:null }));
   const lista = [...grupos, ...faltando];
   res.json({
@@ -18699,7 +18730,7 @@ function _temEntrada(grupo, numero) {
 }
 
 function registrarMovimentoMembros(grupo, participantes, acao, autor) {
-  const destinos = new Set(radarDestinos());
+  const destinos = new Set(censoAlvos());
   if (!destinos.has(grupo)) return;              // so grupos de destino
   if (acao !== 'add' && acao !== 'remove') return;
   const ts = new Date().toISOString();
@@ -18772,7 +18803,8 @@ app.get('/grupos/membros/permanencia', (req, res) => {
 // destino (grupo removido do papel some do grafico junto com a lista).
 app.get('/grupos/censo/historico', (req, res) => {
   const dias = Math.min(Math.max(parseInt(req.query.dias || '90', 10) || 90, 2), CENSO_HIST_DIAS);
-  const destinos = radarDestinos();
+  const destinos = censoAlvos();
+  const nichos = censoNichos();
   const chaves = Object.keys(_censoHist.dias || {}).sort().slice(-dias);
   const serie = chaves.map(d => {
     const reg = _censoHist.dias[d] || {};
@@ -18781,15 +18813,24 @@ app.get('/grupos/censo/historico', (req, res) => {
     // que veio na importacao, senao a linha cairia para zero no inicio da serie.
     const total = reg.totalManual ? (reg.total || 0)
                                   : destinos.reduce((s, j) => s + (porGrupo[j] || 0), 0);
+    // Soma do nicho no dia; null quando nenhum grupo dele foi medido (grupo
+    // novo ou ponto agregado) — no grafico vira lacuna, nao queda para zero.
+    const porNicho = {};
+    for (const n of nichos) {
+      const vals = n.jids.map(j => porGrupo[j]).filter(v => typeof v === 'number');
+      porNicho[n.id] = (reg.totalManual || !vals.length) ? null : vals.reduce((s, v) => s + v, 0);
+    }
     return {
       dia: d, total, agregado: !!reg.totalManual,
       grupos: Object.fromEntries(destinos.map(j => [j, porGrupo[j] ?? null])),
+      nichos: porNicho,
     };
   });
   res.json({
     ok: true,
     dias: serie.length,
     grupos: destinos.map(j => ({ jid: j, nome: NOMES_GRUPOS.get(j) || null })),
+    nichos: nichos.map(n => ({ id: n.id, nome: n.nome, geral: n.geral, grupos: n.jids.length })),
     serie,
   });
 });
