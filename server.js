@@ -19763,6 +19763,60 @@ iniciarFeedPublico({ resolverLink: linkDoCupomTSP });
 // Bot de criacao manual no Telegram. As funcoes reais do servidor sao injetadas
 // para o bot nao guardar copia de nenhuma regra: o cupom criado no celular sai
 // pelo MESMO caminho do capturado no monitoramento (template, dedup, base).
+// ── OFERTA CRIADA NO BOT DO TELEGRAM ─────────────────────────────────────────
+// Antes o bot mandava o texto cru para TODOS os grupos com papel 'destino' —
+// inclusive os de nicho —, sem classificar, sem rastreio de link e sem gravar
+// historico: um gin saia no grupo de bebe e no de ferramentas. Agora a oferta
+// segue a mesma regra da lista "nicho + geral": classificador decide o nicho
+// (so quando confiante) e o despacho passa pelo caminho unico do radar
+// (rastreio, rodape por grupo, preview, historico).
+async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = null, precoFinal = null } = {}) {
+  const lojaN = loja || produto.loja || 'Amazon';
+  let cls = { categoria: null, confianca: 0 };
+  try {
+    cls = classificarProduto({ titulo: produto.titulo || '', asin: produto.asin || null,
+                               loja: lojaN, trilha: produto.trilha || null }) || cls;
+  } catch (e) { console.warn('[BOT-TSP] Classificacao falhou:', e.message); }
+  const confiavel = categoriaConfiavel(cls);
+
+  const oferta = {
+    id: gerarId(), origem: 'bot-telegram',
+    tipoConteudo: lojaN === 'Shopee' ? 'oferta_shopee'
+                : lojaN === 'Mercado Livre' ? 'oferta_ml'
+                : lojaN === 'Magazine Luiza' ? 'oferta_magalu'
+                : String(produto.asin || '').startsWith('AWIN-') ? 'oferta_awin' : 'oferta_amazon',
+    mensagemFormatada: mensagem,
+    dadosExtraidos: {
+      loja: lojaN, asin: produto.asin || null, titulo: produto.titulo || '',
+      preco: produto.preco ?? null, precoDe: produto.precoDe ?? null, desconto: produto.desconto ?? null,
+      link: produto.link || null, cupom: cupom || null,
+      precoFinal: precoFinal ?? produto.preco ?? null,
+      imagemUrl: produto.imagemUrl || null,
+      categoria: confiavel ? cls.categoria : null,
+      categoriaConfianca: confiavel ? cls.confianca : 0,
+    },
+    imagens: [],
+  };
+  try {
+    const img = await baixarImagemProduto(produto.imagemUrl);
+    if (img) oferta.imagens = [img];
+  } catch (e) {}
+
+  // Sem fonte, destinosDaOferta so ve as trilhas gerais; categoriaNicho traz os
+  // destinos da trilha do nicho confirmado. Sem nicho confiavel: so gerais.
+  const opcoes = confiavel ? { categoriaNicho: cls.categoria } : {};
+  console.log('[BOT-TSP] Oferta "' + String(produto.titulo || '').slice(0, 60) + '" -> '
+    + (confiavel ? 'nicho ' + cls.categoria + ' + gerais' : 'so gerais (sem nicho confiavel)'));
+  const r = await enviarOfertaParaDestinos(mensagem, null, oferta, opcoes);
+  oferta.status         = 'enviado';
+  oferta.enviadoEm      = new Date().toISOString();
+  oferta.gruposEnviados = r.enviados;
+  oferta.falhas         = r.falhas;
+  registrarEnvioHistorico(oferta);
+  return { enviados: r.enviados.length, falhas: r.falhas.length,
+           nicho: confiavel ? (cls.nome || cls.categoria) : null };
+}
+
 bootBotTsp({
   PORT,
   formatarCupomTSP,
@@ -19778,6 +19832,9 @@ bootBotTsp({
   enviarCupomParaGrupos,
   enviarMensagem,
   radarDestinos,
+  // Oferta e mensagem livre do bot: mesmo roteamento do painel (trilhas).
+  enviarOfertaBot: enviarOfertaDoBot,
+  enviarLivreBot: (mensagem) => enviarManualParaGrupos({ mensagem, tipo: 'manual' }),
   salvarFila,
   // Lista /inserir (insercao manual de cupons na conta do ML).
   listarCuponsBase,
