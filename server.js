@@ -9423,10 +9423,10 @@ function _podeAvisarEntrega(alvo) {
 }
 
 function notificarOperadorEntrega(texto) {
-  if (!_passaValvulaAvisos()) return;
-  // Fire-and-forget: aviso nunca pode derrubar o handler de retry.
-  enviarMensagem(GRUPOS.operador, { text: texto })
-    .catch(e => console.error('[ENTREGA] Falha ao avisar operador:', e.message));
+  // Silenciado: o grupo do operador recebe apenas alertas graves. Entrega
+  // suspeita e autocura seguem rodando e ficam nos logs [ENTREGA] e em
+  // /entregas-suspeitas.
+  console.warn('[ENTREGA] (aviso nao enviado ao operador) ' + String(texto).split('\n')[0]);
 }
 
 // ── SESSAO E2E POR CONTATO ───────────────────────────────────────────────────
@@ -15749,11 +15749,7 @@ setInterval(async () => {
     if (asin === undefined) {                       // fim da fila
       console.log('[LISTA] "' + lista.nome + '" concluida — ' + ex.enviados.length
         + ' enviado(s), ' + ex.falhas.length + ' falha(s), ' + ex.pulados.length + ' pulado(s).');
-      try {
-        await enviarMensagem(GRUPOS.operador, { text: '*Lista concluida: ' + lista.nome + '*\n\n'
-          + ex.enviados.length + ' enviado(s)\n' + ex.falhas.length + ' falha(s)\n'
-          + ex.pulados.length + ' pulado(s) (sem preco, esgotado ou fora da base)' });
-      } catch(_) {}
+      // Aviso de lista concluida no grupo do operador removido (so alertas graves).
       // Envio unico nao vira historico: cumprida a fila, o registro sai do painel.
       if (lista.efemera) removerLista(lista.id);
       else atualizarExecucaoLista(lista.id, null);
