@@ -3220,7 +3220,6 @@ function formatarMensagemPaganteCDV(d) {
   msg += '💵 *TARIFA PAGANTE* — emissão em dinheiro direto no site da companhia, sem uso de pontos ou milhas.'+n+n;
   msg += '✈️ *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
   msg += '🛬 *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
-  msg += '💺 *CABINE* '+rotuloCabine(d.cabine)+n+n;
   msg += '✈️ *CIA AÉREA* '+(d.cia||'-')+n+n;
   msg += '🔗 *LINK* '+(String(d.link||'').trim()||'-')+n+n;
   msg += rodape;
