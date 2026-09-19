@@ -342,6 +342,12 @@ async function previewOferta(chatId, s, editar) {
   }
   d.mensagem  = r.mensagem;
   d.imagemUrl = r.produto?.imagemUrl || null;
+  // Dados do produto seguem para o envio: e com eles que o servidor classifica
+  // o nicho e grava o historico.
+  d.produto    = r.produto || null;
+  d.loja       = r.loja || null;
+  d.cupomInfo  = r.cupom || null;
+  d.precoFinal = r.precoFinal ?? null;
 
   // Todos os cupons ativos da loja viram botao — os que nao abatem este preco
   // inclusive, marcados no rotulo. O cupom nunca entra sozinho: quem escolhe e
@@ -485,16 +491,6 @@ async function textoLivre(chatId, s, t, msgEntrada) {
 }
 
 // ── ENVIO ────────────────────────────────────────────────────────────────────
-async function enviarParaDestinos(mensagem) {
-  const alvos = dep.radarDestinos();
-  let ok = 0;
-  for (const jid of alvos) {
-    try { await dep.enviarMensagem(jid, { text: mensagem }); ok++; }
-    catch (e) { console.warn('[BOT-TSP] Falha em ' + jid + ':', e.message); }
-  }
-  return { ok, total: alvos.length };
-}
-
 async function confirmarEnvio(chatId, s, acao, editar) {
   const d = s.dados;
 
@@ -542,14 +538,30 @@ async function confirmarEnvio(chatId, s, acao, editar) {
     return falar(chatId, `✅ Cupom enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, editar);
   }
 
-  // Oferta e mensagem livre vao direto para os destinos do radar. O envio passa
-  // grupo a grupo e leva segundos: sem trocar o card ANTES, o toque parecia nao
-  // ter pegado e o segundo toque publicava de novo.
-  const nAlvos = (dep.radarDestinos() || []).length;
-  await falarPlano(chatId, '⏳ Enviando para ' + nAlvos + ' grupo(s)... não toque de novo.', null, editar);
-  const res = await enviarParaDestinos(d.mensagem);
-  sessoes.delete(String(chatId));
-  return falar(chatId, `✅ Enviado em *${res.ok}/${res.total}* grupo(s).`, null, editar);
+  // Oferta segue o roteamento por trilha (gerais + nicho classificado) e
+  // mensagem livre vai so para as gerais — as duas pelo caminho do painel, com
+  // rastreio de link e historico. O envio passa grupo a grupo e leva segundos:
+  // sem trocar o card ANTES, o toque parecia nao ter pegado e o segundo toque
+  // publicava de novo.
+  await falarPlano(chatId, '⏳ Enviando... não toque de novo.', null, editar);
+  try {
+    if (s.fluxo === 'oferta') {
+      const res = await dep.enviarOfertaBot({ mensagem: d.mensagem, produto: d.produto || {},
+        loja: d.loja, cupom: d.cupomInfo, precoFinal: d.precoFinal });
+      sessoes.delete(String(chatId));
+      return falar(chatId, `✅ Enviado em *${res.enviados}* grupo(s)`
+        + (res.falhas ? ` (${res.falhas} falha(s))` : '') + '.\n'
+        + (res.nicho ? `🧭 Nicho: *${res.nicho}* + grupos gerais.` : '🧭 Sem nicho reconhecido — só grupos gerais.'),
+        null, editar);
+    }
+    const res = await dep.enviarLivreBot(d.mensagem);
+    sessoes.delete(String(chatId));
+    return falar(chatId, `✅ Enviado em *${res.enviados.length}* grupo(s) gerais`
+      + (res.falhas.length ? ` (${res.falhas.length} falha(s))` : '') + '.', null, editar);
+  } catch (e) {
+    sessoes.delete(String(chatId));
+    return falar(chatId, '⚠️ Erro no envio: ' + e.message, null, editar);
+  }
 }
 
 // ── CARD DE REVISAO DE OFERTA DO RADAR ───────────────────────────────────────
