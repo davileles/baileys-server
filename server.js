@@ -18858,6 +18858,82 @@ app.get('/grupos/membros/permanencia', (req, res) => {
   });
 });
 
+// GET /grupos/membros/retencao?jid= — curva de sobrevivencia de quem entrou.
+// Para cada horizonte (1h, 6h, 1d, 3d, 7d, 14d, 30d): dos que entraram e que
+// deu para acompanhar por pelo menos esse tempo, quantos % ainda estavam.
+// Censura: a janela sem id (Baileys 7, 29/08 a 20/09) nao permite ver a saida,
+// entao o acompanhamento de quem entrou antes dela termina no inicio dela.
+// Tambem devolve coortes semanais (semana de entrada, SP).
+const RET_HORIZONTES_H = [1, 6, 24, 72, 168, 336, 720];
+app.get('/grupos/membros/retencao', (req, res) => {
+  const jid = String(req.query.jid || '').trim();
+  const evs = _membrosLog.eventos;
+  const agora = Date.now();
+  // O acompanhamento de uma entrada vai ate o primeiro evento sem id posterior.
+  const semIdTs = evs.filter(e => e.semId).map(e => new Date(e.ts).getTime());
+  const proximoSemId = (t) => {
+    let lo = 0, hi = semIdTs.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (semIdTs[m] <= t) lo = m + 1; else hi = m; }
+    return lo < semIdTs.length ? semIdTs[lo] : null;
+  };
+  const abertos = new Map();
+  const estadias = [];
+  for (const e of evs) {
+    if (e.semId || (jid && e.g !== jid)) continue;
+    const k = e.g + '|' + e.n, t = new Date(e.ts).getTime();
+    if (e.a === 'add') {
+      if (abertos.has(k)) estadias.push(abertos.get(k));   // entrada repetida: a anterior fica sem saida vista
+      abertos.set(k, { g: e.g, ini: t, fim: null, expulso: false });
+    } else {
+      const st = abertos.get(k);
+      if (!st) continue;
+      abertos.delete(k);
+      st.fim = t; st.expulso = !!e.por;
+      estadias.push(st);
+    }
+  }
+  for (const st of abertos.values()) estadias.push(st);
+  for (const st of estadias) {
+    const gap = proximoSemId(st.ini);
+    let obs = agora;
+    if (gap != null && gap < obs) obs = gap;
+    // Saida depois do fim do acompanhamento nao conta (as dos demais nem foram vistas).
+    if (st.fim != null && st.fim > obs) st.fim = null;
+    st.obs = st.fim != null ? st.fim : obs;
+  }
+  const curva = (lista) => RET_HORIZONTES_H.map(h => {
+    const ms = h * 3600000;
+    let base = 0, ficaram = 0;
+    for (const st of lista) {
+      const saiuAntes = st.fim != null && (st.fim - st.ini) < ms;
+      if (!saiuAntes && (st.obs - st.ini) < ms) continue;   // nao deu para acompanhar
+      base++; if (!saiuAntes) ficaram++;
+    }
+    return { horas: h, base, ficaram, pct: base ? +(ficaram / base * 100).toFixed(1) : null };
+  });
+  const semana = (t) => {
+    const d = new Date(_censoDia(new Date(t).toISOString()) + 'T12:00:00Z');
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    return d.toISOString().slice(0, 10);
+  };
+  const porSemana = new Map();
+  for (const st of estadias) {
+    const w = semana(st.ini);
+    if (!porSemana.has(w)) porSemana.set(w, []);
+    porSemana.get(w).push(st);
+  }
+  const coortes = [...porSemana.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([w, l]) => ({ semana: w, entradas: l.length, curva: curva(l) }));
+  res.json({
+    ok: true,
+    estadias: estadias.length,
+    saidasVistas: estadias.filter(s => s.fim != null).length,
+    expulsoes: estadias.filter(s => s.fim != null && s.expulso).length,
+    curva: curva(estadias),
+    coortes,
+  });
+});
+
 // GET /grupos/membros/resumo?dias=60&jid= — entradas e saidas por dia (SP) e por
 // grupo. Base do churn: saidas do periodo / membros no inicio (censo). Vale
 // tambem para a janela sem id, porque aqui so se conta.
