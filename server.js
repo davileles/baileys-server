@@ -18899,15 +18899,27 @@ app.get('/grupos/membros/retencao', (req, res) => {
     if (gap != null && gap < obs) obs = gap;
     // Saida depois do fim do acompanhamento nao conta (as dos demais nem foram vistas).
     if (st.fim != null && st.fim > obs) st.fim = null;
+<<<<<<< Updated upstream
     st.obs = st.fim != null ? st.fim : obs;
+=======
+    st.lim = obs;   // ate quando esta entrada podia ser acompanhada
+>>>>>>> Stashed changes
   }
   const curva = (lista) => RET_HORIZONTES_H.map(h => {
     const ms = h * 3600000;
     let base = 0, ficaram = 0;
     for (const st of lista) {
+<<<<<<< Updated upstream
       const saiuAntes = st.fim != null && (st.fim - st.ini) < ms;
       if (!saiuAntes && (st.obs - st.ini) < ms) continue;   // nao deu para acompanhar
       base++; if (!saiuAntes) ficaram++;
+=======
+      // Elegivel so quem podia ser acompanhado pelo horizonte inteiro — contar
+      // quem saiu cedo mas nao quem ficou (e foi censurado) puxaria a curva para baixo.
+      if ((st.lim - st.ini) < ms) continue;
+      base++;
+      if (!(st.fim != null && (st.fim - st.ini) < ms)) ficaram++;
+>>>>>>> Stashed changes
     }
     return { horas: h, base, ficaram, pct: base ? +(ficaram / base * 100).toFixed(1) : null };
   });
