@@ -246,6 +246,27 @@ export async function resolverLinkMlComCard(url) {
   return { url: alvo, card: null, titulo: null, origemProduto: null };
 }
 
+/**
+ * Foto pelo NOSSO link de afiliado. Rede de seguranca para quando a leitura
+ * de dados volta sem imagem: catalogo unificado (/products/{MLBU} e 403) e
+ * anuncio classico lido pela API sem /products/{MLB}. O meli.la resolve no
+ * nosso perfil social, cujo og:image e a foto do item em destaque — o mesmo
+ * que o link abre. Nunca lanca: sem foto, a oferta sai como antes.
+ */
+async function imagemPeloNossoLinkMl(link) {
+  try {
+    if (!link) return null;
+    let alvo = String(link).trim();
+    if (RE_ENCURTADOR_ML.test(alvo)) alvo = await resolverEncurtadorMl(alvo);
+    if (!RE_SOCIAL_ML.test(alvo)) return null;
+    const prod = await produtoDePerfilSocial(alvo);
+    return prod?.imagem || null;
+  } catch (e) {
+    console.warn('[ML] foto pelo nosso link (' + link + '):', e.message);
+    return null;
+  }
+}
+
 async function resolverEncurtadorMl(url, tentativas = 6) {
   let atual = url;
   for (let i = 0; i < tentativas; i++) {
@@ -1998,7 +2019,7 @@ export async function processarTextoMl(texto, opcoes = {}) {
       asin: idProdutoMl(url), id: idProdutoMl(url),
       titulo: dados.titulo || '',
       marca: dados.marca || '',
-      imagemUrl: dados.imagem,
+      imagemUrl: dados.imagem || await imagemPeloNossoLinkMl(r.link),
       link: r.link,                 // meli.la curto, com atribuicao
       linkLongo: r.linkLongo,
       codigoBusca: r.codigoBusca,   // ex: DAVILE-QLJD
@@ -2570,7 +2591,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
       asin: salvo.asin, id: salvo.asin,
       titulo: dados.titulo || salvo.nome || '',
       marca: dados.marca || '',
-      imagemUrl: dados.imagem,
+      imagemUrl: dados.imagem || await imagemPeloNossoLinkMl(r.link),
       link: r.link,                 // meli.la curto, com atribuicao
       linkLongo: r.linkLongo,
       codigoBusca: r.codigoBusca,
