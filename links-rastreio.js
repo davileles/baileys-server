@@ -73,7 +73,7 @@ const LOJAS = [
   ['amazon',       /(^|\.)amazon\.[a-z.]+$|^amzn\.to$|^a\.co$|(^|\.)link\.amazon$/i],
   ['mercadolivre', /(^|\.)mercadoliv?re\.com(\.br)?$|(^|\.)mercadolibre\.com$|^meli\.la$/i],
   ['shopee',       /(^|\.)shopee\.com(\.br)?$|^shp\.ee$|^shope\.ee$/i],
-  ['magalu',       /(^|\.)magazineluiza\.com\.br$|(^|\.)magalu\.com(\.br)?$|^maga\.lu$/i],
+  ['magalu',       /(^|\.)magazineluiza\.com\.br$|(^|\.)magazinevoce\.com\.br$|(^|\.)magalu\.com(\.br)?$|^maga\.lu$/i],
 ];
 export function slugLoja(host) {
   const h = String(host || '').toLowerCase();
