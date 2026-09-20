@@ -549,6 +549,9 @@ const baileysLogger = pino({ level: 'silent' });
       console.log('[SYNC] Modulos recarregados a partir do repositorio.');
     }
   } catch (e) { console.error('[SYNC] Falha no boot:', e.message); }
+  // Depois do download: o ledger ja esta com o conteudo do repositorio.
+  try { await recuperarLedgerMembrosAnterior(); }
+  catch (e) { console.warn('[MEMBROS] Recuperacao do ledger antigo falhou:', e.message); }
 })();
 
 // ── HANDLERS DE ERRO GLOBAIS ──────────────────────────────────────────────────
@@ -7361,6 +7364,8 @@ const PRESERVAR_NO_RESET = new Set([
   'categorias.json',        // taxonomia de categorias (grupos de nicho)
   'categorias_cache.json',  // cache asin -> trilha de categoria
   'contas',                 // credenciais dos numeros secundarios de envio
+  'grupos_censo_hist.json', // serie diaria de membros por grupo (grafico de evolucao)
+  'grupos_membros_log.json',// ledger de entradas/saidas (retencao e LTV) — o reset de 16/09 zerou
 ]);
 
 function enfileirarPorGrupo(jid, fn) {
@@ -18686,13 +18691,60 @@ const MEMBROS_LOG_MAX  = 200000;
 let _membrosLog = { eventos: [] };
 let _membrosLogTimer = null;
 
+// Baileys 7 (29/08/2026) passou a entregar cada participante como objeto
+// ({ id, phoneNumber?, lid?, admin }) e nao mais como string. O String() do
+// objeto virava "[object Object]" e TODO evento ficou com o mesmo "numero":
+// as contagens de entrada/saida continuam validas, mas o pareamento entrada ->
+// saida (permanencia) nao. Esses eventos ficam marcados semId e so contam.
+const MEMBROS_ID_INVALIDO = '[object Object]';
+function _normalizarEventoMembro(e) {
+  if (e && (e.n === MEMBROS_ID_INVALIDO || !e.n)) { delete e.n; e.semId = true; delete e.entradaDesconhecida; }
+  return e;
+}
+
 // Mesma razao de carregarCensoHist(): o boot rechama apos o download.
 function carregarMembrosLog() {
   try {
     if (existsSync(MEMBROS_LOG_FILE)) _membrosLog = JSON.parse(readFileSync(MEMBROS_LOG_FILE, 'utf-8'));
     if (!_membrosLog?.eventos) _membrosLog = { eventos: [] };
+    _membrosLog.eventos.forEach(_normalizarEventoMembro);
     console.log('[MEMBROS] ' + _membrosLog.eventos.length + ' evento(s) no ledger.');
   } catch(e) { console.warn('[MEMBROS] Falha ao ler ledger:', e.message); _membrosLog = { eventos: [] }; }
+}
+
+// O reset de sessao de 16/09/2026 (conta principal bloqueada) apagou o ledger
+// do disco — ele nao estava em PRESERVAR_NO_RESET — e a copia vazia subiu por
+// cima da do repositorio. O historico de 08/08 a 16/09 continua no git: este
+// commit do cdv-tsp-dados e a ultima versao inteira (13.639 eventos). Roda uma
+// vez so; a marca recuperadoDe impede repetir.
+const MEMBROS_LOG_RECUPERAR_SHA = 'ae72ccb0a95e5483cdadefdfeeab315ca319f2d3';
+async function recuperarLedgerMembrosAnterior() {
+  if (_membrosLog.recuperadoDe === MEMBROS_LOG_RECUPERAR_SHA) return;
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) return;
+  const repo  = process.env.GITHUB_REPO_DADOS || 'davileles/cdv-tsp-dados';
+  const pasta = process.env.GITHUB_PASTA_DADOS || 'tsp';
+  const url = 'https://api.github.com/repos/' + repo + '/contents/' + pasta + '/' + MEMBROS_LOG_ARQ
+            + '?ref=' + MEMBROS_LOG_RECUPERAR_SHA;
+  const r = await fetch(url, {
+    headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github.raw', 'User-Agent': 'baileys-server' },
+    signal: AbortSignal.timeout(30000),
+  });
+  if (!r.ok) throw new Error('GitHub respondeu ' + r.status);
+  const antigo = JSON.parse(await r.text());
+  const chave = e => e.ts + '|' + e.g + '|' + (e.n || '') + '|' + e.a;
+  const vistos = new Set(_membrosLog.eventos.map(chave));
+  let n = 0;
+  for (const e of (antigo?.eventos || [])) {
+    _normalizarEventoMembro(e);
+    const k = chave(e);
+    if (vistos.has(k)) continue;
+    vistos.add(k); _membrosLog.eventos.push(e); n++;
+  }
+  _membrosLog.eventos.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  _membrosLog.recuperadoDe = MEMBROS_LOG_RECUPERAR_SHA;
+  salvarMembrosLog();
+  console.log('[MEMBROS] Ledger antigo recuperado: +' + n + ' evento(s).');
 }
 carregarMembrosLog();
 
@@ -18711,7 +18763,14 @@ function salvarMembrosLog() {
   }, 5000);
 }
 
-function _soNumero(jid) { return String(jid || '').split(':')[0].split('@')[0]; }
+// Aceita string (Baileys 6) ou objeto de participante (Baileys 7). O id e o que
+// o proprio WhatsApp usa para o membro (em geral o LID); o telefone, quando vem,
+// e guardado a parte para cruzar com a base de membros.
+function _soNumero(p) {
+  const v = (p && typeof p === 'object') ? (p.id || p.lid || p.phoneNumber || p.jid) : p;
+  const s = String(v || '').split(':')[0].split('@')[0].trim();
+  return /^\d+$/.test(s) ? s : '';
+}
 
 // Quem ja estava no grupo antes deste registro existir nao tem data de entrada:
 // o WhatsApp nao expoe isso. A saida dessa pessoa fica marcada com
@@ -18733,7 +18792,10 @@ function registrarMovimentoMembros(grupo, participantes, acao, autor) {
     const n = _soNumero(p);
     if (!n) continue;
     const ev = { ts, g: grupo, n, a: acao };
-    if (autor && _soNumero(autor) !== n) ev.por = _soNumero(autor);
+    const tel = (p && typeof p === 'object') ? _soNumero(p.phoneNumber) : '';
+    if (tel && tel !== n) ev.tel = tel;
+    const por = _soNumero(autor);
+    if (por && por !== n) ev.por = por;
     if (acao === 'remove' && !_temEntrada(grupo, n)) ev.entradaDesconhecida = true;
     _membrosLog.eventos.push(ev);
   }
@@ -18751,8 +18813,9 @@ app.get('/grupos/membros/eventos', (req, res) => {
   const eventos = _membrosLog.eventos
     .filter(e => (!jid || e.g === jid) && new Date(e.ts).getTime() >= corte)
     .slice(-limite)
-    .map(e => ({ em: e.ts, jid: e.g, grupo: NOMES_GRUPOS.get(e.g) || null, numero: e.n,
-                 acao: e.a, entradaDesconhecida: !!e.entradaDesconhecida }));
+    .map(e => ({ em: e.ts, jid: e.g, grupo: NOMES_GRUPOS.get(e.g) || null, numero: e.n || null,
+                 telefone: e.tel || null, acao: e.a, semId: !!e.semId,
+                 entradaDesconhecida: !!e.entradaDesconhecida }));
   res.json({ ok:true, total: eventos.length, totalNoLedger: _membrosLog.eventos.length, eventos });
 });
 
@@ -18762,10 +18825,12 @@ app.get('/grupos/membros/permanencia', (req, res) => {
   const jid = String(req.query.jid || '').trim();
   const abertos = new Map();     // "grupo|numero" -> ts de entrada
   const ciclos = [];
-  let entradas = 0, saidas = 0, saidasSemEntrada = 0;
+  let entradas = 0, saidas = 0, saidasSemEntrada = 0, eventosSemId = 0;
 
   for (const e of _membrosLog.eventos) {
     if (jid && e.g !== jid) continue;
+    // Evento sem id (janela do bug do Baileys 7) conta, mas nao pareia.
+    if (e.semId) { eventosSemId++; if (e.a === 'add') entradas++; else saidas++; continue; }
     const chave = e.g + '|' + e.n;
     if (e.a === 'add') { abertos.set(chave, e.ts); entradas++; continue; }
     saidas++;
@@ -18784,12 +18849,41 @@ app.get('/grupos/membros/permanencia', (req, res) => {
   const mediana = ordenados.length ? ordenados[Math.floor(ordenados.length / 2)] : null;
   res.json({
     ok: true,
-    entradas, saidas, saidasSemEntrada,
+    entradas, saidas, saidasSemEntrada, eventosSemId,
     aindaDentro: abertos.size,
     ciclosCompletos: ciclos.length,
     permanenciaMediaDias: media,
     permanenciaMedianaDias: mediana,
     ciclos: ciclos.slice(-1000),
+  });
+});
+
+// GET /grupos/membros/resumo?dias=60&jid= — entradas e saidas por dia (SP) e por
+// grupo. Base do churn: saidas do periodo / membros no inicio (censo). Vale
+// tambem para a janela sem id, porque aqui so se conta.
+app.get('/grupos/membros/resumo', (req, res) => {
+  const jid = String(req.query.jid || '').trim();
+  const dias = Math.min(Math.max(parseInt(req.query.dias || '60', 10) || 60, 1), 400);
+  const corte = Date.now() - dias * 86400000;
+  const porDia = new Map();
+  for (const e of _membrosLog.eventos) {
+    if (jid && e.g !== jid) continue;
+    if (new Date(e.ts).getTime() < corte) continue;
+    const d = _censoDia(e.ts);
+    if (!porDia.has(d)) porDia.set(d, { dia: d, entradas: 0, saidas: 0, grupos: {} });
+    const reg = porDia.get(d);
+    const g = reg.grupos[e.g] || (reg.grupos[e.g] = { entradas: 0, saidas: 0 });
+    if (e.a === 'add') { reg.entradas++; g.entradas++; } else { reg.saidas++; g.saidas++; }
+  }
+  const serie = [...porDia.values()].sort((a, b) => (a.dia < b.dia ? -1 : 1));
+  const inicio = _membrosLog.eventos.length ? _membrosLog.eventos[0].ts : null;
+  res.json({
+    ok: true, dias: serie.length, ledgerDesde: inicio,
+    entradas: serie.reduce((s, x) => s + x.entradas, 0),
+    saidas:   serie.reduce((s, x) => s + x.saidas, 0),
+    nomes: Object.fromEntries([...new Set(serie.flatMap(x => Object.keys(x.grupos)))]
+      .map(j => [j, NOMES_GRUPOS.get(j) || null])),
+    serie,
   });
 });
 
