@@ -2586,6 +2586,11 @@ async function copiarEmissaoExecutiva(destinoOriginal, mensagem, dados, rotulo) 
   }
 }
 
+function _tirarDaFila(item) {
+  const i = filaEnvio.indexOf(item);
+  if (i >= 0) filaEnvio.splice(i, 1);
+}
+
 async function workerFila() {
   if (workerRodando) return;
   workerRodando = true;
@@ -2617,12 +2622,17 @@ async function workerFila() {
 
     const item = filaEnvio[0];
     if (!item) break;
+    // _enviando trava o item no topo: POST /fila-envio/ordem nao o tira da
+    // cabeca enquanto o envio esta em curso. A remocao e por identidade
+    // (_tirarDaFila) e nao por shift(), senao uma reordenacao/cancelamento
+    // durante o envio fazia o worker descartar o item errado.
+    item._enviando = true;
     try {
       console.log('[FILA] Enviando oferta #' + item.ofertaId + ' para ' + item.destino + ' (' + filaEnvio.length + ' na fila)');
       // Conta certa antes de mensagem rapida: ver aguardarContaDeEnvio acima.
       await aguardarContaDeEnvio(item.destino);
       await saidaSerializada(() => enviarMensagem(item.destino, { text: item.mensagem }));
-      filaEnvio.shift();
+      _tirarDaFila(item);
       ultimoEnvioMs = Date.now(); // registra timestamp do envio
 
       // Marca como 'enviado' na filaPendentes para não reentrar na fila após restart
@@ -2668,11 +2678,12 @@ async function workerFila() {
         await copiarEmissaoExecutiva(item.destino, item.mensagem, de, '#' + item.ofertaId);
       }
     } catch(e) {
+      item._enviando = false;
       item.tentativas = (item.tentativas || 0) + 1;
       console.error('[FILA] ✗ Erro ao enviar oferta #' + item.ofertaId
         + ' (tentativa ' + item.tentativas + '/' + FILA_MAX_TENTATIVAS + '):', e.message);
       if (item.tentativas >= FILA_MAX_TENTATIVAS) {
-        filaEnvio.shift();
+        _tirarDaFila(item);
         const ofertaFalha = filaPendentes.find(o => String(o.id) === String(item.ofertaId));
         if (ofertaFalha && ofertaFalha.status === 'aprovado') {
           ofertaFalha.status = 'pendente';
@@ -13051,6 +13062,8 @@ app.get('/fila-envio', (req, res) => {
       } : null,
       previsaoMin:     prev.tempoMin,
       previsaoHorario: prev.horario,
+      // true = o worker ja esta publicando este item; nao pode ser reordenado.
+      enviando:        !!item._enviando,
     };
   });
   const espera = msAteJanela();
@@ -13065,6 +13078,31 @@ app.get('/fila-envio', (req, res) => {
     intervaloMinutos: INTERVALO_ENVIO_MS / 60000,
     itens,
   });
+});
+
+// Reordena a fila de envio (prioridade). Body: { ids: [ofertaId, ...] } na
+// nova ordem desejada. IDs ausentes do body mantem a posicao relativa e vao
+// para o fim (protege contra itens que entraram na fila depois que o painel
+// carregou). O item que o worker esta publicando (_enviando) fica sempre no
+// topo. Como o worker so le filaEnvio[0] depois de esperar intervalo/janela,
+// a nova ordem vale ja para o proximo disparo.
+// Obs.: a fila vive em memoria; apos restart o requeue segue a ordem de
+// filaPendentes e a prioridade manual se perde.
+app.post('/fila-envio/ordem', (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String) : null;
+  if (!ids) return res.status(400).json({ ok: false, erro: 'Envie { ids: [...] }' });
+  const travado = filaEnvio.filter(i => i._enviando);
+  const livres  = filaEnvio.filter(i => !i._enviando);
+  const porId   = new Map(livres.map(i => [String(i.ofertaId), i]));
+  const nova = [];
+  for (const id of ids) {
+    const it = porId.get(id);
+    if (it) { nova.push(it); porId.delete(id); }
+  }
+  for (const it of livres) if (porId.has(String(it.ofertaId))) nova.push(it);
+  filaEnvio.splice(0, filaEnvio.length, ...travado, ...nova);
+  console.log('[FILA] Ordem alterada manualmente: ' + filaEnvio.map(i => '#' + i.ofertaId).join(', '));
+  res.json({ ok: true, ordem: filaEnvio.map(i => i.ofertaId), total: filaEnvio.length });
 });
 
 app.delete('/fila-envio/:ofertaId', (req, res) => {
