@@ -8521,6 +8521,7 @@ REGRAS GERAIS OBRIGATÓRIAS:
 - Retorne APENAS um JSON válido, sem texto antes ou depois, sem blocos de código markdown.
 - categoria deve ser uma destas: transferencia, compra, compra_bonificada, clube, cartao, geral.
   • "compra_bonificada" = a pessoa GANHA pontos/milhas por real ou dólar gasto em um parceiro/loja.
+  • Desconto/cupom para RESGATAR ou PAGAR COM pontos (hotel, carro, ingresso, pacote em Azul Viagens, Smiles Viagens, Livelo etc.) NÃO é compra_bonificada — use "geral". compra_bonificada exige GANHAR pontos por real/dólar gasto.
   • "compra" = compra direta de pontos/milhas com dinheiro.
   • "transferencia" = transferência de pontos entre programas com bônus.
 
