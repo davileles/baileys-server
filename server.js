@@ -18918,15 +18918,30 @@ app.get('/grupos/membros/retencao', (req, res) => {
     d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
     return d.toISOString().slice(0, 10);
   };
-  const porSemana = new Map();
-  for (const st of estadias) {
-    const w = semana(st.ini);
-    if (!porSemana.has(w)) porSemana.set(w, []);
-    porSemana.get(w).push(st);
+  const coortesDe = (lista) => {
+    const m = new Map();
+    for (const st of lista) {
+      const w = semana(st.ini);
+      if (!m.has(w)) m.set(w, []);
+      m.get(w).push(st);
+    }
+    return [...m.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+      .map(([w, l]) => ({ semana: w, entradas: l.length, curva: curva(l) }));
+  };
+  const coortes = coortesDe(estadias);
+  // ?porNicho=1 — mesma conta para cada trilha (nicho do censo), numa chamada so.
+  let nichos;
+  if (req.query.porNicho === '1') {
+    nichos = censoNichos().map(n => {
+      const set = new Set(n.jids);
+      const l = estadias.filter(st => set.has(st.g));
+      return { id: n.id, nome: n.nome, estadias: l.length,
+               saidasVistas: l.filter(x => x.fim != null).length,
+               curva: curva(l), coortes: coortesDe(l) };
+    });
   }
-  const coortes = [...porSemana.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([w, l]) => ({ semana: w, entradas: l.length, curva: curva(l) }));
   res.json({
+    ...(nichos ? { nichos } : {}),
     ok: true,
     estadias: estadias.length,
     saidasVistas: estadias.filter(s => s.fim != null).length,
@@ -18997,7 +19012,7 @@ app.get('/grupos/censo/historico', (req, res) => {
     ok: true,
     dias: serie.length,
     grupos: destinos.map(j => ({ jid: j, nome: NOMES_GRUPOS.get(j) || null })),
-    nichos: nichos.map(n => ({ id: n.id, nome: n.nome, geral: n.geral, grupos: n.jids.length })),
+    nichos: nichos.map(n => ({ id: n.id, nome: n.nome, geral: n.geral, grupos: n.jids.length, jids: n.jids })),
     serie,
   });
 });
