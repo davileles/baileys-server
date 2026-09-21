@@ -1739,7 +1739,7 @@ async function conectarConta(id) {
         const codigo = new Boom(u.lastDisconnect?.error)?.output?.statusCode;
         console.log('[CONTA:' + id + '] conexao fechada. Codigo: ' + codigo);
         if (codigo === DisconnectReason.loggedOut) {
-          c.ultimoErro = 'deslogada — escaneie o QR de novo';
+          registrarErroConta(c, 'deslogada — escaneie o QR de novo');
           c.precisaPareamento = true;
           // Sem apagar aqui, o proximo pedido de QR nunca gera QR: as creds
           // invalidas fazem o Baileys pular direto para o 401.
@@ -1774,7 +1774,7 @@ async function conectarConta(id) {
     });
   } catch (e) {
     c.conectando = false;
-    c.ultimoErro = e.message;
+    registrarErroConta(c, e.message);
     console.error('[CONTA:' + id + '] falha ao conectar:', e.message);
   }
   return c;
@@ -2205,6 +2205,20 @@ function _enviarComTeto(promessaEnvio) {
   ]);
 }
 
+// Erro da conta extra com data e grupo, para /contas mostrar ONDE e QUANDO
+// falhou. Envio bem-sucedido limpa (limparErroConta) — antes o erro ficava
+// grudado ate o proximo pareamento e parecia problema atual.
+function registrarErroConta(c, msg, grupo) {
+  if (!c) return;
+  c.ultimoErro = msg || null;
+  c.ultimoErroEm = new Date().toISOString();
+  c.ultimoErroGrupo = grupo ? (NOMES_GRUPOS.get(grupo) || grupo) : null;
+}
+function limparErroConta(c) {
+  if (!c || !c.ultimoErro) return;
+  c.ultimoErro = null; c.ultimoErroEm = null; c.ultimoErroGrupo = null;
+}
+
 async function enviarPelaConta(id, destino, conteudo) {
   const apelidoEnvio = apelidoDaConta(id);
   const contaPadrao = tenantDaConta(id) === TENANT_PADRAO;
@@ -2214,7 +2228,7 @@ async function enviarPelaConta(id, destino, conteudo) {
       try {
         const rw = await enviarPeloWhatsmeow(apelidoEnvio, destino, payload);
         const cw = contasExtras.get(id);
-        if (cw) cw.ultimoEnvio = new Date().toISOString();
+        if (cw) { cw.ultimoEnvio = new Date().toISOString(); limparErroConta(cw); }
         registrarEnvioTelemetria(apelidoEnvio, destino, 'whatsmeow');
         return rw;
       } catch (e) {
@@ -2235,6 +2249,7 @@ async function enviarPelaConta(id, destino, conteudo) {
   } catch (e) {}
   guardarMensagemEnviada(r);
   c.ultimoEnvio = new Date().toISOString();
+  limparErroConta(c);
   return r;
 }
 
@@ -2299,7 +2314,7 @@ async function enviarPorContaSubstituta(contaOriginal, destino, conteudo, motivo
       }
       return { resultado: r, conta: id };
     } catch (e) {
-      const cf = contasExtras.get(id); if (cf) cf.ultimoErro = e.message;
+      registrarErroConta(contasExtras.get(id), e.message, destino);
       // Falha ambigua: a mensagem pode ter saido — nao tenta mais ninguem.
       if (e.semFallback) throw e;
       _aptidaoSubstituta.delete(id + '|' + destino);
@@ -2356,10 +2371,10 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
         // Falha ambigua do wa-envio: a oferta pode ter saido. Cair em outra
         // conta agora dobraria a mensagem no grupo — sobe para a outbox.
         if (e.semFallback) {
-          const cf = contasExtras.get(contaId); if (cf) cf.ultimoErro = e.message;
+          registrarErroConta(contasExtras.get(contaId), e.message, destino);
           throw e;
         }
-        const c = contasExtras.get(contaId); if (c) c.ultimoErro = e.message;
+        registrarErroConta(contasExtras.get(contaId), e.message, destino);
         motivoFalha = 'falhou (' + e.message + ')';
       }
     } else {
@@ -11408,6 +11423,7 @@ app.get('/contas', (req, res) => {
     .map(c => ({
       id: apelidoDaConta(c.id), conectado: c.conectado, conectando: c.conectando,
       qrDisponivel: !!c.qr, ultimoEnvio: c.ultimoEnvio, ultimoErro: c.ultimoErro,
+      ultimoErroEm: c.ultimoErroEm || null, ultimoErroGrupo: c.ultimoErroGrupo || null,
       numero: telefoneDaConta(c.sock),
     }));
   res.json({
@@ -11577,7 +11593,7 @@ app.post('/contas/:id/reparear', async (req, res) => {
 
   await limparCredenciaisConta(id);
   c.precisaPareamento = false;
-  c.ultimoErro = null;
+  limparErroConta(c);
   console.warn('[CONTA:' + id + '] credenciais apagadas a pedido — aguardando novo pareamento.');
   conectarConta(id).catch(()=>{});
   res.json({ ok:true, mensagem:'Credenciais apagadas. Abra /contas/' + apelido + '/qr para parear.' });
