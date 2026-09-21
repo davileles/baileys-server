@@ -2586,6 +2586,15 @@ async function copiarEmissaoExecutiva(destinoOriginal, mensagem, dados, rotulo) 
   }
 }
 
+// Espera do intervalo entre envios que pode ser encurtada por _acordarWorker().
+let _acordarWorker = null;
+function dormirFila(ms) {
+  return new Promise(r => {
+    const t = setTimeout(() => { _acordarWorker = null; r(); }, ms);
+    _acordarWorker = () => { clearTimeout(t); _acordarWorker = null; r(); };
+  });
+}
+
 function _tirarDaFila(item) {
   const i = filaEnvio.indexOf(item);
   if (i >= 0) filaEnvio.splice(i, 1);
@@ -2604,11 +2613,15 @@ async function workerFila() {
     }
 
     // 2. Respeitar intervalo desde o último envio (mesmo que worker tenha encerrado antes)
+    //    Item marcado _agora (botao "Disparar agora" do gestor) fura o intervalo.
+    //    A espera e interrompivel: POST /fila-envio/disparar acorda o worker e o
+    //    loop reavalia janela/intervalo do zero.
     const msDesdoUltimo = Date.now() - ultimoEnvioMs;
-    if (ultimoEnvioMs > 0 && msDesdoUltimo < INTERVALO_ENVIO_MS) {
+    if (ultimoEnvioMs > 0 && msDesdoUltimo < INTERVALO_ENVIO_MS && !filaEnvio[0]?._agora) {
       const aguardar = INTERVALO_ENVIO_MS - msDesdoUltimo;
       console.log('[FILA] Intervalo entre envios: aguardando ' + Math.round(aguardar / 60000) + ' min (último envio há ' + Math.round(msDesdoUltimo / 60000) + ' min).');
-      await new Promise(r => setTimeout(r, aguardar));
+      await dormirFila(aguardar);
+      continue;
     }
 
     // 3. Verificar conexão (qualquer conta de disparo serve — destino e grupo)
@@ -13064,6 +13077,8 @@ app.get('/fila-envio', (req, res) => {
       previsaoHorario: prev.horario,
       // true = o worker ja esta publicando este item; nao pode ser reordenado.
       enviando:        !!item._enviando,
+      // true = marcado para "Disparar agora" (fura o intervalo de 10 min).
+      agora:           !!item._agora,
     };
   });
   const espera = msAteJanela();
@@ -13103,6 +13118,26 @@ app.post('/fila-envio/ordem', (req, res) => {
   filaEnvio.splice(0, filaEnvio.length, ...travado, ...nova);
   console.log('[FILA] Ordem alterada manualmente: ' + filaEnvio.map(i => '#' + i.ofertaId).join(', '));
   res.json({ ok: true, ordem: filaEnvio.map(i => i.ofertaId), total: filaEnvio.length });
+});
+
+// "Disparar agora": leva o item para o topo (atras apenas do que ja esta sendo
+// publicado) e fura o intervalo de 10 min entre envios. A janela 08h–21h SP
+// continua valendo — fora dela o item fica no topo e sai na abertura.
+app.post('/fila-envio/disparar/:ofertaId', (req, res) => {
+  const id  = String(req.params.ofertaId);
+  const idx = filaEnvio.findIndex(i => String(i.ofertaId) === id);
+  if (idx === -1) return res.status(404).json({ ok: false, erro: 'Item não encontrado na fila' });
+  const item = filaEnvio[idx];
+  const dentroJanela = msAteJanela() === 0;
+  if (item._enviando) return res.json({ ok: true, jaEnviando: true, dentroJanela });
+  filaEnvio.splice(idx, 1);
+  item._agora = true;
+  const nTravados = filaEnvio.filter(i => i._enviando).length;
+  filaEnvio.splice(nTravados, 0, item);
+  console.log('[FILA] Disparo imediato solicitado para #' + id + (dentroJanela ? '' : ' (fora da janela — sai na abertura)'));
+  if (_acordarWorker) _acordarWorker();
+  workerFila().catch(e => { console.error('[FILA] Worker erro:', e.message); workerRodando = false; });
+  res.json({ ok: true, dentroJanela, janelaEnvio: `${HORA_INICIO_ENVIO}h–${HORA_FIM_ENVIO}h SP` });
 });
 
 app.delete('/fila-envio/:ofertaId', (req, res) => {
