@@ -15779,6 +15779,17 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
   const item = itemVitrine(asin);
   if (!item) return { ok:false, motivo:'produto nao esta mais na vitrine' };
 
+  // Cupom fixo e de UMA loja. Numa fila mista (ML + Amazon + Shopee), o codigo
+  // do ML aplicado ao item da Amazon dava "cupom nao esta na base" e o item saia
+  // sem cupom nenhum. Quando o codigo e de outra loja, este item volta para o
+  // automatico da propria loja.
+  if (codigoCupom && codigoCupom !== 'auto' && codigoCupom !== 'nenhum'
+      && !cupomPorCodigo(item.loja, codigoCupom)) {
+    const deOutraLoja = ['Mercado Livre', 'Amazon', 'Shopee', 'Magazine Luiza']
+      .some(lj => lj !== item.loja && cupomPorCodigo(lj, codigoCupom));
+    if (deOutraLoja) codigoCupom = 'auto';
+  }
+
   let montado;
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) return { ok:false, motivo:'Shopee nao configurada' };
@@ -16261,6 +16272,53 @@ app.post('/listas/:id/retomar', (req, res) => {
   lista.execucao.pausada = false;
   lista.execucao.proximoEm = Date.now();
   res.json({ ok:true, lista: atualizarExecucaoLista(lista.id, lista.execucao) });
+});
+
+// Ajuste da fila em andamento: reordenar o que ainda nao saiu e trocar o cupom
+// (cupom novo que acabou de sair, prioridade para uma loja). O cupom ja e lido
+// item a item no envio (cupomDaLista), entao a troca vale a partir do proximo.
+// A fila so aceita a MESMA lista de pendentes: se o worker andou enquanto o
+// operador reordenava, o item que ja saiu nao esta mais pendente e o pedido
+// volta 409 para o painel recarregar, em vez de reenviar ou pular produto.
+app.post('/listas/:id/ajustar', (req, res) => {
+  const lista = listaPorId(req.params.id);
+  if (!lista) return res.status(404).json({ ok:false, erro:'lista nao encontrada' });
+  const ex = lista.execucao;
+  const alteracao = { id: lista.id };
+
+  if (Array.isArray(req.body?.pendentes)) {
+    if (ex && _listaWorkerRodando) {
+      return res.status(409).json({ ok:false, erro:'um produto esta saindo agora — tente de novo em alguns segundos' });
+    }
+    const feitos     = ex ? lista.produtos.slice(0, ex.indice) : [];
+    const atuais     = ex ? lista.produtos.slice(ex.indice) : lista.produtos.slice();
+    const novos      = req.body.pendentes.map(String);
+    const mesmoConj  = novos.length === atuais.length && new Set(novos).size === novos.length
+      && novos.every(a => atuais.includes(a));
+    if (!mesmoConj) {
+      return res.status(409).json({ ok:false, erro:'a fila mudou enquanto voce editava (um item ja saiu) — recarregue e ajuste de novo' });
+    }
+    alteracao.produtos = feitos.concat(novos);
+  }
+
+  if (req.body?.cupomModo !== undefined) {
+    const modo = String(req.body.cupomModo);
+    if (!['auto', 'fixo', 'nenhum'].includes(modo)) {
+      return res.status(400).json({ ok:false, erro:'modo de cupom invalido' });
+    }
+    const codigo = String(req.body.cupomCodigo || '').trim();
+    if (modo === 'fixo' && !codigo) return res.status(400).json({ ok:false, erro:'escolha o cupom' });
+    alteracao.cupomModo = modo;
+    alteracao.cupomCodigo = modo === 'fixo' ? codigo : null;
+  }
+
+  try {
+    const salva = salvarLista(alteracao);
+    console.log('[LISTA] "' + salva.nome + '" ajustada'
+      + (alteracao.produtos ? ' — ordem dos pendentes alterada' : '')
+      + (alteracao.cupomModo ? ' — cupom: ' + (salva.cupomModo === 'fixo' ? salva.cupomCodigo : salva.cupomModo) : ''));
+    res.json({ ok:true, lista: salva });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 app.post('/listas/:id/cancelar', (req, res) => {
