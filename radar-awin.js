@@ -490,8 +490,27 @@ async function lerPaginaProduto(url) {
     ],
   });
 
-  return { titulo, imagem, preco, precoDe: resolvido.precoDe, precoDeFonte: resolvido.fonte,
+  // Preco de socio/assinante (ex.: Clube Wine). Quando a pagina expoe um, ele
+  // vira o "Por" da oferta. O "De" foi resolvido antes com o preco publico, para
+  // a conferencia contra o percentual anunciado continuar valendo.
+  const socio = precoSocioDoHtml(html);
+  const usarSocio = !!(preco && socio && socio < preco && socio >= preco * 0.5);
+  if (usarSocio) {
+    console.log('[AWIN] Preco de socio em ' + url.slice(0, 60) + ': ' + socio + ' (publico ' + preco + ').');
+  }
+
+  return { titulo, imagem, preco: usarSocio ? socio : preco,
+           precoPublico: usarSocio ? preco : null,
+           precoDe: resolvido.precoDe, precoDeFonte: resolvido.fonte,
            marca: ld.marca || '', disponivel: ld.disponivel !== false };
+}
+
+// Preco de membro embutido no JS da pagina — Wine usa
+// `const productMemberPrice = 199.06`; cobre tambem memberPrice/member_price em
+// JSON. O \b impede casar flags como hideMemberPrice.
+function precoSocioDoHtml(html) {
+  const m = html.match(/\b(?:product)?[Mm]ember_?[Pp]rice["']?\s*[:=]\s*["']?(\d+(?:[.,]\d+)?)/);
+  return m ? paraNumero(m[1]) : null;
 }
 
 // Ordem de precedencia do layout: template da propria loja (quando o operador
