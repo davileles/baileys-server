@@ -15807,6 +15807,11 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
 
   const o = montado.prontos[0];
   if (!o) return { ok:false, motivo: montado.descartados[0]?.motivo || 'produto descartado' };
+  // Rede de seguranca para qualquer loja: nome provisorio de cadastro
+  // ("Produto MLB123", "Produto B0XXXX") nunca sai para grupo.
+  if (ehNomeProvisorio(o.produto?.titulo)) {
+    return { ok:false, motivo:'sem nome real do produto (' + o.produto.titulo + ') — corrija o nome na lista' };
+  }
 
   const oferta = {
     id: gerarId(), origem:'lista',
@@ -16384,6 +16389,8 @@ app.post('/vitrine/nicho', (req, res) => {
 // quebra em grupos de 10). Falha de rede nao derruba o cadastro: o nome
 // provisorio continua valendo e o disparo ainda o corrige.
 const NOME_PROVISORIO_VIT = /^Produto [A-Z0-9]{10}$/;
+// Qualquer marcador de cadastro: Amazon (ASIN), ML (MLB/MLBU), Shopee (itemId), Magalu.
+function ehNomeProvisorio(t) { return /^Produto [A-Za-z0-9-]+$/.test(String(t || '').trim()); }
 
 async function resolverNomesProvisorios(asins) {
   const alvo = [...new Set(asins)].filter(a => {
@@ -16970,6 +16977,12 @@ app.post('/vitrine/disparar', async (req, res) => {
   }
 
   const enviados = [], falhas = [];
+  // Mesma rede de seguranca do disparo por lista: nome provisorio nao sai.
+  montado.prontos = montado.prontos.filter(o => {
+    if (!ehNomeProvisorio(o.produto?.titulo)) return true;
+    montado.descartados.push({ asin:o.asin, nome:o.produto.titulo, motivo:'sem nome real do produto — corrija o nome na lista' });
+    return false;
+  });
   for (const o of montado.prontos) {
     const oferta = {
       id: gerarId(), origem:'vitrine',

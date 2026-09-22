@@ -52,7 +52,7 @@ export function tagMl() { return credencialTsp('ML_TAG') || null; }
 
 // Tag por produto (pool criado a mao no painel do ML). Sem pool devolve null e
 // tudo segue com a tag unica da conta.
-import { tagMlDoProduto } from './radar-amazon.js';
+import { tagMlDoProduto, salvarItemVitrine } from './radar-amazon.js';
 // A etiqueta do ML e escolhida pela CATEGORIA do produto, entao a geracao de
 // link precisa saber classificar. categorizador.js so depende de fs e do sync,
 // entao nao ha ciclo de import aqui.
@@ -2429,10 +2429,12 @@ function nomeDoSlugMl(url) {
     const caminho = decodeURIComponent(new URL(url).pathname);
     // /espumante-...-750ml/p/MLB18308612   (pagina de catalogo)
     // /MLB-1234567890-nome-do-produto-_JM  (anuncio)
-    let m = caminho.match(/^\/([^\/]+)\/p\/MLB/i);
+    // /parafusadeira-...-baterias/up/MLBU5112746543  (produto de usuario)
+    let m = caminho.match(/^\/([^\/]+)\/(?:p|up)\/MLBU?\d/i);
     if (!m) m = caminho.match(/^\/MLB-?\d{6,}-(.+?)(?:-_JM)?\/?$/i);
     if (!m) return '';
-    return m[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const s = m[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+    return s ? s[0].toUpperCase() + s.slice(1) : '';
   } catch (e) { return ''; }
 }
 
@@ -2579,11 +2581,28 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
       }
     }
 
+    // NOME REAL OU NADA. "Produto MLB..." e so um marcador de cadastro (a
+    // pagina nao respondeu e o slug nao foi reconhecido) — nunca pode chegar ao
+    // grupo. Ordem: titulo lido agora > nome salvo de verdade > slug da URL.
+    // Achou nome melhor, grava na vitrine para o proximo disparo ja nascer certo.
+    const nomeSalvo = NOME_PROVISORIO_ML.test(salvo.nome || '') ? '' : (salvo.nome || '');
+    const nomeReal = (dados.titulo || '').trim() || nomeSalvo
+      || nomeDoSlugMl(salvo.url || '') || nomeDoSlugMl(dados.urlFinal || '') || nomeDoSlugMl(bruta);
+    if (!nomeReal) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome,
+        motivo: 'sem nome do produto (so o provisorio ' + (salvo.nome || salvo.asin) + ') — cadastre como "Nome | link"' });
+      continue;
+    }
+    if (nomeReal !== salvo.nome && !nomeSalvo) {
+      try { salvarItemVitrine({ asin: salvo.asin, nome: nomeReal }); }
+      catch (e) { console.warn('[ML] Vitrine — nao gravou nome corrigido de ' + salvo.asin + ':', e.message); }
+    }
+
     let links;
     // O nome salvo na vitrine e o que da a categoria — e por isso que o item
     // cadastrado sai com a etiqueta do nicho e o link cru capturado num grupo
     // (que chega sem titulo) cai no balde geral.
-    try { links = await gerarLinksAfiliadoMl([url], { titulos: { [url]: salvo.nome || '' } }); }
+    try { links = await gerarLinksAfiliadoMl([url], { titulos: { [url]: nomeReal } }); }
     catch (e) {
       descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'painel de afiliados: ' + e.message });
       continue;
@@ -2593,7 +2612,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
 
     const p = {
       asin: salvo.asin, id: salvo.asin,
-      titulo: dados.titulo || salvo.nome || '',
+      titulo: nomeReal,
       marca: dados.marca || '',
       imagemUrl: dados.imagem || await imagemPeloNossoLinkMl(r.link),
       link: r.link,                 // meli.la curto, com atribuicao
@@ -2614,8 +2633,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
       loja: 'Mercado Livre',
     };
 
-    let nome = salvo.nome || p.titulo;
-    if (NOME_PROVISORIO_ML.test(nome) && p.titulo) nome = p.titulo;
+    const nome = nomeSalvo || p.titulo;
 
     if (!p.preco)      { descartados.push({ asin: salvo.asin, nome, motivo: 'sem preco na pagina' }); continue; }
     if (!p.disponivel) { descartados.push({ asin: salvo.asin, nome, motivo: 'produto pausado ou sem estoque' }); continue; }
