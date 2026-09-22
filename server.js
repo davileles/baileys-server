@@ -20433,6 +20433,7 @@ function sgAgendarVarredura(primeira) {
 
 // GET /grupos/saude — estado de cada grupo de destino (TSP + CDV).
 app.get('/grupos/saude', (req, res) => {
+  if (req.tenantId !== TENANT_PADRAO) return res.status(403).json({ ok: false, erro: 'disponivel so na operacao padrao' });
   const st = _sg();
   const agora = Date.now();
   const grupos = _sgAlvos().map(jid => {
@@ -20463,6 +20464,7 @@ app.get('/grupos/saude', (req, res) => {
 
 // POST /grupos/saude/verificar — pede uma leitura agora (respeita o teto de 10 min).
 app.post('/grupos/saude/verificar', (req, res) => {
+  if (req.tenantId !== TENANT_PADRAO) return res.status(403).json({ ok: false, erro: 'disponivel so na operacao padrao' });
   const quando = sgAgendarForcada('pedido manual');
   res.json({ ok: true, agendadaPara: quando });
 });
