@@ -15171,6 +15171,48 @@ async function processarOfertasAwin({ simular = false } = {}) {
         precoDeReferencia: true,   // preco de feed, nao lido do site agora
       };
 
+      // ── PRECO CONFIRMADO NA PAGINA ──
+      // O feed pode estar horas atrasado e nao traz preco de socio (ex.: Clube
+      // Wine). A pagina e o que o cliente ve no checkout: quando ela responde,
+      // vence o feed (lerPaginaProduto ja troca pelo preco de socio quando ha).
+      // Sem advertiserId de proposito, para nao cair de volta no proprio feed.
+      // Pagina bloqueada/sem preco: segue com o feed, marcado como referencia.
+      if (c.urlLoja) {
+        try {
+          const pg = await extrairProdutoAwin(c.urlLoja);
+          if (pg && pg.disponivel === false) {
+            console.log('[AWIN-OFERTAS] Indisponivel na pagina, pulando — ' + p.titulo.slice(0, 50));
+            if (!simular) marcarOfertado(c.chaveHistorico);
+            continue;
+          }
+          if (pg && pg.preco) {
+            const deFinal = (pg.precoDe && pg.precoDe > pg.preco) ? pg.precoDe
+                          : (p.precoDe && p.precoDe > pg.preco) ? p.precoDe : null;
+            const descPg = deFinal ? Math.round((1 - pg.preco / deFinal) * 100) : 0;
+            if (Math.abs(pg.preco - p.preco) >= 0.01) {
+              console.log('[AWIN-OFERTAS] Preco da pagina ' + pg.preco + ' (feed ' + p.preco + ')'
+                + (pg.precoPublico ? ' — socio; publico ' + pg.precoPublico : '') + ' — ' + p.titulo.slice(0, 40));
+            }
+            if (descPg < cfg.minPct) {
+              console.log('[AWIN-OFERTAS] Desconto real ' + descPg + '% abaixo do minimo ' + cfg.minPct
+                + '%, pulando — ' + p.titulo.slice(0, 50));
+              if (!simular) marcarOfertado(c.chaveHistorico);
+              continue;
+            }
+            p.preco = pg.preco;
+            p.precoDe = deFinal;
+            p.desconto = descPg;
+            p.precoTexto = 'R$ ' + pg.preco.toFixed(2).replace('.', ',');
+            p.precoDeTexto = deFinal ? 'R$ ' + deFinal.toFixed(2).replace('.', ',') : null;
+            p.precoDeReferencia = false;
+            if (pg.precoPublico) p.precoPublico = pg.precoPublico;
+            if (!p.imagemUrl && pg.imagem) p.imagemUrl = pg.imagem;
+          }
+        } catch (e) {
+          console.log('[AWIN-OFERTAS] Pagina nao confirmou o preco (' + e.message + '), usando o feed.');
+        }
+      }
+
       // Cupom vigente da propria loja, se algum se aplicar a este preco. E o
       // ganho de juntar as duas pontas: os cupons da Awin ja estao na base.
       const mc = melhorCupomAplicavel(p.loja, p.preco);
@@ -15194,10 +15236,31 @@ async function processarOfertasAwin({ simular = false } = {}) {
           imagemUrl: p.imagemUrl || null,
           cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto } : null,
           precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
-          precoDeReferencia: true,
+          precoDeReferencia: p.precoDeReferencia,
+          ...(p.precoPublico ? { precoPublico: p.precoPublico } : {}),
         },
         imagens: [], status: 'pendente', tenant: tenantContexto() || TENANT_PADRAO, timestamp: new Date().toISOString(),
       };
+
+      // ── CATEGORIA + CURADORIA DE NICHO ──
+      // Mesmo passo da captura de grupos: sem ele a oferta do feed nunca tinha
+      // categoria e o roteamento so a mandava para as trilhas gerais.
+      try {
+        const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
+        oferta.dadosExtraidos.categoria          = _cls.categoria;
+        oferta.dadosExtraidos.categoriaNome      = _cls.nome;
+        oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
+        oferta.dadosExtraidos.categoriaSinal     = _cls.sinal;
+        console.log('[CAT] Oferta #' + oferta.id + ' ' + p.asin + ' -> ' + explicarClassificacao(_cls));
+        if (categoriaConfiavel(_cls)) {
+          let _stats = null;
+          try { _stats = estatisticasPreco(p.asin) || null; } catch {}
+          const _cur = avaliarCuradoriaNicho(_cls.categoria, { titulo: p.titulo, stats: _stats });
+          oferta.dadosExtraidos.curadoriaNicho = { categoria: _cls.categoria, ..._cur };
+          if (!_cur.ok) console.log('[CURADORIA] Oferta #' + oferta.id + ' fora do grupo de nicho '
+            + _cls.categoria + ' — ' + _cur.motivo);
+        }
+      } catch (e) { console.warn('[CAT] Falha ao classificar oferta do feed Awin:', e.message); }
       try {
         const img = await baixarImagemProduto(p.imagemUrl);
         if (img) oferta.imagens = [img];
