@@ -4248,6 +4248,74 @@ function enviarCupomParaGrupos(mensagem, imagem, oferta) {
     'cupom #' + (oferta?.id || '?'));
 }
 
+// ── CUPOM NOS GRUPOS DE NICHO ─────────────────────────────────────────────────
+// Cupom generico de loja ("10% acima de R$ 79") vale para o produto de nicho
+// tambem: quem esta no grupo de bebidas pode usar o cupom da Amazon no vinho.
+// Por isso o cupom passou a ir tambem para as trilhas de nicho, com tres travas:
+//   1. Cupom com categoria reconhecida no texto ("20% em fraldas") vai SO para
+//      o nicho daquela categoria — no grupo de bebidas ele nao serve para nada.
+//   2. Cupom restrito (valido so numa selecao fechada) sem categoria reconhecida
+//      nao vai para nicho nenhum: nao da para saber se cobre o produto do grupo.
+//   3. Loja que nao comissiona o nicho fica fora dele (Mercado Livre nao paga
+//      comissao em bebidas). Lista padrao abaixo; o campo
+//      categorias[<id>].cupomLojasExcluidas em tsp/categorias.json substitui a
+//      lista daquele nicho sem deploy.
+const CUPOM_LOJAS_EXCLUIDAS_NICHO = {
+  bebidas: ['Mercado Livre'],
+};
+
+function _normLojaCupom(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+function lojasExcluidasDoNichoCupom(categoria) {
+  const taxo = categoriasConfig()?.categorias?.[categoria];
+  const lista = Array.isArray(taxo?.cupomLojasExcluidas)
+    ? taxo.cupomLojasExcluidas
+    : (CUPOM_LOJAS_EXCLUIDAS_NICHO[categoria] || []);
+  return new Set(lista.map(_normLojaCupom).filter(Boolean));
+}
+
+// Decide para quais nichos o cupom vai. Devolve { destinos, categoria, motivo }.
+// Nunca lanca: qualquer falha vira "sem nicho" e o cupom segue como antes
+// (gerais + so-cupons).
+function rotaNichoDoCupom(mensagem, oferta) {
+  try {
+    const cupons = Array.isArray(oferta?.loteCupons) && oferta.loteCupons.length
+      ? oferta.loteCupons
+      : [oferta?.dadosExtraidos].filter(Boolean);
+    const lojas = new Set(cupons.map(c => _normLojaCupom(c?.loja)).filter(Boolean));
+    const restrito = cupons.length > 0 && cupons.every(c => c?.restrito === true);
+
+    const cls = classificarProduto({ titulo: String(mensagem || '').replace(/[*_~`]/g, ' ') });
+    const catCupom = categoriaConfiavel(cls) ? cls.categoria : null;
+
+    const nichos = trilhas().filter(t => t.categoria && t.destinos.length);
+    let elegiveis;
+    if (catCupom) elegiveis = nichos.filter(t => t.categoria === catCupom);
+    else if (restrito) return { destinos: [], categoria: null, motivo: 'restrito sem categoria reconhecida' };
+    else elegiveis = nichos;
+
+    const barrados = [];
+    elegiveis = elegiveis.filter(t => {
+      const excl = lojasExcluidasDoNichoCupom(t.categoria);
+      const bate = [...lojas].some(l => excl.has(l));
+      if (bate) barrados.push(t.categoria);
+      return !bate;
+    });
+
+    return {
+      destinos: [...new Set(elegiveis.flatMap(t => t.destinos))],
+      categoria: catCupom,
+      motivo: (catCupom ? 'categoria ' + catCupom : 'cupom generico')
+        + (barrados.length ? ' (loja sem comissao em: ' + [...new Set(barrados)].join(', ') + ')' : ''),
+    };
+  } catch (e) {
+    console.warn('[CUPONS] Rota de nicho indisponivel, seguindo so gerais:', e.message);
+    return { destinos: [], categoria: null, motivo: 'erro' };
+  }
+}
+
 async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   // A conta e decidida POR GRUPO (contaDoGrupo): grupo com numero atribuido sai
   // sempre pelo mesmo remetente, e o resto segue o turno. O que nao pode variar
@@ -4259,25 +4327,30 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   const _rastExec = _execId + '@' + Date.now();
   // Sentinela do modo so-admins: detecta o descarte silencioso antes do despacho.
   await verificarAdminGruposCupons();
-  // Cupom e de LOJA, nao de produto: nao tem categoria para casar com nicho.
-  // Vai para os destinos gerais mais os so-cupons — mandar cupom generico no
-  // grupo de bebidas descaracterizaria o nicho.
+  // Destinos gerais + so-cupons + trilhas de nicho onde o cupom serve
+  // (regras em rotaNichoDoCupom).
   const destinos = destinosGerais();
   const soCupons = GRUPOS['tsp_cupons'];
-  const alvos = [...new Set([...destinos, ...soCupons])];
+  const _nicho = rotaNichoDoCupom(mensagem, oferta);
+  const alvos = [...new Set([...destinos, ...soCupons, ..._nicho.destinos])];
+  console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' nicho: ' + _nicho.motivo
+    + ' -> ' + _nicho.destinos.length + ' grupo(s) de nicho, ' + alvos.length + ' no total.');
   const jaRecebeu = new Set(Array.isArray(oferta?.enviadosParciais) ? oferta.enviadosParciais : []);
   const enviados = [], falhas = [], pulados = [];
 
   for (const jid of alvos) {
     if (jaRecebeu.has(jid)) { pulados.push(jid); continue; }
     const op = { conta: contaDoGrupo(jid) };
-    // Rodape extra por grupo: cupom nao tem categoria, entao so casam regras
-    // sem filtro de categoria. Sem regra aplicavel, `texto` e a mensagem original.
+    // Rodape extra por grupo: com categoria reconhecida no cupom, casam tambem
+    // as regras daquela categoria (mesmo convite cruzado da oferta). Cupom
+    // generico so casa regras sem filtro de categoria. Sem regra aplicavel,
+    // `texto` e a mensagem original.
     // Tag de afiliado do destino: grupo com tag propria recebe o link com ela,
     // os demais seguem com a tag do pool. Sem grupo no mapa, `texto` e a
     // mensagem original, byte a byte.
     const { texto } = await comLinksRastreados(
-      comTagDoGrupo(comRodapeExtra(mensagem, { jid, tipo: 'cupom' }), jid), null, jid,
+      comTagDoGrupo(comRodapeExtra(mensagem, { jid, tipo: 'cupom',
+        categoria: _nicho.categoria, categoriaConfiavel: !!_nicho.categoria }), jid), null, jid,
       { execId: _rastExec, tipo: 'cupom', oferta });
     try {
       if (imagem?.imagemBase64) {
