@@ -1183,8 +1183,13 @@ export function expurgarVigilancia({ forcar = 0, simular = false } = {}) {
  */
 function ehCamadaQuente(item) {
   if (item.origemSemeadura !== 'divulgacao') return true;
-  const q = Date.parse(item.divulgadoEm || item.criadoEm || 0) || 0;
-  return q >= Date.now() - _cfg.varredura.quenteDias * 86400000;
+  // Semeado por divulgacao mas curado pelo operador (nicho) ou em rotacao de
+  // disparo manual: e base de trabalho diaria, precisa de leitura fresca.
+  if (String(item.nicho || '').trim()) return true;
+  const corte = Date.now() - _cfg.varredura.quenteDias * 86400000;
+  const q = Math.max(Date.parse(item.divulgadoEm || item.criadoEm || 0) || 0,
+                     Date.parse(item.ultimoDisparo || 0) || 0);
+  return q >= corte;
 }
 
 /** Item frio ja lido dentro do intervalo da camada fria pode ser pulado. */
