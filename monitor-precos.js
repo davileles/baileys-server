@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
-import { listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, melhorCupomAplicavel, marcarDisparo, itensDoGrupo,
+import { listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
@@ -137,7 +137,7 @@ const CFG_PADRAO = {
     // nicho que tiver mais produto cadastrado.
     cotaPorNicho: { geral: 18, bebidas: 6, infantil: 6, ferramentas: 6 },
     // Nicho e a categoria do classificador; 'geral' = sem categoria confiavel.
-    aplicarCupom: true,    // pede o melhor cupom aplicavel no disparo
+    aplicarCupom: true,    // usa o cupom VINCULADO ao produto (nunca escolhe um da base)
     // Avalia a queda tambem sobre o preco COM cupom, contra o historico de
     // preco com cupom. Desligado, o monitor volta a olhar so a etiqueta.
     considerarCupom: true,
@@ -903,6 +903,18 @@ export function estadoEpc() {
  * `passou` e `motivo` — o motivo alimenta o modo sombra, que e onde o operador
  * calibra as regras antes de ligar o envio.
  */
+// Cupom que o OPERADOR vinculou ao produto (campo cupom da vitrine). Regra da
+// operacao: o monitor nunca escolhe cupom da base sozinho — so usa o que foi
+// informado para aquele produto.
+function cupomVinculado(item, preco) {
+  const cod = String(item?.cupom || '').trim();
+  if (!cod || !Number.isFinite(preco) || preco <= 0) return null;
+  const reg = cupomPorCodigo(item.loja, cod);
+  if (!reg || !cupomVigente(reg)) return null;
+  const desconto = calcularDesconto(reg, preco);
+  return desconto > 0 ? { reg, desconto } : null;
+}
+
 export function avaliar(item, leitura, stats, nicho, curado = false) {
   const r = regraDoNicho(nicho);
   const preco = leitura.preco;
@@ -957,7 +969,7 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   // gravado ontem.
   let cupomAtual = null;
   if (_cfg.publicacao.aplicarCupom) {
-    try { cupomAtual = melhorCupomAplicavel(item.loja, preco) || null; } catch (e) { cupomAtual = null; }
+    try { cupomAtual = cupomVinculado(item, preco); } catch (e) { cupomAtual = null; }
   }
   const precoEfetivo = cupomAtual ? Math.round((preco - cupomAtual.desconto) * 100) / 100 : preco;
   const ef = stats.efetivo;
@@ -1037,7 +1049,7 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   if (d) score += d.epc * sc.pesoEpc;
 
   return { ...detalhe, passou: true, motivo: 'ok', score: Math.round(score * 10) / 10,
-           // melhorCupomAplicavel devolve { reg, desconto } — ler .codigo direto
+           // cupomVinculado devolve { reg, desconto } — ler .codigo direto
            // do retorno deixava este campo sempre nulo, e a fila do painel
            // aparecia sem cupom mesmo quando havia um aplicavel.
            cupom: cupomAtual?.reg?.codigo || null,
@@ -1236,7 +1248,7 @@ export async function varrer({ manual = false } = {}) {
     // depois seria impossivel: cupom expira e some da base.
     let descontoAgora = 0;
     if (_cfg.publicacao.aplicarCupom && Number.isFinite(leitura.preco)) {
-      try { descontoAgora = melhorCupomAplicavel(item.loja, leitura.preco)?.desconto || 0; }
+      try { descontoAgora = cupomVinculado(item, leitura.preco)?.desconto || 0; }
       catch (e) { descontoAgora = 0; }
     }
     registrarPreco(item.asin, {
@@ -1571,7 +1583,9 @@ function registrarDisparo(reg) {
  * o grupo de bebidas em vez de jogar tudo no geral.
  */
 export async function dispararMonitorado(item, candidato = {}) {
-  const codigoCupom = _cfg.publicacao.aplicarCupom ? 'auto' : null;
+  // null = o montador usa o cupom vinculado ao item (e nada alem dele);
+  // 'nenhum' = sai sem cupom mesmo havendo vinculo.
+  const codigoCupom = _cfg.publicacao.aplicarCupom ? null : 'nenhum';
 
   let montado;
   if (item.loja === 'Shopee') {

@@ -1389,6 +1389,10 @@ export function definirAtivoPorLoja(loja, ativo) {
   return n;
 }
 
+// Escolha automatica de cupom da base (melhorCupomAplicavel). Desligada: ver o
+// comentario na funcao. Religar so com decisao explicita da operacao.
+const CUPOM_AUTOMATICO = false;
+
 export function cupomVigente(reg) {
   return !!reg && reg.ativo !== false && new Date(reg.validadeAte).getTime() > Date.now();
 }
@@ -1439,6 +1443,14 @@ export function calcularDesconto(reg, preco) {
  * Entre varios aplicaveis vence o de maior desconto em reais.
  */
 export function melhorCupomAplicavel(loja, preco) {
+  // DESLIGADA (set/2026). Regra da operacao: cupom so entra quando foi
+  // informado explicitamente na oferta monitorada (codigo citado no post) ou
+  // sugerido pelo operador (vinculado ao produto no site/painel ou pelo bot).
+  // Escolher sozinho um cupom da base para qualquer produto da loja anunciava
+  // desconto que o produto nao tem — o GARIMPEI (ML, 30%) estava entrando em
+  // tudo. A funcao continua exportada para os chamadores (vitrine 'auto',
+  // Awin, monitor) caírem naturalmente em "sem cupom" ou no cupom vinculado.
+  if (!CUPOM_AUTOMATICO) return null;
   const alvo = normalizarTexto(loja);
   let melhor = null, melhorDesc = 0;
   for (const reg of Object.values(E().cupons)) {
@@ -1633,8 +1645,8 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
   // esse codigo esta na base. Nada de deduzir a partir da palavra "cupom".
   //
   // Isto NAO afeta os outros dois caminhos, que continuam valendo:
-  //   - vitrine no modo 'auto' e monitor de precos — chamam
-  //     melhorCupomAplicavel() direto; ali quem mandou aplicar foi o operador;
+  //   - cupom VINCULADO ao produto pelo operador (vitrine/painel/bot) — a
+  //     escolha automatica da base (melhorCupomAplicavel) foi desligada;
   //   - cupom lido da pagina do anuncio no ML (daPagina) — nao e inferencia,
   //     e o proprio ML declarando o desconto daquele item.
   return null;
