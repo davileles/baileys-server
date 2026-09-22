@@ -124,8 +124,10 @@ const CATEGORIA_ROTULO = {
 // Campos que fazem diferenca na mensagem que vai ao grupo. Categoria, programa
 // e origem/destino ficam de fora: mexer neles muda o roteamento e o historico
 // de transferencias, e isso e decisao de tela, nao de celular.
-// Campos em que a edicao abre com o texto atual pre-preenchido.
-const CAMPOS_PREENCHER = new Set(['resumo', 'importante']);
+// Todos os campos abrem com o valor atual pre-preenchido na caixa de texto
+// (botao ✏️ Editar texto atual). Campo vazio, com quebra de linha ou acima de
+// 256 caracteres cai no bloco de copiar — limite da inline query.
+const CAMPOS_PREENCHER = new Set(['titulo', 'resumo', 'bonus', 'prazo', 'loja', 'cupom', 'link', 'importante']);
 
 const CAMPOS = {
   titulo:     'Título',

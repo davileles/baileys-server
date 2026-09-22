@@ -8018,6 +8018,18 @@ async function resolverEncurtadorCustom(url, saltos = 4) {
   return destino;
 }
 
+// Destino de encurtador de terceiro vem com utm_/fbclid/gclid da campanha
+// DELES. O link oficial fica; o rastreio alheio sai.
+function limparRastreioLink(url) {
+  try {
+    const u = new URL(url);
+    for (const k of [...u.searchParams.keys()]) {
+      if (/^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$)/i.test(k)) u.searchParams.delete(k);
+    }
+    return u.href;
+  } catch (e) { return url; }
+}
+
 async function expandirEncurtadores(texto) {
   const urls = String(texto || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
   const alvos = [...new Set(urls.filter(u =>
@@ -8660,6 +8672,11 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
 
   const nomeGrupo = opts.rotulo || nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
   const textoBruto = itens.map(i => i.texto).filter(Boolean).join('\n').trim();
+  // Grupo de plantao costuma mascarar o link oficial num encurtador (x.gd,
+  // bit.ly...). A IA tem ordem de descartar encurtador, entao a oferta chegava
+  // com link vazio. Resolvido aqui, a IA ve o destino real (o utm_ de terceiro
+  // sai em limparRastreioLink); o conteudoOriginal fica como foi publicado.
+  const textoIa = textoBruto ? await expandirEncurtadores(textoBruto).catch(() => textoBruto) : '';
   const imagens = itens.map(i => i.imagemBase64).filter(Boolean).slice(0, OFERTA_MILHAS_MAX_IMGS);
   console.log('[CDV-OFERTA] Janela fechada em "' + nomeGrupo + '" — ' + itens.length
     + ' item(ns), ' + imagens.length + ' imagem(ns).');
@@ -8675,7 +8692,7 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
           ? 'Conteúdo publicado em um grupo de plantão de milhas. Há ' + imagens.length
             + ' imagem(ns) acima — leia os valores, percentuais e prazos direto delas.\n\n'
           : 'Conteúdo publicado em um grupo de plantão de milhas.\n\n')
-        + (textoBruto ? 'Texto da(s) mensagem(ns):\n"""\n' + textoBruto + '\n"""' : '(as mensagens vieram sem texto)')
+        + (textoBruto ? 'Texto da(s) mensagem(ns):\n"""\n' + textoIa + '\n"""' : '(as mensagens vieram sem texto)')
     },
   ];
 
@@ -8715,7 +8732,7 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
   // Link de convite de grupo e encurtador de afiliado nunca entram: o card vai
   // para o radar publico e para o WhatsApp dos assinantes.
   const link = /^https?:\/\//i.test(ia.link || '') && !/chat\.whatsapp\.com/i.test(ia.link)
-    ? ia.link : '';
+    ? limparRastreioLink(ia.link) : '';
 
   const item = {
     titulo:            String(ia.titulo || '').trim(),
