@@ -205,6 +205,17 @@ const CFG_PADRAO = {
     },
   },
 
+  // ── AVISO DE CANDIDATOS (temporario, set/2026) ──
+  // Todo produto que passa no gatilho e avisado no bot do Telegram (@ticopromosbot,
+  // admins) e no grupo do operador — inclusive em modo sombra, que e justamente
+  // quando ninguem ve a fila. Uma mensagem consolidada por varredura, e o mesmo
+  // produto so e avisado de novo depois de cooldownHoras. Para desligar:
+  // avisos.candidatos = false em /monitor-precos/config.
+  avisos: {
+    candidatos: true,
+    cooldownHoras: 24,
+  },
+
   // Regra padrao + sobrescrita por nicho. Nicho sem entrada em porNicho herda
   // integralmente o padrao.
   regras: {
@@ -234,6 +245,7 @@ let _estado = {      // fila de candidatos + contadores do dia
   ultimoEnvioCuradoEm: 0,  // relogio do NICHO curado (espacamento curto, sem cota)
   ultimaVarredura: null,
   historicoDisparos: [],   // ultimos 200 disparos do monitor (auditoria em tela)
+  avisados: {},            // asin -> ts do ultimo aviso de candidato (cooldown)
 };
 
 let _deps = null;          // injetadas no boot
@@ -427,6 +439,7 @@ export function carregarMonitorPrecos() {
   _estado = { ..._estado, ...ler(ARQ_ESTADO, {}) };
   if (!Array.isArray(_estado.fila)) _estado.fila = [];
   if (!Array.isArray(_estado.historicoDisparos)) _estado.historicoDisparos = [];
+  if (!_estado.avisados || typeof _estado.avisados !== 'object') _estado.avisados = {};
   if (!_estado.cotas || typeof _estado.cotas !== 'object') _estado.cotas = { dia: null, porLoja: {}, porNicho: {} };
   console.log('[PRECOS] Monitor carregado — ' + Object.keys(_hist).length + ' produto(s) com serie, '
     + _estado.fila.length + ' na fila, modo ' + _cfg.modo + (_cfg.ativo ? '' : ' (desligado)') + '.');
@@ -474,6 +487,10 @@ function estruturarCfg(bruto) {
   out.publicacao.curado.intervaloMin = limitar(cu.intervaloMin, 0, 1440, CFG_PADRAO.publicacao.curado.intervaloMin);
   out.publicacao.curado.espelharGeralPct = limitar(cu.espelharGeralPct, 0, 100, CFG_PADRAO.publicacao.curado.espelharGeralPct);
   out.publicacao.curado.espelhoRespeitaCota = cu.espelhoRespeitaCota !== false;
+
+  const av = b.avisos || {};
+  out.avisos.candidatos    = av.candidatos !== false;
+  out.avisos.cooldownHoras = limitar(av.cooldownHoras, 1, 720, CFG_PADRAO.avisos.cooldownHoras);
 
   const dz = b.desempenho || {};
   const sem = dz.semear || {}, sc = dz.score || {};
@@ -1208,6 +1225,7 @@ export async function varrer({ manual = false } = {}) {
   _varrendo = true;
   const t0 = Date.now();
   const resumo = { lidos: 0, falhas: 0, candidatos: 0, pulados: 0, porMotivo: {}, erros: [] };
+  const aprovadosRodada = [];   // [{ av, item }] para o aviso consolidado
 
   // Grava a leitura na serie e decide se vira candidato. Compartilhado pelos
   // dois caminhos de leitura (lote da Amazon e item a item das outras lojas)
@@ -1234,7 +1252,7 @@ export async function varrer({ manual = false } = {}) {
     const { nicho, curado } = nichoDoProduto(item, leitura.titulo);
     const av = avaliar(item, leitura, stats, nicho, curado);
     resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
-    if (av.passou) { enfileirar(av); resumo.candidatos++; }
+    if (av.passou) { enfileirar(av); resumo.candidatos++; aprovadosRodada.push({ av, item }); }
   };
 
   const falhar = (item, msg) => {
@@ -1302,6 +1320,8 @@ export async function varrer({ manual = false } = {}) {
     }
 
     podarFila();
+    try { resumo.avisados = avisarCandidatos(aprovadosRodada); }
+    catch (e) { console.warn('[PRECOS] Aviso de candidatos falhou:', e.message); }
     _estado.ultimaVarredura = {
       em: new Date().toISOString(), duracaoSeg: Math.round((Date.now() - t0) / 1000),
       ...resumo,
@@ -1320,6 +1340,51 @@ export async function varrer({ manual = false } = {}) {
   } finally {
     _varrendo = false;
   }
+}
+
+// ── AVISO DE CANDIDATOS ──────────────────────────────────────────────────────
+// Texto puro (sem Markdown): o bot do Telegram manda sem parse_mode e o
+// WhatsApp aceita o mesmo texto. Retorna quantos produtos entraram no aviso.
+function brl(v) {
+  return Number.isFinite(v) ? 'R$ ' + v.toFixed(2).replace('.', ',') : '—';
+}
+
+function avisarCandidatos(aprovados) {
+  if (!_cfg.avisos?.candidatos || typeof _deps?.avisarCandidatos !== 'function') return 0;
+  const agora = Date.now();
+  const coolMs = _cfg.avisos.cooldownHoras * 3600000;
+  // Limpa marcas vencidas para o estado nao crescer para sempre.
+  for (const [a, ts] of Object.entries(_estado.avisados)) {
+    if (agora - ts > coolMs) delete _estado.avisados[a];
+  }
+  const novos = aprovados.filter(({ av }) => !_estado.avisados[av.asin])
+    .sort((x, y) => (y.av.score || 0) - (x.av.score || 0));
+  if (!novos.length) return 0;
+
+  const MAX = 15;
+  const linhas = novos.slice(0, MAX).map(({ av, item }) => {
+    const nome = String(av.nome || item.nome || av.asin).slice(0, 90);
+    const tag = av.nicho + (av.curado ? ' (curado)' : '');
+    let l = '• [' + tag + '] ' + nome + ' — ' + av.loja + '\n'
+      + '  ' + brl(av.preco) + ' | mediana 30d ' + brl(av.mediana30)
+      + ' | queda ' + av.quedaPct + '%' + (av.recorde ? ' | menor preco 90d' : '');
+    if (av.via === 'cupom') {
+      l += '\n  via cupom ' + (av.cupom || '?') + ' -> ' + brl(av.precoEfetivo)
+        + ' (sem cupom: ' + (av.quedaPctBruto ?? 0) + '%)';
+    }
+    if (item.url) l += '\n  ' + item.url;
+    return l;
+  });
+  const extra = novos.length > MAX ? '\n\n+ ' + (novos.length - MAX) + ' outro(s) na fila do painel.' : '';
+  const modo = _cfg.modo === 'on' ? 'modo on — entram na fila de envio'
+    : _cfg.modo === 'sombra' ? 'modo sombra — NAO serao enviados' : 'modo ' + _cfg.modo;
+  const texto = '📉 Monitor de precos — ' + novos.length + ' produto(s) aptos a sair (' + modo + ')\n\n'
+    + linhas.join('\n\n') + extra;
+
+  for (const { av } of novos) _estado.avisados[av.asin] = agora;
+  Promise.resolve(_deps.avisarCandidatos(texto))
+    .catch(e => console.warn('[PRECOS] Envio do aviso de candidatos falhou:', e.message));
+  return novos.length;
 }
 
 // Candidato repetido substitui o anterior: o preco de agora vale mais do que o

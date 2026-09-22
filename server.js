@@ -20738,6 +20738,13 @@ iniciarMonitorPrecos({
   baixarImagem:   baixarImagemProduto,
   gerarId,
   whatsappPronto: () => !!(conectado && sock),
+  // Aviso temporario de candidatos: bot do Telegram (admins) + grupo do operador.
+  avisarCandidatos: async (texto) => {
+    try { await notificarAdminsTelegram(texto); }
+    catch (e) { console.warn('[PRECOS] Aviso Telegram falhou:', e.message); }
+    try { if (conectado && sock) await enviarMensagem(GRUPOS.operador, { text: texto }); }
+    catch (e) { console.warn('[PRECOS] Aviso operador falhou:', e.message); }
+  },
 });
 
 // Relogio dos workflows do painel-cdv. Sobe cedo e independente do WhatsApp: a
