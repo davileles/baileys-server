@@ -1431,6 +1431,7 @@ async function outboxWorker() {
       } catch (e) {
         item.tentativas = (item.tentativas || 0) + 1;
         item.ultimoErro = e.message;
+        sgErroDeEnvio(item.jid, e.message, item.conta || 'principal');
         if (item.tentativas >= OUTBOX_MAX_TENTATIVAS) {
           const idx = outboxFalhas.indexOf(item);
           if (idx >= 0) outboxFalhas.splice(idx, 1);
@@ -1718,6 +1719,11 @@ async function conectarConta(id) {
     });
     c.sock = s;
     s.ev.on('creds.update', saveCreds);
+    // Sentinela de grupos: numero desta conta removido de um grupo de destino.
+    // So escuta — nenhuma requisicao extra.
+    if (tenantDaConta(id) === TENANT_PADRAO) {
+      s.ev.on('group-participants.update', (u) => sgEventoParticipantes(apelidoDaConta(id), s, u));
+    }
     // Telemetria de "Aguardando mensagem" nos grupos desta conta. SO CONTA:
     // a autocura segue exclusiva da principal (ver o handler de leitura abaixo).
     if (tenantDaConta(id) === TENANT_PADRAO) {
@@ -2215,6 +2221,7 @@ function registrarErroConta(c, msg, grupo) {
   c.ultimoErro = msg || null;
   c.ultimoErroEm = new Date().toISOString();
   c.ultimoErroGrupo = grupo ? (NOMES_GRUPOS.get(grupo) || grupo) : null;
+  if (grupo && tenantDaConta(c.id) === TENANT_PADRAO) sgErroDeEnvio(grupo, msg, apelidoDaConta(c.id));
 }
 function limparErroConta(c) {
   if (!c || !c.ultimoErro) return;
@@ -2436,6 +2443,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
       if (!ok) throw new Error('WhatsApp não reconectou a tempo para reenvio.');
       return enviarMensagem(destino, conteudo, tentativa + 1, opcoes);
     }
+    sgErroDeEnvio(destino, err?.message, 'principal');
     throw err;
   }
 }
@@ -10848,6 +10856,7 @@ async function conectar() {
     sock.ev.on('group-participants.update', (u) => {
       try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author); }
       catch(e) { console.error('[MEMBROS] Erro no handler:', e.message); }
+      sgEventoParticipantes('principal', sock, u);
     });
     // Grupo novo (criado agora ou em que a conta acabou de entrar). Sem isto o
     // cache NOMES_GRUPOS so era preenchido em connection==='open', entao grupo
@@ -20125,6 +20134,340 @@ app.post('/agenda-actions/disparar/:id', async (req, res) => {
   const r = await dispararAgora(req.params.id, { ignorarRunRecente: req.query.forcar === '1' });
   res.status(r.ok ? 200 : 500).json(r);
 });
+
+// ── SENTINELA DE GRUPOS DE DESTINO ───────────────────────────────────────────
+// Pergunta que ninguem respondia: "algum grupo nosso caiu?". Grupo bloqueado
+// pelo WhatsApp ou numero nosso removido so aparecia horas depois, quando a
+// outbox desistia (12 tentativas). Esta sentinela fecha esse buraco com o
+// minimo de trafego possivel — nada aqui envia mensagem:
+//
+//   1. PASSIVO (zero requisicao): evento de remocao de um numero nosso
+//      (group-participants.update) e erro de envio com cara de grupo perdido
+//      (forbidden / item-not-found / not-authorized).
+//   2. ATIVO e esparso: uma varredura a cada ~2h (±20 min aleatorios), so entre
+//      8h e 22h SP, com UMA chamada por conta (groupFetchAllParticipating) e
+//      reaproveitando o cache do _gmRetrato. Nunca groupMetadata grupo a grupo.
+//
+// Grupo que some so vira alerta depois de uma CONFIRMACAO 4 min depois (leitura
+// forcada): resposta parcial do WhatsApp nao pode acordar ninguem. Estado e
+// historico de membros ficam em health.json (restart nao zera a regua).
+const SG_INTERVALO_MS       = 2 * 3600e3;
+const SG_JITTER_MS          = 20 * 60e3;
+const SG_PRIMEIRA_MS        = 15 * 60e3;       // apos o boot: deixa as contas conectarem
+const SG_CONFIRMACAO_MS     = 4 * 60e3;
+const SG_FORCADA_MIN_MS     = 10 * 60e3;       // teto de leituras forcadas disparadas por evento
+const SG_QUEDA_PCT          = 0.20;            // queda de membros em 24h que vira alerta
+const SG_QUEDA_MIN_ABS      = 20;              // ...e no minimo esta quantidade (grupo pequeno nao vira ruido)
+const SG_REAVISO_SUMIDO_MS  = 24 * 3600e3;
+const SG_REAVISO_QUEDA_MS   = 12 * 3600e3;
+const SG_REAVISO_CONTA_MS   = 12 * 3600e3;
+const SG_HIST_MS            = 48 * 3600e3;
+const SG_RE_ERRO_GRUPO      = /forbidden|item-not-found|not-authorized|not-acceptable|\bgone\b|not a participant|\b40[34]\b/i;
+
+// Estado em propriedade de funcao (mesmo motivo do _gm): hooks chamados cedo
+// por registrarErroConta/eventos nao podem cair em TDZ.
+function _sg() {
+  if (!_sg.s) {
+    const h = (_health.sentinelaGrupos && typeof _health.sentinelaGrupos === 'object') ? _health.sentinelaGrupos : {};
+    _sg.s = _health.sentinelaGrupos = {
+      grupos: h.grupos || {},              // jid -> registro
+      contagemConta: h.contagemConta || {},// apelido -> qtd de grupos na ultima leitura confiavel
+      ultimaVarreduraEm: h.ultimaVarreduraEm || null,
+      proximaVarreduraEm: null,
+    };
+    _sg.rodando = false;
+    _sg.timer = null;
+    _sg.confirmacaoTimer = null;
+    _sg.forcadaEm = 0;
+    _sg.forcadaTimer = null;
+  }
+  return _sg.s;
+}
+function _sgSalvar() { _healthGravadoEm = 0; _salvarHealth(); }
+function _sgNome(jid, reg) {
+  let extra = null;
+  try { extra = NOMES_GRUPOS_EXTRAS.get(jid); } catch (e) {}
+  return NOMES_GRUPOS.get(jid) || extra || reg?.nome || jid;
+}
+function _sgAlvos() {
+  return [...new Set([..._gmGruposOperacao('tsp'), ..._gmGruposOperacao('cdv')])];
+}
+function _sgOperacao(jid) { return ehGrupoCdv(jid) ? 'CDV' : 'Tica Promos'; }
+
+// Conta que DEVERIA enviar no grupo, quando ha numero fixo. Turno rotativo
+// nao entra: qualquer conta serve e a substituta ja cobre.
+function _sgContaFixa(jid) {
+  try {
+    if (ehGrupoCdv(jid)) return contaEnvioCdv() || 'principal';
+    const { ativo, mapa } = numerosGrupo();
+    return (ativo && mapa[jid]) ? mapa[jid] : null;
+  } catch (e) { return null; }
+}
+
+async function sgVarrer(opcoes = {}) {
+  const st = _sg();
+  if (_sg.rodando) return { ok: false, erro: 'varredura em andamento' };
+  _sg.rodando = true;
+  const confirmacao = !!opcoes.confirmacao;
+  const agora = Date.now();
+  const resumo = { contas: [], suspeitos: [], sumidos: [], voltaram: [], quedas: [], foraDaConta: [] };
+  try {
+    const contas = _gmContas();
+    if (!contas.length) return { ok: false, erro: 'nenhuma conta conectada' };
+
+    // Uma leitura por conta. Resposta vazia ou com menos da metade dos grupos
+    // da ultima leitura e tratada como nao confiavel: fica fora da comparacao.
+    const confiaveis = [];
+    for (const c of contas) {
+      try {
+        const mapa = await _gmRetrato(c.sock, !!opcoes.forcar);
+        const n = Object.keys(mapa || {}).length;
+        const antes = st.contagemConta[c.id] || 0;
+        if (!n || (antes >= 4 && n < antes * 0.5)) {
+          console.warn('[SENTINELA] Leitura de ' + c.id + ' suspeita (' + n + ' grupos; antes ' + antes + ') — ignorada.');
+          continue;
+        }
+        st.contagemConta[c.id] = n;
+        confiaveis.push({ id: c.id, sock: c.sock, mapa });
+        resumo.contas.push(c.id);
+      } catch (e) {
+        console.warn('[SENTINELA] Nao deu para ler grupos de ' + c.id + ': ' + e.message);
+      }
+    }
+    if (!confiaveis.length) return { ok: false, erro: 'nenhuma leitura confiavel' };
+    const avaliadas = new Set(confiaveis.map(c => c.id));
+
+    for (const jid of _sgAlvos()) {
+      const reg = st.grupos[jid] || (st.grupos[jid] = { estado: 'novo' });
+      const presentes = confiaveis.filter(c => c.mapa[jid]);
+
+      if (presentes.length) {
+        const md = presentes[0].mapa[jid];
+        const n = Array.isArray(md.participants) ? md.participants.length : (Number(md.size) || null);
+        if (md.subject) reg.nome = md.subject;
+        if (reg.estado === 'sumido') {
+          resumo.voltaram.push(jid);
+          _avisarOperador('✅ Grupo voltou a ficar acessível: "' + _sgNome(jid, reg) + '" (' + _sgOperacao(jid) + ').\n'
+            + 'Estava inacessível desde ' + new Date(reg.desde).toLocaleString('pt-BR', { timeZone: TZ_SP }) + '.').catch(() => {});
+        }
+        reg.estado = 'ok'; reg.desde = null; reg.suspeitoEm = null;
+        reg.ultimoVistoEm = new Date(agora).toISOString();
+        reg.contas = presentes.map(c => c.id);
+        reg.membros = n;
+
+        // Queda de membros: compara com o maior valor das ultimas 24h.
+        if (n != null) {
+          reg.hist = (reg.hist || []).filter(p => agora - p.t < SG_HIST_MS);
+          reg.hist.push({ t: agora, n });
+          const max24 = Math.max(...reg.hist.filter(p => agora - p.t < 24 * 3600e3).map(p => p.n));
+          const queda = max24 - n;
+          reg.queda24h = max24 > 0 ? +(queda / max24).toFixed(3) : 0;
+          if (queda >= SG_QUEDA_MIN_ABS && queda >= max24 * SG_QUEDA_PCT
+              && agora - (reg.quedaAvisoEm || 0) > SG_REAVISO_QUEDA_MS) {
+            reg.quedaAvisoEm = agora;
+            resumo.quedas.push(jid);
+            registrarAlerta({
+              nivel: 'critico', origem: 'grupos', chave: 'grupo-queda:' + jid,
+              titulo: 'Queda de membros em "' + _sgNome(jid, reg) + '"',
+              corpo: '*Queda anormal de membros* ⚠️\n\nGrupo "' + _sgNome(jid, reg) + '" (' + _sgOperacao(jid) + ') '
+                + 'caiu de ' + max24 + ' para ' + n + ' membros em 24h (-' + Math.round(queda / max24 * 100) + '%).\n'
+                + 'Pode ser remoção em massa, grupo sob restrição do WhatsApp ou admin mexendo no grupo.',
+            }).catch(() => {});
+          }
+        }
+
+        // Numero fixo do grupo fora dele (a substituta cobre, mas o balanceamento quebrou).
+        const fixa = _sgContaFixa(jid);
+        if (fixa && avaliadas.has(fixa) && !reg.contas.includes(fixa)) {
+          resumo.foraDaConta.push(jid);
+          if (agora - (reg.contaAvisoEm || 0) > SG_REAVISO_CONTA_MS) {
+            reg.contaAvisoEm = agora;
+            registrarAlerta({
+              nivel: 'critico', origem: 'grupos', chave: 'grupo-conta:' + jid + ':' + fixa,
+              titulo: 'Número "' + fixa + '" fora de "' + _sgNome(jid, reg) + '"',
+              corpo: '*Número fora do grupo* ⚠️\n\n"' + fixa + '" é o número fixo de "' + _sgNome(jid, reg) + '" ('
+                + _sgOperacao(jid) + '), mas não está mais no grupo.\n'
+                + 'Os envios estão saindo por: ' + reg.contas.join(', ') + '.\n'
+                + 'Readicione o número ou troque a atribuição na aba de números.',
+            }).catch(() => {});
+          }
+        } else if (fixa && reg.contas.includes(fixa)) {
+          reg.contaAvisoEm = 0;
+        }
+        continue;
+      }
+
+      // Ninguem viu o grupo. Se nenhuma conta que estava nele foi lida agora, nao
+      // da para afirmar nada (conta desconectada nao e grupo caido).
+      const contasAntes = reg.contas || [];
+      if (contasAntes.length && !contasAntes.some(id => avaliadas.has(id))) { reg.estado = reg.estado === 'sumido' ? 'sumido' : 'desconhecido'; continue; }
+      if (reg.estado === 'novo' && !reg.ultimoVistoEm) {
+        // Destino configurado que nenhuma conta nossa enxerga: erro de cadastro
+        // ou grupo que ja estava fora antes da sentinela existir.
+        if (agora - (reg.nuncaVistoAvisoEm || 0) > SG_REAVISO_SUMIDO_MS && confirmacao) {
+          reg.nuncaVistoAvisoEm = agora;
+          registrarAlerta({
+            nivel: 'critico', origem: 'grupos', chave: 'grupo-nunca-visto:' + jid,
+            titulo: 'Destino que nenhum número enxerga: ' + _sgNome(jid, reg),
+            corpo: '*Grupo de destino inacessível* ⚠️\n\n"' + _sgNome(jid, reg) + '" (' + _sgOperacao(jid) + ') está '
+              + 'configurado como destino, mas nenhum número conectado participa dele. Confira se o grupo ainda existe.',
+          }).catch(() => {});
+        }
+        if (!confirmacao) resumo.suspeitos.push(jid);
+        continue;
+      }
+      if (!confirmacao) {
+        if (reg.estado !== 'sumido') { reg.suspeitoEm = reg.suspeitoEm || new Date(agora).toISOString(); resumo.suspeitos.push(jid); }
+        continue;
+      }
+      if (reg.estado !== 'sumido') {
+        reg.estado = 'sumido';
+        reg.desde = reg.suspeitoEm ? new Date(reg.suspeitoEm).getTime() : agora;
+        reg.sumidoAvisoEm = 0;
+      }
+      resumo.sumidos.push(jid);
+      if (agora - (reg.sumidoAvisoEm || 0) > SG_REAVISO_SUMIDO_MS) {
+        reg.sumidoAvisoEm = agora;
+        const visto = reg.ultimoVistoEm ? new Date(reg.ultimoVistoEm).toLocaleString('pt-BR', { timeZone: TZ_SP }) : 'nunca';
+        _avisarOperador('🚨 *Grupo inacessível*: "' + _sgNome(jid, reg) + '" (' + _sgOperacao(jid) + ')\n\n'
+          + 'Nenhum número conectado (' + [...avaliadas].join(', ') + ') aparece mais no grupo.\n'
+          + 'Estava com: ' + (contasAntes.join(', ') || '?') + ' · ' + (reg.membros ?? '?') + ' membros · visto por último: ' + visto + '.\n\n'
+          + 'Causas prováveis: grupo bloqueado/banido pelo WhatsApp, grupo apagado ou nossos números removidos. '
+          + 'Abra o grupo pelo celular para confirmar e, se caiu, tire-o dos destinos e divulgue o grupo reserva.',
+          { critico: true }).catch(() => {});
+      }
+    }
+
+    st.ultimaVarreduraEm = new Date(agora).toISOString();
+    _sgSalvar();
+    console.log('[SENTINELA] Varredura' + (confirmacao ? ' (confirmação)' : '') + ' — contas: ' + resumo.contas.join(',')
+      + ' | suspeitos: ' + resumo.suspeitos.length + ' | sumidos: ' + resumo.sumidos.length
+      + ' | quedas: ' + resumo.quedas.length + ' | fora da conta: ' + resumo.foraDaConta.length
+      + (opcoes.motivo ? ' | motivo: ' + opcoes.motivo : ''));
+
+    // Suspeito na primeira passada -> confirma com leitura forcada daqui a 4 min.
+    if (!confirmacao && resumo.suspeitos.length) {
+      clearTimeout(_sg.confirmacaoTimer);
+      _sg.confirmacaoTimer = setTimeout(() => {
+        _sg.forcadaEm = Date.now();
+        sgVarrer({ forcar: true, confirmacao: true, motivo: 'confirmação de ' + resumo.suspeitos.length + ' suspeito(s)' }).catch(() => {});
+      }, SG_CONFIRMACAO_MS);
+    }
+    return { ok: true, ...resumo };
+  } catch (e) {
+    console.error('[SENTINELA] Erro na varredura:', e.message);
+    return { ok: false, erro: e.message };
+  } finally {
+    _sg.rodando = false;
+  }
+}
+
+// Leitura forcada disparada por evento (erro de envio, remocao, pedido manual),
+// com teto de uma a cada 10 min — rajada de erro nao vira rajada de consulta.
+function sgAgendarForcada(motivo) {
+  _sg();
+  if (_sg.forcadaTimer) return new Date(_sg.forcadaTimer._quando).toISOString();
+  const espera = Math.max(30e3, SG_FORCADA_MIN_MS - (Date.now() - _sg.forcadaEm));
+  const quando = Date.now() + espera;
+  _sg.forcadaTimer = setTimeout(() => {
+    _sg.forcadaTimer = null;
+    _sg.forcadaEm = Date.now();
+    sgVarrer({ forcar: true, motivo }).catch(() => {});
+  }, espera);
+  _sg.forcadaTimer._quando = quando;
+  return new Date(quando).toISOString();
+}
+
+// Hook de erro de envio (principal, contas extras e outbox).
+function sgErroDeEnvio(jid, erro, conta) {
+  try {
+    if (!String(jid || '').endsWith('@g.us')) return;
+    if (!SG_RE_ERRO_GRUPO.test(String(erro || ''))) return;
+    if (!_sgAlvos().includes(jid)) return;
+    console.warn('[SENTINELA] Erro de envio com cara de grupo perdido em ' + _sgNome(jid, _sg().grupos[jid])
+      + ' (' + (conta || '?') + '): ' + erro);
+    sgAgendarForcada('erro de envio em ' + _sgNome(jid, _sg().grupos[jid]));
+  } catch (e) {}
+}
+
+// Hook do group-participants.update: numero NOSSO removido de um destino.
+function sgEventoParticipantes(apelido, s, u) {
+  try {
+    if (!u || u.action !== 'remove' || !String(u.id || '').endsWith('@g.us')) return;
+    if (!_sgAlvos().includes(u.id)) return;
+    const meus = _idsDaContaSock(s);
+    const fui = (u.participants || []).some(p => {
+      const ids = (p && typeof p === 'object') ? _ggIdsDoParticipante(p)
+        : [String(p || '').split(':')[0].split('@')[0]];
+      return ids.some(n => meus.has(n));
+    });
+    if (!fui) return;
+    const st = _sg();
+    const reg = st.grupos[u.id] || (st.grupos[u.id] = { estado: 'novo' });
+    reg.contas = (reg.contas || []).filter(c => c !== apelido);
+    _sgSalvar();
+    const por = _soNumero(u.author);
+    registrarAlerta({
+      nivel: 'critico', origem: 'grupos', chave: 'grupo-removido:' + u.id + ':' + apelido,
+      titulo: 'Número "' + apelido + '" removido de ' + _sgNome(u.id, reg),
+      corpo: '🚨 *Número removido de grupo*\n\n"' + apelido + '" saiu de "' + _sgNome(u.id, reg) + '" ('
+        + _sgOperacao(u.id) + ')' + (por ? ' — removido por ' + por : ' — sem autor informado (pode ter sido o próprio WhatsApp)') + '.\n'
+        + (reg.contas.length ? 'Ainda no grupo: ' + reg.contas.join(', ') + '.' : 'Vou conferir se algum outro número nosso continua lá.'),
+    }).catch(() => {});
+    sgAgendarForcada('remoção de ' + apelido);
+  } catch (e) { console.error('[SENTINELA] Erro no evento de participantes:', e.message); }
+}
+
+function sgAgendarVarredura(primeira) {
+  _sg();
+  clearTimeout(_sg.timer);
+  const jitter = Math.round((Math.random() * 2 - 1) * SG_JITTER_MS);
+  const espera = (primeira ? SG_PRIMEIRA_MS : SG_INTERVALO_MS) + jitter;
+  _sg().proximaVarreduraEm = new Date(Date.now() + espera).toISOString();
+  _sg.timer = setTimeout(async () => {
+    const h = horaSP();
+    if (h >= 8 && h < 22) { try { await sgVarrer({ motivo: 'periódica' }); } catch (e) {} }
+    sgAgendarVarredura(false);
+  }, Math.max(60e3, espera));
+}
+
+// GET /grupos/saude — estado de cada grupo de destino (TSP + CDV).
+app.get('/grupos/saude', (req, res) => {
+  const st = _sg();
+  const agora = Date.now();
+  const grupos = _sgAlvos().map(jid => {
+    const r = st.grupos[jid] || { estado: 'novo' };
+    return {
+      jid, nome: _sgNome(jid, r), operacao: _sgOperacao(jid),
+      estado: r.estado, desde: r.desde ? new Date(r.desde).toISOString() : null,
+      ultimoVistoEm: r.ultimoVistoEm || null, contas: r.contas || [],
+      contaFixa: _sgContaFixa(jid), membros: r.membros ?? null,
+      queda24h: r.queda24h ?? 0,
+      semVerHa: r.ultimoVistoEm ? Math.round((agora - new Date(r.ultimoVistoEm).getTime()) / 60000) : null,
+    };
+  });
+  const peso = { sumido: 0, desconhecido: 1, novo: 2, ok: 3 };
+  grupos.sort((a, b) => (peso[a.estado] ?? 9) - (peso[b.estado] ?? 9) || String(a.nome).localeCompare(String(b.nome), 'pt-BR'));
+  res.json({
+    ok: true,
+    ultimaVarreduraEm: st.ultimaVarreduraEm, proximaVarreduraEm: st.proximaVarreduraEm,
+    resumo: {
+      total: grupos.length,
+      sumidos: grupos.filter(g => g.estado === 'sumido').length,
+      desconhecidos: grupos.filter(g => g.estado === 'desconhecido').length,
+      comQueda: grupos.filter(g => g.queda24h >= SG_QUEDA_PCT).length,
+    },
+    grupos,
+  });
+});
+
+// POST /grupos/saude/verificar — pede uma leitura agora (respeita o teto de 10 min).
+app.post('/grupos/saude/verificar', (req, res) => {
+  const quando = sgAgendarForcada('pedido manual');
+  res.json({ ok: true, agendadaPara: quando });
+});
+
+sgAgendarVarredura(true);
 
 app.listen(PORT, () => {
   console.log('Servidor na porta '+PORT);
