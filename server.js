@@ -4545,15 +4545,43 @@ function variantesMiniatura(url) {
  * Miniatura pronta para o preview, ja dentro do limite. Ordem: o que veio na
  * captura (sem rede) -> variantes menores do CDN -> nenhuma.
  */
+// Converte qualquer imagem (PNG do feed da Awin, webp do ML, JPEG grande) em
+// JPEG dentro do limite da miniatura. PNG com transparencia ganha fundo branco
+// — sem isso o fundo vira preto no JPEG. Sem sharp, devolve null e o fluxo
+// segue para as variantes do CDN como antes.
+async function jpegParaMiniatura(buf, rotulo) {
+  if (!Buffer.isBuffer(buf) || !buf.length) return null;
+  const sh = await carregarSharp();
+  if (!sh) return null;
+  try {
+    for (const [larg, q] of [[400, 82], [400, 68], [300, 60], [240, 50]]) {
+      const saida = await sh(buf, { failOn: 'none' }).rotate()
+        .resize({ width: larg, height: larg, fit: 'inside', withoutEnlargement: true })
+        .flatten({ background: '#ffffff' })
+        .jpeg({ quality: q })
+        .toBuffer();
+      if (saida.length <= THUMB_MAX_BYTES) {
+        console.log('[PREVIEW] ' + rotulo + ': miniatura convertida para JPEG ('
+          + Math.round(saida.length / 1024) + 'KB).');
+        return saida;
+      }
+    }
+  } catch (e) {
+    console.warn('[PREVIEW] ' + rotulo + ': conversao para JPEG falhou (' + e.message + ').');
+  }
+  return null;
+}
+
 async function miniaturaDoPreview(imagemBase64, imagemUrl, rotulo, reservaBase64 = null) {
   if (imagemBase64) {
     const buf = Buffer.from(imagemBase64, 'base64');
     // Precisa ser JPEG de verdade: um buffer webp (padrao do Mercado Livre)
     // rotulado como jpegThumbnail faz o cliente descartar o card inteiro.
+    if (ehJpegBuffer(buf) && buf.length <= THUMB_MAX_BYTES) return buf;
+    const conv = await jpegParaMiniatura(buf, rotulo);
+    if (conv) return conv;
     if (!ehJpegBuffer(buf)) {
       console.log('[PREVIEW] ' + rotulo + ': miniatura nao e JPEG — tentando variante do CDN.');
-    } else if (buf.length <= THUMB_MAX_BYTES) {
-      return buf;
     } else {
       console.log('[PREVIEW] ' + rotulo + ': miniatura de ' + Math.round(buf.length / 1024)
         + 'KB acima do limite de ' + Math.round(THUMB_MAX_BYTES / 1024) + 'KB — buscando variante menor.');
@@ -4581,6 +4609,17 @@ async function miniaturaDoPreview(imagemBase64, imagemUrl, rotulo, reservaBase64
         + Math.round(buf.length / 1024) + 'KB).');
       return buf;
     }
+  }
+  // Ultima tentativa: a imagem original da URL, convertida aqui (cobre CDN sem
+  // variante conhecida, como o productserve da Awin, que entrega PNG).
+  if (imagemUrl && !imagemBase64) {
+    try {
+      const res = await fetch(imagemUrl, { signal: AbortSignal.timeout(8000) });
+      if (res.ok) {
+        const conv = await jpegParaMiniatura(Buffer.from(await res.arrayBuffer()), rotulo);
+        if (conv) return conv;
+      }
+    } catch (e) { /* sem imagem: card vai sem foto */ }
   }
   console.log('[PREVIEW] ' + rotulo + ': nenhuma miniatura coube — card vai sem foto.');
   return null;
