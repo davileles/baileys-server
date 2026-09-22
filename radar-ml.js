@@ -2149,9 +2149,13 @@ function numeroBr(txt) {
 /**
  * Ativa um cupom na conta, como o botao "Inserir codigo" da pagina de cupons.
  * Cupom capturado num grupo so vale nas suas compras depois de ativado.
+ *
+ * opcoes.permitirNaPausa: usado SO pela fila espacada (insercao-ml-auto.js),
+ * que tem ritmo, teto diario e disjuntor proprios. Com CUPONS_ML_PAUSADO=1 o
+ * sync e a leitura de "Meus cupons" continuam parados.
  */
-export async function ativarCupomMl(codigo) {
-  if (CUPONS_ML_PAUSADO) throw new Error(ERRO_CUPONS_PAUSADO);
+export async function ativarCupomMl(codigo, opcoes = {}) {
+  if (CUPONS_ML_PAUSADO && !opcoes.permitirNaPausa) throw new Error(ERRO_CUPONS_PAUSADO);
   const r = await chamarAff('https://www.mercadolivre.com.br/cupons/api/input-code', {
     method: 'POST',
     // A chave e coupon_input_code, capturada do proprio botao "Adicionar cupom".

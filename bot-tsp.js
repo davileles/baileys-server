@@ -1241,7 +1241,10 @@ function pendentesInsercaoMl() {
   return dep.listarCuponsBase()
     .filter(r => ehCupomMl(r) && r.codigo && r.ativo !== false
       // So o que da para digitar em "Inserir codigo": card sem codigo ("30% OFF em X") fica fora.
-      && /^[A-Za-z0-9._-]{2,40}$/.test(String(r.codigo)) && r.confirmadoNoMl !== true && !r.insercaoMl)
+      && /^[A-Za-z0-9._-]{2,40}$/.test(String(r.codigo)) && r.confirmadoNoMl !== true
+      // null = nunca decidido; manual/conferir = devolvido pela fila automatica
+      // (teto, disjuntor ou resposta ambigua). fila_auto fica fora: a automacao cuida.
+      && (!r.insercaoMl || r.insercaoMl === 'manual' || r.insercaoMl === 'conferir'))
     // Quem vence primeiro vem primeiro.
     .sort((a, b) => (Date.parse(a.validadeAte) || 0) - (Date.parse(b.validadeAte) || 0));
 }
@@ -1258,7 +1261,8 @@ function linhaInsercao(r, i) {
   if (r.limite != null) partes.push('teto ' + brlCurto(r.limite));
   if (r.maximo != null) partes.push('produtos até ' + brlCurto(r.maximo));
   const capt = horaCurta(r.capturadoEm);
-  return (i + 1) + '. <code>' + esc(r.codigo) + '</code>' + (r.restrito ? ' 🎯' : '') + '\n'
+  return (i + 1) + '. <code>' + esc(r.codigo) + '</code>' + (r.restrito ? ' 🎯' : '')
+    + (r.insercaoMl === 'conferir' ? ' 👀 resposta ambígua na automática' : '') + '\n'
     + '    ' + esc(partes.join(' · ')) + (capt ? ' · capturado ' + esc(capt) : '');
 }
 
@@ -1268,11 +1272,13 @@ async function mostrarInsercao(chatId, msgId) {
   catch (e) { return falarPlano(chatId, '❌ Não consegui ler a base de cupons: ' + e.message, null, msgId); }
 
   const abrirMl = [{ text: '🛒 Abrir cupons do ML', url: URL_CUPONS_ML }];
-  const atualizar = [{ text: '🔄 Atualizar', callback_data: 'm:lista' }];
+  const atualizar = [{ text: '🔄 Atualizar', callback_data: 'm:lista' },
+                     { text: '🤖 Automática', callback_data: 'm:auto' }];
+  const auto = linhaAutoResumo();
   let html, kb;
 
   if (!todos.length) {
-    html = '✅ <b>Nenhum cupom do Mercado Livre esperando inserção.</b>';
+    html = '✅ <b>Nenhum cupom do Mercado Livre esperando inserção.</b>' + auto;
     kb = { inline_keyboard: [atualizar] };
   } else {
     const mostrados = todos.slice(0, MAX_INSERCAO);
@@ -1283,7 +1289,8 @@ async function mostrarInsercao(chatId, msgId) {
       + '\n\nToque no código para copiar e cole em <b>Inserir código</b>.'
       + '\n✅ inseri · 🗑 vencido/esgotado (desativa) · ⏭ pular (sai da lista, segue ativo)'
       + '\n<i>Deu erro de conta ao inserir? Não marque nada e pare de inserir por 24–48h.</i>'
-      + (ritmo >= RITMO_ALERTA ? '\n\n⚠️ ' + ritmo + ' inserções marcadas na última hora — espace as próximas.' : '');
+      + (ritmo >= RITMO_ALERTA ? '\n\n⚠️ ' + ritmo + ' inserções marcadas na última hora — espace as próximas.' : '')
+      + auto;
     kb = { inline_keyboard: [
       abrirMl,
       ...mostrados.map(r => [
@@ -1301,7 +1308,68 @@ async function mostrarInsercao(chatId, msgId) {
   return res;
 }
 
+// ── INSERCAO AUTOMATICA (fila espacada — insercao-ml-auto.js) ────────────────
+function estadoAuto() {
+  try { return dep && dep.insercaoAuto ? dep.insercaoAuto.estado() : null; }
+  catch (e) { return null; }
+}
+
+/** Linha curta no rodape do /inserir sobre a fila automatica. */
+function linhaAutoResumo() {
+  const e = estadoAuto();
+  if (!e || !e.ligada) return '';
+  if (e.disjuntor) return '\n\n🛑 <b>Automática desligada</b> — ' + esc(e.disjuntor.motivo) + ' (/autoinserir)';
+  return '\n\n🤖 Automática: ' + e.naFila.length + ' na fila · hoje ' + e.feitasHoje + '/' + e.tetoDia
+    + (e.naFila.length && e.proximaEm ? ' · próxima ~' + e.proximaHora : '');
+}
+
+async function mostrarAuto(chatId, msgId) {
+  const e = estadoAuto();
+  const voltar = [{ text: '➕ Lista manual', callback_data: 'm:lista' },
+                  { text: '🔄 Atualizar', callback_data: 'm:auto' }];
+  if (!e) return falarHtml(chatId, '❌ Inserção automática indisponível neste servidor.', { inline_keyboard: [voltar] }, msgId);
+  if (!e.ligada) {
+    return falarHtml(chatId, '⚪ <b>Inserção automática desligada</b>\n\n'
+      + 'Para ligar: variável <code>CUPONS_ML_INSERCAO_AUTO=1</code> no Railway.',
+      { inline_keyboard: [voltar] }, msgId);
+  }
+  const partes = [];
+  partes.push(e.disjuntor
+    ? '🛑 <b>Inserção automática DESLIGADA</b>\nMotivo: ' + esc(e.disjuntor.motivo)
+      + (e.disjuntor.codigo ? ' (' + esc(e.disjuntor.codigo) + ')' : '')
+      + '\nDesde: ' + esc(horaCurta(e.disjuntor.em) || e.disjuntor.em)
+    : '🤖 <b>Inserção automática ativa</b>');
+  partes.push('Hoje: <b>' + e.feitasHoje + '/' + e.tetoDia + '</b> · intervalo ' + e.intervaloMin[0] + '–' + e.intervaloMin[1]
+    + ' min · janela ' + e.janela[0] + 'h–' + e.janela[1] + 'h' + (e.dentroDaJanela ? '' : ' (fora agora)'));
+  if (!e.disjuntor) {
+    partes.push('Na fila: <b>' + e.naFila.length + '</b>' + (e.naFila.length ? ' — ' + e.naFila.slice(0, 8).map(c => '<code>' + esc(c) + '</code>').join(', ') : '')
+      + (e.proximaEm ? '\nPróxima tentativa: ~' + e.proximaHora : ''));
+  }
+  if (e.ultimos && e.ultimos.length) {
+    partes.push('<b>Últimas</b>\n' + e.ultimos.slice(0, 8).map(x => x.rotulo + ' <code>' + esc(x.codigo) + '</code>').join('\n'));
+  }
+  const acoes = e.disjuntor
+    ? [{ text: '▶️ Religar', callback_data: 'm:auto:religar' }]
+    : [{ text: '⏸ Pausar', callback_data: 'm:auto:pausar' }];
+  if (e.disjuntor) partes.push('<i>Se foi bloqueio de conta, espere 24–48h antes de religar.</i>');
+  return falarHtml(chatId, partes.join('\n\n'), { inline_keyboard: [acoes, voltar] }, msgId);
+}
+
+async function tratarAuto(chatId, msgId, acao, ctx) {
+  const api = dep && dep.insercaoAuto;
+  if (api && acao === 'religar') {
+    const r = await api.religar();
+    if (ctx) await ctx.toast(r.ok ? '▶️ Religada' + (r.adotados ? ' — ' + r.adotados + ' cupom(ns) da lista manual entraram na fila.' : '.') : '❌ ' + r.erro);
+  } else if (api && acao === 'pausar') {
+    const r = await api.pausar();
+    if (ctx) await ctx.toast('⏸ Pausada' + (r.devolvidos ? ' — ' + r.devolvidos + ' cupom(ns) voltaram para a lista manual.' : '.'));
+  }
+  return mostrarAuto(chatId, msgId);
+}
+
 async function tratarInsercao(chatId, msgId, data, ctx) {
+  const ma = /^m:auto(?::(religar|pausar))?$/.exec(data);
+  if (ma) return tratarAuto(chatId, msgId, ma[1], ctx);
   const m = /^m:(ok|venc|pular|lista)(?::(.+))?$/.exec(data);
   if (!m) return;
   const [, acao, chave] = m;
@@ -1391,6 +1459,7 @@ async function tratarTexto(chatId, texto, msgEntrada) {
 
   if (/^\/fila/i.test(t)) { sessoes.delete(String(chatId)); return mostrarFila(chatId); }
   if (/^\/inserir/i.test(t)) { sessoes.delete(String(chatId)); return mostrarInsercao(chatId); }
+  if (/^\/autoinserir/i.test(t)) { sessoes.delete(String(chatId)); return mostrarAuto(chatId); }
 
   if (/^\/limpar/i.test(t)) {
     sessoes.delete(String(chatId));
@@ -1693,6 +1762,7 @@ export async function bootBotTsp(deps) {
     { command: 'msg',      description: 'Mensagem livre para os grupos' },
     { command: 'fila',     description: 'Ofertas de produto esperando decisão' },
     { command: 'inserir',  description: 'Cupons do ML para inserir na conta' },
+    { command: 'autoinserir', description: 'Estado da inserção automática de cupons no ML' },
     { command: 'limpar',   description: 'Apagar do chat o que já foi aprovado ou descartado' },
     { command: 'status',   description: 'Ver a saúde do servidor (WhatsApp, fila, publicações)' },
     { command: 'reconectar', description: 'Reconectar o WhatsApp (com confirmação)' },

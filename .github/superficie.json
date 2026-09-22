@@ -441,6 +441,17 @@
         "Tela.prototype.porNumero",
         "Tela.prototype.salvarDesc"
       ]
+    },
+    "insercao-ml-auto.js": {
+      "minLinhas": 250,
+      "obrigatorio": [
+        "export function iniciarInsercaoMlAuto",
+        "export function enfileirarInsercaoMl",
+        "export function estadoInsercaoMlAuto",
+        "export async function religarInsercaoMlAuto",
+        "export async function pausarInsercaoMlAuto",
+        "export function insercaoMlAutoLigada"
+      ]
     }
   }
 }

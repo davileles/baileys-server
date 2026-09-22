@@ -118,6 +118,8 @@ import {
 // os workflows por workflow_dispatch na hora certa de SP. Detalhes e medicoes
 // no cabecalho de agenda-actions.js.
 import { iniciarAgendaActions, estadoAgenda, dispararAgora, agendaAtiva } from './agenda-actions.js';
+import { iniciarInsercaoMlAuto, enfileirarInsercaoMl, estadoInsercaoMlAuto,
+         religarInsercaoMlAuto, pausarInsercaoMlAuto } from './insercao-ml-auto.js';
 
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
@@ -5391,53 +5393,25 @@ async function avisarExtracaoFalhou(texto, canal) {
 // na base, gate de auto-envio e envio (ou fila). Antes isso vivia dentro do
 // processador do Telegram; extrair evita que uma segunda fonte reimplemente as
 // mesmas regras de seguranca com sutis diferencas.
-// Ativa na conta do ML um cupom recem-capturado, como o botao "Inserir codigo"
-// da pagina de cupons. Chamada sem await de proposito: o envio aos grupos nao
-// pode depender do ML responder.
 //
-// Recusa NAO desativa o cupom aqui. Essa decisao continua com o sync horario,
-// que tem a pagina inteira como contexto — uma resposta isolada pode ser rate
-// limit ou cupom segmentado, e desativar na captura derrubaria oferta valida.
+// ativarCupomCapturadoMl: destino de um cupom do ML recem-capturado na conta.
 //
-// INSERCAO ASSISTIDA (padrao desde set/2026): a conta TSP tomou restricao no
-// input-code depois de meses de insercao automatizada a partir do Railway. Agora
-// o servidor NAO insere nada: o cupom entra na lista /inserir do bot do Telegram
-// e o operador insere do proprio celular, marcando o desfecho ali. O caminho
-// automatico abaixo so volta com CUPONS_ML_INSERCAO_AUTO=1 (e exige tambem
-// CUPONS_ML_PAUSADO=0 no radar-ml.js).
-const INSERCAO_ML_AUTO = String(process.env.CUPONS_ML_INSERCAO_AUTO || '0') === '1';
-
+// INSERCAO (desde set/2026): a conta TSP tomou restricao no input-code depois
+// de meses de insercao IMEDIATA a partir do Railway. Hoje ha dois caminhos:
+//   - CUPONS_ML_INSERCAO_AUTO=1: o cupom entra na fila espacada de
+//     insercao-ml-auto.js (intervalo aleatorio, janela de horario, teto diario,
+//     disjuntor). O que ela nao aceitar cai no manual.
+//   - padrao: lista /inserir do bot do Telegram; o operador insere do celular.
+// Nenhum dos dois chama o ML na hora da captura.
 function ativarCupomCapturadoMl(c, reg) {
   if (!c || c.loja !== 'Mercado Livre' || !c.codigo) return;
-  if (!INSERCAO_ML_AUTO) {
-    // O bot e da TSP: cupom capturado no contexto de outro tenant nao entra
-    // na lista (ela le a base do tenant raiz).
-    const tenant = tenantContexto() || TENANT_PADRAO;
-    if (tenant === TENANT_PADRAO && reg && reg.confirmadoNoMl !== true && !reg.insercaoMl) {
-      try { avisarInsercaoMlTelegram(); } catch (e) { console.warn('[CUPONS-ML] Aviso de insercao falhou:', e.message); }
-    }
-    return;
-  }
-  if (!tokenAffOk()) return;
-  ativarCupomMl(c.codigo).then(r => {
-    if (r.ok || r.jaTinha) {
-      // Marca o que o sync usa para nao tratar o cupom como "nunca ativado".
-      if (reg?.chave) { try { atualizarCupomBase(reg.chave, { confirmadoNoMl: true }); } catch(e) {} }
-      console.log('[CUPONS-ML] ' + c.codigo + (r.jaTinha ? ' ja estava na conta.' : ' ativado na conta na captura.'));
-    } else if (r.esgotado) {
-      console.warn('[CUPONS-ML] ' + c.codigo + ' ja esgotado no ML na captura — ' +
-        'o sync horario decide se desativa.');
-    } else if (r.invalido) {
-      console.warn('[CUPONS-ML] ' + c.codigo + ' recusado pelo ML na captura: ' +
-        (r.mensagem || 'sem detalhe') + ' — o sync horario decide se desativa.');
-    } else if (r.payloadRejeitado) {
-      console.error('[CUPONS-ML] ' + c.codigo + ': INVALID_6 na captura — o formato do ' +
-        'input-code mudou de novo. Nenhum cupom esta entrando na conta.');
-    } else {
-      console.warn('[CUPONS-ML] Resposta inesperada ao ativar ' + c.codigo + ' na captura: ' +
-        (r.mensagem || r.status));
-    }
-  }).catch(e => console.warn('[CUPONS-ML] Falha ao ativar ' + c.codigo + ' na captura: ' + e.message));
+  // O bot e a fila sao da TSP: cupom capturado no contexto de outro tenant nao
+  // entra (ambos leem a base do tenant raiz).
+  const tenant = tenantContexto() || TENANT_PADRAO;
+  if (tenant !== TENANT_PADRAO || !reg || reg.confirmadoNoMl === true || reg.insercaoMl) return;
+  try { if (enfileirarInsercaoMl(reg)) return; }
+  catch (e) { console.warn('[CUPONS-ML] Fila automatica recusou ' + c.codigo + ':', e.message); }
+  try { avisarInsercaoMlTelegram(); } catch (e) { console.warn('[CUPONS-ML] Aviso de insercao falhou:', e.message); }
 }
 
 async function enfileirarCupomTSP(c, ctx = {}) {
@@ -8018,18 +7992,6 @@ async function resolverEncurtadorCustom(url, saltos = 4) {
   return destino;
 }
 
-// Destino de encurtador de terceiro vem com utm_/fbclid/gclid da campanha
-// DELES. O link oficial fica; o rastreio alheio sai.
-function limparRastreioLink(url) {
-  try {
-    const u = new URL(url);
-    for (const k of [...u.searchParams.keys()]) {
-      if (/^(utm_|fbclid$|gclid$|mc_cid$|mc_eid$)/i.test(k)) u.searchParams.delete(k);
-    }
-    return u.href;
-  } catch (e) { return url; }
-}
-
 async function expandirEncurtadores(texto) {
   const urls = String(texto || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
   const alvos = [...new Set(urls.filter(u =>
@@ -8672,11 +8634,6 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
 
   const nomeGrupo = opts.rotulo || nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
   const textoBruto = itens.map(i => i.texto).filter(Boolean).join('\n').trim();
-  // Grupo de plantao costuma mascarar o link oficial num encurtador (x.gd,
-  // bit.ly...). A IA tem ordem de descartar encurtador, entao a oferta chegava
-  // com link vazio. Resolvido aqui, a IA ve o destino real (o utm_ de terceiro
-  // sai em limparRastreioLink); o conteudoOriginal fica como foi publicado.
-  const textoIa = textoBruto ? await expandirEncurtadores(textoBruto).catch(() => textoBruto) : '';
   const imagens = itens.map(i => i.imagemBase64).filter(Boolean).slice(0, OFERTA_MILHAS_MAX_IMGS);
   console.log('[CDV-OFERTA] Janela fechada em "' + nomeGrupo + '" — ' + itens.length
     + ' item(ns), ' + imagens.length + ' imagem(ns).');
@@ -8692,7 +8649,7 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
           ? 'Conteúdo publicado em um grupo de plantão de milhas. Há ' + imagens.length
             + ' imagem(ns) acima — leia os valores, percentuais e prazos direto delas.\n\n'
           : 'Conteúdo publicado em um grupo de plantão de milhas.\n\n')
-        + (textoBruto ? 'Texto da(s) mensagem(ns):\n"""\n' + textoIa + '\n"""' : '(as mensagens vieram sem texto)')
+        + (textoBruto ? 'Texto da(s) mensagem(ns):\n"""\n' + textoBruto + '\n"""' : '(as mensagens vieram sem texto)')
     },
   ];
 
@@ -8732,7 +8689,7 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
   // Link de convite de grupo e encurtador de afiliado nunca entram: o card vai
   // para o radar publico e para o WhatsApp dos assinantes.
   const link = /^https?:\/\//i.test(ia.link || '') && !/chat\.whatsapp\.com/i.test(ia.link)
-    ? limparRastreioLink(ia.link) : '';
+    ? ia.link : '';
 
   const item = {
     titulo:            String(ia.titulo || '').trim(),
@@ -20227,9 +20184,14 @@ bootBotTsp({
   enviarOfertaBot: enviarOfertaDoBot,
   enviarLivreBot: (mensagem) => enviarManualParaGrupos({ mensagem, tipo: 'manual' }),
   salvarFila,
-  // Lista /inserir (insercao manual de cupons na conta do ML).
+  // Lista /inserir (insercao manual de cupons na conta do ML) e /autoinserir.
   listarCuponsBase,
   atualizarCupomBase,
+  insercaoAuto: {
+    estado: estadoInsercaoMlAuto,
+    religar: religarInsercaoMlAuto,
+    pausar: pausarInsercaoMlAuto,
+  },
   // Operacao pelo celular: /reconectar (com confirmacao) e /status no proprio bot.
   forcarReconexao,
   status: () => ({
@@ -20246,6 +20208,19 @@ bootBotTsp({
     uptimeMin: Math.round((Date.now() - _bootEm) / 60000),
   }),
 }).catch(e => console.warn('[BOT-TSP] Falha no boot:', e.message));
+
+// Fila espacada de insercao de cupons na conta do ML (CUPONS_ML_INSERCAO_AUTO=1).
+// Depois do bot: os avisos saem por ele.
+iniciarInsercaoMlAuto({
+  listarCuponsBase,
+  atualizarCupomBase,
+  ativarCupomMl,
+  tokenAffOk,
+  avisarManual: () => avisarInsercaoMlTelegram(),
+  avisarTelegram: (texto) => notificarAdminsTelegram(texto),
+  avisarOperador: (texto) => enviarMensagem(GRUPOS.operador, { text: texto }),
+  sessaoDir: SESSAO_DIR,
+});
 
 // Bots de revisao CDV. Nao recebem funcao do servidor: falam pelas mesmas rotas
 // HTTP que o painel usa, entao nao ha regra de negocio duplicada neles.
