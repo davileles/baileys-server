@@ -20192,7 +20192,12 @@ function _sgNome(jid, reg) {
 function _sgAlvos() {
   return [...new Set([..._gmGruposOperacao('tsp'), ..._gmGruposOperacao('cdv')])];
 }
-function _sgOperacao(jid) { return ehGrupoCdv(jid) ? 'CDV' : 'Tica Promos'; }
+// Operacao pela lista de onde o grupo veio (inclui grupos de entrada do CDV,
+// que o ehGrupoCdv nao cobre por olhar so os destinos de envio).
+function _sgOperacao(jid) {
+  try { if (ehGrupoCdv(jid) || _gmGruposOperacao('cdv').includes(jid)) return 'CDV'; } catch (e) {}
+  return 'Tica Promos';
+}
 
 // Conta que DEVERIA enviar no grupo, quando ha numero fixo. Turno rotativo
 // nao entra: qualquer conta serve e a substituta ja cobre.
