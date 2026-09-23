@@ -1978,7 +1978,12 @@ export function normalizar(item) {
     precoDe: de?.amount ?? null,
     precoDeTexto: de?.displayAmount || null,
     desconto,
-    disponivel: l?.availability?.type === 'IN_STOCK',
+    // A OffersV2 usa varios tipos para produto compravel (IN_STOCK_SCARCE,
+    // LEADTIME, AVAILABLE_DATE, PREORDER...). Exigir so IN_STOCK marcava como
+    // esgotado item com preco e buy box. Indisponivel = sem preco ou tipo
+    // explicitamente fora de estoque.
+    disponivel: !!preco?.amount
+      && !/^(OUT_OF_STOCK|UNAVAILABLE)$/i.test(String(l?.availability?.type || '')),
     vendedor: l?.merchantInfo?.name || null,
     ehDeal: Boolean(l?.dealDetails),
     dealTermina: l?.dealDetails?.endTime || null,
