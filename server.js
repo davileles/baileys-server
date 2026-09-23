@@ -77,6 +77,7 @@ import {
   carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
   semearVitrinePorDesempenho, rankingEpc, estadoEpc,
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
+  julgarDisparo, vereditosDisparos,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -5403,6 +5404,13 @@ async function registrarEnvioHistorico(oferta) {
       catch (e) { console.warn('[DEDUP] Falha ao marcar ' + d.asin + ':', e.message); }
       // Vigilancia de preco: entra pela DIVULGACAO, nao pela captura. Captura
       // sao ~100 produtos/dia e a lista estouraria; divulgado sao ~20 distintos.
+      // Sombra: a regra do monitor julga este disparo ANTES de a divulgacao
+      // semear a serie (senao "sem serie" nunca apareceria).
+      try {
+        const v = julgarDisparo({ asin: d.asin, loja: d.loja, nome: d.titulo, preco: Number(d.preco), precoDe: Number(d.precoDe),
+          origem: oferta.autoEnviado ? 'auto-envio' : (oferta.grupoOrigem || oferta.origem || 'fila'), cupom: d.cupom || oferta.cupom || null });
+        if (v) console.log('[PRECOS] Sombra — ' + d.asin + ': ' + v.veredito + (v.motivo && v.veredito !== 'passou' ? ' (' + v.motivo + ')' : ''));
+      } catch (e) { console.warn('[PRECOS] Sombra falhou para ' + d.asin + ':', e.message); }
       try {
         vigiarProdutoDivulgado({
           asin: d.asin, loja: d.loja, nome: d.titulo,
@@ -17411,6 +17419,12 @@ app.post('/monitor-precos/simular', (req, res) => {
 // ── DESEMPENHO REAL (ganho por clique) ──
 // O ledger epc-produtos.json e escrito pelo coletor no GitHub Actions; aqui ele
 // so e lido. Sem o arquivo, tudo isto responde vazio e o monitor segue igual.
+// GET /monitor-precos/vereditos?dias=7 — seus disparos x a regra (modo sombra)
+app.get('/monitor-precos/vereditos', (req, res) => {
+  const dias = Math.min(30, Math.max(1, parseInt(req.query.dias, 10) || 7));
+  res.json({ ok: true, ...vereditosDisparos({ dias }) });
+});
+
 app.get('/monitor-precos/epc', (req, res) => {
   res.json({ ok:true, estado: estadoEpc(),
              ranking: rankingEpc({ limite: Math.min(Number(req.query.limite) || 100, 400) }) });

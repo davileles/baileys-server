@@ -1149,6 +1149,60 @@ export function semearVitrinePorDesempenho({ simular: apenasSimular = false } = 
  * a data de ultima divulgacao renovada — o cadastro manual nunca e sobrescrito
  * nem tem a origem trocada.
  */
+// ── SOMBRA: A REGRA JULGA CADA DISPARO REAL ─────────────────────────────────
+// Toda oferta que sai (fila, auto-envio, lista, monitor) passa por aqui ANTES
+// de semear a serie, e a regra do nicho da o seu veredito com o que sabia
+// naquele instante: passou / sem serie / serie imatura / sem queda / so com
+// cupom / outra loja mais barata. Nada e bloqueado — e um espelho para
+// calibrar a regra contra o olho do operador. Quando o produto ja estava na
+// fila do monitor, registra quantos minutos antes ele tinha sido sinalizado.
+const VEREDITOS_MAX = 400;
+function classeDoVeredito(av) {
+  if (av.passou) return 'passou';
+  const mo = String(av.motivo || '');
+  if (mo.startsWith('sem serie')) return 'sem serie';
+  if (mo.startsWith('serie imatura')) return 'serie curta';
+  if (mo.startsWith('sem preco') || mo.startsWith('sem referencia')) return 'sem preco';
+  if (mo.startsWith('outra loja')) return 'outra loja mais barata';
+  if (mo.includes('cupom')) return 'so com cupom';
+  if (mo.startsWith('abaixo') || mo.startsWith('acima')) return 'fora da faixa de preco';
+  return 'sem queda';
+}
+export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null, cupom = null }) {
+  if (!asin) return null;
+  const item = itemVitrine(asin) || { asin, loja, nome: nome || '', cupom: cupom || '' };
+  if (cupom && !item.cupom) item.cupom = cupom;
+  const h = _hist[asin];
+  const stats = estatisticas(asin);
+  const { nicho } = nichoDoProduto(item, nome || h?.n || item.nome);
+  let av;
+  try { av = avaliar(item, { preco: Number(preco), precoDe: Number(precoDe), disponivel: true }, stats, nicho); }
+  catch (e) { av = { passou: false, motivo: 'erro: ' + e.message }; }
+  const naFila = _estado.fila.find(f => f.asin === asin);
+  const reg = {
+    em: new Date().toISOString(), asin, loja, nome: String(nome || item.nome || '').slice(0, 120), nicho, origem,
+    preco: Number(preco) || null, precoDe: Number(precoDe) || null,
+    mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null, diasSerie: stats?.dias ?? 0,
+    quedaPct: av.quedaPct ?? null, recorde: !!av.recorde, via: av.via || null,
+    veredito: classeDoVeredito(av), motivo: av.motivo || null,
+    sinalizadoAntesMin: naFila?.em ? Math.max(0, Math.round((Date.now() - new Date(naFila.em).getTime()) / 60000)) : null,
+  };
+  _estado.vereditosDisparos = [reg, ...(_estado.vereditosDisparos || [])].slice(0, VEREDITOS_MAX);
+  return reg;
+}
+export function vereditosDisparos({ dias = 7 } = {}) {
+  const corte = Date.now() - dias * 86400000;
+  const lista = (_estado.vereditosDisparos || []).filter(v => new Date(v.em).getTime() >= corte);
+  const porVeredito = {};
+  for (const v of lista) porVeredito[v.veredito] = (porVeredito[v.veredito] || 0) + 1;
+  const sinalizados = lista.filter(v => v.sinalizadoAntesMin != null);
+  return { dias, total: lista.length, porVeredito,
+    sinalizadosAntes: sinalizados.length,
+    sinalizadoAntesMedianaMin: sinalizados.length ? sinalizados.map(v => v.sinalizadoAntesMin).sort((a, b) => a - b)[Math.floor(sinalizados.length / 2)] : null,
+    passariamPorDia: Object.entries(_estado.passariamPorDia || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([dia, v]) => ({ dia, ...v })),
+    regras: _cfg.regras, lista };
+}
+
 export function vigiarProdutoDivulgado({ asin, loja, nome, url, preco, precoDe }) {
   if (!_cfg.vigilancia?.ativo) return { ok: false, motivo: 'vigilancia desligada' };
   if (!asin) return { ok: false, motivo: 'sem id de produto' };
@@ -1338,6 +1392,21 @@ export async function varrer({ manual = false } = {}) {
       em: new Date().toISOString(), duracaoSeg: Math.round((Date.now() - t0) / 1000),
       ...resumo,
     };
+    // Sombra: quantos produtos passariam HOJE com as regras atuais. Guarda o
+    // maximo do dia (a varredura roda varias vezes) por 30 dias — e a serie
+    // "passariam por dia" da tela do vigia, recalculada so para o instante da
+    // varredura, nunca retroativamente.
+    try {
+      const hoje = diaSP(Date.now());
+      const sim = simular();
+      _estado.passariamPorDia = _estado.passariamPorDia || {};
+      const ant = _estado.passariamPorDia[hoje] || { passaram: 0, avaliados: 0, reprovados: {} };
+      if (sim.passaram.length >= ant.passaram) {
+        _estado.passariamPorDia[hoje] = { passaram: sim.passaram.length, avaliados: sim.total, reprovados: sim.reprovados };
+      }
+      const corte = diaSP(Date.now() - 30 * 86400000);
+      for (const d of Object.keys(_estado.passariamPorDia)) if (d < corte) delete _estado.passariamPorDia[d];
+    } catch (e) { console.warn('[PRECOS] Serie passariam/dia falhou:', e.message); }
     // So o shard do mes corrente: a varredura nunca acrescenta ponto em mes
     // fechado, entao reescrever os antigos seria reenviar dado identico.
     gravarShardCorrente();
