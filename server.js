@@ -15506,7 +15506,8 @@ app.post('/awin/ofertas/cadastrar', async (req, res) => {
         // Preco do feed serve de plano B se a loja bloquear a leitura na hora
         // do disparo. Datado agora, para o TTL poder vence-lo.
         preco: c.preco, precoDe: c.precoDe,
-        cupom,
+        // Mesma regra do POST /vitrine: cupom vazio nao apaga o que ja estava salvo.
+        ...(cupom ? { cupom } : (req.body?.cupomModo === 'nenhum' ? { cupom: null } : {})),
       }), jaExistia: jaTinha });
       marcarOfertado(c.chaveHistorico);
     }
@@ -16815,6 +16816,21 @@ app.post('/vitrine', async (req, res) => {
   }
   const salvos = [], erros = [];
 
+  // CURADORIA SO SOBRESCREVE QUANDO FOI DECLARADA. salvarItemVitrine trata null
+  // como "limpar" e so undefined como "preservar" — passar cupom/nicho/grupo
+  // vazios fazia o recadastro de um produto que ja estava na base apagar em
+  // silencio o nicho curado, o cupom fixo e o agrupamento entre lojas.
+  // Excecao: modo "nenhum" (sem cupom) escolhido de proposito limpa o cupom salvo.
+  const cupomModo = String(req.body?.cupomModo || '');
+  const curadoria = (grupo) => {
+    const c = {};
+    if (cupom) c.cupom = cupom;
+    else if (cupomModo === 'nenhum') c.cupom = null;
+    if (nicho) c.nicho = nicho;
+    if (grupo) c.grupo = grupo;
+    return c;
+  };
+
   // ── AGRUPAMENTO POR LINHA ──
   // Linha com DUAS OU MAIS URLs = o mesmo produto em lojas diferentes. Os itens
   // entram na base separados (cada loja tem seu preco e seu identificador), mas
@@ -16869,7 +16885,7 @@ app.post('/vitrine', async (req, res) => {
           shopId: String(ids[0].shopId), itemId: String(ids[0].itemId),
           nome: (nomeManual || '').trim() || node?.productName || ('Produto ' + ids[0].itemId),
           url: node?.offerLink || node?.productLink || linha.trim(),
-          cupom, nicho, grupo,
+          ...curadoria(grupo),
         }), jaExistia: jaTinha });
         continue;
       }
@@ -16879,7 +16895,7 @@ app.post('/vitrine', async (req, res) => {
         const rmg = await resolverLinhaVitrineMagalu(linha);
         if (!rmg || rmg.erro) { erros.push({ linha, erro: rmg?.erro || 'falhou' }); continue; }
         const jaTinhaMg = !!itemVitrine(rmg.asin);
-        salvos.push({ ...salvarItemVitrine({ ...rmg, cupom, nicho, grupo }), jaExistia: jaTinhaMg });
+        salvos.push({ ...salvarItemVitrine({ ...rmg, ...curadoria(grupo) }), jaExistia: jaTinhaMg });
         continue;
       }
       // Mercado Livre: identificador e MLB, nao ASIN, e o link de afiliado so
@@ -16889,7 +16905,7 @@ app.post('/vitrine', async (req, res) => {
         const rml = await resolverLinhaVitrineMl(linha);
         if (!rml || rml.erro) { erros.push({ linha, erro: rml?.erro || 'falhou' }); continue; }
         const jaTinhaMl = !!itemVitrine(rml.asin);
-        salvos.push({ ...salvarItemVitrine({ ...rml, cupom, nicho, grupo }), jaExistia: jaTinhaMl });
+        salvos.push({ ...salvarItemVitrine({ ...rml, ...curadoria(grupo) }), jaExistia: jaTinhaMl });
         continue;
       }
       // Rede Awin: qualquer anunciante afiliado. Vem antes do fallback da
@@ -16898,14 +16914,14 @@ app.post('/vitrine', async (req, res) => {
         const raw = await resolverLinhaVitrineAwin(linha);
         if (!raw || raw.erro) { erros.push({ linha, erro: raw?.erro || 'falhou' }); continue; }
         const jaTinhaAw = !!itemVitrine(raw.asin);
-        salvos.push({ ...salvarItemVitrine({ ...raw, cupom, nicho, grupo }), jaExistia: jaTinhaAw,
+        salvos.push({ ...salvarItemVitrine({ ...raw, ...curadoria(grupo) }), jaExistia: jaTinhaAw,
           aviso: raw.precoManual ? 'preco informado a mao — a loja bloqueou a leitura automatica' : null });
         continue;
       }
       const r = await resolverLinhaVitrine(linha);
       if (!r || r.erro) { erros.push({ linha, erro: r?.erro || 'falhou' }); continue; }
       const jaTinha = !!itemVitrine(r.asin);
-      salvos.push({ ...salvarItemVitrine({ ...r, cupom, nicho, grupo }), jaExistia: jaTinha });
+      salvos.push({ ...salvarItemVitrine({ ...r, ...curadoria(grupo) }), jaExistia: jaTinha });
     } catch (e) { erros.push({ linha, erro: e.message }); }
   }
   // Titulo real antes de o produto aparecer na base — ver resolverNomesProvisorios.
