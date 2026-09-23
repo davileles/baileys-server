@@ -161,7 +161,83 @@ func enfileirarLeitura(it *itemLeitura) {
 
 // Chamado do handler de eventos da conta: NAO pode bloquear (o whatsmeow
 // entrega os eventos em ordem, num unico fluxo). Download e HTTP ficam no worker.
+// itemParticipantes: entrada/saida de membros repassada ao servidor para o
+// ledger de membros (entradas, saidas, migracoes, retencao). Diferente das
+// mensagens, vale para TODA conta e TODO grupo — o servidor filtra pelos
+// destinos — porque os grupos de tico-02/03 nao tem o Baileys da principal.
+type itemParticipantes struct {
+	Conta        string   `json:"conta"`
+	Grupo        string   `json:"grupo"`
+	Acao         string   `json:"acao"` // add | remove
+	Participants []string `json:"participantes"`
+	Telefones    []string `json:"telefones,omitempty"` // mesmo indice; vazio quando so o LID e conhecido
+	Autor        string   `json:"autor,omitempty"`
+	Timestamp    int64    `json:"timestamp"`
+}
+
+func (c *Conta) repassarParticipantes(e *events.GroupInfo) {
+	if leitura.url == "" || e == nil || e.JID.Server != types.GroupServer {
+		return
+	}
+	montar := func(acao string, jids []types.JID) *itemParticipantes {
+		if len(jids) == 0 {
+			return nil
+		}
+		it := &itemParticipantes{Conta: c.ID, Grupo: e.JID.String(), Acao: acao, Timestamp: e.Timestamp.Unix()}
+		tem := false
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		for _, j := range jids {
+			j = j.ToNonAD()
+			it.Participants = append(it.Participants, j.String())
+			tel := ""
+			if j.Server == types.DefaultUserServer {
+				tel = j.User
+			} else if cli := c.cliente(); cli != nil && j.Server == types.HiddenUserServer {
+				if pn, err := cli.Store.LIDs.GetPNForLID(ctx, j); err == nil && !pn.IsEmpty() {
+					tel = pn.User
+				}
+			}
+			if tel != "" {
+				tem = true
+			}
+			it.Telefones = append(it.Telefones, tel)
+		}
+		if !tem {
+			it.Telefones = nil
+		}
+		if e.Sender != nil {
+			it.Autor = e.Sender.ToNonAD().String()
+		}
+		return it
+	}
+	for _, it := range []*itemParticipantes{montar("add", e.Join), montar("remove", e.Leave)} {
+		if it == nil {
+			continue
+		}
+		go func(it *itemParticipantes) {
+			corpo, err := json.Marshal(it)
+			if err != nil {
+				return
+			}
+			req, _ := http.NewRequest("POST", leitura.url+"/interno/wa-leitura/participantes", bytes.NewReader(corpo))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := httpLeitura.Do(req)
+			if err != nil {
+				registrarErroLeitura("participantes: " + err.Error())
+				return
+			}
+			resp.Body.Close()
+		}(it)
+	}
+}
+
 func (c *Conta) repassarEvento(evt any) {
+	if gi, ok := evt.(*events.GroupInfo); ok {
+		c.repassarParticipantes(gi)
+		return
+	}
 	if !leituraAtiva(c.ID) {
 		return
 	}

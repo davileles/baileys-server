@@ -57,6 +57,11 @@ recebidas nos grupos que o servidor lê — fontes do radar TSP e monitorados do
 protojson, com a imagem já baixada. Nesta fase o servidor só compara com o Baileys
 (`GET /interno/wa-leitura/comparacao`); nada entra no pipeline.
 
+Entradas e saídas de membros (`events.GroupInfo`) de **toda** conta e **todo** grupo são repassadas a
+`POST /interno/wa-leitura/participantes` sempre que `LEITURA_URL` está definida, independentemente de
+`LEITURA_CONTAS`; o servidor filtra pelos grupos de destino e faz dedup com o que o Baileys já viu.
+Quando o whatsmeow conhece o telefone por trás do LID, ele vai junto.
+
 ## Recuperação de fila x problema de entrega
 
 Celular que fica fora do ar pede, ao voltar, o reenvio de tudo o que perdeu — um aparelho só chegou a

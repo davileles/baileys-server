@@ -1722,7 +1722,14 @@ async function conectarConta(id) {
     // Sentinela de grupos: numero desta conta removido de um grupo de destino.
     // So escuta — nenhuma requisicao extra.
     if (tenantDaConta(id) === TENANT_PADRAO) {
-      s.ev.on('group-participants.update', (u) => sgEventoParticipantes(apelidoDaConta(id), s, u));
+      s.ev.on('group-participants.update', (u) => {
+        // Ledger de membros: grupo onde so esta conta esta (sem a principal)
+        // nao tinha entrada/saida registrada. O dedup segura a duplicata
+        // quando a principal tambem esta la.
+        try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author, apelidoDaConta(id)); }
+        catch (e) { console.error('[MEMBROS] Erro no handler (' + id + '):', e.message); }
+        sgEventoParticipantes(apelidoDaConta(id), s, u);
+      });
     }
     // Telemetria de "Aguardando mensagem" nos grupos desta conta. SO CONTA:
     // a autocura segue exclusiva da principal (ver o handler de leitura abaixo).
@@ -13179,6 +13186,29 @@ app.post('/interno/wa-leitura/mensagens', (req, res) => {
 // mensagens com mais de 2 min, para dar tempo de todas as fontes chegarem.
 // Resumo persistido (dia corrente + historico) e, da memoria, os exemplos e a
 // possibilidade de comparar outro par de fontes (?ref=&alvo=).
+// Entradas e saidas vistas pelo whatsmeow (toda conta, todo grupo — o ledger
+// filtra pelos destinos). Fecha a cobertura dos grupos onde so tico-02/03 estao.
+app.post('/interno/wa-leitura/participantes', (req, res) => {
+  if (!_authWaLeitura(req, res)) return;
+  try {
+    const it = req.body || {};
+    const grupo = String(it.grupo || '');
+    const acao = it.acao === 'add' ? 'add' : (it.acao === 'remove' ? 'remove' : null);
+    if (!grupo.endsWith('@g.us') || !acao || !Array.isArray(it.participantes)) {
+      return res.status(400).json({ ok: false, erro: 'grupo, acao e participantes obrigatorios' });
+    }
+    _wmUltimoContato = Date.now();
+    const participantes = it.participantes.map((jid, i) => ({
+      id: String(jid || ''),
+      phoneNumber: (Array.isArray(it.telefones) && it.telefones[i]) ? String(it.telefones[i]) + '@s.whatsapp.net' : undefined,
+    }));
+    registrarMovimentoMembros(grupo, participantes, acao, it.autor || null, 'wm:' + String(it.conta || '?'));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
+  }
+});
+
 app.get('/interno/wa-leitura/comparacao', (req, res) => {
   try {
     const dias = Math.min(8, Math.max(1, parseInt(req.query.dias, 10) || 1));
@@ -19385,25 +19415,54 @@ function _temEntrada(grupo, numero) {
   return false;
 }
 
-function registrarMovimentoMembros(grupo, participantes, acao, autor) {
+// Dedup entre fontes: o mesmo ADD chega pela principal (Baileys), pela conta
+// extra que tambem esta no grupo (Baileys) e pelo wa-envio (whatsmeow). Chave
+// grupo|identificador|acao dentro de 2 min = mesmo evento. O identificador
+// pode vir como LID numa fonte e telefone noutra, entao as duas formas entram
+// na chave.
+const _MEMBROS_DEDUP_MS = 2 * 60 * 1000;
+const _membrosVistos = new Map();   // chave -> ts (ms)
+function _membrosJaVisto(grupo, ids, acao, agoraMs) {
+  if (_membrosVistos.size > 5000) {
+    for (const [k, t] of _membrosVistos) if (agoraMs - t > _MEMBROS_DEDUP_MS) _membrosVistos.delete(k);
+  }
+  let visto = false;
+  for (const id of ids) {
+    if (!id) continue;
+    const k = grupo + '|' + id + '|' + acao;
+    const t = _membrosVistos.get(k);
+    if (t && agoraMs - t < _MEMBROS_DEDUP_MS) visto = true;
+    _membrosVistos.set(k, agoraMs);
+  }
+  return visto;
+}
+
+// fonte: 'principal' | apelido da conta extra | 'wm:<conta>' (wa-envio).
+function registrarMovimentoMembros(grupo, participantes, acao, autor, fonte = 'principal') {
   const destinos = new Set(censoAlvos());
   if (!destinos.has(grupo)) return;              // so grupos de destino
   if (acao !== 'add' && acao !== 'remove') return;
-  const ts = new Date().toISOString();
+  const agoraMs = Date.now();
+  const ts = new Date(agoraMs).toISOString();
+  let novos = 0;
   for (const p of (participantes || [])) {
     const n = _soNumero(p);
     if (!n) continue;
-    const ev = { ts, g: grupo, n, a: acao };
     const tel = (p && typeof p === 'object') ? _soNumero(p.phoneNumber) : '';
+    if (_membrosJaVisto(grupo, [n, tel], acao, agoraMs)) continue;
+    const ev = { ts, g: grupo, n, a: acao };
     if (tel && tel !== n) ev.tel = tel;
     const por = _soNumero(autor);
     if (por && por !== n) ev.por = por;
+    if (fonte && fonte !== 'principal') ev.f = fonte;
     if (acao === 'remove' && !_temEntrada(grupo, n)) ev.entradaDesconhecida = true;
     _membrosLog.eventos.push(ev);
+    novos++;
   }
+  if (!novos) return;
   salvarMembrosLog();
-  console.log('[MEMBROS] ' + acao + ' — ' + (participantes || []).length + ' em '
-    + (NOMES_GRUPOS.get(grupo) || grupo));
+  console.log('[MEMBROS] ' + acao + ' — ' + novos + ' em '
+    + (NOMES_GRUPOS.get(grupo) || grupo) + ' (via ' + fonte + ')');
 }
 
 // GET /grupos/membros/eventos?jid=&dias=30&limite=500 — leitura crua do ledger.
@@ -19561,15 +19620,18 @@ app.get('/grupos/membros/resumo', (req, res) => {
   const dias = Math.min(Math.max(parseInt(req.query.dias || '60', 10) || 60, 1), 400);
   const corte = Date.now() - dias * 86400000;
   const porDia = new Map();
-  for (const e of _membrosLog.eventos) {
-    if (jid && e.g !== jid) continue;
-    if (new Date(e.ts).getTime() < corte) continue;
+  const janela = _membrosLog.eventos.filter(e => new Date(e.ts).getTime() >= corte);
+  const { migracao, desistencia } = classificarMovimentos(janela);
+  janela.forEach((e, i) => {
+    if (jid && e.g !== jid) return;
     const d = _censoDia(e.ts);
-    if (!porDia.has(d)) porDia.set(d, { dia: d, entradas: 0, saidas: 0, grupos: {} });
+    if (!porDia.has(d)) porDia.set(d, { dia: d, entradas: 0, saidas: 0, migracoes: 0, desistencias: 0, grupos: {} });
     const reg = porDia.get(d);
     const g = reg.grupos[e.g] || (reg.grupos[e.g] = { entradas: 0, saidas: 0 });
-    if (e.a === 'add') { reg.entradas++; g.entradas++; } else { reg.saidas++; g.saidas++; }
-  }
+    if (migracao.has(i)) { if (e.a === 'remove') reg.migracoes++; return; }
+    if (e.a === 'add') { reg.entradas++; g.entradas++; if (desistencia.has(i)) reg.desistencias++; }
+    else { reg.saidas++; g.saidas++; }
+  });
   const serie = [...porDia.values()].sort((a, b) => (a.dia < b.dia ? -1 : 1));
   const inicio = _membrosLog.eventos.length ? _membrosLog.eventos[0].ts : null;
   res.json({
@@ -19579,6 +19641,95 @@ app.get('/grupos/membros/resumo', (req, res) => {
     nomes: Object.fromEntries([...new Set(serie.flatMap(x => Object.keys(x.grupos)))]
       .map(j => [j, NOMES_GRUPOS.get(j) || null])),
     serie,
+  });
+});
+
+// ── HOJE: ENTRADAS, SAIDAS, MIGRACOES E DESISTENCIAS ─────────────────────────
+// Migracao: a pessoa saiu de um destino e entrou (ou ja estava) em outro
+// destino nosso numa janela curta — troca de grupo, nao e entrada nem saida.
+// Desistencia: entrou e saiu do mesmo grupo no mesmo dia (SP).
+// Tudo calculado na leitura, a partir do ledger cru; nada e reescrito.
+const MIGRACAO_JANELA_MS = 15 * 60 * 1000;
+function _idsDoEvento(e) { return [e.n, e.tel].filter(Boolean); }
+function classificarMovimentos(eventos) {
+  const porPessoa = new Map();   // id -> [{i, e}]
+  eventos.forEach((e, i) => {
+    if (e.semId) return;
+    for (const id of _idsDoEvento(e)) {
+      if (!porPessoa.has(id)) porPessoa.set(id, []);
+      porPessoa.get(id).push({ i, e });
+    }
+  });
+  const migracao = new Set(), desistencia = new Set();
+  for (const lista of porPessoa.values()) {
+    for (const { i, e } of lista) {
+      const t = new Date(e.ts).getTime();
+      for (const { i: j, e: o } of lista) {
+        if (i === j) continue;
+        const to = new Date(o.ts).getTime();
+        if (e.a === 'remove' && o.a === 'add' && o.g !== e.g && Math.abs(to - t) <= MIGRACAO_JANELA_MS) {
+          migracao.add(i); migracao.add(j);
+        }
+        if (e.a === 'add' && o.a === 'remove' && o.g === e.g && to > t && _censoDia(o.ts) === _censoDia(e.ts)) {
+          desistencia.add(i); desistencia.add(j);
+        }
+      }
+    }
+  }
+  return { migracao, desistencia };
+}
+
+// GET /grupos/membros/hoje — o dia de hoje contra o mesmo horario de ontem.
+// Entradas e saidas ja descontam migracoes; desistencias sao contadas a parte
+// (entram nas entradas e nas saidas). Vagas por grupo: teto de MEMBROS_TETO
+// (padrao 1.010, abaixo do limite do WhatsApp) menos o censo mais recente.
+const MEMBROS_TETO = Math.max(100, parseInt(process.env.MEMBROS_TETO || '1010', 10) || 1010);
+app.get('/grupos/membros/hoje', (req, res) => {
+  const agora = new Date();
+  const hoje = _censoDia(agora.toISOString());
+  const ontemD = new Date(agora.getTime() - 86400000);
+  const ontem = _censoDia(ontemD.toISOString());
+  const destinos = new Set(censoAlvos());
+  const corte = agora.getTime() - 3 * 86400000;
+  const evs = _membrosLog.eventos.filter(e => destinos.has(e.g) && new Date(e.ts).getTime() >= corte);
+  const { migracao, desistencia } = classificarMovimentos(evs);
+
+  const conta = (dia, ateMs) => {
+    const r = { entradas: 0, saidas: 0, migracoes: 0, desistencias: 0, semId: 0, grupos: {} };
+    evs.forEach((e, i) => {
+      const t = new Date(e.ts).getTime();
+      if (_censoDia(e.ts) !== dia || t > ateMs) return;
+      if (e.semId) { r.semId++; }
+      const g = r.grupos[e.g] || (r.grupos[e.g] = { nome: NOMES_GRUPOS.get(e.g) || null, entradas: 0, saidas: 0, migracoes: 0 });
+      if (migracao.has(i)) { if (e.a === 'remove') { r.migracoes++; g.migracoes++; } return; }
+      if (e.a === 'add') { r.entradas++; g.entradas++; if (desistencia.has(i)) r.desistencias++; }
+      else { r.saidas++; g.saidas++; }
+    });
+    r.saldo = r.entradas - r.saidas;
+    return r;
+  };
+  const h = conta(hoje, agora.getTime());
+  const o = conta(ontem, ontemD.getTime());       // ontem ate o mesmo horario
+  const oDiaInteiro = conta(ontem, ontemD.getTime() + 86400000);
+
+  const censoPorJid = new Map((_censo.grupos || []).map(g => [g.jid, g]));
+  const vagas = [...destinos].map(j => {
+    const cg = censoPorJid.get(j);
+    const membros = cg && typeof cg.membros === 'number' ? cg.membros : null;
+    return { jid: j, nome: NOMES_GRUPOS.get(j) || cg?.nome || null, membros,
+      vagas: membros == null ? null : Math.max(0, MEMBROS_TETO - membros),
+      cheio: membros != null && membros >= MEMBROS_TETO };
+  }).sort((a, b) => (b.vagas ?? -1) - (a.vagas ?? -1));
+
+  res.json({
+    ok: true, dia: hoje, horaSP: hhmmSP(), teto: MEMBROS_TETO,
+    hoje: h,
+    ontemMesmoHorario: { entradas: o.entradas, saidas: o.saidas, saldo: o.saldo, migracoes: o.migracoes, desistencias: o.desistencias },
+    ontemDiaInteiro:   { entradas: oDiaInteiro.entradas, saidas: oDiaInteiro.saidas, saldo: oDiaInteiro.saldo },
+    variacao: { entradas: h.entradas - o.entradas, saidas: h.saidas - o.saidas, saldo: h.saldo - o.saldo },
+    vagas: { total: vagas.reduce((s, g) => s + (g.vagas || 0), 0), cheios: vagas.filter(g => g.cheio).length,
+      censoEm: _censo.atualizadoEm, grupos: vagas },
+    membrosUnicos: null,   // pede a lista de participantes por grupo; fica para o censo por pessoa
   });
 });
 
