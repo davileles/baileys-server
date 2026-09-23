@@ -16000,21 +16000,25 @@ function dataHoraSP(ts) {
     .format(new Date(ts));
 }
 
-// Worker: acorda a cada 15s e envia o proximo produto de cada lista cuja hora
-// chegou. Uma lista por vez dentro do tick — se duas vencerem juntas, a segunda
-// espera o proximo ciclo, evitando dois envios no mesmo segundo.
-let _listaWorkerRodando = false;
-setInterval(async () => {
-  if (_listaWorkerRodando) return;
-  const pendentes = listarListas().filter(l =>
-    l.execucao && !l.execucao.pausada && l.execucao.proximoEm <= Date.now());
-  if (!pendentes.length) return;
+// Worker: acorda a cada 15s e poe para andar TODA lista cuja hora chegou, cada
+// uma na sua propria execucao. Antes o worker era um so para todas as listas e
+// esperava o envio terminar: como cada envio aguarda o portao de publicacao
+// (fila global com o radar), um item de uma lista de 30 grupos segurava as
+// outras listas por varios minutos — em 23/09 os envios unicos de Bebidas e
+// Ferramentas sairam 10-20 min atrasados atras da "Quarta - Shopee" e do radar.
+// Agora cada lista so espera por si mesma; quem continua serializando a saida
+// (e evitando dois envios no mesmo segundo) e o portao de publicacao.
+const _listasEmEnvio = new Set();   // ids de listas com um item em andamento
 
-  _listaWorkerRodando = true;
+async function processarItemLista(id) {
   try {
-    const lista = pendentes[0];
-    const ex = lista.execucao;
+    const lista = listaPorId(id);
+    const ex = lista?.execucao;
+    if (!ex || ex.pausada || ex.proximoEm > Date.now()) return;
     const asin = lista.produtos[ex.indice];
+    // Cancelada, removida ou reiniciada enquanto o item saia: o andamento que
+    // esta execucao carrega nao vale mais e nao pode ser gravado por cima.
+    const execucaoVigente = () => listaPorId(id)?.execucao === ex;
 
     if (asin === undefined) {                       // fim da fila
       console.log('[LISTA] "' + lista.nome + '" concluida — ' + ex.enviados.length
@@ -16046,6 +16050,10 @@ setInterval(async () => {
 
     try {
       const r = await dispararProdutoDaLista(asin, cupomDaLista(lista), lista.roteamento);
+      if (!execucaoVigente()) {
+        console.log('[LISTA] "' + lista.nome + '" mudou durante o envio de ' + asin + ' — andamento descartado.');
+        return;
+      }
       // Bloqueio do antibot e da infra, nao do item: adia 10 min em vez de
       // consumir a fila (25/08: uma lista inteira virou "pulado" em sequencia).
       // Depois de 3 tentativas (30 min) desiste deste item e segue: o bloqueio
@@ -16065,6 +16073,7 @@ setInterval(async () => {
                                    origemNicho:r.origemNicho || null, em:new Date().toISOString() });
       else      ex.pulados.push({ asin, motivo:r.motivo, em:new Date().toISOString() });
     } catch (e) {
+      if (!execucaoVigente()) return;
       ex.falhas.push({ asin, erro:e.message, em:new Date().toISOString() });
     }
 
@@ -16074,8 +16083,18 @@ setInterval(async () => {
     console.log('[LISTA] "' + lista.nome + '" — item ' + ex.indice + '/' + lista.produtos.length
       + ', proximo em ' + lista.intervaloMin + ' min.');
   } catch (e) {
-    console.error('[LISTA] Erro no worker:', e.message);
-  } finally { _listaWorkerRodando = false; }
+    console.error('[LISTA] Erro no worker (' + id + '):', e.message);
+  } finally { _listasEmEnvio.delete(id); }
+}
+
+setInterval(() => {
+  const vencidas = listarListas().filter(l =>
+    l.execucao && !l.execucao.pausada && l.execucao.proximoEm <= Date.now()
+    && !_listasEmEnvio.has(l.id));
+  for (const l of vencidas) {
+    _listasEmEnvio.add(l.id);
+    processarItemLista(l.id);   // sem await: uma lista nao espera a outra
+  }
 }, 15000);
 
 // Agendador: dispara a lista no dia da semana e hora marcados. Guarda o dia ja
@@ -16302,7 +16321,7 @@ app.post('/listas/:id/ajustar', (req, res) => {
   const alteracao = { id: lista.id };
 
   if (Array.isArray(req.body?.pendentes)) {
-    if (ex && _listaWorkerRodando) {
+    if (ex && _listasEmEnvio.has(lista.id)) {
       return res.status(409).json({ ok:false, erro:'um produto esta saindo agora — tente de novo em alguns segundos' });
     }
     const feitos     = ex ? lista.produtos.slice(0, ex.indice) : [];
