@@ -10436,6 +10436,148 @@ setInterval(async () => {
   } catch (e) { console.error('[RESUMO] Erro:', e.message); }
 }, 10 * 60 * 1000).unref?.();
 
+// ── TRAVAS: ALERTA QUE SO SE APAGA QUANDO A CORRECAO ESTA NO AR ──────────────
+// Um alerta comum e um evento: dispara, e lido, acabou. Uma TRAVA e uma
+// condicao: remetente deslogado, wa-envio fora do ar, Telegram sem sessao,
+// inserção de cupom no ML com disjuntor armado. Marcar como lido nao resolve
+// nada — ela so sai da lista quando a condicao some, e ai avisa "OK —". A lista
+// e recalculada a cada minuto a partir do estado real (nao de eventos), entao um
+// restart nao esquece nenhuma. Persistida em health.json para nao reavisar a
+// cada boot.
+//
+// A principal deslogada/surda ja e coberta pelos watchdogs (aviso + reaviso por
+// hora); aqui ela entra so na lista (soRegistrar), sem mensagem dobrada.
+const TRAVA_DESCONEXAO_MS = 10 * 60 * 1000;   // conta secundaria fora ha 10 min
+const TRAVA_WAENVIO_MS    = 5 * 60 * 1000;    // servico wa-envio sem responder ha 5 min
+let _travas = _health.travas && typeof _health.travas === 'object' ? _health.travas : {};
+let _waEnvioErroDesde = 0;
+
+function avaliarTravas() {
+  const agora = Date.now();
+  const atuais = {};   // id -> { nivel, titulo, corpo, soRegistrar }
+
+  if (_logoutEm) atuais['principal:logout'] = { nivel: 'critico', soRegistrar: true,
+    titulo: 'Principal deslogada — precisa parear (/pair ou /qr)' };
+  else if (_surdezEstado !== 'ok') atuais['principal:surdez'] = { nivel: 'critico', soRegistrar: true,
+    titulo: 'Principal surda (escada: ' + _surdezEstado + ')' };
+
+  for (const [id, cx] of contasExtras) {
+    if (!cx || cx.removida) continue;
+    const ap = apelidoDaConta(id);
+    const wm = (tenantDaConta(id) === TENANT_PADRAO && WA_ENVIO_CONTAS.has(ap)) ? waEnvioEstadoConta(ap) : null;
+    if (wm) {
+      if (!wm.logado) atuais['conta:' + id + ':logout'] = { nivel: 'critico',
+        titulo: 'Remetente ' + ap + ' deslogado no wa-envio — precisa parear de novo' + (wm.ultimoErro ? ' (' + wm.ultimoErro + ')' : '') };
+      else if (!wm.conectado) {
+        cx._foraDesde = cx._foraDesde || agora;
+        if (agora - cx._foraDesde >= TRAVA_DESCONEXAO_MS) atuais['conta:' + id + ':fora'] = { nivel: 'atencao',
+          titulo: 'Remetente ' + ap + ' desconectado ha ' + Math.round((agora - cx._foraDesde) / 60000) + ' min (wa-envio)' };
+      } else cx._foraDesde = 0;
+    } else {
+      if (cx.precisaPareamento) atuais['conta:' + id + ':logout'] = { nivel: 'critico',
+        titulo: 'Remetente ' + ap + ' deslogado — escaneie o QR em /contas/' + id + '/qr' };
+      else if (!(cx.conectado && cx.sock)) {
+        cx._foraDesde = cx._foraDesde || agora;
+        if (agora - cx._foraDesde >= TRAVA_DESCONEXAO_MS) atuais['conta:' + id + ':fora'] = { nivel: 'atencao',
+          titulo: 'Remetente ' + ap + ' desconectado ha ' + Math.round((agora - cx._foraDesde) / 60000) + ' min' };
+      } else cx._foraDesde = 0;
+    }
+  }
+
+  if (WA_ENVIO_URL && WA_ENVIO_TOKEN && WA_ENVIO_CONTAS.size) {
+    if (_waEnvio.erro) {
+      _waEnvioErroDesde = _waEnvioErroDesde || agora;
+      if (agora - _waEnvioErroDesde >= TRAVA_WAENVIO_MS) atuais['wa-envio:fora'] = { nivel: 'critico',
+        titulo: 'Servico wa-envio sem responder ha ' + Math.round((agora - _waEnvioErroDesde) / 60000) + ' min (' + _waEnvio.erro + ') — ' + [...WA_ENVIO_CONTAS].join(', ') + ' sem disparo' };
+    } else _waEnvioErroDesde = 0;
+  }
+
+  if (!tgConectado && agora - _bootEm > TRAVA_DESCONEXAO_MS) atuais['telegram:desconectado'] = { nivel: 'atencao',
+    titulo: 'Telegram (GramJS) desconectado — cupons das fontes nao chegam; refaça o login em /tg-auth' };
+
+  try {
+    const ml = estadoInsercaoMlAuto();
+    if (ml && ml.disjuntor) atuais['ml:insercao-disjuntor'] = { nivel: 'atencao',
+      titulo: 'Insercao automatica de cupom no ML parada pelo disjuntor: ' + (typeof ml.disjuntor === 'string' ? ml.disjuntor : JSON.stringify(ml.disjuntor)) };
+  } catch (e) {}
+
+  let mudou = false;
+  for (const [id, t] of Object.entries(atuais)) {
+    if (_travas[id]) { _travas[id].titulo = t.titulo; _travas[id].nivel = t.nivel; continue; }
+    _travas[id] = { desde: agora, nivel: t.nivel, titulo: t.titulo };
+    mudou = true;
+    registrarAlerta({ nivel: t.nivel, origem: 'trava', chave: 'trava:' + id, janelaMs: 0,
+      soRegistrar: !!t.soRegistrar,
+      titulo: '🔒 ' + t.titulo,
+      corpo: '🔒 Trava: ' + t.titulo + '\n\nEste aviso so se apaga quando a correcao estiver no ar. Lista: /alertas/travas' })
+      .catch(() => {});
+  }
+  for (const id of Object.keys(_travas)) {
+    if (atuais[id]) continue;
+    const t = _travas[id]; delete _travas[id]; mudou = true;
+    const durMin = Math.round((agora - (t.desde || agora)) / 60000);
+    registrarAlerta({ nivel: 'info', origem: 'trava', chave: 'trava-ok:' + id + ':' + agora, janelaMs: 0,
+      soRegistrar: !!(id.startsWith('principal:')),
+      titulo: 'OK — trava resolvida: ' + t.titulo,
+      corpo: '✅ OK — trava resolvida apos ' + durMin + ' min: ' + t.titulo }).catch(() => {});
+  }
+  if (mudou) { _health.travas = _travas; _healthGravadoEm = 0; _salvarHealth(); }
+  return _travas;
+}
+function travasAtivas() {
+  const agora = Date.now();
+  return Object.entries(_travas).map(([id, t]) => ({ id, nivel: t.nivel, titulo: t.titulo,
+    desde: new Date(t.desde).toISOString(), haMin: Math.round((agora - t.desde) / 60000) }))
+    .sort((a, b) => (a.nivel === 'critico' ? 0 : 1) - (b.nivel === 'critico' ? 0 : 1) || b.haMin - a.haMin);
+}
+setInterval(() => { try { avaliarTravas(); } catch (e) { console.error('[TRAVAS] Erro:', e.message); } }, 60 * 1000).unref?.();
+setTimeout(() => { try { avaliarTravas(); } catch (e) {} }, 3 * 60 * 1000).unref?.();   // 1a avaliacao 3 min apos o boot
+
+// ── RESUMO DA MANHA (7h55) ───────────────────────────────────────────────────
+// Antes das primeiras ofertas do dia: com que remetentes a operacao vai
+// trabalhar, quais travas estao abertas, o que a outbox ainda deve e o que a
+// fila de aprovacao acumulou. Mesmo mecanismo de marca diaria do resumo da
+// noite. RESUMO_MANHA_HM no formato HH:MM (padrao 07:55).
+const RESUMO_MANHA_HM = /^\d{2}:\d{2}$/.test(process.env.RESUMO_MANHA_HM || '') ? process.env.RESUMO_MANHA_HM : '07:55';
+function hhmmSP() {
+  return new Date().toLocaleTimeString('en-GB', { timeZone: 'America/Sao_Paulo', hour12: false, hour: '2-digit', minute: '2-digit' });
+}
+setInterval(async () => {
+  try {
+    if (Date.now() - _bootEm < 2 * 60 * 1000) return;
+    if (hhmmSP() < RESUMO_MANHA_HM) return;
+    const hoje = new Date().toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+    if (_health.resumoManhaData === hoje) return;
+    _health.resumoManhaData = hoje;
+    _healthGravadoEm = 0; _salvarHealth();
+
+    const rem = estadoRemetentes();
+    const linhasRem = rem.contas.map(r => {
+      const nome = r.apelido || r.id;
+      if (r.disparoHabilitado) return '✅ ' + nome + ' — conectado' + (r.conectadoHaS != null ? ' ha ' + Math.round(r.conectadoHaS / 3600) + ' h' : '');
+      if (r.quarentena) return '⏳ ' + nome + ' — em quarentena de pareamento ate ' + new Date(r.quarentenaAte).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+      if (r.logout || r.precisaPareamento) return '❌ ' + nome + ' — DESLOGADO, precisa parear';
+      return '❌ ' + nome + ' — fora do ar' + (r.ultimoErro ? ' (' + String(r.ultimoErro).slice(0, 60) + ')' : '');
+    });
+    const travas = travasAtivas();
+    const pendAprov = filaPendentes.filter(o => o.status === 'pendente' && !o.autoAgendado).length;
+    let ml = null; try { ml = estadoInsercaoMlAuto(); } catch (e) {}
+    const [d, m] = hoje.split('-').slice(1).reverse();
+
+    const texto = 'Watchdog — bom dia ' + d + '/' + m + '\n\n'
+      + '📡 Remetentes:\n' + linhasRem.join('\n') + '\n\n'
+      + (travas.length
+        ? '🔒 Travas abertas (' + travas.length + '):\n' + travas.map(t => '• ' + t.titulo + ' — ha ' + (t.haMin >= 60 ? Math.round(t.haMin / 60) + ' h' : t.haMin + ' min')).join('\n') + '\n\n'
+        : '🔓 Nenhuma trava aberta.\n\n')
+      + '🔁 Outbox: ' + outboxFalhas.length + ' entrega(s) pendente(s)\n'
+      + '📥 Fila de aprovacao: ' + pendAprov + ' pendente(s)\n'
+      + (ml ? '🎟 Cupons ML: insercao ' + (ml.ligada ? 'ligada' : 'DESLIGADA') + ' · ' + (ml.naFila ? ml.naFila.length : 0) + ' na fila' + (ml.disjuntor ? ' · DISJUNTOR ARMADO' : '') + '\n' : '')
+      + '📤 Ontem: ver resumo da noite · telegram ' + (tgConectado ? 'ok' : 'FORA');
+    await _avisarOperador(texto);
+    console.log('[RESUMO] Resumo da manha enviado.');
+  } catch (e) { console.error('[RESUMO] Erro (manha):', e.message); }
+}, 60 * 1000).unref?.();
+
 setInterval(async () => {
   try {
     const h = horaSP();
@@ -13192,7 +13334,7 @@ function estadoRemetentes() {
 
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, disparoDisponivel:haContaDeDisparo(), remetentes:estadoRemetentes(), sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), leitorWhatsmeow:estadoLeitorWhatsmeow(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, disparoDisponivel:haContaDeDisparo(), remetentes:estadoRemetentes(), travas:travasAtivas(), sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), leitorWhatsmeow:estadoLeitorWhatsmeow(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────
@@ -13573,8 +13715,14 @@ app.get('/alertas', (req, res) => {
     ok: true, total: alertas.length, naoLidos,
     origens: [...new Set(alertas.map(x => x.origem))].sort(),
     destinoPorNivel: DESTINO_POR_NIVEL,
+    travas: travasAtivas(),
     itens: itens.slice(0, n),
   });
+});
+
+// Travas ativas: condicoes que continuam abertas (ver avaliarTravas).
+app.get('/alertas/travas', (req, res) => {
+  res.json({ ok: true, travas: travasAtivas() });
 });
 
 app.post('/alertas/lido/:id', (req, res) => {

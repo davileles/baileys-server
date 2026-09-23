@@ -15,6 +15,7 @@
         "app.delete('/vitrine/:asin'",
         "app.get('/'",
         "app.get('/agendamentos'",
+        "app.get('/alertas/travas'",
         "app.get('/awin/cupons/estado'",
         "app.get('/awin/estado'",
         "app.get('/awin/ofertas'",
@@ -159,6 +160,7 @@
         "const WM_LEITOR",
         "function _sombraCaso",
         "function _sombraConsolidar",
+        "function avaliarTravas",
         "function conteudoParaWhatsmeow",
         "function despacharParaPipeline",
         "function enviarPeloWhatsmeow",
@@ -173,6 +175,7 @@
         "function rotaDeRoteamento",
         "function saidaSerializada",
         "function silencioUtilMs",
+        "function travasAtivas",
         "function waEnvioEstadoConta",
         "saidaSerializada(() => enviarMensagem(item.destino"
       ]
