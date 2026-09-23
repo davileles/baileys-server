@@ -1820,7 +1820,14 @@ async function atualizarEstadoWaEnvio() {
     const r = await fetch(WA_ENVIO_URL + '/health', { signal: AbortSignal.timeout(5000) });
     const d = await r.json();
     const contas = {};
-    for (const c of (d.contas || [])) contas[String(c.id)] = !!c.conectado;
+    for (const c of (d.contas || [])) {
+      contas[String(c.id)] = {
+        conectado: !!c.conectado, logado: !!c.logado,
+        conectadoEm: c.conectadoEm || null, conectadoHaS: c.conectadoHaS ?? null,
+        quarentena: !!c.quarentena, quarentenaAte: c.quarentenaAte || null,
+        pareadoEm: c.pareadoEm || null, ultimoErro: c.ultimoErro || null,
+      };
+    }
     _waEnvio.contas = contas; _waEnvio.erro = null;
   } catch (e) {
     if (_waEnvio.erro !== e.message) console.warn('[WA-ENVIO] /health indisponivel: ' + e.message);
@@ -1836,8 +1843,20 @@ if (WA_ENVIO_URL && WA_ENVIO_TOKEN && WA_ENVIO_CONTAS.size) {
   if (typeof _tWm.unref === 'function') _tWm.unref();
 }
 
+function waEnvioEstadoConta(apelido) {
+  if (Date.now() - _waEnvio.em >= 90000) return null;   // sonda velha: nao confiar
+  return _waEnvio.contas[String(apelido || '').toLowerCase()] || null;
+}
+function waEnvioContaEmQuarentena(apelido) {
+  const c = waEnvioEstadoConta(apelido);
+  return !!(c && c.quarentena && c.quarentenaAte && Date.parse(c.quarentenaAte) > Date.now());
+}
+// Conectada E fora da quarentena de pareamento: numero recem-pareado espera
+// QUARENTENA_H (padrao 24 h, no wa-envio) antes do primeiro disparo em grupo.
+// Em quarentena a conta conta como indisponivel e a escala escolhe outra.
 function waEnvioContaConectada(apelido) {
-  return Date.now() - _waEnvio.em < 90000 && _waEnvio.contas[String(apelido || '').toLowerCase()] === true;
+  const c = waEnvioEstadoConta(apelido);
+  return !!(c && c.conectado) && !waEnvioContaEmQuarentena(apelido);
 }
 
 function usaWhatsmeow(apelido, destino) {
@@ -2383,8 +2402,14 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
           registrarErroConta(contasExtras.get(contaId), e.message, destino);
           throw e;
         }
-        registrarErroConta(contasExtras.get(contaId), e.message, destino);
-        motivoFalha = 'falhou (' + e.message + ')';
+        if (e.fase === 'quarentena') {
+          // Nao e falha: o numero foi pareado ha pouco e o wa-envio segura o
+          // disparo em grupo. Escolhe outra conta sem manchar o historico.
+          motivoFalha = 'em quarentena de pareamento';
+        } else {
+          registrarErroConta(contasExtras.get(contaId), e.message, destino);
+          motivoFalha = 'falhou (' + e.message + ')';
+        }
       }
     } else {
       motivoFalha = 'indisponivel';
@@ -2507,12 +2532,17 @@ let ultimoEnvioMs = 0;
 // anterior — duas mensagens no mesmo segundo pelo mesmo numero. Toda saida passa
 // por esta cadeia de promessas: nunca ha dois sendMessage simultaneos.
 let _cadeiaSaida = Promise.resolve();
+// Quantas saidas estao enfileiradas ou em andamento. Uma reconexao pedida com
+// isto > 0 derruba o socket no meio de um despacho (ver reconectarQuandoLivre).
+let _saidasEmVoo = 0;
 function saidaSerializada(fn) {
-  const proxima = _cadeiaSaida.then(fn, fn);
+  _saidasEmVoo++;
+  const proxima = _cadeiaSaida.then(fn, fn).finally(() => { _saidasEmVoo = Math.max(0, _saidasEmVoo - 1); });
   // O catch mantem a cadeia viva depois de um erro; quem chamou recebe a rejeicao.
   _cadeiaSaida = proxima.catch(() => {});
   return proxima;
 }
+function saidasEmVoo() { return _saidasEmVoo; }
 
 // ── ESPERA PELA CONTA DE ENVIO DO CDV ────────────────────────────────────────
 // Depois de um restart do Railway as contas secundarias so COMECAM a reconectar
@@ -12792,6 +12822,34 @@ app.post('/cdv/entrada/adicionar', async (req, res) => {
 // Nucleo da reconexao soft: usado pelo endpoint manual e pela autocura do
 // watchdog de surdez. Declarada como function para valer por hoisting no
 // watchdog, que fica acima neste arquivo.
+// Regra da casa: nada reinicia com disparo na fila. Para pedidos em que o
+// socket ainda esta (aparentemente) de pe — /reconectar manual e supervisor de
+// zumbi — espera a cadeia de saida esvaziar antes de derrubar, com teto: passado
+// o teto, reconecta mesmo assim (o disparo preso cai na outbox e retenta).
+const RECONEXAO_ESPERA_TETO_MS = 2 * 60 * 1000;
+let _reconexaoAdiada = null;   // { motivo, desde } enquanto espera
+function reconectarQuandoLivre(motivo) {
+  if (saidasEmVoo() === 0) { forcarReconexao(motivo); return { adiada: false }; }
+  if (_reconexaoAdiada) {
+    console.log('[RECONEXAO] Pedido "' + motivo + '" ja aguardando a saida esvaziar (' + saidasEmVoo() + ' em voo).');
+    return { adiada: true, emVoo: saidasEmVoo() };
+  }
+  _reconexaoAdiada = { motivo, desde: Date.now() };
+  console.log('[RECONEXAO] "' + motivo + '" adiada: ' + saidasEmVoo() + ' saida(s) em voo. Espero ate '
+    + Math.round(RECONEXAO_ESPERA_TETO_MS / 1000) + 's.');
+  const t = setInterval(() => {
+    const livre = saidasEmVoo() === 0;
+    const estourou = Date.now() - _reconexaoAdiada.desde > RECONEXAO_ESPERA_TETO_MS;
+    if (!livre && !estourou) return;
+    clearInterval(t);
+    const m = _reconexaoAdiada.motivo; _reconexaoAdiada = null;
+    if (!livre) console.warn('[RECONEXAO] Teto de espera estourado com ' + saidasEmVoo() + ' saida(s) em voo — reconectando assim mesmo.');
+    forcarReconexao(m);
+  }, 2000);
+  if (typeof t.unref === 'function') t.unref();
+  return { adiada: true, emVoo: saidasEmVoo() };
+}
+
 function forcarReconexao(motivo) {
   console.log('[RECONEXAO] Forçada (' + (motivo || 'manual') + ')');
   conectado = false;
@@ -12883,7 +12941,7 @@ setInterval(() => {
     }
     _wsZumbiPolls = 0;
     console.error('[SUPERVISOR-WS] Socket-zumbi confirmado: conectado=true com o websocket fechado. Forcando reconexao.');
-    forcarReconexao('supervisor-ws-zumbi');
+    reconectarQuandoLivre('supervisor-ws-zumbi');
   } catch (e) { console.error('[SUPERVISOR-WS] Erro no ciclo:', e.message); }
 }, 30 * 1000).unref?.();
 
@@ -12910,8 +12968,11 @@ setInterval(async () => {
 }, 60 * 60 * 1000).unref?.();
 
 app.post('/reconectar', async (req, res) => {
-  forcarReconexao('endpoint-/reconectar');
-  res.json({ ok: true, mensagem: 'Reconectando... aguarde 10s e verifique /status' });
+  const r = reconectarQuandoLivre('endpoint-/reconectar');
+  res.json({ ok: true, adiada: r.adiada, saidasEmVoo: r.emVoo || 0,
+    mensagem: r.adiada
+      ? 'Ha ' + r.emVoo + ' envio(s) em andamento: reconecto assim que a saida esvaziar (teto 2 min). Verifique /status.'
+      : 'Reconectando... aguarde 10s e verifique /status' });
 });
 
 app.get('/debug-upserts', (req, res) => {
@@ -13090,9 +13151,48 @@ app.get('/entrega/grupos', async (req, res) => {
   }
 });
 
+// ── HEARTBEAT POR REMETENTE ──────────────────────────────────────────────────
+// Um retrato por numero, seja o Baileys (principal e contas extras) ou o
+// whatsmeow (wa-envio): conectado, ha quantos segundos, se pode disparar em
+// grupo e por que nao. E o bloco que o resumo diario e o painel leem.
+function estadoRemetentes() {
+  const agora = Date.now();
+  const lista = [];
+  const wmDe = (apelido) => (WA_ENVIO_CONTAS.has(apelido) ? waEnvioEstadoConta(apelido) : null);
+  const motorPrincipal = wmDe('principal');
+  lista.push({
+    id: 'principal', motor: motorPrincipal ? 'whatsmeow' : 'baileys',
+    conectado: motorPrincipal ? motorPrincipal.conectado : (conectado && !!sock),
+    conectadoHaS: motorPrincipal ? motorPrincipal.conectadoHaS
+      : ((conectado && sock && _abertoEm) ? Math.round((agora - _abertoEm) / 1000) : null),
+    quarentena: !!(motorPrincipal && motorPrincipal.quarentena), quarentenaAte: motorPrincipal?.quarentenaAte || null,
+    logout: !!_logoutEm, surdez: _surdezEstado,
+    disparoHabilitado: motorPrincipal ? waEnvioContaConectada('principal') : (conectado && !!sock && !_logoutEm && _surdezEstado === 'ok'),
+    ultimoErro: motorPrincipal?.ultimoErro || null,
+  });
+  for (const [id, c] of contasExtras) {
+    const ap = apelidoDaConta(id);
+    const wm = tenantDaConta(id) === TENANT_PADRAO ? wmDe(ap) : null;
+    const viaBaileys = !!(c && c.conectado && c.sock);
+    lista.push({
+      id, apelido: ap, motor: wm ? 'whatsmeow' : 'baileys',
+      conectado: wm ? wm.conectado : viaBaileys,
+      conectadoHaS: wm ? wm.conectadoHaS : null,
+      quarentena: !!(wm && wm.quarentena), quarentenaAte: wm?.quarentenaAte || null,
+      precisaPareamento: !!c?.precisaPareamento,
+      disparoHabilitado: contaDisponivel(id),
+      ultimoErro: wm?.ultimoErro || c?.ultimoErro || null,
+    });
+  }
+  return { sondaWaEnvioHaS: _waEnvio.em ? Math.round((agora - _waEnvio.em) / 1000) : null,
+    waEnvioErro: _waEnvio.erro, saidasEmVoo: saidasEmVoo(),
+    reconexaoAdiada: _reconexaoAdiada ? { motivo: _reconexaoAdiada.motivo, haS: Math.round((agora - _reconexaoAdiada.desde) / 1000) } : null,
+    contas: lista };
+}
+
 app.get('/status', (req, res) => {
   const emBuffer = [...bufferAgrupamento.values()].reduce((s,e) => s+e.itens.length, 0);
-  res.json({ conectado, disparoDisponivel:haContaDeDisparo(), sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), leitorWhatsmeow:estadoLeitorWhatsmeow(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
+  res.json({ conectado, disparoDisponivel:haContaDeDisparo(), remetentes:estadoRemetentes(), sockAtivo:!!sock, qrDisponivel:!!qrAtual, telegramConectado:tgConectado, telegramAuthState:tgAuthState, telegramGrupos:TG_CANAIS_MONITORADOS, tgFontesRadar:tgFontesRadar(), autoEnvioCupom:autoEnvioModo(), telegramConta:tgConta, grupos:Object.keys(GRUPOS), gruposMonitorados:gruposMonitoradosCdv(), leitores:estadoLeitores(), leitorWhatsmeow:estadoLeitorWhatsmeow(), radarFontes:radarFontes(), radarDestinos:radarDestinos(), mlOrigemProduto:estadoOrigemSocialMl(), radarAtivo:radarConfig().ativo!==false, bufferAtivo:emBuffer, filaPendentes:filaPendentes.filter(o=>o.status==='pendente'&&!o.autoAgendado).length, filaTotal:filaPendentes.length, reconectarTentativas:_reconectarTentativas, reconexoesCegas:_reconexoesCegas, limpezaCegaFeita:_limpezaCegaFeita, conexaoEmAndamento:!!_conexaoPromise, errosDecodificacao:errosDescripto, indecifraveisStub:_stub2Total, indecifraveisStubGrupos:[..._stub2PorGrupo].sort((a,b)=>b[1].n-a[1].n).slice(0,10).map(([j,r])=>({jid:j,n:r.n,ultimaEm:new Date(r.ultimaEm).toISOString()})), entregasSuspeitas:_retriesPorUser.size, ultimoUpsertEm:(_health.ultimoUpsertEm?new Date(_health.ultimoUpsertEm).toISOString():null), surdezEstado:_surdezEstado, ultimaPublicacaoEm:(_health.ultimaPublicacaoEm?new Date(_health.ultimaPublicacaoEm).toISOString():null), publicacoesHoje:publicacoesHoje(), ultimasCapturas:Object.fromEntries([...ultimaCapturaPorGrupo].map(([j,t])=>[j, new Date(t).toISOString()])) });
 });
 
 // ── HEALTH CHECK PARA MONITOR EXTERNO ─────────────────────────────────────────

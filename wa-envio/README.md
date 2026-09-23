@@ -17,6 +17,7 @@ Serviço `wa-envio` neste repositório, configurado **pelo painel** (Config as C
 - **Volume** montado em `/data` (sessões `<conta>.db` + `metricas.json`).
 - **Variáveis**:
   - `WA_ENVIO_TOKEN` (obrigatória), `PORT=8080`, `WA_LOG_NIVEL` (padrão `WARN`)
+  - `QUARENTENA_H` (padrão `24`, `0` desliga) — horas sem disparo em **grupo** depois de um pareamento novo; o momento do pareamento fica em `/data/pareamentos.json` e some no logout
   - `RAILWAY_DEPLOYMENT_OVERLAP_SECONDS=0` — duas instâncias na mesma sessão derrubam uma à outra
   - `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15`
 
@@ -27,7 +28,7 @@ No `baileys-server`: `WA_ENVIO_URL=http://wa-envio.railway.internal:8080`, `WA_E
 
 | Método | Rota | Auth | |
 |---|---|---|---|
-| GET | `/health` | não | estado das contas, sem número |
+| GET | `/health` | não | estado das contas, sem número: `conectado`, `conectadoEm`/`conectadoHaS` (heartbeat), `quarentena`/`quarentenaAte`, `ultimoErro` |
 | GET | `/pair` | não | tela para parear por código |
 | GET | `/contas/{id}` | sim | estado com número |
 | POST | `/contas/{id}/conectar` | sim | sobe o socket (abre QR se não pareada) |
@@ -39,8 +40,9 @@ No `baileys-server`: `WA_ENVIO_URL=http://wa-envio.railway.internal:8080`, `WA_E
 | GET | `/leitura` | sim | estado do repasse de leitura (fila, entregues, falhas, imagens) |
 | GET | `/metricas` | sim | envios, retries por hora/grupo/dia, tentativas e eventos de conexão (30 dias) |
 
-Erro de envio devolve `fase`: `validacao`, `conexao`, `preparo`, `upload` (nada saiu, pode
-tentar por outro caminho) ou `envio` (ambíguo: não reenviar por outro número).
+Erro de envio devolve `fase`: `validacao`, `conexao`, `quarentena` (número pareado há menos de
+`QUARENTENA_H`; nada saiu), `preparo`, `upload` (nada saiu, pode tentar por outro caminho) ou
+`envio` (ambíguo: não reenviar por outro número).
 
 Pareamento: cada número vira um **dispositivo vinculado novo** ("Tica Envio"). A sessão do
 Baileys não é convertível. Limite do WhatsApp: 4 dispositivos por número. O código deve ser

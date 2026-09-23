@@ -89,6 +89,84 @@ type Conta struct {
 	ultimoEnvio time.Time
 	conectadoEm time.Time
 	recriadoEm  time.Time
+	// Momento do ultimo pareamento (PairSuccess), persistido em
+	// pareamentos.json. Base da quarentena: numero recem-pareado nao dispara
+	// em grupo ate completar QUARENTENA_H horas (padrao 24; 0 desliga).
+	pareadoEm time.Time
+}
+
+// ── QUARENTENA DE PAREAMENTO ─────────────────────────────────────────────────
+// Numero que acabou de ser pareado e o alvo mais facil de bloqueio se sai
+// disparando em dezenas de grupos. O envio para grupo e recusado (fase
+// "quarentena") ate completar QUARENTENA_H; o baileys-server trata a conta como
+// indisponivel e a escala escolhe outra. DM continua liberada.
+var quarentenaH = func() int {
+	n, err := strconv.Atoi(envOr("QUARENTENA_H", "24"))
+	if err != nil || n < 0 {
+		return 24
+	}
+	return n
+}()
+
+var (
+	pareamentosMu sync.Mutex
+	pareamentos   = map[string]string{} // conta -> RFC3339 do ultimo pareamento
+)
+
+func caminhoPareamentos() string { return filepath.Join(dataDir, "pareamentos.json") }
+
+func carregarPareamentos() {
+	b, err := os.ReadFile(caminhoPareamentos())
+	if err != nil {
+		return
+	}
+	pareamentosMu.Lock()
+	defer pareamentosMu.Unlock()
+	_ = json.Unmarshal(b, &pareamentos)
+}
+
+func salvarPareamentos() {
+	pareamentosMu.Lock()
+	b, err := json.MarshalIndent(pareamentos, "", "  ")
+	pareamentosMu.Unlock()
+	if err != nil {
+		return
+	}
+	tmp := caminhoPareamentos() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err == nil {
+		_ = os.Rename(tmp, caminhoPareamentos())
+	}
+}
+
+func pareamentoDe(id string) time.Time {
+	pareamentosMu.Lock()
+	defer pareamentosMu.Unlock()
+	if s := pareamentos[id]; s != "" {
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func registrarPareamento(id string, em time.Time, apagar bool) {
+	pareamentosMu.Lock()
+	if apagar {
+		delete(pareamentos, id)
+	} else {
+		pareamentos[id] = em.UTC().Format(time.RFC3339)
+	}
+	pareamentosMu.Unlock()
+	salvarPareamentos()
+}
+
+// quarentenaAte devolve ate quando a conta nao pode disparar em grupo; zero
+// quando nao ha quarentena. Chamar com c.mu preso ou fora de secao critica.
+func (c *Conta) quarentenaAte() time.Time {
+	if quarentenaH == 0 || c.pareadoEm.IsZero() {
+		return time.Time{}
+	}
+	return c.pareadoEm.Add(time.Duration(quarentenaH) * time.Hour)
 }
 
 var (
@@ -244,7 +322,13 @@ func (c *Conta) onEvento(evt any) {
 		c.mu.Unlock()
 		log.Printf("[CONTA:%s] conectada", c.ID)
 	case *events.PairSuccess:
-		log.Printf("[CONTA:%s] pareada como %s", c.ID, e.ID)
+		log.Printf("[CONTA:%s] pareada como %s — quarentena de %dh antes do primeiro disparo em grupo", c.ID, e.ID, quarentenaH)
+		registrarEvento(c.ID, "pareou", e.ID.User)
+		agora := time.Now()
+		c.mu.Lock()
+		c.pareadoEm = agora
+		c.mu.Unlock()
+		registrarPareamento(c.ID, agora, false)
 	case *events.LoggedOut:
 		log.Printf("[CONTA:%s] DESLOGADA (%v) — precisa parear de novo", c.ID, e.Reason)
 		registrarEvento(c.ID, "logout", fmt.Sprint(e.Reason))
@@ -276,6 +360,8 @@ func (c *Conta) descartar(motivo string) {
 	}
 	c.cli, c.container, c.qr, c.pareando = nil, nil, "", false
 	c.ultimoErro = motivo
+	c.pareadoEm = time.Time{}
+	registrarPareamento(c.ID, time.Time{}, true)
 	for _, suf := range []string{"", "-wal", "-shm"} {
 		_ = os.Remove(caminhoDB(c.ID) + suf)
 	}
@@ -327,6 +413,13 @@ type estadoConta struct {
 	Numero      string `json:"numero,omitempty"`
 	UltimoEnvio string `json:"ultimoEnvio,omitempty"`
 	UltimoErro  string `json:"ultimoErro,omitempty"`
+	// Heartbeat: quando a conexao atual abriu e ha quantos segundos.
+	ConectadoEm  string `json:"conectadoEm,omitempty"`
+	ConectadoHaS int64  `json:"conectadoHaS,omitempty"`
+	// Quarentena de pareamento (ver quarentenaAte).
+	PareadoEm     string `json:"pareadoEm,omitempty"`
+	Quarentena    bool   `json:"quarentena"`
+	QuarentenaAte string `json:"quarentenaAte,omitempty"`
 }
 
 func (c *Conta) estado(comNumero bool) estadoConta {
@@ -342,6 +435,17 @@ func (c *Conta) estado(comNumero bool) estadoConta {
 	}
 	if !c.ultimoEnvio.IsZero() {
 		e.UltimoEnvio = c.ultimoEnvio.UTC().Format(time.RFC3339)
+	}
+	if e.Conectado && !c.conectadoEm.IsZero() {
+		e.ConectadoEm = c.conectadoEm.UTC().Format(time.RFC3339)
+		e.ConectadoHaS = int64(time.Since(c.conectadoEm).Seconds())
+	}
+	if !c.pareadoEm.IsZero() {
+		e.PareadoEm = c.pareadoEm.UTC().Format(time.RFC3339)
+	}
+	if ate := c.quarentenaAte(); !ate.IsZero() && time.Now().Before(ate) {
+		e.Quarentena = true
+		e.QuarentenaAte = ate.UTC().Format(time.RFC3339)
 	}
 	return e
 }
@@ -396,6 +500,15 @@ func (c *Conta) enviar(ctx context.Context, p pedidoEnvio) (whatsmeow.SendRespon
 	jid, err := types.ParseJID(p.JID)
 	if err != nil || jid.User == "" {
 		return whatsmeow.SendResponse{}, &erroEnvio{"validacao", 400, fmt.Errorf("jid invalido: %q", p.JID)}
+	}
+	if jid.Server == types.GroupServer {
+		c.mu.Lock()
+		ate := c.quarentenaAte()
+		c.mu.Unlock()
+		if !ate.IsZero() && time.Now().Before(ate) {
+			return whatsmeow.SendResponse{}, &erroEnvio{"quarentena", 503,
+				fmt.Errorf("numero pareado ha pouco; disparo em grupo liberado em %s", ate.In(tzSP).Format("02/01 15:04"))}
+		}
 	}
 
 	msg, errMsg := montarMensagem(ctx, cli, p)
@@ -1038,6 +1151,7 @@ func main() {
 	store.SetOSInfo("Tica Envio", [3]uint32{1, 0, 0})
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 	carregarMetricas()
+	carregarPareamentos()
 	iniciarLeitura()
 	iniciarDiagRetry()
 
@@ -1051,6 +1165,7 @@ func main() {
 		c := conta(id)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		c.mu.Lock()
+		c.pareadoEm = pareamentoDe(id)
 		err := c.abrir(ctx)
 		pareada := err == nil && c.cli.Store.ID != nil
 		c.mu.Unlock()

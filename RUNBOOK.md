@@ -17,6 +17,7 @@ servidor já degradado.
 | `GET /health` | **200** = saudável. **503** = degradado; o corpo diz o `motivo`. É o endpoint para monitor externo (UptimeRobot/BetterStack). |
 | `GET /status` | Retrato completo em JSON (`conectado`, `surdezEstado`, `ultimoUpsertEm`, `publicacoesHoje`, fila…). Sempre 200. |
 | Bot Telegram `/status` | O mesmo retrato, pelo celular. |
+| `remetentes` em `/status` | Um retrato por número (principal, tico-02, tico-03…): `conectado`, `conectadoHaS` (heartbeat), `disparoHabilitado`, `quarentena`/`quarentenaAte` e `ultimoErro`. `saidasEmVoo` e `reconexaoAdiada` mostram se há disparo em andamento segurando uma reconexão. |
 | `publicacoesHoje` | **O número que importa.** Se está em 0 num dia útil depois das 10h, algo está errado mesmo que `conectado` seja `true`. Conta **entregas** (1 por grupo que recebeu), não ofertas: uma oferta em 30 grupos soma 30. `despachosHoje` é o par: 1 por oferta/cupom distinto. |
 
 Sinais de **degradação** em `/status` ou `/health`:
@@ -42,6 +43,8 @@ antes de intervir** — intervir no meio de uma cura automática atrapalha.
 | Auto-reset de Bad MAC | 8 mensagens indecifráveis seguidas → limpa sender-keys; 20 → reseta sessão (preserva pareamento) | cura desync de criptografia | `[BAD-MAC]` |
 | Teto de envio | `sendMessage` preso > 60 s | rejeita e cai no retry | `[FILA]` / `[MKT]` |
 | **Outbox** | destino falhou num despacho de vários grupos | guarda em disco e retenta com backoff (1→30 min) quando o socket volta; TTL 6 h; desiste após 12 e avisa | `[OUTBOX]` |
+| **Quarentena de pareamento** | número pareado há menos de `QUARENTENA_H` horas (padrão 24, no wa-envio) | recusa disparo em **grupo** com `fase: quarentena`; o servidor trata a conta como indisponível e a escala escolhe outra | `[ENVIO:<conta>]` |
+| **Reconexão adiada** | `/reconectar` ou supervisor de zumbi com envio em andamento | espera a saída esvaziar (teto 2 min) antes de derrubar o socket; nunca reinicia com disparo na fila | `[RECONEXAO]` |
 | Logout | WhatsApp respondeu 401 | **avisa imediatamente** (Telegram + grupo operador + e-mail) e reavisa a cada hora; **não** tenta reconectar em loop | `[WA]` |
 | Crash-only | `uncaughtException` | loga, salva e sai com 1 → Railway reinicia | `[FATAL]` |
 
@@ -55,7 +58,7 @@ variáveis antes de qualquer outra coisa** — sem elas o aviso volta `false` em
 ## 3. WhatsApp caiu ou está surdo (`conectado:false` ou `surdezEstado != ok`)
 
 1. **Espere 3 minutos.** Keepalive + handler + supervisor resolvem a maioria dos casos sem você.
-2. Ainda caído? `/reconectar` no bot Telegram (pede confirmação) — ou `POST /reconectar`.
+2. Ainda caído? `/reconectar` no bot Telegram (pede confirmação) — ou `POST /reconectar`. Se a resposta vier `adiada: true`, há envio em andamento: a reconexão acontece sozinha assim que a saída esvaziar (teto 2 min).
 3. Ainda caído depois de mais 2 min? Olhe `/status`:
    - `logout: true` → vá para a **seção 4**. Reconectar não resolve logout.
    - `errosDecodificacao` alto / logs cheios de `[BAD-MAC]` → `POST /reset-sessao` (limpa sessões e sender-keys, **preserva** o pareamento; reconecta sozinho).
@@ -159,6 +162,7 @@ nunca deixa JSON truncado. `.tmp` órfãos são varridos pela faxina periódica.
 | `RESEND_API_KEY`, `ALERTA_EMAIL` | e-mail nos alertas críticos (logout, degrau 3) |
 | `OUTBOX_TTL_H` | validade das entregas na outbox (padrão 6 h) |
 | `RESUMO_DIARIO_HORA` | hora SP do resumo diário (padrão 21) |
+| `QUARENTENA_H` (no serviço **wa-envio**) | horas sem disparo em grupo após um pareamento novo (padrão 24; `0` desliga) |
 | `ANTHROPIC_API_KEY` | classificação/extração por IA |
 | `GITHUB_TOKEN`, `GITHUB_REPO` | sync de dados para `davileles/dados` |
 

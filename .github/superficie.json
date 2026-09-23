@@ -163,6 +163,8 @@
         "function despacharParaPipeline",
         "function enviarPeloWhatsmeow",
         "function estadoLeitorWhatsmeow",
+        "function estadoRemetentes",
+        "function reconectarQuandoLivre",
         "function registrarContatoPrivado(",
         "function registrarEnvioTelemetria",
         "function registrarEventoEntrega",
@@ -171,6 +173,7 @@
         "function rotaDeRoteamento",
         "function saidaSerializada",
         "function silencioUtilMs",
+        "function waEnvioEstadoConta",
         "saidaSerializada(() => enviarMensagem(item.destino"
       ]
     },
