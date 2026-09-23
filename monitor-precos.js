@@ -1190,6 +1190,27 @@ export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null,
   _estado.vereditosDisparos = [reg, ...(_estado.vereditosDisparos || [])].slice(0, VEREDITOS_MAX);
   return reg;
 }
+// Dinheiro na mesa: candidato que passou na regra, esta na fila ha mais de N
+// horas e ninguem publicou. Em modo sombra a fila so acumula; em modo ativo a
+// cota/janela pode ter segurado. Lista o que esta parado, do maior score para o
+// menor, com a ultima leitura para conferir se a oferta ainda esta de pe.
+export function dinheiroNaMesa({ horas = 6 } = {}) {
+  const corte = Date.now() - horas * 3600000;
+  const lista = (_estado.fila || [])
+    .filter(f => f.em && new Date(f.em).getTime() <= corte)
+    .map(f => {
+      const h = _hist[f.asin];
+      const ult = h?.ult || null;
+      const precoAgora = ult?.preco ?? null;
+      const aindaVale = (precoAgora != null && Number.isFinite(f.preco)) ? precoAgora <= f.preco * 1.02 : null;
+      return { asin: f.asin, nome: f.nome, loja: f.loja, nicho: f.nicho, preco: f.preco, precoAgora, aindaVale,
+        mediana30: f.mediana30 ?? null, min90: f.min90 ?? null, quedaPct: f.quedaPct ?? null, recorde: !!f.recorde,
+        score: f.score ?? null, naFilaDesde: f.em, paradoHaH: +((Date.now() - new Date(f.em).getTime()) / 3600000).toFixed(1),
+        curado: !!f.curado, naVitrine: !!itemVitrine(f.asin) };
+    })
+    .sort((a, b) => (b.score || 0) - (a.score || 0));
+  return { horas, modo: _cfg.modo, ativo: !!_cfg.ativo, total: lista.length, lista };
+}
 export function vereditosDisparos({ dias = 7 } = {}) {
   const corte = Date.now() - dias * 86400000;
   const lista = (_estado.vereditosDisparos || []).filter(v => new Date(v.em).getTime() >= corte);

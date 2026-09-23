@@ -77,7 +77,7 @@ import {
   carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
   semearVitrinePorDesempenho, rankingEpc, estadoEpc,
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
-  julgarDisparo, vereditosDisparos,
+  julgarDisparo, vereditosDisparos, dinheiroNaMesa,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -10587,6 +10587,7 @@ setInterval(async () => {
       + '🔁 Outbox: ' + outboxFalhas.length + ' entrega(s) pendente(s)\n'
       + '📥 Fila de aprovacao: ' + pendAprov + ' pendente(s)\n'
       + (ml ? '🎟 Cupons ML: insercao ' + (ml.ligada ? 'ligada' : 'DESLIGADA') + ' · ' + (ml.naFila ? ml.naFila.length : 0) + ' na fila' + (ml.disjuntor ? ' · DISJUNTOR ARMADO' : '') + '\n' : '')
+      + (() => { try { const dm = dinheiroNaMesa({ horas: 6 }); return dm.total ? '💰 Dinheiro na mesa: ' + dm.total + ' oferta(s) boa(s) parada(s) ha 6 h+ (' + dm.lista.slice(0, 3).map(x => x.nome.slice(0, 40) + ' R$ ' + x.preco).join(' · ') + ')\n' : ''; } catch (e) { return ''; } })()
       + '📤 Ontem: ver resumo da noite · telegram ' + (tgConectado ? 'ok' : 'FORA');
     await _avisarOperador(texto);
     console.log('[RESUMO] Resumo da manha enviado.');
@@ -17419,6 +17420,81 @@ app.post('/monitor-precos/simular', (req, res) => {
 // ── DESEMPENHO REAL (ganho por clique) ──
 // O ledger epc-produtos.json e escrito pelo coletor no GitHub Actions; aqui ele
 // so e lido. Sem o arquivo, tudo isto responde vazio e o monitor segue igual.
+// ── CANDIDATOS A REENVIO ─────────────────────────────────────────────────────
+// O que vale mandar de novo, medido por cliques UNICOS por grupo (a contagem
+// limpa do encurtador: sem preview, robo, Meta nem rajada). Por produto conta
+// so o ultimo disparo — se foi reenviado depois, o anterior sai da lista.
+// Saem tambem: cupom vinculado que ja nao esta vigente, preco atual acima do
+// anunciado (leitura do monitor, quando existe) e disparo recente demais.
+// Cupom do dia (tipo 'cupom') fica a parte: sempre lidera e nao e reenvio de
+// oferta. Nada dispara daqui: o painel leva o produto para uma lista de envio,
+// que reconsulta o preco na hora.
+const REENVIO_TOLERANCIA_PRECO = 1.03;
+app.get('/reenvio/candidatos', async (req, res) => {
+  const dias = Math.min(31, Math.max(1, parseInt(req.query.dias, 10) || 7));
+  const lojaF = String(req.query.loja || '').trim().toLowerCase();
+  const minH = Math.max(0, parseFloat(req.query.minHoras || '6') || 6);
+  let envios = [];
+  try {
+    const r = await fetch(CDV_PROXY_URL + '/links-stats?dias=' + dias, { signal: AbortSignal.timeout(30000) });
+    const d = await r.json();
+    envios = Array.isArray(d.envios) ? d.envios : [];
+  } catch (e) { return res.status(502).json({ ok: false, erro: 'links-stats: ' + e.message }); }
+
+  const agora = Date.now();
+  const cupomDoDia = [], porProduto = new Map();
+  for (const e of envios) {
+    const gruposEnviados = Object.keys(e.grupos || {}).length;
+    const item = {
+      codigo: e.codigo, produto: e.produto || null, loja: e.loja || null, titulo: e.titulo || null, ofertaId: e.ofertaId || null,
+      preco: e.preco ?? null, precoDe: e.precoDe ?? null, cupom: e.cupom || null, categoria: e.categoria || null,
+      enviadoEm: e.enviadoEm, gruposEnviados, cliques: e.cliques || 0, unicos: e.unicos || 0, bots: e.bots || 0,
+      cliquesPorGrupo: gruposEnviados ? +((e.unicos || 0) / gruposEnviados).toFixed(1) : 0,
+    };
+    if (e.tipo === 'cupom') { cupomDoDia.push(item); continue; }
+    if (e.tipo && e.tipo !== 'oferta') continue;
+    if (lojaF && String(item.loja || '').toLowerCase() !== lojaF) continue;
+    const chave = item.produto || item.codigo;
+    const ant = porProduto.get(chave);
+    if (!ant) { porProduto.set(chave, { ...item, vezesNoPeriodo: 1 }); continue; }
+    ant.vezesNoPeriodo++;
+    if (String(item.enviadoEm) > String(ant.enviadoEm)) porProduto.set(chave, { ...item, vezesNoPeriodo: ant.vezesNoPeriodo });
+  }
+
+  const candidatos = [], excluidos = [];
+  for (const it of porProduto.values()) {
+    const motivos = [];
+    const haH = (agora - Date.parse(it.enviadoEm)) / 3600000;
+    if (haH < minH) motivos.push('enviado ha ' + haH.toFixed(1) + ' h');
+    if (it.cupom && it.loja) {
+      try {
+        const reg = cupomPorCodigo(it.loja, it.cupom);
+        if (!reg || !cupomVigente(reg)) motivos.push('cupom ' + it.cupom + ' nao vigente');
+      } catch (e) {}
+    }
+    let precoAgora = null;
+    if (it.produto) {
+      try { const st = estatisticasPreco(it.produto); precoAgora = st?.ultimo ?? null; } catch (e) {}
+      if (precoAgora != null && Number.isFinite(it.preco) && precoAgora > it.preco * REENVIO_TOLERANCIA_PRECO) {
+        motivos.push('preco subiu para R$ ' + precoAgora.toFixed(2));
+      }
+    }
+    const out = { ...it, precoAgora, naVitrine: !!(it.produto && itemVitrine(it.produto)), haHoras: +haH.toFixed(1) };
+    if (motivos.length) excluidos.push({ ...out, motivos }); else candidatos.push(out);
+  }
+  candidatos.sort((a, b) => b.cliquesPorGrupo - a.cliquesPorGrupo || b.unicos - a.unicos);
+  excluidos.sort((a, b) => b.cliquesPorGrupo - a.cliquesPorGrupo);
+  cupomDoDia.sort((a, b) => String(b.enviadoEm).localeCompare(String(a.enviadoEm)));
+  res.json({ ok: true, dias, loja: lojaF || null, minHoras: minH, total: candidatos.length,
+    candidatos: candidatos.slice(0, 100), excluidos: excluidos.slice(0, 100), cupomDoDia: cupomDoDia.slice(0, 20) });
+});
+
+// GET /monitor-precos/dinheiro-na-mesa?horas=6 — oferta boa parada sem disparo
+app.get('/monitor-precos/dinheiro-na-mesa', (req, res) => {
+  const horas = Math.max(1, parseFloat(req.query.horas || '6') || 6);
+  res.json({ ok: true, ...dinheiroNaMesa({ horas }) });
+});
+
 // GET /monitor-precos/vereditos?dias=7 — seus disparos x a regra (modo sombra)
 app.get('/monitor-precos/vereditos', (req, res) => {
   const dias = Math.min(30, Math.max(1, parseInt(req.query.dias, 10) || 7));
