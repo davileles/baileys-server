@@ -19844,6 +19844,121 @@ app.get('/grupos/membros/trafego', async (req, res) => {
     avisos, total: tot, campanhas, serie });
 });
 
+// ── QUEM ENTROU FICOU? COORTES POR DIA, LTV ÷ CAC ───────────────────────────
+// Cada dia (SP) e uma coorte: de quem entrou, quantos ainda estavam em algum
+// grupo nosso depois de 1, 3, 7, 15 e 30 dias. Uma idade so aparece quando a
+// coorte INTEIRA ja passou dela; nada e projetado. A comparacao natural e pelo
+// mesmo dia da semana (o trafego tem sazonalidade semanal): cada coorte traz a
+// media das coortes anteriores do mesmo dia da semana.
+// Receita por membro-dia = comissao do dia (revisada quando houver) ÷ base de
+// membros do dia (censo). Vida media da base = base media ÷ saidas por dia.
+// LTV = receita por membro-dia × vida media. "Devolveu" = o que a coorte ja
+// rendeu por pessoa nos dias observados, contra o custo da entrada (3.1).
+const LTV_HORIZONTES_D = [1, 3, 7, 15, 30];
+async function comissoesPorDia(de, ate) {
+  const r = await fetch(CDV_PROXY_URL + '/afiliados/comissoes?de=' + de + '&ate=' + ate, { signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error('comissoes HTTP ' + r.status);
+  const d = await r.json();
+  const out = {};
+  for (const [dia, plats] of Object.entries(d.dias || {})) {
+    let com = 0, cliques = 0;
+    for (const p of Object.values(plats || {})) {
+      if (!p) continue;
+      com += Number(p.comissaoRev ?? p.comissao) || 0;
+      cliques += Number(p.cliques) || 0;
+    }
+    out[dia] = { comissao: +com.toFixed(2), cliques };
+  }
+  return out;
+}
+function _diaSemanaSP(dia) {
+  return ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sab'][new Date(dia + 'T12:00:00-03:00').getDay()];
+}
+
+// GET /grupos/membros/ltv?dias=60
+app.get('/grupos/membros/ltv', async (req, res) => {
+  const dias = Math.min(Math.max(parseInt(req.query.dias || '60', 10) || 60, 7), 180);
+  const agora = Date.now();
+  const hoje = _censoDia(new Date(agora).toISOString());
+  const de = _censoDia(new Date(agora - dias * 86400000).toISOString());
+  const avisos = [];
+  let comissoes = {}, gasto = {};
+  try { comissoes = await comissoesPorDia(de, hoje); } catch (e) { avisos.push('comissoes: ' + e.message); }
+  try { gasto = await gastoTrafegoPorDia(); } catch (e) { avisos.push('planilha: ' + e.message); }
+
+  // Estadias (entrada -> saida) so nos destinos TSP, migracao descontada.
+  const destinos = new Set(censoAlvos());
+  const evs = _membrosLog.eventos.filter(e => destinos.has(e.g));
+  const { migracao } = classificarMovimentos(evs.filter(e => new Date(e.ts).getTime() >= agora - (dias + 2) * 86400000));
+  const semIdTs = evs.filter(e => e.semId).map(e => new Date(e.ts).getTime());
+  const proximoSemId = (t) => { let lo = 0, hi = semIdTs.length; while (lo < hi) { const m = (lo + hi) >> 1; if (semIdTs[m] <= t) lo = m + 1; else hi = m; } return lo < semIdTs.length ? semIdTs[lo] : null; };
+  const abertos = new Map(), estadias = [];
+  const recentes = evs.filter(e => new Date(e.ts).getTime() >= agora - (dias + 2) * 86400000);
+  recentes.forEach((e, i) => {
+    if (e.semId) return;
+    const t = new Date(e.ts).getTime(), k = e.g + '|' + e.n;
+    if (migracao.has(i)) {
+      // Troca de grupo: a estadia continua — move a chave para o grupo novo.
+      if (e.a === 'add') { const st = [...abertos.values()].find(s => s.n === e.n && s.migrando); if (st) { st.migrando = false; abertos.delete(st.k); st.k = k; st.g = e.g; abertos.set(k, st); return; } }
+      else { const st = abertos.get(k); if (st) { st.migrando = true; } return; }
+    }
+    if (e.a === 'add') { if (abertos.has(k)) estadias.push(abertos.get(k)); abertos.set(k, { k, g: e.g, n: e.n, ini: t, fim: null }); }
+    else { const st = abertos.get(k); if (!st) return; abertos.delete(k); st.fim = t; estadias.push(st); }
+  });
+  for (const st of abertos.values()) estadias.push(st);
+  for (const st of estadias) { const gap = proximoSemId(st.ini); st.lim = (gap != null && gap < agora) ? gap : agora; if (st.fim != null && st.fim > st.lim) st.fim = null; }
+
+  // Saidas por dia (sem migracao) e base do censo: vida media da base.
+  const saidasPorDia = {}, entradasPorDia = {};
+  recentes.forEach((e, i) => { if (e.semId || migracao.has(i)) return; const d = _censoDia(e.ts); if (e.a === 'remove') saidasPorDia[d] = (saidasPorDia[d] || 0) + 1; else entradasPorDia[d] = (entradasPorDia[d] || 0) + 1; });
+  const censoDias = _censoHist?.dias || {};
+  const baseDe = (d) => { if (censoDias[d]?.total) return censoDias[d].total; const ks = Object.keys(censoDias).filter(k => k <= d).sort(); return ks.length ? censoDias[ks[ks.length - 1]].total : (_censo.grupos || []).reduce((s, g) => s + (g.membros || 0), 0); };
+  const diasJanela = []; for (let i = dias; i >= 1; i--) diasJanela.push(_censoDia(new Date(agora - i * 86400000).toISOString()));
+  const baseMedia = diasJanela.reduce((s, d) => s + baseDe(d), 0) / diasJanela.length;
+  const saidasMedia = diasJanela.reduce((s, d) => s + (saidasPorDia[d] || 0), 0) / diasJanela.length;
+  const vidaMediaDias = saidasMedia > 0 ? +(baseMedia / saidasMedia).toFixed(1) : null;
+  const diasComReceita = diasJanela.filter(d => comissoes[d]);
+  const receitaMembroDia = diasComReceita.length
+    ? +(diasComReceita.reduce((s, d) => s + comissoes[d].comissao / Math.max(1, baseDe(d)), 0) / diasComReceita.length).toFixed(4) : null;
+  const ltv = (receitaMembroDia != null && vidaMediaDias != null) ? +(receitaMembroDia * vidaMediaDias).toFixed(2) : null;
+
+  // Coortes por dia de entrada.
+  const fator = 1 + TRAFEGO_IMPOSTO_PCT / 100;
+  const porDia = new Map();
+  for (const st of estadias) { const d = _censoDia(new Date(st.ini).toISOString()); if (d < de) continue; if (!porDia.has(d)) porDia.set(d, []); porDia.get(d).push(st); }
+  const coortesBrutas = [...porDia.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([d, lista]) => {
+    const fimDoDia = new Date(d + 'T23:59:59-03:00').getTime();
+    const ret = {};
+    for (const h of LTV_HORIZONTES_D) {
+      const ms = h * 86400000;
+      if (fimDoDia + ms > agora) { ret[h] = null; continue; }   // coorte ainda nao passou da idade
+      let base = 0, fic = 0;
+      for (const st of lista) { if ((st.lim - st.ini) < ms) continue; base++; if (!(st.fim != null && (st.fim - st.ini) < ms)) fic++; }
+      ret[h] = base ? +(fic / base * 100).toFixed(1) : null;
+    }
+    const g = gasto[d] ? +(gasto[d].anuncio * fator).toFixed(2) : 0;
+    const entradas = entradasPorDia[d] || lista.length;
+    const custoEntrada = (g > 0 && entradas > 0) ? +(g / entradas).toFixed(2) : null;
+    const diasObs = Math.max(0, Math.min(30, Math.floor((agora - fimDoDia) / 86400000)));
+    const devolveuPct = (custoEntrada && receitaMembroDia != null) ? +(receitaMembroDia * diasObs / custoEntrada * 100).toFixed(0) : null;
+    const ltvCac = (custoEntrada && ltv != null) ? +(ltv / custoEntrada).toFixed(1) : null;
+    return { dia: d, diaSemana: _diaSemanaSP(d), entradas, retencao: ret, gastoAnuncio: g, custoEntrada, diasObservados: diasObs, devolveuPct, ltvCac };
+  });
+  // Media das coortes anteriores do mesmo dia da semana, idade a idade.
+  const coortes = coortesBrutas.map((c, idx) => {
+    const ant = coortesBrutas.slice(0, idx).filter(x => x.diaSemana === c.diaSemana);
+    const ref = {};
+    for (const h of LTV_HORIZONTES_D) { const v = ant.map(x => x.retencao[h]).filter(x => x != null); ref[h] = v.length ? +(v.reduce((s, x) => s + x, 0) / v.length).toFixed(1) : null; }
+    return { ...c, mesmoDiaSemanaMedia: ref, coortesComparadas: ant.length };
+  }).reverse();
+
+  const permanencias = estadias.filter(s => s.fim != null).map(s => (s.fim - s.ini) / 86400000).sort((a, b) => a - b);
+  res.json({ ok: true, dias, de, ate: hoje, avisos,
+    base: { media: Math.round(baseMedia), saidasPorDia: +saidasMedia.toFixed(1), vidaMediaDias, permanenciaMedianaDias: permanencias.length ? +permanencias[Math.floor(permanencias.length / 2)].toFixed(1) : null,
+      receitaMembroDia, ltv, diasComReceita: diasComReceita.length, imposto: TRAFEGO_IMPOSTO_PCT },
+    coortes });
+});
+
 // GET /grupos/censo/historico?dias=90 — serie diaria para o grafico de evolucao.
 // Devolve o total do dia e a contagem por grupo, so dos grupos que ainda sao
 // destino (grupo removido do papel some do grafico junto com a lista).
