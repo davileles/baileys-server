@@ -17,6 +17,7 @@ servidor já degradado.
 | `GET /health` | **200** = saudável. **503** = degradado; o corpo diz o `motivo`. É o endpoint para monitor externo (UptimeRobot/BetterStack). |
 | `GET /status` | Retrato completo em JSON (`conectado`, `surdezEstado`, `ultimoUpsertEm`, `publicacoesHoje`, fila…). Sempre 200. |
 | Bot Telegram `/status` | O mesmo retrato, pelo celular. |
+| `GET /grupos/membros/trafego?dias=30` | Custo por entrada: gasto da planilha de tráfego (via proxy) ÷ entradas novas (CAC), ÷ entradas **confirmadas** (clique no convite `/g/<slug>` casado com o ADD do mesmo grupo em até `TRAFEGO_CONFIRMA_MIN` min, padrão 10) e ÷ saldo (custo por membro que fica). Por campanha (`?o=` da landing): cliques, confirmadas e taxa clique→entrada. |
 | `GET /grupos/membros/hoje` | Entradas e saídas de hoje **contra o mesmo horário de ontem**, saldo, migrações (troca entre grupos nossos em 15 min: não conta como entrada nem saída), desistências (entrou e saiu no mesmo dia) e vagas por grupo (teto `MEMBROS_TETO`, padrão 1.010). Ledger alimentado pela principal, pelas contas extras e pelo wa-envio, com dedup entre fontes. |
 | `travas` em `/status` ou `GET /alertas/travas` | Condições abertas que **só saem da lista quando a correção está no ar** (remetente deslogado, wa-envio fora, Telegram sem sessão, disjuntor da inserção ML). Marcar como lido não resolve; quando a condição some, chega um "OK — trava resolvida". |
 | `remetentes` em `/status` | Um retrato por número (principal, tico-02, tico-03…): `conectado`, `conectadoHaS` (heartbeat), `disparoHabilitado`, `quarentena`/`quarentenaAte` e `ultimoErro`. `saidasEmVoo` e `reconexaoAdiada` mostram se há disparo em andamento segurando uma reconexão. |
@@ -165,6 +166,7 @@ nunca deixa JSON truncado. `.tmp` órfãos são varridos pela faxina periódica.
 | `RESEND_API_KEY`, `ALERTA_EMAIL` | e-mail nos alertas críticos (logout, degrau 3) |
 | `OUTBOX_TTL_H` | validade das entregas na outbox (padrão 6 h) |
 | `RESUMO_DIARIO_HORA` | hora SP do resumo diário (padrão 21) |
+| `TRAFEGO_CONFIRMA_MIN`, `TRAFEGO_IMPOSTO_PCT` | janela clique→ADD (padrão 10 min) e imposto somado ao gasto de anúncio (padrão 0) em `/grupos/membros/trafego` |
 | `MEMBROS_TETO` | teto de membros por grupo para o cálculo de vagas em `/grupos/membros/hoje` (padrão 1010) |
 | `RESUMO_MANHA_HM` | hora SP do resumo da manhã, `HH:MM` (padrão `07:55`): remetentes, travas abertas, outbox, fila e inserção ML, antes das primeiras ofertas |
 | `QUARENTENA_H` (no serviço **wa-envio**) | horas sem disparo em grupo após um pareamento novo (padrão 24; `0` desliga) |

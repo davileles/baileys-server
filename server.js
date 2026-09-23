@@ -19733,6 +19733,117 @@ app.get('/grupos/membros/hoje', (req, res) => {
   });
 });
 
+// ── TRAFEGO PAGO: CUSTO POR ENTRADA CONFIRMADA ───────────────────────────────
+// Clique nao e entrada. A entrada confirmada e o ADD que o grupo registra ate
+// TRAFEGO_CONFIRMA_MIN minutos depois de um clique no convite do rodizio
+// (/g/<slug>, eventos em GET /gg/cliques no proxy), no MESMO grupo. Cada clique
+// confirma no maximo um ADD e cada ADD e confirmado por no maximo um clique.
+// Migracao (troca entre grupos nossos) nao e entrada nem saida. O gasto vem da
+// planilha de trafego (aba trafego, via proxy), por dia, com o imposto opcional
+// TRAFEGO_IMPOSTO_PCT por cima. Campanha = ?o=<origem> da landing; a planilha
+// nao abre gasto por campanha, entao por campanha saem so cliques e entradas.
+const TRAFEGO_CONFIRMA_MIN = Math.max(1, parseInt(process.env.TRAFEGO_CONFIRMA_MIN || '10', 10) || 10);
+const TRAFEGO_IMPOSTO_PCT  = Math.max(0, parseFloat(process.env.TRAFEGO_IMPOSTO_PCT || '0') || 0);
+function _csvLinhas(txt) {
+  const linhas = []; let campo = '', linha = [], aspas = false;
+  for (let i = 0; i < txt.length; i++) {
+    const ch = txt[i];
+    if (aspas) {
+      if (ch === '"' && txt[i + 1] === '"') { campo += '"'; i++; }
+      else if (ch === '"') aspas = false;
+      else campo += ch;
+    } else if (ch === '"') aspas = true;
+    else if (ch === ',') { linha.push(campo); campo = ''; }
+    else if (ch === '\n') { linha.push(campo); linhas.push(linha); linha = []; campo = ''; }
+    else if (ch !== '\r') campo += ch;
+  }
+  if (campo.length || linha.length) { linha.push(campo); linhas.push(linha); }
+  return linhas;
+}
+function _num(v) { const n = parseFloat(String(v ?? '').replace(/\./g, (m, i, s) => (s.includes(',') ? '' : m)).replace(',', '.')); return Number.isFinite(n) ? n : 0; }
+async function gastoTrafegoPorDia() {
+  const r = await fetch(CDV_PROXY_URL + '/tsp/planilha?sheet=trafego', { signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error('planilha de trafego HTTP ' + r.status);
+  const linhas = _csvLinhas(await r.text());
+  const cab = (linhas[0] || []).map(s => String(s).toLowerCase());
+  const iData = cab.findIndex(h => h.startsWith('data'));
+  const iAnuncio = cab.findIndex(h => h.includes('anúncio') || h.includes('anuncio'));
+  const iEstrat = cab.findIndex(h => h.includes('estrateg'));
+  const iCliq = cab.findIndex(h => h.startsWith('clique an'));
+  const out = {};
+  for (const l of linhas.slice(1)) {
+    const d = String(l[iData] || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+    out[d] = { anuncio: iAnuncio >= 0 ? _num(l[iAnuncio]) : 0, estrategista: iEstrat >= 0 ? _num(l[iEstrat]) : 0,
+      cliquesAnuncioPlanilha: iCliq >= 0 ? _num(l[iCliq]) : null };
+  }
+  return out;
+}
+
+// GET /grupos/membros/trafego?dias=30
+app.get('/grupos/membros/trafego', async (req, res) => {
+  const dias = Math.min(Math.max(parseInt(req.query.dias || '30', 10) || 30, 1), 90);
+  const agora = Date.now();
+  const corte = agora - dias * 86400000;
+  let cliques = [], gasto = {}, avisos = [];
+  try {
+    const r = await fetch(CDV_PROXY_URL + '/gg/cliques?dias=' + Math.min(31, dias), { signal: AbortSignal.timeout(30000) });
+    const d = await r.json();
+    if (d && d.ok) cliques = d.eventos || []; else avisos.push('cliques no convite indisponiveis');
+    if (dias > 31) avisos.push('cliques no convite cobrem no maximo 31 dias');
+  } catch (e) { avisos.push('cliques no convite: ' + e.message); }
+  try { gasto = await gastoTrafegoPorDia(); } catch (e) { avisos.push('planilha: ' + e.message); }
+
+  const destinos = new Set(censoAlvos());
+  const evs = _membrosLog.eventos.filter(e => destinos.has(e.g) && new Date(e.ts).getTime() >= corte - 3600000);
+  const { migracao } = classificarMovimentos(evs);
+  const adds = [];   // ADDs reais (sem migracao), ordenados por ts
+  evs.forEach((e, i) => { if (e.a === 'add' && !migracao.has(i) && !e.semId) adds.push({ ts: new Date(e.ts).getTime(), g: e.g, usado: false }); });
+  adds.sort((a, b) => a.ts - b.ts);
+
+  const janela = TRAFEGO_CONFIRMA_MIN * 60000;
+  const porDia = {}, porOrigem = {};
+  const diaDe = (ms) => _censoDia(new Date(ms).toISOString());
+  const reg = (d) => porDia[d] || (porDia[d] = { dia: d, cliquesConvite: 0, entradasConfirmadas: 0, entradasNovas: 0, saidas: 0, migracoes: 0 });
+  for (const ck of cliques.sort((a, b) => String(a.em).localeCompare(String(b.em)))) {
+    const t = Date.parse(ck.em); if (!Number.isFinite(t) || t < corte) continue;
+    const d = reg(diaDe(t)); d.cliquesConvite++;
+    const o = porOrigem[ck.origem || 'direto'] || (porOrigem[ck.origem || 'direto'] = { origem: ck.origem || 'direto', cliquesConvite: 0, entradasConfirmadas: 0 });
+    o.cliquesConvite++;
+    const add = ck.jid ? adds.find(a => !a.usado && a.g === ck.jid && a.ts >= t && a.ts <= t + janela) : null;
+    if (add) { add.usado = true; d.entradasConfirmadas++; o.entradasConfirmadas++; }
+  }
+  evs.forEach((e, i) => {
+    const t = new Date(e.ts).getTime(); if (t < corte) return;
+    const d = reg(diaDe(t));
+    if (migracao.has(i)) { if (e.a === 'remove') d.migracoes++; return; }
+    if (e.a === 'add') d.entradasNovas++; else d.saidas++;
+  });
+  for (const d of Object.keys(gasto)) if (new Date(d + 'T12:00:00-03:00').getTime() >= corte) reg(d);
+
+  const fator = 1 + TRAFEGO_IMPOSTO_PCT / 100;
+  const custo = (g, n) => (g > 0 && n > 0) ? +(g / n).toFixed(2) : null;
+  const serie = Object.values(porDia).sort((a, b) => (a.dia < b.dia ? -1 : 1)).map(d => {
+    const gd = gasto[d.dia] || { anuncio: 0, estrategista: 0, cliquesAnuncioPlanilha: null };
+    const g = +(gd.anuncio * fator).toFixed(2);
+    const saldo = d.entradasNovas - d.saidas;
+    return { ...d, saldo, gastoAnuncio: g, gastoEstrategista: gd.estrategista, cliquesAnuncioPlanilha: gd.cliquesAnuncioPlanilha,
+      cac: custo(g, d.entradasNovas), custoEntradaConfirmada: custo(g, d.entradasConfirmadas), custoMembroQueFica: custo(g, saldo),
+      cliqueParaEntrada: d.cliquesConvite ? +(d.entradasConfirmadas / d.cliquesConvite * 100).toFixed(1) : null };
+  });
+  const tot = serie.reduce((s, d) => { for (const k of ['cliquesConvite', 'entradasConfirmadas', 'entradasNovas', 'saidas', 'migracoes', 'gastoAnuncio', 'gastoEstrategista']) s[k] = +((s[k] || 0) + (d[k] || 0)).toFixed(2); return s; }, {});
+  tot.saldo = tot.entradasNovas - tot.saidas;
+  tot.cac = custo(tot.gastoAnuncio, tot.entradasNovas);
+  tot.custoEntradaConfirmada = custo(tot.gastoAnuncio, tot.entradasConfirmadas);
+  tot.custoMembroQueFica = custo(tot.gastoAnuncio, tot.saldo);
+  tot.cliqueParaEntrada = tot.cliquesConvite ? +(tot.entradasConfirmadas / tot.cliquesConvite * 100).toFixed(1) : null;
+  const campanhas = Object.values(porOrigem).map(o => ({ ...o, cliqueParaEntrada: o.cliquesConvite ? +(o.entradasConfirmadas / o.cliquesConvite * 100).toFixed(1) : null }))
+    .sort((a, b) => b.cliquesConvite - a.cliquesConvite);
+
+  res.json({ ok: true, dias, regras: { confirmaMin: TRAFEGO_CONFIRMA_MIN, impostoPct: TRAFEGO_IMPOSTO_PCT, fonteGasto: 'planilha trafego (via proxy)' },
+    avisos, total: tot, campanhas, serie });
+});
+
 // GET /grupos/censo/historico?dias=90 — serie diaria para o grafico de evolucao.
 // Devolve o total do dia e a contagem por grupo, so dos grupos que ainda sao
 // destino (grupo removido do papel some do grafico junto com a lista).
