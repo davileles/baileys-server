@@ -10471,6 +10471,17 @@ setInterval(async () => {
 // A principal deslogada/surda ja e coberta pelos watchdogs (aviso + reaviso por
 // hora); aqui ela entra so na lista (soRegistrar), sem mensagem dobrada.
 const TRAVA_DESCONEXAO_MS = 10 * 60 * 1000;   // conta secundaria fora ha 10 min
+const RODIZIO_VAGAS_MIN = Math.max(10, parseInt(process.env.RODIZIO_VAGAS_MIN || '100', 10) || 100);
+let _rodizioVagas = { em: 0, portas: [] };
+async function sondarRodizioVagas() {
+  try {
+    const r = await fetch(CDV_PROXY_URL + '/gg/vagas', { signal: AbortSignal.timeout(15000) });
+    const d = await r.json();
+    if (d && d.ok) _rodizioVagas = { em: Date.now(), portas: d.portas || [] };
+  } catch (e) { /* proxy fora: mantem a ultima leitura; a trava do wa-envio cobre o resto */ }
+}
+setInterval(sondarRodizioVagas, 5 * 60 * 1000).unref?.();
+setTimeout(sondarRodizioVagas, 90 * 1000).unref?.();
 const TRAVA_WAENVIO_MS    = 5 * 60 * 1000;    // servico wa-envio sem responder ha 5 min
 let _travas = _health.travas && typeof _health.travas === 'object' ? _health.travas : {};
 let _waEnvioErroDesde = 0;
@@ -10515,7 +10526,18 @@ function avaliarTravas() {
     } else _waEnvioErroDesde = 0;
   }
 
+  // Portas do rodizio (proxy /gg/vagas, sondado a cada 5 min): porta fechada
+  // = nenhum grupo com vaga, a landing esta mandando para a emergencia.
+  for (const p of (_rodizioVagas.portas || [])) {
+    if (!p.ativo) continue;
+    if (p.fechada) atuais['rodizio:' + p.slug + ':fechada'] = { nivel: 'critico',
+      titulo: 'Porta /g/' + p.slug + ' fechada — todos os ' + p.grupos + ' grupos no teto; landing caindo na emergencia. Crie ou libere um grupo' };
+    else if (p.grupos > 0 && p.vagas < RODIZIO_VAGAS_MIN) atuais['rodizio:' + p.slug + ':baixa'] = { nivel: 'atencao',
+      titulo: 'Porta /g/' + p.slug + ' com so ' + p.vagas + ' vaga(s) em ' + p.elegiveis + ' grupo(s) — prepare o proximo grupo' };
+  }
+
   if (!tgConectado && agora - _bootEm > TRAVA_DESCONEXAO_MS) atuais['telegram:desconectado'] = { nivel: 'atencao',
+
     titulo: 'Telegram (GramJS) desconectado — cupons das fontes nao chegam; refaça o login em /tg-auth' };
 
   try {
@@ -10592,7 +10614,9 @@ setInterval(async () => {
       + (travas.length
         ? '🔒 Travas abertas (' + travas.length + '):\n' + travas.map(t => '• ' + t.titulo + ' — ha ' + (t.haMin >= 60 ? Math.round(t.haMin / 60) + ' h' : t.haMin + ' min')).join('\n') + '\n\n'
         : '🔓 Nenhuma trava aberta.\n\n')
+      + ((_rodizioVagas.portas || []).length ? '🚪 Vagas: ' + _rodizioVagas.portas.filter(p => p.ativo).map(p => '/g/' + p.slug + ' ' + (p.fechada ? 'FECHADA' : p.vagas)).join(' · ') + '\n' : '')
       + '🔁 Outbox: ' + outboxFalhas.length + ' entrega(s) pendente(s)\n'
+
       + '📥 Fila de aprovacao: ' + pendAprov + ' pendente(s)\n'
       + (ml ? '🎟 Cupons ML: insercao ' + (ml.ligada ? 'ligada' : 'DESLIGADA') + ' · ' + (ml.naFila ? ml.naFila.length : 0) + ' na fila' + (ml.disjuntor ? ' · DISJUNTOR ARMADO' : '') + '\n' : '')
       + (() => { try { const dm = dinheiroNaMesa({ horas: 6 }); return dm.total ? '💰 Dinheiro na mesa: ' + dm.total + ' oferta(s) boa(s) parada(s) ha 6 h+ (' + dm.lista.slice(0, 3).map(x => x.nome.slice(0, 40) + ' R$ ' + x.preco).join(' · ') + ')\n' : ''; } catch (e) { return ''; } })()
@@ -20252,6 +20276,72 @@ app.get('/grupos/membros/ltv', async (req, res) => {
     base: { media: Math.round(baseMedia), saidasPorDia: +saidasMedia.toFixed(1), vidaMediaDias, permanenciaMedianaDias: permanencias.length ? +permanencias[Math.floor(permanencias.length / 2)].toFixed(1) : null,
       receitaMembroDia, ltv, diasComReceita: diasComReceita.length, imposto: TRAFEGO_IMPOSTO_PCT },
     coortes });
+});
+
+// ── FINANCEIRO MENSAL ────────────────────────────────────────────────────────
+// As plataformas nao entregam venda a venda, entao o resumo trabalha com o que
+// existe: comissao por plataforma e por dia (coletores, via proxy), gasto de
+// anuncio da planilha com imposto opcional, e a base de membros pelo censo.
+// Receita por clique por loja diz onde vale disparar; receita por membro
+// alimenta o LTV; mes anterior nos MESMOS dias da a comparacao honesta.
+async function _financeiroDoPeriodo(de, ate) {
+  const r = await fetch(CDV_PROXY_URL + '/afiliados/comissoes?de=' + de + '&ate=' + ate, { signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error('comissoes HTTP ' + r.status);
+  const d = await r.json();
+  const plat = {}, porDia = {};
+  for (const [dia, ps] of Object.entries(d.dias || {})) {
+    const reg = (porDia[dia] = porDia[dia] || { dia, receita: 0, vendas: 0, cliques: 0 });
+    for (const [p, v] of Object.entries(ps || {})) {
+      if (!v) continue;
+      const com = Number(v.comissaoRev ?? v.comissao) || 0, ven = Number(v.vendas) || 0, cli = Number(v.cliques) || 0;
+      const a = (plat[p] = plat[p] || { plataforma: p, receita: 0, vendas: 0, cliques: 0, dias: 0, revisada: false });
+      a.receita += com; a.vendas += ven; a.cliques += cli; a.dias++; if (v.comissaoRev != null) a.revisada = true;
+      reg.receita += com; reg.vendas += ven; reg.cliques += cli;
+    }
+  }
+  return { plataformas: plat, porDia };
+}
+// GET /financeiro/mensal?mes=2026-09
+app.get('/financeiro/mensal', async (req, res) => {
+  const hojeSP = _censoDia(new Date().toISOString());
+  const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || '')) ? String(req.query.mes) : hojeSP.slice(0, 7);
+  const ini = mes + '-01';
+  const fimMes = new Date(new Date(ini + 'T12:00:00Z').getTime()); fimMes.setUTCMonth(fimMes.getUTCMonth() + 1); fimMes.setUTCDate(0);
+  const fimMesStr = fimMes.toISOString().slice(0, 10);
+  const ate = (mes === hojeSP.slice(0, 7)) ? hojeSP : fimMesStr;
+  const diasCorridos = Math.round((new Date(ate + 'T12:00:00Z') - new Date(ini + 'T12:00:00Z')) / 86400000) + 1;
+  const antD = new Date(ini + 'T12:00:00Z'); antD.setUTCMonth(antD.getUTCMonth() - 1);
+  const mesAnt = antD.toISOString().slice(0, 7);
+  const antIni = mesAnt + '-01';
+  const antAteD = new Date(antIni + 'T12:00:00Z'); antAteD.setUTCDate(antAteD.getUTCDate() + diasCorridos - 1);
+  const antAte = antAteD.toISOString().slice(0, 10);
+  const avisos = [];
+  let atual = { plataformas: {}, porDia: {} }, anterior = { plataformas: {}, porDia: {} }, gasto = {};
+  try { atual = await _financeiroDoPeriodo(ini, ate); } catch (e) { avisos.push('comissoes: ' + e.message); }
+  try { anterior = await _financeiroDoPeriodo(antIni, antAte); } catch (e) { avisos.push('comissoes (mes anterior): ' + e.message); }
+  try { gasto = await gastoTrafegoPorDia(); } catch (e) { avisos.push('planilha: ' + e.message); }
+  const fator = 1 + TRAFEGO_IMPOSTO_PCT / 100;
+  const somaGasto = (a, b) => Object.entries(gasto).filter(([d]) => d >= a && d <= b).reduce((acc, [, g]) => { acc.anuncio += g.anuncio * fator; acc.estrategista += g.estrategista; return acc; }, { anuncio: 0, estrategista: 0 });
+  const gAtual = somaGasto(ini, ate), gAnt = somaGasto(antIni, antAte);
+  const receita = Object.values(atual.plataformas).reduce((s, p) => s + p.receita, 0);
+  const receitaAnt = Object.values(anterior.plataformas).reduce((s, p) => s + p.receita, 0);
+  const censoDias = _censoHist?.dias || {};
+  const bases = Object.entries(censoDias).filter(([d]) => d >= ini && d <= ate).map(([, v]) => v.total).filter(n => n > 0);
+  const baseMedia = bases.length ? Math.round(bases.reduce((a, b) => a + b, 0) / bases.length) : ((_censo.grupos || []).reduce((s, g) => s + (g.membros || 0), 0) || null);
+  const r2 = (n) => +Number(n || 0).toFixed(2);
+  const plataformas = Object.values(atual.plataformas).map(p => ({ ...p, receita: r2(p.receita), vendas: r2(p.vendas),
+    receitaPorClique: p.cliques ? r2(p.receita / p.cliques) : null, comissaoPct: p.vendas ? +(p.receita / p.vendas * 100).toFixed(1) : null,
+    mesAnterior: anterior.plataformas[p.plataforma] ? r2(anterior.plataformas[p.plataforma].receita) : 0 })).sort((a, b) => b.receita - a.receita);
+  const resultado = receita - gAtual.anuncio - gAtual.estrategista;
+  res.json({ ok: true, mes, de: ini, ate, diasCorridos, avisos, impostoPct: TRAFEGO_IMPOSTO_PCT,
+    receita: r2(receita), receitaMesAnteriorMesmosDias: r2(receitaAnt),
+    variacaoPct: receitaAnt ? +((receita / receitaAnt - 1) * 100).toFixed(1) : null,
+    anuncios: r2(gAtual.anuncio), estrategista: r2(gAtual.estrategista), anunciosMesAnterior: r2(gAnt.anuncio),
+    resultado: r2(resultado), margemPct: receita ? +(resultado / receita * 100).toFixed(1) : null,
+    baseMedia, receitaPorMembro: baseMedia ? +(receita / baseMedia).toFixed(4) : null,
+    plataformas,
+    porDia: Object.values(atual.porDia).sort((a, b) => (a.dia < b.dia ? -1 : 1)).map(d => ({ ...d, receita: r2(d.receita), vendas: r2(d.vendas),
+      anuncio: gasto[d.dia] ? r2(gasto[d.dia].anuncio * fator) : 0, base: censoDias[d.dia]?.total || null })) });
 });
 
 // GET /grupos/censo/historico?dias=90 — serie diaria para o grafico de evolucao.

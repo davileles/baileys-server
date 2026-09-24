@@ -34,6 +34,7 @@
         "app.get('/debug-upserts'",
         "app.get('/entrega/grupos'",
         "app.get('/fila-envio'",
+        "app.get('/financeiro/mensal'",
         "app.get('/grupos'",
         "app.get('/grupos-gestao/contato'",
         "app.get('/grupos-gestao/grupos'",
