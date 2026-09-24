@@ -252,6 +252,22 @@ const CFG_PADRAO = {
     },
     porNicho: {},
   },
+
+  // FILTRO DE DISPARO (set/2026): a serie julga o que sai dos DISPAROS
+  // AUTOMATICOS (auto-envio do radar e listas). So opina sobre produto com serie
+  // madura — produto novo, sem historico, segue o criterio de sempre.
+  //   modo  'off'    nao julga
+  //         'sombra' julga e registra (vereditos), nunca segura nada
+  //         'ativo'  segura o que a regra vetar: radar vai para a fila manual,
+  //                  lista pula o item
+  //   vetar 'falsoDesconto' so o preco igual ou acima da mediana de 30 dias
+  //         'semQuedaReal'  tambem queda abaixo do minimo do nicho / fora do
+  //                          menor patamar de 90 dias
+  // Disparo manual (painel, vitrine, bot) nunca e segurado: e decisao do operador.
+  filtroDisparo: {
+    modo: 'sombra',
+    vetar: 'semQuedaReal',
+  },
 };
 
 // ── ESTADO EM MEMORIA ────────────────────────────────────────────────────────
@@ -555,6 +571,10 @@ function estruturarCfg(bruto) {
       if (Object.keys(parcial).length) out.regras.porNicho[id] = estruturarRegra(parcial, {}, true);
     }
   }
+
+  const fd = b.filtroDisparo || {};
+  out.filtroDisparo.modo  = ['off', 'sombra', 'ativo'].includes(fd.modo) ? fd.modo : CFG_PADRAO.filtroDisparo.modo;
+  out.filtroDisparo.vetar = ['falsoDesconto', 'semQuedaReal'].includes(fd.vetar) ? fd.vetar : CFG_PADRAO.filtroDisparo.vetar;
   return out;
 }
 
@@ -1276,7 +1296,7 @@ export function semearVitrinePorDesempenho({ simular: apenasSimular = false } = 
 // cupom / outra loja mais barata. Nada e bloqueado — e um espelho para
 // calibrar a regra contra o olho do operador. Quando o produto ja estava na
 // fila do monitor, registra quantos minutos antes ele tinha sido sinalizado.
-const VEREDITOS_MAX = 400;
+const VEREDITOS_MAX = 800;   // ~1 semana de disparos: base do corte medido pelo filtro
 function classeDoVeredito(av) {
   if (av.passou) return 'passou';
   const mo = String(av.motivo || '');
@@ -1288,6 +1308,47 @@ function classeDoVeredito(av) {
   if (mo.startsWith('abaixo') || mo.startsWith('acima')) return 'fora da faixa de preco';
   return 'sem queda';
 }
+// ── FILTRO DE DISPARO ───────────────────────────────────────────────────────
+// Le o veredito do avaliar() so pelo lado do PRECO. Cooldown, EPC, faixa de
+// preco e "outra loja mais barata" nao sao desconto falso e nao vetam aqui.
+//   nivel 'falsoDesconto'  melhor leitura (bruta ou com cupom) sem queda nenhuma
+//   nivel 'semQuedaReal'   caiu, mas abaixo da regra do nicho / fora do minimo 90d
+function classificarFiltro(av, stats, nicho) {
+  const r = regraDoNicho(nicho);
+  if (!stats || !(stats.dias >= r.maturidadeMinDias)) return { julgavel: false, nivel: null, motivo: 'serie imatura ou inexistente' };
+  if (av.via) return { julgavel: true, nivel: null, motivo: 'queda real' };
+  const qb = Number.isFinite(av.quedaPctBruto) ? av.quedaPctBruto : null;
+  const qe = Number.isFinite(av.quedaPctEfetivo) ? av.quedaPctEfetivo : null;
+  if (qb === null && qe === null) return { julgavel: false, nivel: null, motivo: av.motivo || 'sem leitura de preco' };
+  const melhor = Math.max(qb ?? -Infinity, qe ?? -Infinity);
+  if (melhor <= 0) return { julgavel: true, nivel: 'falsoDesconto', motivo: 'preco na mediana de 30d ou acima (' + melhor + '%)', quedaPct: melhor };
+  return { julgavel: true, nivel: 'semQuedaReal', motivo: av.motivo || ('queda de ' + melhor + '%'), quedaPct: melhor };
+}
+
+/**
+ * Consulta ANTES de um disparo automatico. Nao grava nada.
+ * Retorna { modo, vetar, julgavel, nivel, veto, bloqueia, motivo, diasSerie, mediana30 }.
+ */
+export function filtroDisparo({ asin, loja, nome, preco, precoDe, cupom = null }) {
+  const cfg = _cfg.filtroDisparo || CFG_PADRAO.filtroDisparo;
+  const base = { modo: cfg.modo, vetar: cfg.vetar, julgavel: false, nivel: null, veto: false, bloqueia: false };
+  if (cfg.modo === 'off' || !asin || !Number.isFinite(Number(preco)) || Number(preco) <= 0) return base;
+  try {
+    const item = { ...(itemVitrine(asin) || { asin, loja, nome: nome || '' }) };
+    if (cupom && !item.cupom) item.cupom = cupom;
+    const stats = estatisticas(asin);
+    const { nicho } = nichoDoProduto(item, nome || _hist[asin]?.n || item.nome);
+    const av = avaliar(item, { preco: Number(preco), precoDe: Number(precoDe), disponivel: true }, stats, nicho);
+    const c = classificarFiltro(av, stats, nicho);
+    const veto = !!c.nivel && (cfg.vetar === 'semQuedaReal' || c.nivel === 'falsoDesconto');
+    return { ...base, ...c, nicho, veto, bloqueia: veto && cfg.modo === 'ativo',
+             diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null };
+  } catch (e) {
+    // Filtro nunca derruba envio: erro = nao julgavel.
+    return { ...base, motivo: 'erro: ' + e.message };
+  }
+}
+
 export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null, cupom = null }) {
   if (!asin) return null;
   const item = itemVitrine(asin) || { asin, loja, nome: nome || '', cupom: cupom || '' };
@@ -1307,6 +1368,10 @@ export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null,
     veredito: classeDoVeredito(av), motivo: av.motivo || null,
     sinalizadoAntesMin: naFila?.em ? Math.max(0, Math.round((Date.now() - new Date(naFila.em).getTime()) / 60000)) : null,
   };
+  try {
+    const c = classificarFiltro(av, stats, nicho);
+    reg.filtro = { julgavel: c.julgavel, nivel: c.nivel };
+  } catch (e) { /* relatorio nao segura envio */ }
   _estado.vereditosDisparos = [reg, ...(_estado.vereditosDisparos || [])].slice(0, VEREDITOS_MAX);
   return reg;
 }
@@ -1337,7 +1402,20 @@ export function vereditosDisparos({ dias = 7 } = {}) {
   const porVeredito = {};
   for (const v of lista) porVeredito[v.veredito] = (porVeredito[v.veredito] || 0) + 1;
   const sinalizados = lista.filter(v => v.sinalizadoAntesMin != null);
-  return { dias, total: lista.length, porVeredito,
+  // Quanto o filtro de disparo cortaria (ou cortou) do que saiu. So conta
+  // registro com o campo — os anteriores a set/2026 ficam fora da conta.
+  const comFiltro = lista.filter(v => v.filtro);
+  const filtro = {
+    ...(_cfg.filtroDisparo || {}),
+    registros: comFiltro.length,
+    julgaveis: comFiltro.filter(v => v.filtro.julgavel).length,
+    falsoDesconto: comFiltro.filter(v => v.filtro.nivel === 'falsoDesconto').length,
+    semQuedaReal: comFiltro.filter(v => v.filtro.nivel === 'semQuedaReal').length,
+    quedaReal: comFiltro.filter(v => v.filtro.julgavel && !v.filtro.nivel).length,
+  };
+  filtro.cortePctFalsoDesconto = comFiltro.length ? Math.round(1000 * filtro.falsoDesconto / comFiltro.length) / 10 : null;
+  filtro.cortePctSemQuedaReal  = comFiltro.length ? Math.round(1000 * (filtro.falsoDesconto + filtro.semQuedaReal) / comFiltro.length) / 10 : null;
+  return { dias, total: lista.length, porVeredito, filtro,
     sinalizadosAntes: sinalizados.length,
     sinalizadoAntesMedianaMin: sinalizados.length ? sinalizados.map(v => v.sinalizadoAntesMin).sort((a, b) => a - b)[Math.floor(sinalizados.length / 2)] : null,
     passariamPorDia: Object.entries(_estado.passariamPorDia || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([dia, v]) => ({ dia, ...v })),

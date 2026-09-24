@@ -77,7 +77,7 @@ import {
   carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
   semearVitrinePorDesempenho, rankingEpc, estadoEpc,
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
-  julgarDisparo, vereditosDisparos, dinheiroNaMesa,
+  julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
 } from './monitor-precos.js';
 
@@ -8170,10 +8170,10 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         const lidos = await processarTextoAmazon(texto);
         // Em modo sem API o preco vem do texto do grupo. Alimentar a serie com
         // numero digitado por terceiro envenenaria a mediana — mesma razao pela
-        // qual Magalu e Awin nunca entram. So le quando veio da API.
-        // Amazon esta fora da vigilancia de precos neste momento: a leitura fora
-        // da janela nao tem serie para alimentar.
-        await lerPrecosParaSerie([], jid, podeAmazon.motivo);
+        // qual Magalu e Awin nunca entram. So le quando veio da API (sem semApi).
+        const _amzApi = (lidos || []).filter(r => r && !r.descartadoPor && r.produto && !r.produto.semApi)
+                                     .map(r => r.produto);
+        await lerPrecosParaSerie(_amzApi, jid, podeAmazon.motivo);
       } catch (e) { console.warn('[LEITURA] Amazon:', e.message); }
     } else {
       console.log('[MONITOR] Amazon ignorada em ' + jid.split('@')[0] + ' — ' + podeAmazon.motivo);
@@ -8280,9 +8280,10 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // pontos intradiarios que a varredura horaria sozinha nao pega.
     try {
       // p.semApi: preco lido do texto do grupo, nao de fonte verificavel.
-      // Amazon: leitura de catalogo restrita a montagem da oferta — nao alimenta
-      // serie (ver LOJAS_MONITORAVEIS_PRECO em monitor-precos.js).
-      if (!p.semApi && p.loja !== 'Amazon') {
+      // Amazon alimenta a serie desde set/2026: a leitura ja nao usa credencial
+      // emprestada restrita a montagem (ver LOJAS_MONITORAVEIS_PRECO). Quando a
+      // API falha, o radar marca semApi e o preco do texto continua fora.
+      if (!p.semApi) {
         registrarLeituraPreco(p.asin, {
           nome: p.titulo, loja: p.loja, preco: p.preco,
           precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
@@ -8564,7 +8565,25 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // entao continua exigindo aprovacao manual como antes.
     const _seguraPorPreco = oferta.dadosExtraidos.precoDeReferencia
                          && !oferta.dadosExtraidos.autoEnvioMesmoSemVerificar;
+    // ── FILTRO DE DISPARO (serie de precos) ──
+    // Produto com serie madura so sai sozinho se o preco caiu de verdade. Em
+    // 'sombra' so registra; em 'ativo' o vetado vai para a fila com o motivo,
+    // e o operador ainda pode aprovar na mao.
+    let _filtro = null;
+    if (!oferta.dadosExtraidos.precoDeReferencia) {
+      try {
+        _filtro = filtroDisparo({ asin: p.asin, loja: p.loja, nome: p.titulo, preco: Number(p.preco),
+          precoDe: Number(p.precoDe), cupom: oferta.dadosExtraidos.cupom || null });
+        if (_filtro?.julgavel) {
+          oferta.dadosExtraidos.filtroPreco = { modo: _filtro.modo, nivel: _filtro.nivel, veto: _filtro.veto,
+            bloqueia: _filtro.bloqueia, motivo: _filtro.motivo, diasSerie: _filtro.diasSerie, mediana30: _filtro.mediana30 };
+          if (_filtro.veto) console.log('[FILTRO] #' + oferta.id + ' ' + (p.asin || '?') + ' — '
+            + (_filtro.bloqueia ? 'SEGURADA' : 'vetaria (sombra)') + ': ' + _filtro.nivel + ' — ' + _filtro.motivo);
+        }
+      } catch (e) { /* filtro nunca segura o pipeline por erro */ }
+    }
     if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
+        && !_filtro?.bloqueia
         && !oferta.cupomAmbiguo
         && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
       try {
@@ -16337,6 +16356,18 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
   // ("Produto MLB123", "Produto B0XXXX") nunca sai para grupo.
   if (ehNomeProvisorio(o.produto?.titulo)) {
     return { ok:false, motivo:'sem nome real do produto (' + o.produto.titulo + ') — corrija o nome na lista' };
+  }
+  // Filtro de disparo: item de lista com serie madura e sem queda real pula a
+  // vez (modo 'ativo'). Em 'sombra' so loga — o veredito completo fica em
+  // /monitor-precos/vereditos quando o envio passa pelo historico.
+  if (!o.precoDeReferencia) {
+    try {
+      const _f = filtroDisparo({ asin: o.asin || asin, loja: o.produto.loja, nome: o.produto.titulo,
+        preco: Number(o.produto.preco), precoDe: Number(o.produto.precoDe), cupom: o.cupom?.codigo || null });
+      if (_f?.veto) console.log('[FILTRO] Lista ' + asin + ' — ' + (_f.bloqueia ? 'PULADO' : 'vetaria (sombra)')
+        + ': ' + _f.nivel + ' — ' + _f.motivo);
+      if (_f?.bloqueia) return { ok:false, motivo:'filtro de preco: ' + _f.motivo + ' (serie ' + _f.diasSerie + 'd)' };
+    } catch (e) { /* filtro nunca derruba a lista */ }
   }
 
   const oferta = {
