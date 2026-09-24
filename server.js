@@ -78,6 +78,7 @@ import {
   semearVitrinePorDesempenho, rankingEpc, estadoEpc,
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
   julgarDisparo, vereditosDisparos, dinheiroNaMesa,
+  recusarCandidato, curadoriaEstado, curadoriaRemover,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -17717,6 +17718,40 @@ app.get('/reenvio/candidatos', async (req, res) => {
     candidatos: candidatos.slice(0, 100), excluidos: excluidos.slice(0, 100), cupomDoDia: cupomDoDia.slice(0, 20) });
 });
 
+// ── DETECCAO DE REPASSE ──────────────────────────────────────────────────────
+// Grupo com mais cliques unicos do que membros num disparo e sinal de que a
+// mensagem circulou fora do grupo (a marca d'agua viaja junto). Nao e problema:
+// e alcance real que a contagem por grupo esconde — e um aviso para nao
+// superestimar o grupo ao decidir reenvio. Cruza /links-stats com o censo.
+app.get('/links/repasse', async (req, res) => {
+  const dias = Math.min(31, Math.max(1, parseInt(req.query.dias, 10) || 7));
+  let envios = [];
+  try {
+    const r = await fetch(CDV_PROXY_URL + '/links-stats?dias=' + dias, { signal: AbortSignal.timeout(30000) });
+    envios = (await r.json()).envios || [];
+  } catch (e) { return res.status(502).json({ ok: false, erro: 'links-stats: ' + e.message }); }
+  const censo = new Map((_censo.grupos || []).map(g => [g.jid, g]));
+  const porGrupo = new Map();
+  const sinais = [];
+  for (const e of envios) {
+    for (const [suf, g] of Object.entries(e.grupos || {})) {
+      if (!g.jid) continue;
+      const membros = censo.get(g.jid)?.membros || null;
+      const reg = porGrupo.get(g.jid) || (porGrupo.set(g.jid, { jid: g.jid, nome: NOMES_GRUPOS.get(g.jid) || g.nome || null, membros, envios: 0, unicos: 0, repasses: 0, maiorTaxa: 0 }), porGrupo.get(g.jid));
+      reg.envios++; reg.unicos += g.u || 0;
+      if (membros) {
+        const taxa = (g.u || 0) / membros;
+        if (taxa > reg.maiorTaxa) reg.maiorTaxa = taxa;
+        if ((g.u || 0) > membros) { reg.repasses++; sinais.push({ codigo: e.codigo, titulo: e.titulo, enviadoEm: e.enviadoEm, grupo: g.jid, nome: reg.nome, unicos: g.u, membros, taxa: +taxa.toFixed(2) }); }
+      }
+    }
+  }
+  const grupos = [...porGrupo.values()].map(g => ({ ...g, cliquesPorMembro: (g.membros && g.envios) ? +((g.unicos / g.envios) / g.membros).toFixed(3) : null, maiorTaxa: +g.maiorTaxa.toFixed(2) }))
+    .sort((a, b) => (b.maiorTaxa - a.maiorTaxa));
+  sinais.sort((a, b) => b.taxa - a.taxa);
+  res.json({ ok: true, dias, censoEm: _censo.atualizadoEm, gruposComRepasse: grupos.filter(g => g.repasses > 0).length, grupos, sinais: sinais.slice(0, 100) });
+});
+
 // GET /monitor-precos/dinheiro-na-mesa?horas=6 — oferta boa parada sem disparo
 app.get('/monitor-precos/dinheiro-na-mesa', (req, res) => {
   const horas = Math.max(1, parseFloat(req.query.horas || '6') || 6);
@@ -17748,6 +17783,19 @@ app.post('/monitor-precos/semear', (req, res) => {
 
 app.delete('/monitor-precos/fila/:asin', (req, res) => {
   res.json({ ok: descartarCandidato(req.params.asin) });
+});
+
+// Recusa COM motivo (curadoria que aprende): o motivo pode virar regra.
+// body: { motivo, aprender: 'produto'|'termo'|'loja'|null, termo }
+app.post('/monitor-precos/fila/:asin/recusar', (req, res) => {
+  try { res.json(recusarCandidato(req.params.asin, req.body || {})); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+app.get('/monitor-precos/curadoria', (req, res) => res.json({ ok: true, ...curadoriaEstado() }));
+app.delete('/monitor-precos/curadoria', (req, res) => {
+  const { tipo, valor } = req.body || {};
+  if (!['termo', 'produto', 'loja'].includes(tipo) || !valor) return res.status(400).json({ ok: false, erro: 'tipo (termo|produto|loja) e valor' });
+  res.json(curadoriaRemover({ tipo, valor: String(valor) }));
 });
 
 // Publica um candidato agora, ignorando janela e espacamento (a cota continua

@@ -91,6 +91,15 @@ function itensMonitorados() {
 // aprovaria.
 const CFG_PADRAO = {
   ativo: false,
+  // Curadoria que aprende: cada recusa na fila pede motivo, e o motivo pode
+  // virar regra (termo no nome, produto, loja) — o candidato seguinte que bater
+  // na regra e reprovado com 'evitado: ...' antes de gastar leitura.
+  curadoria: {
+    termosEvitados: [],     // [{ termo, motivo, em }] casado no nome do produto (sem acento, sem caixa)
+    produtosEvitados: [],   // [{ asin, motivo, em }]
+    lojasEvitadas: [],      // [{ loja, motivo, em }]
+    recusas: [],            // ultimas 300 recusas: { asin, nome, loja, motivo, aprendeu, em }
+  },
   // 'off'    nao avalia nada
   // 'sombra' avalia, pontua e enfileira — mas nunca envia (a fila vira relatorio)
   // 'on'     envia respeitando janela, cota e intervalo
@@ -487,6 +496,13 @@ function estruturarCfg(bruto) {
   out.publicacao.curado.intervaloMin = limitar(cu.intervaloMin, 0, 1440, CFG_PADRAO.publicacao.curado.intervaloMin);
   out.publicacao.curado.espelharGeralPct = limitar(cu.espelharGeralPct, 0, 100, CFG_PADRAO.publicacao.curado.espelharGeralPct);
   out.publicacao.curado.espelhoRespeitaCota = cu.espelhoRespeitaCota !== false;
+
+  const cr = b.curadoria || {};
+  const lista = (arr, campo) => Array.isArray(arr) ? arr.filter(x => x && String(x[campo] || '').trim()).slice(0, 500) : [];
+  out.curadoria.termosEvitados   = lista(cr.termosEvitados, 'termo');
+  out.curadoria.produtosEvitados = lista(cr.produtosEvitados, 'asin');
+  out.curadoria.lojasEvitadas    = lista(cr.lojasEvitadas, 'loja');
+  out.curadoria.recusas          = Array.isArray(cr.recusas) ? cr.recusas.slice(0, 300) : [];
 
   const av = b.avisos || {};
   out.avisos.candidatos    = av.candidatos !== false;
@@ -915,6 +931,56 @@ function cupomVinculado(item, preco) {
   return desconto > 0 ? { reg, desconto } : null;
 }
 
+function _normTexto(s) { return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase(); }
+function motivoEvitado(item) {
+  const c = _cfg.curadoria || {};
+  const asin = String(item?.asin || '');
+  const p = (c.produtosEvitados || []).find(x => x.asin === asin);
+  if (p) return 'produto (' + (p.motivo || 'recusado') + ')';
+  const lj = (c.lojasEvitadas || []).find(x => _normTexto(x.loja) === _normTexto(item?.loja));
+  if (lj) return 'loja ' + lj.loja + ' (' + (lj.motivo || 'recusada') + ')';
+  const nome = _normTexto(item?.nome);
+  const t = (c.termosEvitados || []).find(x => nome.includes(_normTexto(x.termo)));
+  if (t) return 'termo "' + t.termo + '" (' + (t.motivo || 'recusado') + ')';
+  return null;
+}
+/**
+ * Recusa um candidato COM motivo; o motivo pode virar regra:
+ *   aprender: 'produto' | 'termo' | 'loja' | null   (termo exige `termo`)
+ */
+export function recusarCandidato(asin, { motivo = '', aprender = null, termo = '' } = {}) {
+  const f = _estado.fila.find(x => x.asin === asin) || null;
+  const item = itemVitrine(asin) || f || { asin };
+  const em = new Date().toISOString();
+  const c = _cfg.curadoria;
+  let aprendeu = null;
+  if (aprender === 'produto') { if (!c.produtosEvitados.some(x => x.asin === asin)) c.produtosEvitados.push({ asin, motivo, em }); aprendeu = 'produto ' + asin; }
+  else if (aprender === 'loja' && item.loja) { if (!c.lojasEvitadas.some(x => _normTexto(x.loja) === _normTexto(item.loja))) c.lojasEvitadas.push({ loja: item.loja, motivo, em }); aprendeu = 'loja ' + item.loja; }
+  else if (aprender === 'termo' && String(termo).trim().length >= 3) { const tt = String(termo).trim().slice(0, 60); if (!c.termosEvitados.some(x => _normTexto(x.termo) === _normTexto(tt))) c.termosEvitados.push({ termo: tt, motivo, em }); aprendeu = 'termo "' + tt + '"'; }
+  c.recusas.unshift({ asin, nome: String(item.nome || f?.nome || '').slice(0, 120), loja: item.loja || null, motivo: String(motivo).slice(0, 200), aprendeu, em });
+  c.recusas = c.recusas.slice(0, 300);
+  removerDaFila(asin);
+  if (aprendeu) {
+    // Regra nova derruba tambem o que ja estava na fila e bate nela.
+    _estado.fila = _estado.fila.filter(x => !motivoEvitado(itemVitrine(x.asin) || x));
+  }
+  gravar(ARQ_CFG, _cfg);
+  gravar(ARQ_ESTADO, _estado);
+  return { ok: true, asin, aprendeu, naFila: _estado.fila.length };
+}
+export function curadoriaEstado() {
+  const c = _cfg.curadoria;
+  return { termosEvitados: c.termosEvitados, produtosEvitados: c.produtosEvitados, lojasEvitadas: c.lojasEvitadas, recusas: c.recusas.slice(0, 100) };
+}
+export function curadoriaRemover({ tipo, valor }) {
+  const c = _cfg.curadoria; let n = 0;
+  if (tipo === 'termo')   { const a = c.termosEvitados.length;   c.termosEvitados   = c.termosEvitados.filter(x => _normTexto(x.termo) !== _normTexto(valor)); n = a - c.termosEvitados.length; }
+  if (tipo === 'produto') { const a = c.produtosEvitados.length; c.produtosEvitados = c.produtosEvitados.filter(x => x.asin !== valor); n = a - c.produtosEvitados.length; }
+  if (tipo === 'loja')    { const a = c.lojasEvitadas.length;    c.lojasEvitadas    = c.lojasEvitadas.filter(x => _normTexto(x.loja) !== _normTexto(valor)); n = a - c.lojasEvitadas.length; }
+  if (n) gravar(ARQ_CFG, _cfg);
+  return { ok: true, removidos: n };
+}
+
 export function avaliar(item, leitura, stats, nicho, curado = false) {
   const r = regraDoNicho(nicho);
   const preco = leitura.preco;
@@ -926,6 +992,8 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   if (!Number.isFinite(preco) || preco <= 0)  return { ...base, passou: false, motivo: 'sem preco' };
   if (r.exigirDisponivel && leitura.disponivel === false)
                                               return { ...base, passou: false, motivo: 'indisponivel' };
+  const ev = motivoEvitado(item);
+  if (ev)                                     return { ...base, passou: false, motivo: 'evitado: ' + ev };
   if (!stats)                                 return { ...base, passou: false, motivo: 'sem serie' };
   if (stats.dias < r.maturidadeMinDias)
     return { ...base, passou: false, motivo: 'serie imatura (' + stats.dias + '/' + r.maturidadeMinDias + ' dias)' };
