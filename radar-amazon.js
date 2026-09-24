@@ -2662,6 +2662,18 @@ export function renderTemplate(corpo, vars) {
   return out.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// ── SELO DE MENOR PRECO ──────────────────────────────────────────────────────
+// Quem conhece a serie de precos e o monitor-precos.js, que ja importa este
+// arquivo — importar de volta criaria ciclo. Por isso o monitor REGISTRA o
+// provedor no boot e o template so pergunta: (asin, preco) -> dias | null.
+let _provedorSelo = null;
+export function registrarSeloPreco(fn) { _provedorSelo = typeof fn === 'function' ? fn : null; }
+function diasMenorPreco(p, preco) {
+  if (!_provedorSelo || !p?.asin || !Number.isFinite(preco)) return null;
+  try { const n = _provedorSelo(String(p.asin), preco); return Number.isFinite(n) && n > 0 ? n : null; }
+  catch { return null; }
+}
+
 /** Variaveis disponiveis no template, a partir do produto ja normalizado. */
 export function varsDoProduto(p, cupom) {
   const precoPrazo = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
@@ -2710,6 +2722,14 @@ export function varsDoProduto(p, cupom) {
           // dizer que 100,04 e o que sai no cartao.
           : ('ou R$ ' + brl(precoPrazo) + ' parcelado no cart\u00e3o')),
     preco_de: (riscado && riscado > precoFinal) ? brl(riscado) : '',
+    // Selo pela serie propria (nunca pelo 'de' da loja). Compara o preco SEM o
+    // desconto de meio de pagamento: a serie guarda o preco da API, e comparar o
+    // a vista com ela anunciaria um recorde que nao existe.
+    ...(() => {
+      const n = diasMenorPreco(p, precoPrazo);
+      return { menor_preco: n ? 'Menor preço dos últimos ' + n + ' dias' : '',
+               menor_preco_dias: n ? String(n) : '' };
+    })(),
     desconto: descTotal > 0 ? descTotal : '',
     economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
     // 'codigo' direto vence 'reg.codigo': o cupom lido do anuncio pode nao ter
@@ -2751,6 +2771,8 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'avista_str',    desc:'Ex: "à vista no Pix ou NuPay (28% off)" — vazio quando não há' },
   { chave:'parcelas_str',  desc:'Ex: "ou em até 4x de R$ 25,01 sem juros (total R$ 100,04)"' },
   { chave:'preco_de',      desc:'Preço de lista (vazio quando não há)' },
+  { chave:'menor_preco',   desc:'Ex: "Menor preço dos últimos 63 dias" — pela série do monitor; vazio quando não é recorde' },
+  { chave:'menor_preco_dias', desc:'Só o número de dias do selo de menor preço' },
   { chave:'desconto',      desc:'Percentual total de desconto' },
   { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
   { chave:'cupom',         desc:'Código do cupom (vazio quando não há)' },

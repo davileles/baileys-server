@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
-import { listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
+import { registrarSeloPreco, listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
@@ -220,6 +220,14 @@ const CFG_PADRAO = {
   // quando ninguem ve a fila. Uma mensagem consolidada por varredura, e o mesmo
   // produto so e avisado de novo depois de cooldownHoras. Para desligar:
   // avisos.candidatos = false em /monitor-precos/config.
+  // Selo "Menor preço dos últimos X dias" no template ({{menor_preco}}). Vale
+  // para QUALQUER disparo de produto que tenha serie, nao so os do monitor.
+  selo: {
+    ativo: true,
+    minDias: 30,       // abaixo disso o selo nao impressiona e nao aparece
+    minLeituras: 10,   // dias com leitura dentro da janela — serie rala nao sustenta a frase
+  },
+
   avisos: {
     candidatos: true,
     cooldownHoras: 24,
@@ -512,6 +520,11 @@ function estruturarCfg(bruto) {
   out.avisos.cooldownHoras = limitar(av.cooldownHoras, 1, 720, CFG_PADRAO.avisos.cooldownHoras);
   out.avisos.previas       = limitar(av.previas, 0, 15, CFG_PADRAO.avisos.previas);
 
+  const sl = b.selo || {};
+  out.selo.ativo       = sl.ativo !== false;
+  out.selo.minDias     = limitar(sl.minDias, 7, 120, CFG_PADRAO.selo.minDias);
+  out.selo.minLeituras = limitar(sl.minLeituras, 3, 120, CFG_PADRAO.selo.minLeituras);
+
   const dz = b.desempenho || {};
   const sem = dz.semear || {}, sc = dz.score || {};
   out.desempenho.semear.ativo      = sem.ativo === true;
@@ -658,6 +671,41 @@ export function registrarLeituraPreco(asin, dados = {}) {
   const h = registrarPreco(String(asin), dados);
   if (h) gravarShardCorrente();
   return h;
+}
+
+/**
+ * Ha quantos dias o preco nao fica tao baixo quanto `preco`?
+ *
+ * Anda para tras a partir de ONTEM (hoje ja pode conter o proprio preco atual)
+ * ate achar um dia MAIS barato. X = dias entre aquele dia e hoje, menos um; sem
+ * dia mais barato, X = idade da serie. Por dia vale o menor entre o preco e o
+ * preco com cupom daquele dia — a comparacao mais dura possivel, para a frase
+ * nunca prometer mais do que a serie mostra.
+ */
+const MS_DIA = 86400000;
+function diffDias(a, b) { return Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / MS_DIA); }
+
+export function diasComoMenorPreco(asin, preco) {
+  const cfg = _cfg.selo;
+  if (!cfg?.ativo || !Number.isFinite(preco) || preco <= 0) return null;
+  const h = _hist[asin];
+  if (!h?.dias) return null;
+  const hoje = diaSP();
+  const val = d => {
+    const a = h.dias[d], e = h.diasEf?.[d];
+    return Number.isFinite(e) ? Math.min(a, e) : a;
+  };
+  const dias = Object.keys(h.dias).filter(d => d < hoje).sort().reverse();
+  if (!dias.length) return null;
+
+  let leituras = 0, x = null;
+  for (const d of dias) {
+    if (val(d) < preco - 0.005) { x = diffDias(d, hoje) - 1; break; }
+    leituras++;
+  }
+  if (x === null) x = diffDias(dias[dias.length - 1], hoje);
+  if (leituras < cfg.minLeituras || x < cfg.minDias) return null;
+  return x;
 }
 
 /** Estatisticas da serie de um produto. Base de toda decisao de disparo. */
@@ -2096,6 +2144,7 @@ function reprogramarVarredura() {
 export function iniciarMonitorPrecos(deps) {
   _deps = deps;
   carregarMonitorPrecos();
+  registrarSeloPreco(diasComoMenorPreco);
   // Shard tem nome dinamico e nao entra na varredura do boot do sync: num
   // volume novo do Railway o disco esta vazio e a serie inteira mora so no
   // repo. Sem esta restauracao, a primeira gravacao do mes subiria um shard
