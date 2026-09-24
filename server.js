@@ -3668,6 +3668,11 @@ function nomeLojaExibicao(loja) {
 // cai na Awin, que cobre qualquer anunciante afiliado. Um link ja resolvido em
 // dados.urlAfiliado (caso da propria Offers API) tem prioridade sobre tudo.
 function linkDoCupomTSP(loja, codigo, dados = {}) {
+  // Link digitado a mao na aba Criar cupom (ex.: lista direta dos produtos do
+  // cupom) vence o link fixo da loja. So vem do painel — o auto-envio nunca o
+  // preenche, entao o comportamento automatico nao muda.
+  const manual = String(dados.linkManual || '').trim();
+  if (/^https?:\/\/\S+$/i.test(manual)) return manual;
   const lojaNorm = loja.toLowerCase().replace(/^outro:\s*/, '').trim();
   const isMagalu = /magazine\s*luiza|magalu/.test(lojaNorm);
 
@@ -17792,6 +17797,7 @@ app.post('/cupons/montar', (req, res) => {
       codigo:  String(b.codigo || '').trim(),
       gatilho: b.gatilho,
       aviso:   b.aviso,
+      linkManual: String(b.link || '').trim(),
       minimoDesconhecido: !!b.minimoDesconhecido,
     }) });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
