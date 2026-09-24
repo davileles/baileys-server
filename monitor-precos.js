@@ -223,6 +223,9 @@ const CFG_PADRAO = {
   avisos: {
     candidatos: true,
     cooldownHoras: 24,
+    // Quantos produtos do aviso ganham PREVIA: a mensagem montada exatamente
+    // como sairia no grupo (template, cupom, preco lido agora). 0 desliga.
+    previas: 5,
   },
 
   // Regra padrao + sobrescrita por nicho. Nicho sem entrada em porNicho herda
@@ -507,6 +510,7 @@ function estruturarCfg(bruto) {
   const av = b.avisos || {};
   out.avisos.candidatos    = av.candidatos !== false;
   out.avisos.cooldownHoras = limitar(av.cooldownHoras, 1, 720, CFG_PADRAO.avisos.cooldownHoras);
+  out.avisos.previas       = limitar(av.previas, 0, 15, CFG_PADRAO.avisos.previas);
 
   const dz = b.desempenho || {};
   const sem = dz.semear || {}, sc = dz.score || {};
@@ -1552,9 +1556,79 @@ function avisarCandidatos(aprovados) {
     + linhas.join('\n\n') + extra;
 
   for (const { av } of novos) _estado.avisados[av.asin] = agora;
+  // Previas DEPOIS do resumo, em sequencia: no chat o resumo aparece primeiro e
+  // cada previa logo abaixo, na mesma ordem de score.
+  const nPrev = _cfg.avisos.previas ?? 0;
   Promise.resolve(_deps.avisarCandidatos(texto))
-    .catch(e => console.warn('[PRECOS] Envio do aviso de candidatos falhou:', e.message));
+    .catch(e => console.warn('[PRECOS] Envio do aviso de candidatos falhou:', e.message))
+    .then(() => nPrev > 0 ? enviarPrevias(novos.slice(0, nPrev)) : null)
+    .catch(e => console.warn('[PRECOS] Previas falharam:', e.message));
   return novos.length;
+}
+
+/**
+ * Monta a mensagem de cada candidato pelo MESMO caminho do disparo real
+ * (montador da loja + template + cupom vinculado) e manda so para os admins do
+ * bot. Nada entra em fila e o ledger de rastreio nao e tocado (rastrear:false):
+ * previa de produto que nunca sai nao pode ocupar etiqueta do pool da Amazon.
+ * O link da previa e o de afiliado cru; o encurtado ir.ticapromos.com.br/...
+ * e gerado so no envio, por grupo.
+ */
+async function enviarPrevias(lista) {
+  if (!lista.length || typeof _deps?.previaCandidato !== 'function') return;
+  const codigoCupom = _cfg.publicacao.aplicarCupom ? null : 'nenhum';
+  const montados = new Map();   // asin -> { o } | { erro }
+
+  // Amazon em lote (uma chamada para ate 10 ASINs).
+  const amz = lista.filter(({ item }) => ehItemAmazon(item));
+  if (amz.length) {
+    if (!credenciaisAmazonOk()) {
+      for (const { av } of amz) montados.set(av.asin, { erro: 'Amazon nao configurada' });
+    } else {
+      try {
+        const m = await _deps.montarAmazon(amz.map(({ av }) => av.asin), codigoCupom, { rastrear: false });
+        for (const o of m?.prontos || []) montados.set(o.asin, { o });
+        for (const d of m?.descartados || []) montados.set(d.asin, { erro: d.motivo });
+      } catch (e) { for (const { av } of amz) montados.set(av.asin, { erro: e.message }); }
+    }
+  }
+  // Shopee e ML, item a item.
+  for (const { av, item } of lista) {
+    if (ehItemAmazon(item)) continue;
+    try {
+      let m = null;
+      if (item.loja === 'Shopee') {
+        m = credenciaisShopeeOk() ? await _deps.montarShopee([item], codigoCupom) : null;
+        if (!m) { montados.set(av.asin, { erro: 'Shopee nao configurada' }); continue; }
+      } else if (item.loja === 'Mercado Livre') {
+        m = tokenAffOk() ? await _deps.montarMl([item], codigoCupom, { rastrear: false }) : null;
+        if (!m) { montados.set(av.asin, { erro: 'Mercado Livre nao configurado' }); continue; }
+      } else { montados.set(av.asin, { erro: 'loja fora do monitor: ' + item.loja }); continue; }
+      const o = m?.prontos?.[0];
+      montados.set(av.asin, o ? { o } : { erro: m?.descartados?.[0]?.motivo || 'produto descartado' });
+    } catch (e) { montados.set(av.asin, { erro: e.message }); }
+  }
+
+  let i = 0;
+  for (const { av } of lista) {
+    i++;
+    const r = montados.get(av.asin) || { erro: 'nao montado' };
+    const pctFmt = String(av.quedaPct).replace('.', ',');
+    let cab = '👁 PRÉVIA ' + i + '/' + lista.length + ' — como sairia no grupo\n'
+      + '[' + av.nicho + (av.curado ? ' · curado' : '') + '] queda ' + pctFmt + '% vs mediana 30d';
+    if (r.o) {
+      const precoAgora = r.o.produto?.preco;
+      if (Number.isFinite(precoAgora) && Number.isFinite(av.preco) && Math.abs(precoAgora - av.preco) >= 0.01) {
+        cab += '\n⚠ preço mudou desde a varredura: ' + brl(av.preco) + ' → ' + brl(precoAgora);
+      }
+      if (r.o.avisoCupom) cab += '\n⚠ ' + r.o.avisoCupom;
+    }
+    cab += '\n━━━━━━━━━━━━━━━\n';
+    try {
+      if (r.o) await _deps.previaCandidato({ texto: cab + r.o.mensagem, imagemUrl: r.o.produto?.imagemUrl || null });
+      else await _deps.previaCandidato({ texto: cab + '✖ Não montou: ' + r.erro, imagemUrl: null });
+    } catch (e) { console.warn('[PRECOS] Previa ' + av.asin + ' falhou:', e.message); }
+  }
 }
 
 // Candidato repetido substitui o anterior: o preco de agora vale mais do que o

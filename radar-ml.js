@@ -2539,7 +2539,7 @@ export async function dadosPeloNossoLinkMl(url, titulo = '') {
  * informado no disparo vence o vinculado ao produto) e renderiza o template.
  * Nada e enviado aqui — devolve { prontos, descartados }.
  */
-export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
+export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes = {}) {
   const prontos = [], descartados = [];
 
   for (const salvo of itens) {
@@ -2687,7 +2687,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null) {
         : null,
       avisoCupom,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
-      mensagem: formatarOfertaMl(p, { cupom }),
+      mensagem: formatarOfertaMl(p, { cupom, rastrear: opcoes.rastrear }),
     });
     await new Promise(r2 => setTimeout(r2, 400));
   }

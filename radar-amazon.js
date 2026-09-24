@@ -3225,7 +3225,7 @@ export function itensDoGrupo(grupo) {
  * sobre o vinculado ao produto) e renderiza o template da loja.
  * Devolve { prontos, descartados } — nada e enviado aqui.
  */
-export async function montarOfertasVitrine(asins, codigoCupom = null) {
+export async function montarOfertasVitrine(asins, codigoCupom = null, opcoes = {}) {
   const itens = await buscarProdutos(asins);
   const prontos = [], descartados = [];
   const achados = new Set();
@@ -3284,7 +3284,8 @@ export async function montarOfertasVitrine(asins, codigoCupom = null) {
       avisoCupom,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       precoAnunciado: precoAnunciadoDe(p, cupom),
-      mensagem: formatarOfertaAmazon(p, { cupom }),
+      // rastrear:false = previa (monitor de precos): nao ocupa etiqueta do pool.
+      mensagem: formatarOfertaAmazon(p, { cupom, rastrear: opcoes.rastrear }),
     });
   }
 

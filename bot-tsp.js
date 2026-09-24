@@ -87,6 +87,28 @@ export async function notificarAdminsTelegram(texto) {
   return algum;
 }
 
+// Previa com foto para os admins. Legenda do sendPhoto aceita 1024 caracteres:
+// passou disso, a foto vai sozinha e o texto segue logo abaixo. Foto que o
+// Telegram nao consegue baixar nao derruba a previa — cai para texto puro.
+export async function notificarAdminsTelegramFoto(imagemUrl, texto) {
+  if (!TOKEN || !ADMINS.size) return false;
+  let algum = false;
+  for (const chatId of ADMINS) {
+    try {
+      let ok = false;
+      if (imagemUrl) {
+        const cabe = String(texto || '').length <= 1024;
+        const d = await tg('sendPhoto', { chat_id: chatId, photo: imagemUrl, ...(cabe ? { caption: texto } : {}) });
+        ok = !!(d && d.ok);
+        if (ok && !cabe) ok = !!(await tg('sendMessage', { chat_id: chatId, text: texto, disable_web_page_preview: true }))?.ok;
+      }
+      if (!ok) ok = !!(await tg('sendMessage', { chat_id: chatId, text: texto, disable_web_page_preview: true }))?.ok;
+      if (ok) algum = true;
+    } catch (e) { console.warn('[BOT-TSP] Previa a admin ' + chatId + ' falhou:', e.message); }
+  }
+  return algum;
+}
+
 function teclado(linhas) {
   return { inline_keyboard: linhas.map(l => l.map(([texto, data]) => ({ text: texto, callback_data: data }))) };
 }

@@ -151,7 +151,7 @@ import {
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
-import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram,
+import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram, notificarAdminsTelegramFoto,
          enviarCardRevisaoTelegram, estadoFaxinaTsp, avisarInsercaoMlTelegram } from './bot-tsp.js';
 // Bots de revisao por fluxo. Cada um tem token, chat e fila proprios: o que
 // decide passagem nao e a mesma cabeca (nem o mesmo momento) do que decide
@@ -21837,6 +21837,11 @@ iniciarMonitorPrecos({
     catch (e) { console.warn('[PRECOS] Aviso Telegram falhou:', e.message); }
     try { if (conectado && sock) await enviarMensagem(GRUPOS.operador, { text: texto }); }
     catch (e) { console.warn('[PRECOS] Aviso operador falhou:', e.message); }
+  },
+  // Previa de cada candidato (mensagem exata do grupo + foto): so no bot.
+  previaCandidato: async ({ texto, imagemUrl }) => {
+    try { await notificarAdminsTelegramFoto(imagemUrl, texto); }
+    catch (e) { console.warn('[PRECOS] Previa Telegram falhou:', e.message); }
   },
 });
 
