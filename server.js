@@ -1784,6 +1784,9 @@ async function conectarConta(id) {
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
         if (!msg.message) continue;
+        if (tenantDaConta(id) === TENANT_PADRAO && String(msg.key?.remoteJid || '').endsWith('@g.us')) {
+          shieldObservar(msg, apelidoDaConta(id), c.sock).catch(e => console.warn('[SHIELD] ' + e.message));
+        }
         try { await despacharParaPipeline(msg, ctx); }
         catch (e) { console.error('[CONTA:' + id + '] Falha ao processar mensagem:', e.message); }
       }
@@ -11119,6 +11122,9 @@ async function conectar() {
         return;
       }
       for (const msg of messages) {
+        if (msg?.message && String(msg.key?.remoteJid || '').endsWith('@g.us')) {
+          shieldObservar(msg, 'principal', sock).catch(e => console.warn('[SHIELD] ' + e.message));
+        }
         if (msg.messageStubType === 2 || (msg.message === null && !msg.key.fromMe)) {
           const jidInd = msg.key?.remoteJid || '?';
           errosDescripto++;                                          // global: /status e gatilho do hard
@@ -12393,6 +12399,199 @@ function registrarContatoPrivado(apelido, s, msg) {
     }
   } catch (e) {}
 }
+
+
+// ── SHIELD: PROTECAO CONTRA GOLPE NOS GRUPOS ─────────────────────────────────
+// O golpe classico no grupo so-admins: alguem entra e ja manda um link (ou
+// "pix" + encurtador). O Shield observa cada mensagem de grupo de destino,
+// anuncia o que faria e, em PROTECT, apaga a mensagem, remove e bloqueia na
+// hora — pela conta executora configurada (tico-02/03), nunca pela principal a
+// menos que se permita. Falha fechado: sem texto legivel nao age; reacao,
+// figurinha, mensagem de sistema e admin nunca sao golpe. Modo por grupo
+// sobrepoe o global; comece em OBSERVE, ligue PROTECT grupo a grupo, conte os
+// falsos positivos. Estado em sessao/shield.json.
+const SHIELD_PATH = SESSAO_DIR + '/shield.json';
+const SHIELD_DOMINIOS_NOSSOS = /(^|\.)(ticapromos\.com\.br|clubedoviajante\.com\.br|tudosobrepromos\.com\.br)$/i;
+const SHIELD_RE_URL = /(?:https?:\/\/|www\.)[^\s<>"']+|\b[a-z0-9-]+\.(?:com|com\.br|net|org|io|app|link|me|ly|to|gg|xyz|site|online|shop|store|top|club|vip|info|br)\b(?:\/[^\s<>"']*)?/gi;
+const SHIELD_RE_PIX = /\bpix\b|chave\s*pix|transfer[eê]ncia|pagamento|comprovante|premi(?:o|ação)|sorte(?:io|ado)|ganh(?:ou|ador)|resgat|cadastr[eo]\s*(?:aqui|agora)|clique\s*(?:aqui|no\s*link)/i;
+const SHIELD_DEDUP_MS = 10 * 60 * 1000;
+let _shield = null;
+function _shieldPadrao() {
+  return { ativo: true, modo: 'observe', porGrupo: {}, janelaNovoMin: 15, apenasNovos: true,
+    executores: ['tico-02', 'tico-03'], permitirPrincipal: false, apagarMensagem: true,
+    violacoes: [], falsosPositivos: [], criadoEm: new Date().toISOString() };
+}
+function _shieldCarregar() {
+  if (_shield) return _shield;
+  try { _shield = existsSync(SHIELD_PATH) ? { ..._shieldPadrao(), ...JSON.parse(readFileSync(SHIELD_PATH, 'utf-8')) } : _shieldPadrao(); }
+  catch (e) { console.warn('[SHIELD] shield.json ilegivel, recomecando:', e.message); _shield = _shieldPadrao(); }
+  if (!Array.isArray(_shield.violacoes)) _shield.violacoes = [];
+  if (!Array.isArray(_shield.falsosPositivos)) _shield.falsosPositivos = [];
+  return _shield;
+}
+function _shieldSalvar() {
+  try { escreverAtomico(SHIELD_PATH, JSON.stringify(_shieldCarregar()), 'utf-8'); } catch (e) { console.warn('[SHIELD] Falha ao gravar:', e.message); }
+}
+function shieldModoDe(jid) {
+  const s = _shieldCarregar();
+  if (!s.ativo) return 'off';
+  const g = s.porGrupo[jid];
+  return (g === 'observe' || g === 'protect' || g === 'off') ? g : (s.modo === 'protect' ? 'protect' : 'observe');
+}
+// Texto legivel da mensagem; null quando nao ha (falha fechado).
+function shieldTextoDe(msg) {
+  const m = msg?.message || {};
+  const inner = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m;
+  const t = inner.conversation || inner.extendedTextMessage?.text || inner.imageMessage?.caption || inner.videoMessage?.caption
+    || inner.documentMessage?.caption || inner.buttonsMessage?.contentText || inner.listMessage?.description || null;
+  const s = String(t || '').trim();
+  return s ? s : null;
+}
+function shieldAnalisar(texto) {
+  const urls = [...String(texto).matchAll(SHIELD_RE_URL)].map(m => m[0]);
+  const externos = urls.filter(u => {
+    let host = '';
+    try { host = new URL(/^https?:\/\//i.test(u) ? u : 'https://' + u).hostname; } catch { host = u.split('/')[0]; }
+    return host && !SHIELD_DOMINIOS_NOSSOS.test(host);
+  });
+  const pix = SHIELD_RE_PIX.test(texto);
+  if (externos.length && pix) return { viu: 'link externo + isca de pagamento/premio', links: externos };
+  if (externos.length) return { viu: 'link externo', links: externos };
+  if (pix && /\bpix\b/i.test(texto)) return { viu: 'pedido de pix sem link', links: [] };
+  return null;
+}
+// Ha quantos minutos a pessoa entrou neste grupo, pelo ledger; null = nao sei.
+function shieldEntrouHaMin(jid, ids) {
+  const set = new Set(ids.filter(Boolean));
+  for (let i = _membrosLog.eventos.length - 1; i >= 0; i--) {
+    const e = _membrosLog.eventos[i];
+    if (e.g !== jid || e.a !== 'add' || e.semId) continue;
+    if (set.has(e.n) || (e.tel && set.has(e.tel))) return (Date.now() - new Date(e.ts).getTime()) / 60000;
+  }
+  return null;
+}
+const _shieldVistos = new Map();   // grupo|remetente -> ts
+let _shieldFila = Promise.resolve();
+async function shieldObservar(msg, contaId, sockDe) {
+  const s = _shieldCarregar();
+  const jid = msg?.key?.remoteJid || '';
+  if (!jid.endsWith('@g.us') || msg?.key?.fromMe || !msg?.message) return;
+  const modo = shieldModoDe(jid);
+  if (modo === 'off') return;
+  if (!new Set(censoAlvos()).has(jid)) return;
+  const texto = shieldTextoDe(msg);
+  if (!texto) return;                                       // nao age no que nao le
+  const achado = shieldAnalisar(texto);
+  if (!achado) return;
+  const remetente = msg.key?.participant || msg.participant || '';
+  const remetentePn = msg.key?.participantPn || msg.participantPn || '';
+  const ids = [remetente, remetentePn].map(_gmDigitos).filter(Boolean);
+  if (!ids.length) return;
+  const chave = jid + '|' + ids[0];
+  const agora = Date.now();
+  if ((_shieldVistos.get(chave) || 0) > agora - SHIELD_DEDUP_MS) return;
+
+  // Admin nunca e golpe. Metadados pelo retrato em cache do socket que leu.
+  let md = null;
+  try { md = (await _gmRetrato(sockDe, false))[jid] || null; } catch (e) {}
+  const part = (md?.participants || []).find(p => _gmIdsParticipante(p).some(n => ids.includes(n))) || null;
+  if (part?.admin) return;
+  const entrouHaMin = shieldEntrouHaMin(jid, ids);
+  if (s.apenasNovos && (entrouHaMin == null || entrouHaMin > s.janelaNovoMin)) {
+    _shieldVistos.set(chave, agora);
+    return;   // membro antigo (ou entrada desconhecida) com link: fora do alvo do Shield
+  }
+  _shieldVistos.set(chave, agora);
+
+  const reg = { id: 'sh-' + agora.toString(36), em: new Date(agora).toISOString(), grupo: jid, nome: NOMES_GRUPOS.get(jid) || null,
+    remetente: ids[0], remetenteTel: _gmTelefoneDe(part) || (remetentePn ? _gmDigitos(remetentePn) : null),
+    entrouHaMin: entrouHaMin == null ? null : +entrouHaMin.toFixed(1), viu: achado.viu, links: achado.links.slice(0, 5),
+    trecho: texto.slice(0, 160), lidoPor: contaId, modo, acao: modo === 'protect' ? 'pendente' : 'so observado', por: null, erro: null };
+  s.violacoes.unshift(reg); s.violacoes = s.violacoes.slice(0, 500); _shieldSalvar();
+
+  if (modo === 'protect') {
+    _shieldFila = _shieldFila.then(() => shieldAgir(reg, msg, part)).catch(e => { reg.erro = e.message; reg.acao = 'falhou'; _shieldSalvar(); });
+  }
+  const titulo = (modo === 'protect' ? '🛡 Shield PROTECT · ' : '👁 Shield OBSERVE · ') + (reg.nome || jid.slice(0, 18)) + ' — ' + achado.viu
+    + (entrouHaMin != null ? ' por numero que entrou ha ' + Math.round(entrouHaMin) + ' min' : '');
+  registrarAlerta({ nivel: modo === 'protect' ? 'atencao' : 'info', origem: 'shield', chave: 'shield:' + chave, janelaMs: SHIELD_DEDUP_MS,
+    titulo, corpo: titulo + '\n\n' + (modo === 'protect' ? 'Removido e bloqueado' : 'So observado — em PROTECT seria removido e bloqueado') + '.\nTrecho: ' + reg.trecho.slice(0, 120) + '\n/shield para ver e marcar falso positivo' }).catch(() => {});
+}
+async function shieldAgir(reg, msg, part) {
+  const s = _shieldCarregar();
+  const jid = reg.grupo;
+  // Executor: conta admin no grupo, preferindo as configuradas; principal so
+  // se permitido. Precisa do retrato para saber quem e admin ali.
+  const cands = _gaCandidatosExecutor(TENANT_PADRAO, '__shield__').filter(c => c.id !== 'principal' || s.permitirPrincipal);
+  const pref = (s.executores || []).map(x => String(x).toLowerCase());
+  cands.sort((a, b) => (pref.indexOf(a.id.toLowerCase()) === -1 ? 99 : pref.indexOf(a.id.toLowerCase())) - (pref.indexOf(b.id.toLowerCase()) === -1 ? 99 : pref.indexOf(b.id.toLowerCase())));
+  let exec = null, alvoId = part?.id || null;
+  for (const cnd of cands) {
+    try {
+      const md = (await _gmRetrato(cnd.sock, false))[jid];
+      if (!md) continue;
+      const eu = _gmEuNoGrupo(cnd.sock, md);
+      if (!eu?.admin) continue;
+      if (!alvoId) { const p = (md.participants || []).find(p => _gmIdsParticipante(p).includes(reg.remetente)); alvoId = p?.id || null; }
+      exec = cnd; break;
+    } catch (e) {}
+  }
+  if (!exec) { reg.acao = 'bloqueado'; reg.erro = 'nenhuma conta executora e admin deste grupo' + (s.permitirPrincipal ? '' : ' (principal nao permitida)'); _shieldSalvar(); return; }
+  if (!alvoId) alvoId = (msg.key?.participant || '');
+  reg.por = exec.id;
+  const feitos = [];
+  if (s.apagarMensagem && msg?.key?.id) {
+    try { await exec.sock.sendMessage(jid, { delete: { remoteJid: jid, id: msg.key.id, participant: msg.key.participant, fromMe: false } }); feitos.push('apagou'); }
+    catch (e) { feitos.push('apagar falhou: ' + e.message); }
+  }
+  try {
+    const r = await exec.sock.groupParticipantsUpdate(jid, [alvoId], 'remove');
+    feitos.push(String(r?.[0]?.status || '') === '200' ? 'removeu' : 'remover status ' + (r?.[0]?.status || '?'));
+  } catch (e) { feitos.push('remover falhou: ' + e.message); }
+  try { await exec.sock.updateBlockStatus(alvoId, 'block'); feitos.push('bloqueou'); }
+  catch (e) { feitos.push('bloquear falhou: ' + e.message); }
+  reg.acao = feitos.join(', ');
+  _shieldSalvar();
+  console.log('[SHIELD] ' + (reg.nome || jid) + ' · ' + reg.viu + ' · ' + reg.acao + ' (por ' + exec.id + ')');
+  await new Promise(r => setTimeout(r, 3000));   // ritmo: nunca uma rajada de remocoes
+}
+function shieldEstado() {
+  const s = _shieldCarregar();
+  const corte = Date.now() - 30 * 86400000;
+  const v30 = s.violacoes.filter(v => new Date(v.em).getTime() >= corte);
+  const grupos = censoAlvos().map(j => ({ jid: j, nome: NOMES_GRUPOS.get(j) || null, modo: shieldModoDe(j) }));
+  return { ativo: s.ativo, modo: s.modo, janelaNovoMin: s.janelaNovoMin, apenasNovos: s.apenasNovos, executores: s.executores,
+    permitirPrincipal: s.permitirPrincipal, apagarMensagem: s.apagarMensagem,
+    grupos, resumo30d: { violacoes: v30.length, removidos: v30.filter(v => /removeu/.test(v.acao)).length,
+      soObservados: v30.filter(v => v.acao === 'so observado').length, falsosPositivos: s.falsosPositivos.filter(f => new Date(f.em).getTime() >= corte).length,
+      protect: grupos.filter(g => g.modo === 'protect').length, observe: grupos.filter(g => g.modo === 'observe').length },
+    violacoes: s.violacoes.slice(0, 100) };
+}
+app.get('/shield', (req, res) => res.json({ ok: true, ...shieldEstado() }));
+app.post('/shield/config', (req, res) => {
+  const s = _shieldCarregar(); const b = req.body || {};
+  if (typeof b.ativo === 'boolean') s.ativo = b.ativo;
+  if (b.modo === 'observe' || b.modo === 'protect') s.modo = b.modo;
+  if (Number.isFinite(+b.janelaNovoMin) && +b.janelaNovoMin >= 1) s.janelaNovoMin = Math.min(1440, +b.janelaNovoMin);
+  if (typeof b.apenasNovos === 'boolean') s.apenasNovos = b.apenasNovos;
+  if (Array.isArray(b.executores)) s.executores = b.executores.map(x => String(x).trim()).filter(Boolean).slice(0, 10);
+  if (typeof b.permitirPrincipal === 'boolean') s.permitirPrincipal = b.permitirPrincipal;
+  if (typeof b.apagarMensagem === 'boolean') s.apagarMensagem = b.apagarMensagem;
+  _shieldSalvar(); res.json({ ok: true, ...shieldEstado() });
+});
+app.post('/shield/grupo/:jid', (req, res) => {
+  const s = _shieldCarregar(); const modo = req.body?.modo;
+  if (!['observe', 'protect', 'off', 'padrao'].includes(modo)) return res.status(400).json({ ok: false, erro: 'modo: observe | protect | off | padrao' });
+  if (modo === 'padrao') delete s.porGrupo[req.params.jid]; else s.porGrupo[req.params.jid] = modo;
+  _shieldSalvar(); res.json({ ok: true, jid: req.params.jid, modo: shieldModoDe(req.params.jid) });
+});
+app.post('/shield/falso-positivo/:id', (req, res) => {
+  const s = _shieldCarregar(); const v = s.violacoes.find(x => x.id === req.params.id);
+  if (!v) return res.status(404).json({ ok: false, erro: 'violacao nao encontrada' });
+  v.falsoPositivo = true; s.falsosPositivos.unshift({ id: v.id, em: new Date().toISOString(), remetente: v.remetente, grupo: v.grupo, nota: String(req.body?.nota || '').slice(0, 200) });
+  s.falsosPositivos = s.falsosPositivos.slice(0, 200); _shieldSalvar();
+  res.json({ ok: true, violacao: v, dica: 'para reincluir a pessoa use a gestao de grupos (acao add)' });
+});
 
 function _gmContas() {
   return _gaCandidatosExecutor(TENANT_PADRAO, '__gestao__')
