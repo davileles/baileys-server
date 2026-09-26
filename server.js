@@ -1787,9 +1787,6 @@ async function conectarConta(id) {
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
         if (!msg.message) continue;
-        // Grupo de origem so com esta conta dentro nunca chega ao pipeline
-        // (dona = principal): o redirecionamento olha antes do despacho.
-        if (tenantDaConta(id) === TENANT_PADRAO) redirecionarSeOrigem(msg, ctx);
         if (tenantDaConta(id) === TENANT_PADRAO && String(msg.key?.remoteJid || '').endsWith('@g.us')) {
           shieldObservar(msg, apelidoDaConta(id), c.sock).catch(e => console.warn('[SHIELD] ' + e.message));
         }
