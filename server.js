@@ -7,6 +7,8 @@ import makeWASocket, {
   proto,
   signedKeyPair,
   jidNormalizedUser,
+  generateWAMessageFromContent,
+  normalizeMessageContent,
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import cors from 'cors';
@@ -9004,8 +9006,135 @@ function avisarPalavraBug(jid, msg, texto, ehEdicao) {
 // ctx = { contaId, sock } da conta que RECEBEU a mensagem. Importa para a
 // midia: o reupload precisa do socket que tem a sessao daquela mensagem —
 // pedir pelo principal uma imagem que chegou na secundaria falha.
+// ── REDIRECIONAMENTO DE GRUPOS (copia fiel para o grupo "Redirect") ─────────
+// Toda mensagem que chega nos grupos de origem e repetida no grupo de destino
+// EXATAMENTE como veio: o mesmo conteudo (texto, imagem, video, documento,
+// audio, legenda, formatacao), sem passar pela IA e sem virar alerta. Nao e
+// "encaminhar" do WhatsApp: a copia sai sem o selo "Encaminhada".
+//
+// Origens e destino sao pelo NOME do grupo (o nome e resolvido no cache
+// NOMES_GRUPOS, entao renomear o grupo no WhatsApp exige ajustar a env) ou pelo
+// JID. Envs (opcionais):
+//   REDIRECT_ATIVO=0      desliga
+//   REDIRECT_DESTINO      nome ou JID do grupo destino (padrao "Redirect")
+//   REDIRECT_ORIGENS      nomes/JIDs separados por virgula
+// A copia sai pela MESMA conta que leu a mensagem — ela precisa estar no grupo
+// destino. Estado e diagnostico: GET /redirect/estado.
+const REDIRECT_ORIGENS_PADRAO = 'QVF Emissões,Embarque Executiva,QVF Promoções';
+const REDIRECT_MAX_IDADE_MS = 6 * 3600000;   // backlog de reconexao velho nao sai
+const REDIRECT_PAUSA_MS = 2500;              // espacamento minimo entre copias
+const _redir = { enviadas: 0, falhas: 0, puladas: 0, ultimaEm: null, ultimoErro: null, ultimoErroEm: null };
+let _redirCadeia = Promise.resolve();
+
+function _redirAtivo() { return String(process.env.REDIRECT_ATIVO ?? '1') !== '0'; }
+function _redirNorm(s) {
+  return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+// Nome ou JID -> { jid, nome, erro }. Nome: igual depois de normalizar (sem
+// acento, emoji, espaco ou pontuacao); sem igual, um UNICO grupo que contenha o
+// nome. Ambiguidade nao escolhe — anuncia no estado.
+function _redirResolver(alvo) {
+  const a = String(alvo || '').trim();
+  if (!a) return { jid: null, nome: '', erro: 'vazio' };
+  if (a.endsWith('@g.us')) return { jid: a, nome: NOMES_GRUPOS.get(a) || '' };
+  const n = _redirNorm(a);
+  const todos = [...NOMES_GRUPOS.entries()];
+  const iguais = todos.filter(([, nome]) => _redirNorm(nome) === n);
+  const achados = iguais.length ? iguais : todos.filter(([, nome]) => n && _redirNorm(nome).includes(n));
+  if (achados.length === 1) return { jid: achados[0][0], nome: achados[0][1] };
+  if (!achados.length) return { jid: null, nome: a, erro: 'grupo "' + a + '" nao encontrado' };
+  return { jid: null, nome: a, erro: 'nome "' + a + '" ambiguo: ' + achados.map(x => x[1]).join(' | ') };
+}
+function _redirConfig() {
+  const destino = _redirResolver(process.env.REDIRECT_DESTINO || 'Redirect');
+  const origens = String(process.env.REDIRECT_ORIGENS || REDIRECT_ORIGENS_PADRAO)
+    .split(',').map(s => s.trim()).filter(Boolean).map(o => ({ alvo: o, ..._redirResolver(o) }));
+  return { destino, origens };
+}
+
+// Conteudo copiado byte a byte (encode/decode do proto). Sai o que so tem
+// sentido na mensagem original: a distribuicao de chave do grupo de origem e o
+// messageContextInfo (segredo da mensagem, que amarra edicao/enquete a ela).
+function _redirConteudo(message) {
+  const n = normalizeMessageContent(message);
+  if (!n) return null;
+  const tipos = Object.keys(n).filter(k => n[k] != null
+    && !['senderKeyDistributionMessage', 'messageContextInfo'].includes(k));
+  if (!tipos.length) return null;
+  if (tipos.some(k => ['protocolMessage', 'reactionMessage', 'pollUpdateMessage', 'keepInChatMessage'].includes(k))) return null;
+  const copia = proto.Message.decode(proto.Message.encode(n).finish());
+  delete copia.senderKeyDistributionMessage;
+  delete copia.messageContextInfo;
+  return copia;
+}
+
+function redirecionarSeOrigem(msg, ctx) {
+  try {
+    if (!_redirAtivo() || !msg?.message) return;
+    const jid = String(msg.key?.remoteJid || '');
+    if (!jid.endsWith('@g.us')) return;
+    const cfg = _redirConfig();
+    if (!cfg.origens.some(o => o.jid === jid)) return;
+    if (!cfg.destino.jid || cfg.destino.jid === jid) {
+      _redir.puladas++;
+      _redir.ultimoErro = 'destino: ' + (cfg.destino.erro || 'igual a origem'); _redir.ultimoErroEm = new Date().toISOString();
+      return;
+    }
+    const ts = Number(msg.messageTimestamp?.low ?? msg.messageTimestamp) * 1000;
+    if (ts && Date.now() - ts > REDIRECT_MAX_IDADE_MS) { _redir.puladas++; return; }
+
+    // Leitura pelo wa-envio (whatsmeow): o conteudo veio convertido de JSON e a
+    // midia ja baixada — refaz texto/imagem pela principal em vez de copiar o proto.
+    const viaWm = !ctx?.sock || !!msg._imagemBase64;
+    let conteudo = null, simples = null;
+    if (viaWm) {
+      const m = desembrulharMessage(msg.message);
+      const texto = m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '';
+      if (msg._imagemBase64) simples = { image: Buffer.from(msg._imagemBase64, 'base64'), caption: texto || undefined };
+      else if (texto) simples = { text: texto };
+    } else {
+      conteudo = _redirConteudo(msg.message);
+    }
+    if (!conteudo && !simples) { _redir.puladas++; return; }
+
+    const destino = cfg.destino.jid;
+    const origemNome = NOMES_GRUPOS.get(jid) || jid;
+    const executar = async () => {
+      const s = viaWm ? sock : ctx.sock;
+      if (!s) throw new Error('conta leitora sem socket');
+      if (simples) {
+        await _enviarComTeto(s.sendMessage(destino, simples));
+      } else {
+        const wm = generateWAMessageFromContent(destino, conteudo, { userJid: s.user?.id });
+        await _enviarComTeto(s.relayMessage(destino, wm.message, { messageId: wm.key.id }));
+      }
+    };
+    _redirCadeia = _redirCadeia
+      .then(() => saidaSerializada(executar))
+      .then(() => {
+        _redir.enviadas++; _redir.ultimaEm = new Date().toISOString();
+        console.log('[REDIRECT] ' + origemNome + ' -> ' + (cfg.destino.nome || destino) + ' (via ' + (viaWm ? 'principal' : ctx.contaId) + ')');
+      })
+      .catch(e => {
+        _redir.falhas++; _redir.ultimoErro = e.message; _redir.ultimoErroEm = new Date().toISOString();
+        console.error('[REDIRECT] Falha ao copiar de ' + origemNome + ':', e.message);
+      })
+      .then(() => new Promise(r => setTimeout(r, REDIRECT_PAUSA_MS)));
+  } catch (e) {
+    _redir.falhas++; _redir.ultimoErro = e.message; _redir.ultimoErroEm = new Date().toISOString();
+    console.error('[REDIRECT] Erro:', e.message);
+  }
+}
+
+app.get('/redirect/estado', (req, res) => {
+  const cfg = _redirConfig();
+  res.json({ ok: true, ativo: _redirAtivo(), destino: cfg.destino, origens: cfg.origens,
+    gruposConhecidos: NOMES_GRUPOS.size, ..._redir });
+});
+
 async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
   try {
+    redirecionarSeOrigem(msg, ctx);
     const jid    = msg.key.remoteJid;
     // Dois monitoramentos convivem: os monitorados do CDV alimentam o pipeline de
     // emissoes CDV; os grupos marcados como 'fonte' no painel alimentam o radar
