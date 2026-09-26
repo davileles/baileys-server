@@ -17248,8 +17248,11 @@ app.post('/vitrine/previa', async (req, res) => {
 // outros ASINs do mesmo grupo (mesmo produto em outra loja). Nada de titulo
 // parecido — juntar dois produtos diferentes daria um veredito falso.
 //
-// A comparacao principal e SEM cupom: o cupom do disparo muda e distorceria o
-// veredito. O preco final com cupom vai junto so como referencia.
+// A comparacao e pelo PRECO DIVULGADO: o de hoje ja com o cupom que este
+// disparo aplicaria (mesma regra do envio: 'nenhum' ignora vinculo, 'fixo'
+// vence tudo, 'auto' usa o vinculado ao produto) contra o preco final do
+// ultimo envio (com o cupom daquele dia, quando houve). Comparar preco de
+// balcao com preco de balcao escondia justamente o desconto que o grupo ve.
 const COMP_MESES = 4;          // cobre os 90 dias com folga
 const COMP_TOLERANCIA = 0.02;  // ±2% conta como "igual"
 const COMP_LEITURA_VELHA_MS = 6 * 3600000;
@@ -17289,8 +17292,42 @@ function _resumoEnvio(r) {
   };
 }
 
+// Cupom que o disparo aplicaria a este item agora — espelha a escolha de
+// montarOfertasVitrine/dispararProdutoDaLista, sem montar a mensagem.
+function _cupomComparativo(item, loja, preco, modo, codigoFixo) {
+  if (modo === 'nenhum' || !(preco > 0)) return null;
+  let codigo = null;
+  if (modo === 'fixo' && codigoFixo) {
+    codigo = cupomPorCodigo(loja, codigoFixo) ? codigoFixo : null;
+    if (!codigo) {
+      const deOutraLoja = ['Mercado Livre', 'Amazon', 'Shopee', 'Magazine Luiza']
+        .some(lj => lj !== loja && cupomPorCodigo(lj, codigoFixo));
+      if (!deOutraLoja) return { codigo: codigoFixo, desconto: 0, aviso: 'cupom ' + codigoFixo + ' nao esta na base' };
+    }
+  }
+  if (!codigo) codigo = item?.cupom || null;
+  if (!codigo) {
+    const m = melhorCupomAplicavel(loja, preco);
+    return m ? { codigo: m.reg.codigo, desconto: m.desconto } : null;
+  }
+  const reg = cupomPorCodigo(loja, codigo);
+  if (!reg) return { codigo, desconto: 0, aviso: 'cupom ' + codigo + ' nao esta na base' };
+  if (!cupomVigente(reg)) return { codigo, desconto: 0, aviso: 'cupom ' + codigo + ' expirado ou inativo' };
+  const desconto = calcularDesconto(reg, preco);
+  return { codigo: reg.codigo || codigo, desconto,
+           aviso: desconto > 0 ? null : 'cupom ' + codigo + ' nao abate neste preco' };
+}
+
+// Preco que o grupo viu num envio: o final com cupom quando houve.
+function _precoDivulgadoEnvio(r) {
+  const pf = Number(r?.precoFinal), p = Number(r?.preco);
+  return Number.isFinite(pf) && pf > 0 && pf < p ? pf : p;
+}
+
 app.post('/vitrine/comparativo', async (req, res) => {
   try {
+    const modoCupom = ['auto', 'fixo', 'nenhum'].includes(req.body?.cupomModo) ? req.body.cupomModo : 'auto';
+    const codigoFixo = modoCupom === 'fixo' ? (String(req.body?.cupomCodigo || '').trim() || null) : null;
     const pedidos = (Array.isArray(req.body?.asins) ? req.body.asins : String(req.body?.asins || '').split(','))
       .map(x => String(x).trim()).filter(Boolean).slice(0, 500);
     if (!pedidos.length) return res.json({ ok:true, itens:{} });
@@ -17330,17 +17367,24 @@ app.post('/vitrine/comparativo', async (req, res) => {
         atual = { preco: Number(item.preco), precoEfetivo: null, em: item.precoEm || item.atualizadoEm || null,
                   disponivel: true, fonte: 'cadastro', velho: true };
       }
+      if (atual) {
+        const cp = _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, modoCupom, codigoFixo);
+        atual.cupom = cp ? cp.codigo : null;
+        atual.descontoCupom = cp && cp.desconto > 0 ? cp.desconto : 0;
+        atual.avisoCupom = cp?.aviso || null;
+        atual.precoDivulgado = Math.round(Math.max(0, atual.preco - atual.descontoCupom) * 100) / 100;
+      }
 
       // Referencia do veredito: ultimo envio do proprio ASIN; sem ele, o do grupo.
       const ref = proprios[0] || doGrupo[0] || null;
       let veredito = todos.length ? 'sem_preco' : 'inedito';
       let variacaoPct = null;
       if (ref && atual) {
-        variacaoPct = Math.round((atual.preco / Number(ref.preco) - 1) * 1000) / 10;
+        variacaoPct = Math.round((atual.precoDivulgado / _precoDivulgadoEnvio(ref) - 1) * 1000) / 10;
         veredito = variacaoPct <= -COMP_TOLERANCIA * 100 ? 'melhor'
                  : variacaoPct >=  COMP_TOLERANCIA * 100 ? 'pior' : 'igual';
       }
-      const menor = todos.reduce((m, r) => (!m || Number(r.preco) < Number(m.preco)) ? r : m, null);
+      const menor = todos.reduce((m, r) => (!m || _precoDivulgadoEnvio(r) < _precoDivulgadoEnvio(m)) ? r : m, null);
 
       itens[asin] = {
         veredito, variacaoPct,
@@ -17353,7 +17397,7 @@ app.post('/vitrine/comparativo', async (req, res) => {
         mediana30: stats?.mediana30 ?? null,
       };
     }
-    res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, itens });
+    res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, cupomModo: modoCupom, itens });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
