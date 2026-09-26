@@ -9040,9 +9040,19 @@ function _redirResolver(alvo) {
   const n = _redirNorm(a);
   const todos = [...NOMES_GRUPOS.entries()];
   const iguais = todos.filter(([, nome]) => _redirNorm(nome) === n);
-  const achados = iguais.length ? iguais : todos.filter(([, nome]) => n && _redirNorm(nome).includes(n));
+  let achados = iguais.length ? iguais : todos.filter(([, nome]) => n && _redirNorm(nome).includes(n));
+  // Palavras em qualquer ordem ("Emissões - QVF" casa com "QVF Emissões").
+  const palavras = a.split(/\s+/).map(_redirNorm).filter(p => p.length >= 2);
+  if (!achados.length && palavras.length)
+    achados = todos.filter(([, nome]) => palavras.every(p => _redirNorm(nome).includes(p)));
   if (achados.length === 1) return { jid: achados[0][0], nome: achados[0][1] };
-  if (!achados.length) return { jid: null, nome: a, erro: 'grupo "' + a + '" nao encontrado' };
+  if (!achados.length) {
+    // Sugestoes: grupos que tem pelo menos uma das palavras (>= 3 letras).
+    const fortes = palavras.filter(p => p.length >= 3);
+    const sugestoes = todos.filter(([, nome]) => fortes.some(p => _redirNorm(nome).includes(p)))
+      .slice(0, 15).map(([jid, nome]) => ({ jid, nome }));
+    return { jid: null, nome: a, erro: 'grupo "' + a + '" nao encontrado', sugestoes };
+  }
   return { jid: null, nome: a, erro: 'nome "' + a + '" ambiguo: ' + achados.map(x => x[1]).join(' | ') };
 }
 function _redirConfig() {
