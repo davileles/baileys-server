@@ -115,6 +115,15 @@ const CFG_CDV_PADRAO = {
   // sumir tambem da reentrada. `ativo:false` tira da reentrada sem perder o
   // cadastro, igual aos monitorados.
   entrada: [],
+  // REDIRECIONAMENTO: copia fiel de toda mensagem dos grupos de origem para o
+  // grupo destino (ver redirecionarSeOrigem no server.js). Destino vazio =
+  // desligado pela tela; sem nada gravado aqui vale o legado por env
+  // (REDIRECT_DESTINO / REDIRECT_ORIGENS).
+  redirect: {
+    ativo: true,
+    destino: '',
+    origens: [],
+  },
   // Filtro da fila de aprovacao: categorias que NAO viram card, mesmo quando a
   // IA reconhece a promocao como valida. Serve para conteudo ja coberto por
   // outro pipeline (compra bonificada tem radar proprio no painel) — bloquear
@@ -171,6 +180,10 @@ function estruturar(bruto) {
   out.monitorados = normalizarMonitorados(out.monitorados);
   out.ofertas.categoriasBloqueadas = normalizarCategoriasOferta(out.ofertas.categoriasBloqueadas);
   out.entrada     = normalizarEntrada(out.entrada);
+  out.redirect.ativo   = out.redirect.ativo !== false;
+  out.redirect.destino = String(out.redirect.destino || '').trim();
+  if (out.redirect.destino && !RE_JID_GRUPO.test(out.redirect.destino)) out.redirect.destino = '';
+  out.redirect.origens = normalizarEntrada(out.redirect.origens);
   out.admins      = normalizarAdmins(out.admins);
   out.grupos.ofertas  = String(out.grupos.ofertas  || '').trim();
   out.grupos.emissao  = String(out.grupos.emissao  || '').trim();
@@ -315,6 +328,7 @@ export function salvarConfigCdv(parcial = {}) {
     leitura:     { ...atual.leitura, ...(parcial.leitura || {}) },
     monitorados: parcial.monitorados !== undefined ? parcial.monitorados : atual.monitorados,
     entrada:     parcial.entrada     !== undefined ? parcial.entrada     : atual.entrada,
+    redirect:    { ...atual.redirect, ...(parcial.redirect || {}) },
     ofertas:     { ...atual.ofertas, ...(parcial.ofertas || {}) },
     admins:      parcial.admins      !== undefined ? parcial.admins      : atual.admins,
   });
@@ -338,6 +352,9 @@ export function salvarConfigCdv(parcial = {}) {
   }
   if (novo.grupos.operador && !RE_JID_GRUPO.test(novo.grupos.operador)) {
     throw new Error('Grupo de avisos invalido: informe um JID de grupo (…@g.us) ou deixe vazio.');
+  }
+  if (novo.redirect.destino && novo.redirect.origens.some(o => o.jid === novo.redirect.destino)) {
+    throw new Error('O grupo de destino do redirecionamento nao pode estar entre os grupos de origem.');
   }
   if (novo.envio.conta && !RE_CONTA.test(novo.envio.conta)) {
     throw new Error('Conta de envio invalida: use o apelido da conta (2 a 24 caracteres).');
@@ -425,6 +442,12 @@ export function ehGrupoCdv(jid) {
   // A copia de executiva e destino do CDV como os outros: sai pela conta de
   // envio do CDV e fica fora da marca d'agua/tag do TSP.
   return j === g.ofertas || j === g.emissao || (!!g.executiva && j === g.executiva);
+}
+
+/** Redirecionamento gravado pela tela: { ativo, destino, origens[] }. */
+export function redirectCdv() {
+  const r = configCdv().redirect;
+  return { ativo: r.ativo, destino: r.destino, origens: r.origens.map(o => ({ ...o })) };
 }
 
 /** Cadastro completo dos grupos de reentrada, ligados e desligados — para a tela. */

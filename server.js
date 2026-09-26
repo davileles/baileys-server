@@ -110,7 +110,7 @@ import {
 import {
   carregarConfigCdv, configCdv, salvarConfigCdv, PAPEIS_CDV,
   grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv, grupoExecutivaCdv,
-  gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
+  redirectCdv, gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
   entradaCdv, gruposEntradaCdv,
   CATEGORIAS_OFERTA_CDV, categoriasBloqueadasCdv, ehCategoriaOfertaBloqueadaCdv,
@@ -1787,6 +1787,9 @@ async function conectarConta(id) {
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
         if (!msg.message) continue;
+        // Grupo de origem so com esta conta dentro nunca chega ao pipeline
+        // (dona = principal): o redirecionamento olha antes do despacho.
+        if (tenantDaConta(id) === TENANT_PADRAO) redirecionarSeOrigem(msg, ctx);
         if (tenantDaConta(id) === TENANT_PADRAO && String(msg.key?.remoteJid || '').endsWith('@g.us')) {
           shieldObservar(msg, apelidoDaConta(id), c.sock).catch(e => console.warn('[SHIELD] ' + e.message));
         }
@@ -9012,9 +9015,9 @@ function avisarPalavraBug(jid, msg, texto, ehEdicao) {
 // audio, legenda, formatacao), sem passar pela IA e sem virar alerta. Nao e
 // "encaminhar" do WhatsApp: a copia sai sem o selo "Encaminhada".
 //
-// Origens e destino sao pelo NOME do grupo (o nome e resolvido no cache
-// NOMES_GRUPOS, entao renomear o grupo no WhatsApp exige ajustar a env) ou pelo
-// JID. Envs (opcionais):
+// Configuracao: aba Config do gestor-cdv (config_cdv.redirect, por JID). Sem
+// destino gravado la, vale o legado por env — nome do grupo (resolvido nos
+// caches de nomes) ou JID:
 //   REDIRECT_ATIVO=0      desliga
 //   REDIRECT_DESTINO      nome ou JID do grupo destino (padrao "Redirect")
 //   REDIRECT_ORIGENS      nomes/JIDs separados por virgula
@@ -9024,9 +9027,26 @@ const REDIRECT_ORIGENS_PADRAO = 'QVF Emissões,Embarque Executiva,QVF Promoçõe
 const REDIRECT_MAX_IDADE_MS = 6 * 3600000;   // backlog de reconexao velho nao sai
 const REDIRECT_PAUSA_MS = 2500;              // espacamento minimo entre copias
 const _redir = { enviadas: 0, falhas: 0, puladas: 0, ultimaEm: null, ultimoErro: null, ultimoErroEm: null };
+// Mais de uma conta pode estar no mesmo grupo de origem: a primeira que recebe
+// copia, as outras ignoram (chave = grupo + id da mensagem).
+const _redirVistos = new Map();
+function _redirJaVisto(msg) {
+  const k = String(msg.key?.remoteJid || '') + '|' + String(msg.key?.id || '');
+  const agora = Date.now();
+  if (_redirVistos.size > 2000) for (const [kk, t] of _redirVistos) if (agora - t > 3600000) _redirVistos.delete(kk);
+  if (_redirVistos.has(k)) return true;
+  _redirVistos.set(k, agora);
+  return false;
+}
+function _redirNomeDe(jid) {
+  return NOMES_GRUPOS.get(jid) || NOMES_GRUPOS_EXTRAS.get(jid) || '';
+}
 let _redirCadeia = Promise.resolve();
 
-function _redirAtivo() { return String(process.env.REDIRECT_ATIVO ?? '1') !== '0'; }
+function _redirAtivo() {
+  if (String(process.env.REDIRECT_ATIVO ?? '1') === '0') return false;
+  try { return redirectCdv().ativo !== false; } catch { return true; }
+}
 function _redirNorm(s) {
   return String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -9036,9 +9056,9 @@ function _redirNorm(s) {
 function _redirResolver(alvo) {
   const a = String(alvo || '').trim();
   if (!a) return { jid: null, nome: '', erro: 'vazio' };
-  if (a.endsWith('@g.us')) return { jid: a, nome: NOMES_GRUPOS.get(a) || '' };
+  if (a.endsWith('@g.us')) return { jid: a, nome: _redirNomeDe(a) };
   const n = _redirNorm(a);
-  const todos = [...NOMES_GRUPOS.entries()];
+  const todos = [...new Map([...NOMES_GRUPOS_EXTRAS, ...NOMES_GRUPOS]).entries()];
   const iguais = todos.filter(([, nome]) => _redirNorm(nome) === n);
   let achados = iguais.length ? iguais : todos.filter(([, nome]) => n && _redirNorm(nome).includes(n));
   // Palavras em qualquer ordem ("Emissões - QVF" casa com "QVF Emissões").
@@ -9056,10 +9076,20 @@ function _redirResolver(alvo) {
   return { jid: null, nome: a, erro: 'nome "' + a + '" ambiguo: ' + achados.map(x => x[1]).join(' | ') };
 }
 function _redirConfig() {
+  let tela = null;
+  try { tela = redirectCdv(); } catch {}
+  if (tela && tela.destino) {
+    return {
+      fonte: 'gestor',
+      destino: { jid: tela.destino, nome: _redirNomeDe(tela.destino) },
+      origens: tela.origens.filter(o => o.ativo !== false)
+        .map(o => ({ alvo: o.jid, jid: o.jid, nome: _redirNomeDe(o.jid) || o.nome || '' })),
+    };
+  }
   const destino = _redirResolver(process.env.REDIRECT_DESTINO || 'Redirect');
   const origens = String(process.env.REDIRECT_ORIGENS || REDIRECT_ORIGENS_PADRAO)
     .split(',').map(s => s.trim()).filter(Boolean).map(o => ({ alvo: o, ..._redirResolver(o) }));
-  return { destino, origens };
+  return { fonte: 'env', destino, origens };
 }
 
 // Conteudo copiado byte a byte (encode/decode do proto). Sai o que so tem
@@ -9085,6 +9115,7 @@ function redirecionarSeOrigem(msg, ctx) {
     if (!jid.endsWith('@g.us')) return;
     const cfg = _redirConfig();
     if (!cfg.origens.some(o => o.jid === jid)) return;
+    if (_redirJaVisto(msg)) return;
     if (!cfg.destino.jid || cfg.destino.jid === jid) {
       _redir.puladas++;
       _redir.ultimoErro = 'destino: ' + (cfg.destino.erro || 'igual a origem'); _redir.ultimoErroEm = new Date().toISOString();
@@ -9108,7 +9139,7 @@ function redirecionarSeOrigem(msg, ctx) {
     if (!conteudo && !simples) { _redir.puladas++; return; }
 
     const destino = cfg.destino.jid;
-    const origemNome = NOMES_GRUPOS.get(jid) || jid;
+    const origemNome = _redirNomeDe(jid) || jid;
     const executar = async () => {
       const s = viaWm ? sock : ctx.sock;
       if (!s) throw new Error('conta leitora sem socket');
@@ -9138,7 +9169,7 @@ function redirecionarSeOrigem(msg, ctx) {
 
 app.get('/redirect/estado', (req, res) => {
   const cfg = _redirConfig();
-  res.json({ ok: true, ativo: _redirAtivo(), destino: cfg.destino, origens: cfg.origens,
+  res.json({ ok: true, ativo: _redirAtivo(), fonte: cfg.fonte, destino: cfg.destino, origens: cfg.origens,
     gruposConhecidos: NOMES_GRUPOS.size, ..._redir });
 });
 
@@ -11344,6 +11375,7 @@ async function conectar() {
         // Sem isto o sistema cobra quem ja respondeu — o pior erro possivel
         // numa campanha de recuperacao.
         campanhaMarcarResposta(msg).catch(() => {});
+        redirecionarSeOrigem(msg, CTX_PRINCIPAL);
         // Enfileira por grupo: mesmo grupo = sequencial, grupos distintos =
         // paralelo. Dedup por key.id (pode ja ter vindo via 'append') e guarda
         // de dono vivem dentro do despacho.
