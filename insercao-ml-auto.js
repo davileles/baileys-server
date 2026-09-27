@@ -303,6 +303,7 @@ async function vigiar() {
       }
     }
   }
+  adotarPendentes();
   podarLiberaEm();
   salvar();
 }
@@ -364,6 +365,9 @@ export function proximoLoteInsercaoMl({ espiar = false } = {}) {
     return { ...base, motivo: 'pausa_entre_visitas', aguardar: estado.proximaVisitaEm - agora };
   }
 
+  // A base de cupons chega do GitHub depois do boot: adotar so no boot deixava
+  // a fila vazia. Adota aqui o que nunca passou por decisao (cupom novo, valido).
+  adotarPendentes();
   const eleg = elegiveis(agora);
   if (!eleg.length) {
     const fila = naFila();
