@@ -189,7 +189,7 @@ import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
-  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto,
+  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto, validadeDeVencimento,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
@@ -22077,6 +22077,7 @@ bootBotTsp({
 iniciarInsercaoMlAuto({
   listarCuponsBase,
   atualizarCupomBase,
+  validadeDeVencimento,
   avisarManual: () => avisarInsercaoMlTelegram(),
   avisarTelegram: (texto) => notificarAdminsTelegram(texto),
   avisarOperador: (texto) => enviarMensagem(GRUPOS.operador, { text: texto }),

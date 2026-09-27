@@ -433,7 +433,9 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   } else if (veredito === 'esgotado' || veredito === 'vencido') {
     estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
     const campos = { ativo: false, insercaoMl: 'recusado', observacao: 'Recusado na inserção pela extensão: ' + (msg || rc || veredito) };
-    if (venceuEm && !isNaN(Date.parse(venceuEm))) campos.validadeAte = new Date(venceuEm).toISOString();
+    let quando = venceuEm && !isNaN(Date.parse(venceuEm)) ? new Date(venceuEm).toISOString() : null;
+    if (!quando && veredito === 'vencido' && dep.validadeDeVencimento) { try { quando = dep.validadeDeVencimento(msg); } catch (e) {} }
+    if (quando) campos.validadeAte = quando;
     marcar(reg, campos);
     registrarDesfecho(reg, veredito === 'esgotado' ? '🗑 esgotado' : '🗑 vencido');
   } else if (veredito === 'inexistente') {
@@ -575,7 +577,7 @@ export async function pausarInsercaoMlAuto(motivo = 'pausada pelo operador') {
 }
 
 /**
- * deps: { listarCuponsBase, atualizarCupomBase, avisarManual,
+ * deps: { listarCuponsBase, atualizarCupomBase, avisarManual, validadeDeVencimento(txt),
  *         avisarTelegram(texto), avisarOperador(texto), sessaoDir }
  */
 export function iniciarInsercaoMlAuto(deps) {
