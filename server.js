@@ -14092,6 +14092,13 @@ async function radarWorker() {
       filaRadar.shift();
       salvarFilaRadar();
       radarUltimoEnvioMs = Date.now();
+      // Guarda o texto EXATO que saiu, para o lembrete "ACABA HOJE" no ultimo
+      // dia da promocao. O proprio lembrete nao se registra (senao viraria
+      // lembrete de lembrete).
+      if (!item.lembrete) {
+        try { registrarEnvioParaLembrete(item); }
+        catch (eL) { console.error('[LEMBRETE] Falha ao registrar envio:', eL.message); }
+      }
       console.log('[RADAR] ✓ Oferta "' + item.id + '" enviada. Restam ' + filaRadar.length + '.');
     } catch(e) {
       console.error('[RADAR] ✗ Erro ao enviar "' + item.id + '":', e.message);
@@ -14150,6 +14157,187 @@ app.get('/radar/fila', (req, res) => {
       id: item.id,
       tentativas: item.tentativas || 0,
       preview: item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
+    })),
+  });
+});
+
+// ── LEMBRETE "ACABA HOJE" DAS OFERTAS DO RADAR CDV ──────────────────────────
+// Toda oferta do radar que sai num grupo (transferencia bonificada, assinatura
+// de clube, compra de pontos) e reenviada automaticamente no ULTIMO DIA do
+// prazo, com o mesmo texto e "⏰ ACABA HOJE!" no titulo.
+//
+// - O texto vem do que foi REALMENTE enviado (inclusive edicoes do gestor):
+//   gravado em sessao/lembretes_radar.json no sucesso do radarWorker.
+// - Categoria e prazo vem de ofertas.json (painel-cdv) no momento do lembrete,
+//   casando pelo id: assim um prazo corrigido depois do envio vale, e envio
+//   manual que nao e oferta do radar (id sem par em ofertas.json) nao lembra.
+// - O lembrete vai direto para a filaRadar marcado como `lembrete`: nao passa
+//   pelo proxy, entao NAO mexe em historico-transferencias.json nem em
+//   ofertas.json — e so uma mensagem.
+// Kill switch: LEMBRETE_ACABA_HOJE=off. Categorias: LEMBRETE_ACABA_HOJE_CATS.
+const LEMBRETES_RADAR_PATH = SESSAO_DIR + '/lembretes_radar.json';
+const LEMBRETE_OFERTAS_URL = process.env.LEMBRETE_OFERTAS_URL || 'https://painel.clubedoviajante.com.br/ofertas.json';
+const LEMBRETE_HORA_PADRAO = '09:00';   // horario do lembrete no dia do prazo (SP)
+const LEMBRETE_HORA_LIMITE = '21:00';   // depois disso nao manda (servidor ficou fora o dia todo)
+const LEMBRETE_RETENCAO_DIAS = 60;
+let lembretesRadar = [];
+function lembreteAtivo() {
+  return !/^(off|0|false|nao|não)$/i.test(String(process.env.LEMBRETE_ACABA_HOJE || 'on').trim());
+}
+function lembreteCategorias() {
+  return String(process.env.LEMBRETE_ACABA_HOJE_CATS || 'transferencia,clube,compra')
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+}
+function salvarLembretesRadar() {
+  try { escreverAtomico(LEMBRETES_RADAR_PATH, JSON.stringify(lembretesRadar)); }
+  catch (e) { console.error('[LEMBRETE] Erro ao salvar:', e.message); }
+}
+function carregarLembretesRadar() {
+  try {
+    if (!existsSync(LEMBRETES_RADAR_PATH)) return;
+    const lista = JSON.parse(readFileSync(LEMBRETES_RADAR_PATH, 'utf-8'));
+    if (Array.isArray(lista)) lembretesRadar = lista.filter(x => x && x.id && x.grupo && x.mensagem);
+  } catch (e) { console.error('[LEMBRETE] Erro ao carregar:', e.message); }
+}
+carregarLembretesRadar();
+
+function hojeSPIso(d = new Date()) {
+  return d.toLocaleDateString('sv-SE', { timeZone: 'America/Sao_Paulo' });
+}
+
+// Uma entrada por oferta+grupo; reenvio manual da mesma oferta so atualiza o
+// texto (o lembrete replica a versao mais recente).
+function registrarEnvioParaLembrete(item) {
+  if (!item || !item.id || String(item.id).startsWith('r_')) return;
+  const agoraIso = new Date().toISOString();
+  const ex = lembretesRadar.find(x => x.id === item.id && x.grupo === item.grupo);
+  if (ex) {
+    ex.mensagem = item.mensagem;
+    ex.enviadoEm = agoraIso;
+  } else {
+    lembretesRadar.push({ id: item.id, grupo: item.grupo, mensagem: item.mensagem, enviadoEm: agoraIso, lembradoEm: null });
+  }
+  const corte = Date.now() - LEMBRETE_RETENCAO_DIAS * 86400000;
+  lembretesRadar = lembretesRadar.filter(x => new Date(x.enviadoEm).getTime() >= corte);
+  salvarLembretesRadar();
+}
+
+// "27/09/2026", "25/09/2026 às 10h", "de 20/09 a 27/09" -> { data:'2026-09-27', hora:'10:00'|null }.
+// Pega a ULTIMA data do texto (faixas "de X a Y"). Ano ausente: o do envio.
+function prazoDoTexto(prazo, anoPadrao) {
+  const s = String(prazo || '');
+  const datas = [...s.matchAll(/(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?/g)];
+  if (!datas.length) return null;
+  const m = datas[datas.length - 1];
+  let ano = m[3] ? Number(m[3]) : Number(anoPadrao);
+  if (ano < 100) ano += 2000;
+  const dia = Number(m[1]), mes = Number(m[2]);
+  if (!ano || mes < 1 || mes > 12 || dia < 1 || dia > 31) return null;
+  const resto = s.slice(m.index + m[0].length);
+  const h = resto.match(/(\d{1,2})\s*(?:h|:)\s*(\d{2})?/i);
+  let hora = null;
+  if (h && Number(h[1]) <= 23) hora = String(h[1]).padStart(2, '0') + ':' + String(h[2] || '00').padStart(2, '0');
+  return { data: `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`, hora };
+}
+
+// Horario do lembrete: 09:00; se a promo acaba cedo (ex. "às 10h"), 2h antes
+// do fim, nunca antes das 07:00.
+function horaDoLembrete(horaFim) {
+  if (!horaFim) return LEMBRETE_HORA_PADRAO;
+  const [hh, mm] = horaFim.split(':').map(Number);
+  const minFim = hh * 60 + mm;
+  if (minFim - 120 >= 9 * 60) return LEMBRETE_HORA_PADRAO;
+  const min = Math.max(7 * 60, minFim - 120);
+  return String(Math.floor(min / 60)).padStart(2, '0') + ':' + String(min % 60).padStart(2, '0');
+}
+
+// Mesmo texto, com "⏰ ACABA HOJE!" no titulo (primeira linha em *negrito*).
+// Tira chamadas de urgencia que ficaram velhas ("Acaba amanhã!", "Últimos dias").
+function mensagemAcabaHoje(msg) {
+  const linhas = String(msg || '').split('\n');
+  const i = linhas.findIndex(l => l.trim());
+  if (i < 0) return msg;
+  const m = linhas[i].match(/^(\s*)\*(.+)\*\s*$/);
+  if (m) {
+    const titulo = m[2].replace(/^\s*(?:acaba\s+(?:amanh[ãa]|hoje)|[úu]ltimos?\s+dias?|[úu]ltimo\s+dia)\s*[!.:–-]*\s*/i, '');
+    linhas[i] = m[1] + '*⏰ ACABA HOJE! ' + titulo + '*';
+  } else {
+    linhas.splice(i, 0, '*⏰ ACABA HOJE!*', '');
+  }
+  return linhas.join('\n');
+}
+
+async function ofertasAprovadasCdv() {
+  const r = await fetch(LEMBRETE_OFERTAS_URL + '?t=' + Date.now(), { signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error('ofertas.json status ' + r.status);
+  const j = await r.json();
+  return Array.isArray(j.items) ? j.items : [];
+}
+
+let lembreteChecando = false;
+async function checarLembretesAcabaHoje({ forcar = false } = {}) {
+  if (lembreteChecando) return { ok: false, motivo: 'ja_rodando' };
+  if (!lembreteAtivo() && !forcar) return { ok: true, desligado: true };
+  const pendentes = lembretesRadar.filter(x => !x.lembradoEm);
+  if (!pendentes.length) return { ok: true, enfileirados: 0 };
+  lembreteChecando = true;
+  try {
+    const hoje = hojeSPIso();
+    const agoraHM = _fmtHoraMinSP.format(new Date());
+    const cats = lembreteCategorias();
+    const porId = new Map((await ofertasAprovadasCdv()).map(o => [o.id, o]));
+    let enfileirados = 0, mudou = false;
+    for (const l of pendentes) {
+      // ofertas.json guarda so as 100 mais recentes (o Meliuz sozinho empurra
+      // varias por dia): categoria/prazo ficam copiados na entrada na primeira
+      // checagem, para a oferta que saiu do arquivo ainda lembrar.
+      const o = porId.get(l.id);
+      if (o && (l.categoria !== o.categoria || l.prazo !== o.prazo)) {
+        l.categoria = o.categoria || ''; l.prazo = o.prazo || ''; mudou = true;
+      }
+      if (l.categoria == null || !cats.includes(String(l.categoria).toLowerCase())) continue;
+      const pz = prazoDoTexto(l.prazo, hojeSPIso(new Date(l.enviadoEm)).slice(0, 4));
+      if (!pz || pz.data !== hoje) continue;
+      // Divulgada no proprio ultimo dia: o post original ja e o lembrete.
+      if (hojeSPIso(new Date(l.enviadoEm)) >= pz.data) { l.lembradoEm = 'pulado:enviado_no_dia'; mudou = true; continue; }
+      if (agoraHM < horaDoLembrete(pz.hora)) continue;
+      if (agoraHM >= LEMBRETE_HORA_LIMITE || (pz.hora && agoraHM >= pz.hora)) {
+        l.lembradoEm = 'pulado:fora_do_horario'; mudou = true; continue;
+      }
+      filaRadar.push({ id: 'lembrete_' + l.id, mensagem: mensagemAcabaHoje(l.mensagem), grupo: l.grupo, tentativas: 0, lembrete: true });
+      l.lembradoEm = new Date().toISOString();
+      enfileirados++; mudou = true;
+      console.log('[LEMBRETE] "ACABA HOJE" enfileirado: ' + l.id + ' -> ' + (NOMES_GRUPOS.get(l.grupo) || l.grupo));
+    }
+    if (mudou) salvarLembretesRadar();
+    if (enfileirados) {
+      salvarFilaRadar();
+      radarWorker().catch(e => { console.error('[RADAR] Worker erro:', e.message); radarWorkerRodando = false; });
+    }
+    return { ok: true, enfileirados };
+  } catch (e) {
+    console.error('[LEMBRETE] Falha na checagem:', e.message);
+    return { ok: false, erro: e.message };
+  } finally {
+    lembreteChecando = false;
+  }
+}
+setInterval(() => { checarLembretesAcabaHoje().catch(() => {}); }, 10 * 60 * 1000);
+setTimeout(() => { checarLembretesAcabaHoje().catch(() => {}); }, 90 * 1000);
+
+// GET /radar/lembretes — o que esta registrado e quando cada um lembra.
+// ?checar=1 roda a checagem agora.
+app.get('/radar/lembretes', async (req, res) => {
+  let checagem = null;
+  if (req.query.checar) checagem = await checarLembretesAcabaHoje();
+  res.json({
+    ok: true,
+    ativo: lembreteAtivo(),
+    categorias: lembreteCategorias(),
+    checagem,
+    itens: lembretesRadar.map(x => ({
+      id: x.id, grupo: NOMES_GRUPOS.get(x.grupo) || x.grupo, enviadoEm: x.enviadoEm, lembradoEm: x.lembradoEm,
+      titulo: (String(x.mensagem).split('\n').find(l => l.trim()) || '').slice(0, 100),
     })),
   });
 });

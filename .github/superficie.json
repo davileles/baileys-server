@@ -80,6 +80,7 @@
         "app.get('/painel-json'",
         "app.get('/qr'",
         "app.get('/radar/fila'",
+        "app.get('/radar/lembretes'",
         "app.get('/reenvio/candidatos'",
         "app.get('/shield'",
         "app.get('/shopee/status'",
