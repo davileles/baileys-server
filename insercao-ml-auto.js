@@ -13,9 +13,9 @@
 //
 //   - fila: cupom capturado entra na fila e so fica ELEGIVEL depois de um
 //     atraso aleatorio (humano nao insere no segundo em que o cupom sai)
-//   - visitas: a extensao pede "o proximo lote"; o servidor entrega 2–4 cupons
-//     de uma vez (rajada curta, como quem abre a pagina e insere alguns) e so
-//     libera a proxima visita depois de uma pausa longa e aleatoria
+//   - visitas: a extensao pede "o proximo lote"; o servidor entrega o que
+//     estiver elegivel (o operador, a mao, insere a lista inteira em sequencia,
+//     15–20 s por cupom) e so libera a proxima visita depois de uma pausa
 //   - janela diurna, teto diario SORTEADO por dia e dias de folga sorteados
 //   - disjuntor: erro de conta, pagina mudada, login caido ou respostas
 //     estranhas desligam tudo, devolvem a fila ao /inserir e avisam. So volta
@@ -25,12 +25,12 @@
 // Variaveis (Railway):
 //   CUPONS_ML_INSERCAO_AUTO=1          liga a fila (padrao desligada)
 //   CUPONS_ML_EXTENSAO_TOKEN=...       token que a extensao manda (obrigatorio)
-//   CUPONS_ML_AUTO_TETO_DIA=6-14       teto diario, sorteado na faixa a cada dia
+//   CUPONS_ML_AUTO_TETO_DIA=15-30      teto diario, sorteado na faixa a cada dia
 //   CUPONS_ML_AUTO_JANELA=8-23         horas (inicio inclusive, fim exclusive)
-//   CUPONS_ML_AUTO_ATRASO_MIN=5-40     minutos entre captura e elegibilidade
-//   CUPONS_ML_AUTO_LOTE=2-4            cupons por visita
-//   CUPONS_ML_AUTO_PAUSA_MIN=40-150    minutos entre visitas
-//   CUPONS_ML_AUTO_FOLGA_PCT=10        % de dias sem inserir nada
+//   CUPONS_ML_AUTO_ATRASO_MIN=2-10     minutos entre captura e elegibilidade
+//   CUPONS_ML_AUTO_LOTE=8-15           cupons por visita (quem recebe a lista insere a lista)
+//   CUPONS_ML_AUTO_PAUSA_MIN=10-40     minutos entre visitas
+//   CUPONS_ML_AUTO_FOLGA_PCT=0         % de dias sem inserir nada
 //   CUPONS_ML_AUTO_ESPERA_MAX_MIN=180  cupom parado na fila alem disso → /inserir
 //   CUPONS_ML_AUTO_SELETORES={...}     JSON que sobrepoe os seletores da pagina
 // CUPONS_ML_PAUSADO continua valendo para sync e leitura de "Meus cupons";
@@ -54,12 +54,12 @@ function faixa(txt, padrao) {
 function sortear([a, b]) { return a + Math.random() * (b - a); }
 function sortearInt([a, b]) { return Math.round(sortear([a, b])); }
 
-const TETO_DIA = faixa(process.env.CUPONS_ML_AUTO_TETO_DIA, [6, 14]);
+const TETO_DIA = faixa(process.env.CUPONS_ML_AUTO_TETO_DIA, [15, 30]);
 const [JANELA_INI, JANELA_FIM] = faixa(process.env.CUPONS_ML_AUTO_JANELA, [8, 23]);
-const ATRASO_MIN = faixa(process.env.CUPONS_ML_AUTO_ATRASO_MIN, [5, 40]);
-const LOTE = faixa(process.env.CUPONS_ML_AUTO_LOTE, [2, 4]);
-const PAUSA_MIN = faixa(process.env.CUPONS_ML_AUTO_PAUSA_MIN, [40, 150]);
-const FOLGA_PCT = Math.max(0, Math.min(100, Number(process.env.CUPONS_ML_AUTO_FOLGA_PCT ?? 10) || 0));
+const ATRASO_MIN = faixa(process.env.CUPONS_ML_AUTO_ATRASO_MIN, [2, 10]);
+const LOTE = faixa(process.env.CUPONS_ML_AUTO_LOTE, [8, 15]);
+const PAUSA_MIN = faixa(process.env.CUPONS_ML_AUTO_PAUSA_MIN, [10, 40]);
+const FOLGA_PCT = Math.max(0, Math.min(100, Number(process.env.CUPONS_ML_AUTO_FOLGA_PCT ?? 0) || 0));
 const ESPERA_MAX_MS = Math.max(30, Number(process.env.CUPONS_ML_AUTO_ESPERA_MAX_MIN) || 180) * 60000;
 
 // Seletores da pagina de cupons do ML (lidos em 27/09/2026). Vao para a
@@ -82,12 +82,12 @@ function seletores() {
 }
 // Tempos que a extensao usa dentro da visita (segundos / ms). Sorteados la.
 const TEMPOS = {
-  antesDoPrimeiroS: [2, 8],      // pagina aberta → primeiro cupom
-  entreCuponsS: [20, 90],        // entre um cupom e o outro, na mesma aba
+  antesDoPrimeiroS: [2, 5],      // pagina aberta → primeiro cupom
+  entreCuponsS: [12, 35],        // entre um cupom e o outro, na mesma aba (ritmo do operador a mao)
   digitacaoMs: [80, 250],        // por caractere
   pausaDigitacaoMs: [300, 900],  // pausa maior ocasional entre caracteres
-  aposClicarS: [3, 10],          // espera a resposta antes de ler o resultado
-  antesDeFecharS: [2, 12],       // fica um pouco na pagina antes de fechar a aba
+  aposClicarS: [2, 6],           // espera a resposta antes de ler o resultado
+  antesDeFecharS: [2, 8],        // fica um pouco na pagina antes de fechar a aba
 };
 
 // Valores de insercaoMl usados aqui. O /inserir do bot lista null, MANUAL e
