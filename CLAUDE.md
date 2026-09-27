@@ -355,7 +355,7 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 - Links rastreados: todo envio TSP sai como `ir.ticapromos.com.br/<loja>/<codigo>-<grupo>` (grupo = número, ex. `-15`) para contar cliques e decidir reenvio.
 - Marca d'água `@TICAPROMOS` só em grupos TSP (`ehGrupoTsp`), nunca em CDV.
 - Mascote **Tico** (andorinha-do-ártico), verbo "ticar", Instagram `@ticapromos`; também cobre avatares de grupos do CDV (comunidade, balcão, Superpromos). Bíblia do Tico em `davileles/dados`.
-- Extensão Chrome "Captura Tica" (em outro repo): lê a página do produto, cadastra na vitrine e oferece disparo automático.
+- Extensão Chrome "Captura Tica" (`tudo-sobre-promos/extensao/`): lê a página do produto, cadastra na vitrine, oferece disparo automático e, desde 27/09/2026, **insere os cupons do ML na conta TSP** (`cupons-ml.js`, fila servida pelo baileys-server em `/cupons/auto/*`; modos "perguntar antes" e "automático"; token em `CUPONS_ML_EXTENSAO_TOKEN`).
 - Domínio: migração tudosobrepromos → **ticapromos**; chaves `tsp-*` continuam por compatibilidade.
 - Roadmap "aprendizados do Cupons do Oda": **fases 1–5 concluídas** (quarentena, travas, resumo da manhã, ledger de membros, defesa do encurtador, custo por entrada, LTV÷CAC, vereditos do monitor, candidatos a reenvio, dinheiro na mesa, Shield em OBSERVE, trava de porta fechada, financeiro mensal, repasse de links, curadoria que aprende). 5.5 (atendimento de pedidos) descartado.
 
