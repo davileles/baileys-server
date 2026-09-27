@@ -178,7 +178,9 @@ function salvar() {
 /** Sorteia teto e folga do dia; zera contadores. Idempotente dentro do dia. */
 function virarDia() {
   const { dia } = agoraBr();
-  if (estado.dia === dia) return;
+  // Estado gravado pela versao anterior (sem tetoHoje) ja trazia o dia de hoje:
+  // sem esta guarda o teto ficava 0 e nada entrava na fila.
+  if (estado.dia === dia && estado.tetoHoje > 0) return;
   estado.dia = dia;
   estado.feitasHoje = 0;
   estado.tetoHoje = sortearInt(TETO_DIA);
