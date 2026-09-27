@@ -1340,9 +1340,10 @@ function estadoAuto() {
 function linhaAutoResumo() {
   const e = estadoAuto();
   if (!e || !e.ligada) return '';
-  if (e.disjuntor) return '\n\n🛑 <b>Automática desligada</b> — ' + esc(e.disjuntor.motivo) + ' (/autoinserir)';
-  return '\n\n🤖 Automática: ' + e.naFila.length + ' na fila · hoje ' + e.feitasHoje + '/' + e.tetoDia
-    + (e.naFila.length && e.proximaEm ? ' · próxima ~' + e.proximaHora : '');
+  if (e.disjuntor) return '\n\n🛑 <b>Extensão desligada</b> — ' + esc(e.disjuntor.motivo) + ' (/autoinserir)';
+  return '\n\n🧩 Extensão: ' + e.naFila.length + ' na fila · hoje ' + e.feitasHoje + '/' + e.tetoDia
+    + (e.extensaoPresente ? '' : ' · <b>Chrome sem contato</b>')
+    + (e.naFila.length && e.proximaEm ? ' · próxima visita ~' + e.proximaHora : '');
 }
 
 async function mostrarAuto(chatId, msgId) {
@@ -1352,7 +1353,8 @@ async function mostrarAuto(chatId, msgId) {
   if (!e) return falarHtml(chatId, '❌ Inserção automática indisponível neste servidor.', { inline_keyboard: [voltar] }, msgId);
   if (!e.ligada) {
     return falarHtml(chatId, '⚪ <b>Inserção automática desligada</b>\n\n'
-      + 'Para ligar: variável <code>CUPONS_ML_INSERCAO_AUTO=1</code> no Railway.',
+      + 'Para ligar: variáveis <code>CUPONS_ML_INSERCAO_AUTO=1</code> e <code>CUPONS_ML_EXTENSAO_TOKEN</code> no Railway, '
+      + 'e o mesmo token na extensão Captura Tica.',
       { inline_keyboard: [voltar] }, msgId);
   }
   const partes = [];
@@ -1360,12 +1362,18 @@ async function mostrarAuto(chatId, msgId) {
     ? '🛑 <b>Inserção automática DESLIGADA</b>\nMotivo: ' + esc(e.disjuntor.motivo)
       + (e.disjuntor.codigo ? ' (' + esc(e.disjuntor.codigo) + ')' : '')
       + '\nDesde: ' + esc(horaCurta(e.disjuntor.em) || e.disjuntor.em)
-    : '🤖 <b>Inserção automática ativa</b>');
-  partes.push('Hoje: <b>' + e.feitasHoje + '/' + e.tetoDia + '</b> · intervalo ' + e.intervaloMin[0] + '–' + e.intervaloMin[1]
-    + ' min · janela ' + e.janela[0] + 'h–' + e.janela[1] + 'h' + (e.dentroDaJanela ? '' : ' (fora agora)'));
+    : '🧩 <b>Inserção pela extensão ativa</b>' + (e.folgaHoje ? ' — hoje é dia de folga' : ''));
+  partes.push('Hoje: <b>' + e.feitasHoje + '/' + e.tetoDia + '</b> (faixa ' + e.tetoFaixa[0] + '–' + e.tetoFaixa[1] + ') · lotes de '
+    + e.lote[0] + '–' + e.lote[1] + ' · pausa ' + e.pausaMin[0] + '–' + e.pausaMin[1] + ' min · janela ' + e.janela[0] + 'h–' + e.janela[1] + 'h'
+    + (e.dentroDaJanela ? '' : ' (fora agora)'));
+  partes.push(e.extensaoConfigurada
+    ? (e.extensaoPresente ? '🟢 Chrome com a extensão: em contato' + (e.extensaoContatoMin ? ' (há ' + e.extensaoContatoMin + ' min)' : '')
+                          : '🔴 Chrome sem contato' + (e.extensaoContatoMin != null ? ' há ' + e.extensaoContatoMin + ' min' : ' — nunca conectou') + ' — abra o Chrome com a Captura Tica ligada')
+    : '⚠️ <code>CUPONS_ML_EXTENSAO_TOKEN</code> não configurado no Railway');
   if (!e.disjuntor) {
     partes.push('Na fila: <b>' + e.naFila.length + '</b>' + (e.naFila.length ? ' — ' + e.naFila.slice(0, 8).map(c => '<code>' + esc(c) + '</code>').join(', ') : '')
-      + (e.proximaEm ? '\nPróxima tentativa: ~' + e.proximaHora : ''));
+      + (e.emVisita.length ? '\nNa aba do ML agora: ' + e.emVisita.map(c => '<code>' + esc(c) + '</code>').join(', ') : '')
+      + (e.proximaEm && e.proximaEm > Date.now() ? '\nPróxima visita: ~' + e.proximaHora : ''));
   }
   if (e.ultimos && e.ultimos.length) {
     partes.push('<b>Últimas</b>\n' + e.ultimos.slice(0, 8).map(x => x.rotulo + ' <code>' + esc(x.codigo) + '</code>').join('\n'));

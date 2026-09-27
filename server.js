@@ -123,7 +123,8 @@ import {
 // no cabecalho de agenda-actions.js.
 import { iniciarAgendaActions, estadoAgenda, dispararAgora, agendaAtiva } from './agenda-actions.js';
 import { iniciarInsercaoMlAuto, enfileirarInsercaoMl, estadoInsercaoMlAuto,
-         religarInsercaoMlAuto, pausarInsercaoMlAuto } from './insercao-ml-auto.js';
+         religarInsercaoMlAuto, pausarInsercaoMlAuto, tokenExtensaoMlOk, extensaoMlConfigurada,
+         proximoLoteInsercaoMl, registrarResultadoInsercaoMl, finalizarVisitaInsercaoMl } from './insercao-ml-auto.js';
 
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
@@ -5535,11 +5536,12 @@ async function avisarExtracaoFalhou(texto, canal) {
 //
 // INSERCAO (desde set/2026): a conta TSP tomou restricao no input-code depois
 // de meses de insercao IMEDIATA a partir do Railway. Hoje ha dois caminhos:
-//   - CUPONS_ML_INSERCAO_AUTO=1: o cupom entra na fila espacada de
-//     insercao-ml-auto.js (intervalo aleatorio, janela de horario, teto diario,
-//     disjuntor). O que ela nao aceitar cai no manual.
+//   - CUPONS_ML_INSERCAO_AUTO=1: o cupom entra na fila de insercao-ml-auto.js e
+//     quem insere e a extensao Captura Tica, no Chrome do operador (rotas
+//     /cupons/auto/*). O servidor so orquestra: atraso, lotes, janela, teto,
+//     disjuntor. O que a fila nao aceitar cai no manual.
 //   - padrao: lista /inserir do bot do Telegram; o operador insere do celular.
-// Nenhum dos dois chama o ML na hora da captura.
+// Nenhum dos dois chama o ML a partir deste servidor.
 function ativarCupomCapturadoMl(c, reg) {
   if (!c || c.loja !== 'Mercado Livre' || !c.codigo) return;
   // O bot e a fila sao da TSP: cupom capturado no contexto de outro tenant nao
@@ -18330,6 +18332,37 @@ app.post('/cupons/sync-ml', async (req, res) => {
 // Alimentada automaticamente pelo pipeline de cupons. Estes endpoints existem
 // para o operador corrigir um valor mal extraido ou desligar um cupom que a
 // loja derrubou antes da validade.
+// ── INSERCAO DE CUPONS NO ML PELA EXTENSAO (Captura Tica) ────────────────────
+// A extensao roda no Chrome do operador e e quem toca a pagina do ML. Estas
+// rotas so entregam lotes e recebem vereditos. Token proprio
+// (CUPONS_ML_EXTENSAO_TOKEN, header X-Extensao-Token): as rotas /cupons/* sao
+// publicas por heranca, e estas devolvem codigos e alteram a base.
+function exigirExtensaoMl(req, res) {
+  if (!extensaoMlConfigurada()) { res.status(503).json({ ok: false, erro: 'CUPONS_ML_EXTENSAO_TOKEN não configurado no Railway' }); return false; }
+  if (!tokenExtensaoMlOk(req.headers['x-extensao-token'])) { res.status(401).json({ ok: false, erro: 'token da extensão inválido' }); return false; }
+  return true;
+}
+app.get('/cupons/auto/estado', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  try { res.json({ ok: true, ...estadoInsercaoMlAuto() }); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+app.get('/cupons/auto/proximo', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  try { res.json(proximoLoteInsercaoMl({ espiar: String(req.query.espiar || '') === '1' })); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+app.post('/cupons/auto/resultado', async (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  try { res.json(await registrarResultadoInsercaoMl(req.body || {})); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+app.post('/cupons/auto/visita/fim', async (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  try { res.json(await finalizarVisitaInsercaoMl(req.body || {})); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
 app.get('/cupons/base', (req, res) => {
   const itens = listarCuponsBase();
   const agora = Date.now();
@@ -22039,13 +22072,11 @@ bootBotTsp({
   }),
 }).catch(e => console.warn('[BOT-TSP] Falha no boot:', e.message));
 
-// Fila espacada de insercao de cupons na conta do ML (CUPONS_ML_INSERCAO_AUTO=1).
-// Depois do bot: os avisos saem por ele.
+// Orquestrador da insercao de cupons na conta do ML pela extensao Captura Tica
+// (CUPONS_ML_INSERCAO_AUTO=1). Depois do bot: os avisos saem por ele.
 iniciarInsercaoMlAuto({
   listarCuponsBase,
   atualizarCupomBase,
-  ativarCupomMl,
-  tokenAffOk,
   avisarManual: () => avisarInsercaoMlTelegram(),
   avisarTelegram: (texto) => notificarAdminsTelegram(texto),
   avisarOperador: (texto) => enviarMensagem(GRUPOS.operador, { text: texto }),
