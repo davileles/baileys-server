@@ -8131,12 +8131,79 @@ async function resolverEncurtadorCustom(url, saltos = 4) {
   return destino;
 }
 
+// ── PECHINCHOU ──────────────────────────────────────────────────────────────
+// O Pechinchou nao posta link de loja: posta pechin.co/<id>, que redireciona
+// para pechinchou.com.br/oferta/<id> (pagina deles). O link da loja so existe
+// dentro dessa pagina, no JSON do Next (props.pageProps.promo.long_url). Sem
+// isto, toda oferta dos grupos do Pechinchou caia em "nenhum pipeline
+// reconheceu o link". So vale para oferta numerada: pechin.co/whatsapp e as
+// propagandas do VIP (pechinchou.com.br sem /oferta/) continuam ignoradas.
+const RE_PECHINCHOU = /^https?:\/\/(?:www\.)?(?:pechin\.co\/(\d{3,10})|pechinchou\.com\.br\/oferta\/(\d{3,10}))\/?$/i;
+
+function ehLinkPechinchou(url) { return RE_PECHINCHOU.test(String(url || '')); }
+
+// Tira a tag de afiliado deles: a nossa e aplicada depois, no envio.
+function _limparAfiliadoPechinchou(url) {
+  try {
+    const u = new URL(url);
+    for (const k of ['tag', 'ascsubtag', 'linkCode', 'linkId', 'ref_']) u.searchParams.delete(k);
+    return u.toString();
+  } catch (e) { return url; }
+}
+
+async function resolverPechinchou(url) {
+  const emCache = _cacheEncurtador.get(url);
+  if (emCache && Date.now() - emCache.em < ENCURTADOR_TTL_MS) return emCache.destino;
+  const m = String(url).match(RE_PECHINCHOU);
+  const id = m && (m[1] || m[2]);
+  let destino = null;
+  try {
+    // O id do pechin.co e o mesmo da pagina de oferta; ir direto evita um salto.
+    const res = await fetch('https://pechinchou.com.br/oferta/' + id, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const bloco = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+      const promo = bloco ? JSON.parse(bloco[1])?.props?.pageProps?.promo : null;
+      // So aceita a oferta pedida (a pagina tambem lista produtos relacionados).
+      if (promo && String(promo.id) === String(id)) {
+        const link = promo.long_url || promo.short_url || '';
+        if (/^https?:\/\//i.test(link) && !/pechinchou\.com\.br|pechin\.co/i.test(link)) {
+          destino = _limparAfiliadoPechinchou(link);
+        }
+      }
+      if (!destino) console.warn('[PECHINCHOU] Oferta ' + id + ' sem link de loja na pagina.');
+    } else {
+      console.warn('[PECHINCHOU] Oferta ' + id + ' respondeu HTTP ' + res.status);
+    }
+  } catch (e) {
+    console.warn('[PECHINCHOU] Nao resolveu ' + url + ': ' + e.message);
+  }
+  if (_cacheEncurtador.size >= ENCURTADOR_CACHE_MAX) {
+    _cacheEncurtador.delete(_cacheEncurtador.keys().next().value);
+  }
+  _cacheEncurtador.set(url, { destino, em: Date.now() });
+  return destino;
+}
+
 async function expandirEncurtadores(texto) {
   const urls = String(texto || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
-  const alvos = [...new Set(urls.filter(u =>
-    ENCURTADORES_GENERICOS.test(_hostSemWww(u)) || ehEncurtadorCustom(u)))];
-  if (!alvos.length) return texto;
   let saida = texto;
+  for (const curta of [...new Set(urls.filter(ehLinkPechinchou))]) {
+    const destino = await resolverPechinchou(curta);
+    if (!destino) continue;
+    console.log('[ENCURTADOR] (pechinchou) ' + curta + ' -> ' + destino.slice(0, 140));
+    saida = saida.split(curta).join(destino);
+  }
+  const alvos = [...new Set(urls.filter(u => !ehLinkPechinchou(u) && (
+    ENCURTADORES_GENERICOS.test(_hostSemWww(u)) || ehEncurtadorCustom(u))))];
+  if (!alvos.length) return saida;
   for (const curta of alvos) {
     const generico = ENCURTADORES_GENERICOS.test(_hostSemWww(curta));
     const destino = generico

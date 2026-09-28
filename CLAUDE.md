@@ -344,6 +344,7 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 
 ### 4.9 Regras de negócio TSP / Tica Promos
 - Fontes: grupos WhatsApp + canais Telegram (GramJS). **O TSP não dispara no Telegram** (Telegram é só fonte).
+- Grupos do **Pechinchou** (ex. "🍻 Bebidas - Pechinchou 21"): o link `pechin.co/<id>` leva a `pechinchou.com.br/oferta/<id>`; `resolverPechinchou` (`server.js`) lê o link da loja em `__NEXT_DATA__ → promo.long_url`, tira a tag deles e entrega aos pipelines. `pechin.co/whatsapp` e propaganda do VIP (sem `/oferta/`) são ignorados.
 - Radares: Amazon (Creators API, rodízio de tags), Mercado Livre (OAuth2, links de perfil social, cupons), Shopee, Magalu, Awin (feed + API, cotas, roteamento por nicho).
 - **Cupom só entra numa oferta** quando citado explicitamente na oferta monitorada ou sugerido pelo usuário (bot/site) — o sistema **nunca** escolhe sozinho um cupom da base.
 - Cupons vão também para os **grupos de nicho** (não só gerais/cupons).
