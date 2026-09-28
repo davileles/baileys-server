@@ -1363,8 +1363,7 @@ async function mostrarAuto(chatId, msgId) {
       + (e.disjuntor.codigo ? ' (' + esc(e.disjuntor.codigo) + ')' : '')
       + '\nDesde: ' + esc(horaCurta(e.disjuntor.em) || e.disjuntor.em)
     : '🧩 <b>Inserção pela extensão ativa</b>' + (e.folgaHoje ? ' — hoje é dia de folga' : ''));
-  partes.push('Hoje: <b>' + e.feitasHoje + '/' + e.tetoDia + '</b> (faixa ' + e.tetoFaixa[0] + '–' + e.tetoFaixa[1] + ') · lotes de '
-    + e.lote[0] + '–' + e.lote[1] + ' · pausa ' + e.pausaMin[0] + '–' + e.pausaMin[1] + ' min · janela ' + e.janela[0] + 'h–' + e.janela[1] + 'h'
+  partes.push('Hoje: <b>' + e.feitasHoje + '</b> (trava ' + e.tetoDia + ') · agrupa ' + (e.agruparMin ?? 10) + ' min e insere a fila inteira · janela ' + e.janela[0] + 'h–' + e.janela[1] + 'h'
     + (e.dentroDaJanela ? '' : ' (fora agora)'));
   partes.push(e.extensaoConfigurada
     ? (e.extensaoPresente ? '🟢 Chrome com a extensão: em contato' + (e.extensaoContatoMin ? ' (há ' + e.extensaoContatoMin + ' min)' : '')

@@ -11,26 +11,22 @@
 // sessao logada de verdade, pagina aberta, digitacao e clique). Aqui fica so o
 // cerebro:
 //
-//   - fila: cupom capturado entra na fila e so fica ELEGIVEL depois de um
-//     atraso aleatorio (humano nao insere no segundo em que o cupom sai)
-//   - visitas: a extensao pede "o proximo lote"; o servidor entrega o que
-//     estiver elegivel (o operador, a mao, insere a lista inteira em sequencia,
-//     15–20 s por cupom) e so libera a proxima visita depois de uma pausa
-//   - janela diurna, teto diario SORTEADO por dia e dias de folga sorteados
+//   - fila (modo enxuto, 28/09/2026): cupom capturado entra na fila; quando o
+//     mais antigo completa AGRUPAR_MIN (10 min), a fila INTEIRA vai para a
+//     extensao, que insere em sequencia (~15 s por cupom, como a mao)
+//   - janela diurna e uma trava diaria alta (seguranca, nao ritmo)
 //   - disjuntor: erro de conta, pagina mudada, login caido ou respostas
 //     estranhas desligam tudo, devolvem a fila ao /inserir e avisam. So volta
 //     pelo /autoinserir (estado persistido: redeploy nao religa)
+//   - visita sem atividade por 7 min volta para a fila (a extensao retoma)
 //   - extensao ausente: cupom parado alem do limite volta ao /inserir
 //
 // Variaveis (Railway):
 //   CUPONS_ML_INSERCAO_AUTO=1          liga a fila (padrao desligada)
 //   CUPONS_ML_EXTENSAO_TOKEN=...       token que a extensao manda (obrigatorio)
-//   CUPONS_ML_AUTO_TETO_DIA=15-30      teto diario, sorteado na faixa a cada dia
+//   CUPONS_ML_AUTO_AGRUPAR_MIN=10      espera para juntar um pacote (0 = na hora)
+//   CUPONS_ML_AUTO_TETO=100            trava diaria de seguranca
 //   CUPONS_ML_AUTO_JANELA=8-23         horas (inicio inclusive, fim exclusive)
-//   CUPONS_ML_AUTO_ATRASO_MIN=2-10     minutos entre captura e elegibilidade
-//   CUPONS_ML_AUTO_LOTE=8-15           cupons por visita (quem recebe a lista insere a lista)
-//   CUPONS_ML_AUTO_PAUSA_MIN=10-40     minutos entre visitas
-//   CUPONS_ML_AUTO_FOLGA_PCT=0         % de dias sem inserir nada
 //   CUPONS_ML_AUTO_ESPERA_MAX_MIN=180  cupom parado na fila alem disso → /inserir
 //   CUPONS_ML_AUTO_SELETORES={...}     JSON que sobrepoe os seletores da pagina
 // CUPONS_ML_PAUSADO continua valendo para sync e leitura de "Meus cupons";
@@ -54,12 +50,19 @@ function faixa(txt, padrao) {
 function sortear([a, b]) { return a + Math.random() * (b - a); }
 function sortearInt([a, b]) { return Math.round(sortear([a, b])); }
 
-const TETO_DIA = faixa(process.env.CUPONS_ML_AUTO_TETO_DIA, [15, 30]);
+// 28/09/2026 — modo ENXUTO (decisao do Davi): o cupom entra na fila e, no
+// maximo AGRUPAR_MIN depois, a fila INTEIRA e inserida em sequencia, no ritmo
+// de quem insere a mao. Sem lote sorteado, sem pausa longa entre visitas, sem
+// teto sorteado e sem dia de folga. As variaveis antigas
+// (CUPONS_ML_AUTO_{TETO_DIA,ATRASO_MIN,LOTE,PAUSA_MIN,FOLGA_PCT}) sao ignoradas.
+const AGRUPAR_MIN = Math.max(0, Number(process.env.CUPONS_ML_AUTO_AGRUPAR_MIN ?? 10) || 0);
+const TETO_FIXO = Math.max(1, Number(process.env.CUPONS_ML_AUTO_TETO) || 100);   // trava de seguranca, nao ritmo
+const TETO_DIA = [TETO_FIXO, TETO_FIXO];
 const [JANELA_INI, JANELA_FIM] = faixa(process.env.CUPONS_ML_AUTO_JANELA, [8, 23]);
-const ATRASO_MIN = faixa(process.env.CUPONS_ML_AUTO_ATRASO_MIN, [2, 10]);
-const LOTE = faixa(process.env.CUPONS_ML_AUTO_LOTE, [8, 15]);
-const PAUSA_MIN = faixa(process.env.CUPONS_ML_AUTO_PAUSA_MIN, [10, 40]);
-const FOLGA_PCT = Math.max(0, Math.min(100, Number(process.env.CUPONS_ML_AUTO_FOLGA_PCT ?? 0) || 0));
+const LOTE_MAX = 40;
+const LOTE = [1, LOTE_MAX];
+const PAUSA_MIN = [1, 1];        // so um respiro entre uma visita e a proxima
+const FOLGA_PCT = 0;
 const ESPERA_MAX_MS = Math.max(30, Number(process.env.CUPONS_ML_AUTO_ESPERA_MAX_MIN) || 180) * 60000;
 
 // Seletores da pagina de cupons do ML (lidos em 27/09/2026). Vao para a
@@ -85,12 +88,12 @@ function seletores() {
 }
 // Tempos que a extensao usa dentro da visita (segundos / ms). Sorteados la.
 const TEMPOS = {
-  antesDoPrimeiroS: [2, 5],      // pagina aberta → primeiro cupom
-  entreCuponsS: [12, 35],        // entre um cupom e o outro, na mesma aba (ritmo do operador a mao)
-  digitacaoMs: [80, 250],        // por caractere
-  pausaDigitacaoMs: [300, 900],  // pausa maior ocasional entre caracteres
-  aposClicarS: [2, 6],           // espera a resposta antes de ler o resultado
-  antesDeFecharS: [2, 8],        // fica um pouco na pagina antes de fechar a aba
+  antesDoPrimeiroS: [1, 3],      // pagina aberta → primeiro cupom
+  entreCuponsS: [4, 9],          // entre um cupom e o outro (~15 s por cupom no total, como a mao)
+  digitacaoMs: [60, 160],        // por caractere
+  pausaDigitacaoMs: [200, 500],  // pausa maior ocasional entre caracteres
+  aposClicarS: [1, 3],           // espera a resposta antes de ler o resultado
+  antesDeFecharS: [1, 3],        // fica um pouco na pagina antes de fechar a aba
 };
 
 // Valores de insercaoMl usados aqui. O /inserir do bot lista null, MANUAL e
@@ -103,7 +106,7 @@ const FALHAS_MAX = 3;                      // erros seguidos da extensao que abr
 const PROBLEMAS_MAX = 2;                   // "Tivemos um problema" seguidos = conta restrita
 const INVALIDOS_SEGUIDOS_MAX = 3;          // "nao existe" em serie = canal suspeito
 const CANAL_OK_VALIDADE_MS = 24 * 60 * 60 * 1000;
-const VISITA_EXPIRA_MS = 25 * 60000;       // lote entregue sem resultado: volta para a fila
+const VISITA_EXPIRA_MS = 7 * 60000;        // visita SEM ATIVIDADE ha tanto: lote volta para a fila
 const EXTENSAO_AUSENTE_MS = 30 * 60000;    // sem contato ha tanto = extensao fora do ar
 const RE_CODIGO = /^[A-Za-z0-9._-]{2,23}$/;  // 23 = maxlength do campo do ML
 const VEREDITOS = new Set(['inserido', 'ja_tinha', 'esgotado', 'vencido', 'inexistente', 'problema', 'sem_login', 'pagina_mudou', 'erro']);
@@ -183,7 +186,11 @@ function virarDia() {
   const { dia } = agoraBr();
   // Estado gravado pela versao anterior (sem tetoHoje) ja trazia o dia de hoje:
   // sem esta guarda o teto ficava 0 e nada entrava na fila.
-  if (estado.dia === dia && estado.tetoHoje > 0) return;
+  if (estado.dia === dia && estado.tetoHoje > 0) {
+    // Estado de hoje veio do modo antigo (teto sorteado 15–30): vale a trava nova.
+    if (estado.tetoHoje !== TETO_FIXO || estado.folgaHoje) { estado.tetoHoje = TETO_FIXO; estado.folgaHoje = false; salvar(); }
+    return;
+  }
   estado.dia = dia;
   estado.feitasHoje = 0;
   estado.tetoHoje = sortearInt(TETO_DIA);
@@ -218,10 +225,14 @@ function devolverFilaAoManual() {
   return itens.length;
 }
 /** Cupom novo na fila: marca a entrada e sorteia o atraso ate ficar elegivel. */
-function agendarLiberacao(chave) {
+function agendarLiberacao(chave, { ja = false } = {}) {
   const agora = Date.now();
   if (!estado.entrouEm[chave]) estado.entrouEm[chave] = agora;
-  if (!estado.liberaEm[chave]) estado.liberaEm[chave] = agora + Math.round(sortear(ATRASO_MIN) * 60000);
+  if (!estado.liberaEm[chave]) estado.liberaEm[chave] = ja ? agora : agora + Math.round(AGRUPAR_MIN * 60000);
+}
+/** Ultima atividade da visita (entrega ou resultado): a expiracao conta daqui. */
+function visitaParada(agora = Date.now()) {
+  return !!estado.visita && agora - (estado.visita.ativoEm || estado.visita.iniciadaEm) > VISITA_EXPIRA_MS;
 }
 /** Limpa os mapas de cupons que ja sairam da fila. */
 function podarLiberaEm() {
@@ -236,8 +247,7 @@ function tetoAtingido() { virarDia(); return estado.feitasHoje >= estado.tetoHoj
 // ── RITMO ────────────────────────────────────────────────────────────────────
 /** Proxima visita: pausa longa aleatoria; de manha a pausa e 50% maior. */
 function sortearProximaVisita(agora = Date.now()) {
-  let min = sortear(PAUSA_MIN);
-  if (agoraBr(agora).hora < 12) min *= 1.5;
+  const min = sortear(PAUSA_MIN);
   estado.proximaVisitaEm = agora + Math.round(min * 60000);
   salvar();
 }
@@ -282,9 +292,9 @@ async function vigiar() {
   const agora = Date.now();
 
   // Lote entregue e nunca concluido (Chrome fechou no meio): volta para a fila.
-  if (estado.visita && agora - estado.visita.iniciadaEm > VISITA_EXPIRA_MS) {
+  if (visitaParada(agora)) {
     for (const r of emVisita()) marcar(r, { insercaoMl: FILA });
-    console.warn('[CUPONS-ML-AUTO] Visita ' + estado.visita.id + ' expirou sem resultado; lote devolvido a fila.');
+    console.warn('[CUPONS-ML-AUTO] Visita ' + estado.visita.id + ' parada ha mais de ' + (VISITA_EXPIRA_MS / 60000) + ' min; lote devolvido a fila.');
     estado.visita = null;
     sortearProximaVisita(agora);
   }
@@ -348,7 +358,7 @@ export function proximoLoteInsercaoMl({ espiar = false } = {}) {
   if (!dentroDaJanela(agora)) { salvar(); return { ...base, motivo: 'fora_da_janela', aguardar: msAteJanela(agora) + Math.round(Math.random() * 15 * 60000) }; }
 
   if (estado.visita) {
-    if (agora - estado.visita.iniciadaEm <= VISITA_EXPIRA_MS) { salvar(); return { ...base, motivo: 'visita_em_andamento', visitaId: estado.visita.id, aguardar: 3 * 60000 }; }
+    if (!visitaParada(agora)) { salvar(); return { ...base, motivo: 'visita_em_andamento', visitaId: estado.visita.id, aguardar: 60000 }; }
     for (const r of emVisita()) marcar(r, { insercaoMl: FILA });
     estado.visita = null;
   }
@@ -380,14 +390,16 @@ export function proximoLoteInsercaoMl({ espiar = false } = {}) {
       aguardar: fila.length ? Math.max(60000, proxima - agora) : 5 * 60000 };
   }
   const vagas = Math.max(0, estado.tetoHoje - estado.feitasHoje);
-  const tamanho = Math.max(1, Math.min(sortearInt(LOTE), vagas, eleg.length));
-  const lote = eleg.slice(0, tamanho);
+  // Basta UM cupom vencer o agrupamento para a fila INTEIRA sair junto.
+  const todos = naFila();
+  const tamanho = Math.max(1, Math.min(LOTE_MAX, vagas, todos.length));
+  const lote = todos.slice(0, tamanho);
   if (espiar) { salvar(); return { ...base, motivo: 'pronto', espiar: true, lote: lote.map(r => ({ chave: r.chave, codigo: String(r.codigo).trim().toUpperCase() })) }; }
 
   const id = randomBytes(6).toString('hex');
   const chaves = [];
   for (const r of lote) if (marcar(r, { insercaoMl: VISITA })) chaves.push(r.chave);
-  estado.visita = { id, chaves, iniciadaEm: agora };
+  estado.visita = { id, chaves, iniciadaEm: agora, ativoEm: agora };
   salvar();
   console.log('[CUPONS-ML-AUTO] Visita ' + id + ' entregue a extensao: ' + lote.map(r => r.codigo).join(', '));
   return { ...base, motivo: 'pronto', visitaId: id,
@@ -406,6 +418,7 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   if (!VEREDITOS.has(veredito)) { salvar(); return { ok: false, erro: 'veredito inválido' }; }
   const reg = (dep.listarCuponsBase() || []).find(r => r.chave === chave);
   if (!reg || !estado.visita.chaves.includes(chave)) { salvar(); return { ok: false, erro: 'cupom não pertence a esta visita' }; }
+  estado.visita.ativoEm = Date.now();
   const codigo = String(reg.codigo || '').toUpperCase();
   const msg = String(mensagem || '').slice(0, 160);
   const st = Number(status) || 0;
@@ -522,7 +535,7 @@ export function enfileirarInsercaoMl(reg) {
  * nunca passou por decisao nenhuma; ao religar, adota tambem o que o teto, a
  * folga ou o disjuntor devolveram. CONFERIR nunca e adotado.
  */
-function adotarPendentes({ incluirDevolvidos = false } = {}) {
+function adotarPendentes({ incluirDevolvidos = false, ja = false } = {}) {
   if (!podeRodar()) return 0;
   virarDia();
   if (estado.folgaHoje) return 0;
@@ -531,7 +544,7 @@ function adotarPendentes({ incluirDevolvidos = false } = {}) {
   const adotavel = x => !x.insercaoMl || (incluirDevolvidos && x.insercaoMl === MANUAL);
   const candidatos = inseriveis().filter(adotavel).sort(porValidade);
   for (const r of candidatos.slice(0, vagas)) {
-    if (marcar(r, { insercaoMl: FILA })) { agendarLiberacao(r.chave); n++; }
+    if (marcar(r, { insercaoMl: FILA })) { agendarLiberacao(r.chave, { ja }); n++; }
   }
   salvar();
   return n;
@@ -551,7 +564,7 @@ export function estadoInsercaoMlAuto() {
     folgaHoje: !!estado.folgaHoje,
     janela: [JANELA_INI, JANELA_FIM],
     dentroDaJanela: dentroDaJanela(agora),
-    lote: LOTE, pausaMin: PAUSA_MIN, atrasoMin: ATRASO_MIN,
+    lote: LOTE, pausaMin: PAUSA_MIN, agruparMin: AGRUPAR_MIN,
     naFila: dep ? naFila().map(r => r.codigo) : [],
     emVisita: dep ? emVisita().map(r => r.codigo) : [],
     visita: estado.visita,
@@ -571,7 +584,9 @@ export async function religarInsercaoMlAuto() {
   estado.folgaHoje = false;   // religar a mao vale mais que o sorteio
   estado.proximaVisitaEm = 0;
   salvar();
-  const adotados = adotarPendentes({ incluirDevolvidos: true });
+  // Religar a mao = inserir ja: o que estava no /inserir sai na proxima consulta.
+  for (const r of naFila()) estado.liberaEm[r.chave] = Math.min(estado.liberaEm[r.chave] || Infinity, Date.now());
+  const adotados = adotarPendentes({ incluirDevolvidos: true, ja: true });
   console.log('[CUPONS-ML-AUTO] Religada pelo operador; ' + adotados + ' cupom(ns) adotados do /inserir.');
   return { ok: true, adotados };
 }
@@ -611,8 +626,8 @@ export function iniciarInsercaoMlAuto(deps) {
     // Redeploy no meio de uma visita: o lote volta para a fila.
     if (estado.visita) { for (const r of emVisita()) marcar(r, { insercaoMl: FILA }); estado.visita = null; }
     const adotados = adotarPendentes();
-    console.log('[CUPONS-ML-AUTO] Ligada (extensão): teto ' + estado.tetoHoje + ' hoje (faixa ' + TETO_DIA.join('–') + '), lote ' + LOTE.join('–')
-      + ', pausa ' + PAUSA_MIN.join('–') + ' min, janela ' + JANELA_INI + 'h–' + JANELA_FIM + 'h. Hoje: ' + estado.feitasHoje + '. Adotados: ' + adotados + '.');
+    console.log('[CUPONS-ML-AUTO] Ligada (extensão, modo enxuto): agrupa ' + AGRUPAR_MIN + ' min e insere a fila inteira; trava ' + TETO_FIXO
+      + '/dia, janela ' + JANELA_INI + 'h–' + JANELA_FIM + 'h. Hoje: ' + estado.feitasHoje + '. Adotados: ' + adotados + '.');
   }
   if (_vigia) clearInterval(_vigia);
   _vigia = setInterval(() => vigiar().catch(e => console.error('[CUPONS-ML-AUTO] Erro no vigia:', e.message)), 5 * 60000);
