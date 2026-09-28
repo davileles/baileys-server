@@ -169,6 +169,7 @@ function tecladoEdicao(o) {
   const bt = (k) => [CAMPOS[k] + (d[k] ? '' : ' ⚠️'), 'p:campo:' + k + ':' + id];
   const linhas = [];
   for (let i = 0; i < lista.length; i += 2) linhas.push(lista.slice(i, i + 2).map(bt));
+  linhas.push([['🔁 Inverter origem ⇄ destino', 'p:inverter:' + id]]);
   linhas.push([[pag ? '🎟️ Virar emissão com milhas' : '💵 Virar tarifa pagante',
                 'p:tarifa:' + (pag ? 'milhas' : 'pagante') + ':' + id]]);
   linhas.push([['↩️ Voltar ao card', 'p:ver:' + id]]);
@@ -395,6 +396,23 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
     const atual = await apiLocal('GET', '/cdv/oferta/' + id);
     if (!atual.ok) return encerrarCard(chatId, msgId, '⚠️ #' + e(id) + ' saiu da fila enquanto você editava.');
     return bot.falarHtml(chatId, telaEdicao(atual.oferta), tecladoEdicao(atual.oferta), msgId);
+  }
+
+  // Inverter o sentido: origem <-> destino e, junto, datas de ida <-> volta —
+  // a ida do trecho invertido e a antiga volta. Trecho so de ida (sem datas de
+  // volta) mantem as datas onde estao: inverter as deixaria sem ida.
+  // Vai numa unica chamada para a mensagem ser remontada uma vez so.
+  if (acao === 'inverter') {
+    const d = o.dados || {};
+    const dados = { origem: d.destino || '', destino: d.origem || '' };
+    if (String(d.datasVolta || '').trim()) {
+      dados.datasIda = d.datasVolta || '';
+      dados.datasVolta = d.datasIda || '';
+    }
+    sessoes.delete(String(chatId));
+    return aplicarDados(chatId, msgId, id, dados,
+      '🔁 Invertido: ' + (dados.origem || '?') + ' → ' + (dados.destino || '?')
+      + (dados.datasIda !== undefined ? ' (datas de ida e volta trocadas)' : ''));
   }
 
   if (acao === 'campo') {
