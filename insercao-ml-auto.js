@@ -69,9 +69,12 @@ const SELETORES_PADRAO = {
   url: 'https://www.mercadolivre.com.br/cupons',
   abrir: '.input-code-modal__action-button',        // botao "Inserir codigo"
   campo: '#inputcode-textfield-with-link',          // input do modal (maxlength 23)
-  botao: '.andes-modal__scroll button.andes-button--loud',  // "Inserir" (desabilitado ate digitar)
-  fechar: '.andes-modal__close-button',
-  modal: '.andes-modal__scroll',
+  // 28/09/2026: o ML esta migrando o Andes para o prefixo andes-ui-* (o botao
+  // antigo sumiu). Listas com as duas geracoes + [role=dialog]: querySelector
+  // pega o primeiro que existir.
+  botao: '.andes-modal__scroll button.andes-button--loud, .andes-ui-modal button.andes-ui-button--loud, [role=dialog] button.andes-ui-button--loud, [role=dialog] button.andes-button--loud',  // "Inserir" (desabilitado ate digitar)
+  fechar: '.andes-modal__close-button, .andes-ui-modal__close-button, [role=dialog] button[aria-label*="echar"]',
+  modal: '.andes-modal__scroll, .andes-ui-modal__scroll, .andes-ui-modal, [role=dialog]',
   apiInputCode: '/cupons/api/input-code',           // a resposta e o veredito confiavel
 };
 function seletores() {
