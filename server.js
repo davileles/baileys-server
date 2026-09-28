@@ -18593,6 +18593,7 @@ app.post('/cupons/sync-ml', async (req, res) => {
 // (CUPONS_ML_EXTENSAO_TOKEN, header X-Extensao-Token): as rotas /cupons/* sao
 // publicas por heranca, e estas devolvem codigos e alteram a base.
 function exigirExtensaoMl(req, res) {
+  res.set('Cache-Control', 'no-store');
   if (!extensaoMlConfigurada()) { res.status(503).json({ ok: false, erro: 'CUPONS_ML_EXTENSAO_TOKEN não configurado no Railway' }); return false; }
   if (!tokenExtensaoMlOk(req.headers['x-extensao-token'])) { res.status(401).json({ ok: false, erro: 'token da extensão inválido' }); return false; }
   return true;

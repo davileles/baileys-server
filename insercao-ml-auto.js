@@ -234,6 +234,21 @@ function agendarLiberacao(chave, { ja = false } = {}) {
 function visitaParada(agora = Date.now()) {
   return !!estado.visita && agora - (estado.visita.ativoEm || estado.visita.iniciadaEm) > VISITA_EXPIRA_MS;
 }
+/**
+ * Cupom marcado "em visita" sem visita ativa que o contenha (redeploy no meio
+ * da visita com a base ainda chegando do GitHub, 28/09/2026): volta para a
+ * fila, liberado na hora. Sem isto ele ficava invisivel para sempre.
+ */
+function resgatarOrfaos() {
+  const ativas = new Set(estado.visita ? estado.visita.chaves : []);
+  let n = 0;
+  for (const r of emVisita()) {
+    if (ativas.has(r.chave)) continue;
+    if (marcar(r, { insercaoMl: FILA })) { estado.liberaEm[r.chave] = Date.now(); if (!estado.entrouEm[r.chave]) estado.entrouEm[r.chave] = Date.now(); n++; }
+  }
+  if (n) console.log('[CUPONS-ML-AUTO] ' + n + ' cupom(ns) presos "em visita" voltaram para a fila.');
+  return n;
+}
 /** Limpa os mapas de cupons que ja sairam da fila. */
 function podarLiberaEm() {
   const vivas = new Set(naFila().map(r => r.chave));
@@ -316,6 +331,7 @@ async function vigiar() {
       }
     }
   }
+  resgatarOrfaos();
   adotarPendentes();
   podarLiberaEm();
   salvar();
@@ -341,7 +357,8 @@ export function extensaoMlConfigurada() { return !!String(process.env.CUPONS_ML_
 export function proximoLoteInsercaoMl({ espiar = false } = {}) {
   const agora = Date.now();
   estado.ultimoContatoExt = agora;
-  const base = { ok: true, lote: [], visitaId: null, seletores: seletores(), tempos: TEMPOS };
+  // "agora" muda a cada resposta: o navegador nunca recebe 304 com um lote velho.
+  const base = { ok: true, lote: [], visitaId: null, seletores: seletores(), tempos: TEMPOS, agora };
   if (!LIGADA) { salvar(); return { ...base, ok: false, motivo: 'desligada', aguardar: 30 * 60000 }; }
   if (estado.disjuntor) { salvar(); return { ...base, ok: false, motivo: 'disjuntor', disjuntor: estado.disjuntor, aguardar: 30 * 60000 }; }
   virarDia();
@@ -380,6 +397,7 @@ export function proximoLoteInsercaoMl({ espiar = false } = {}) {
 
   // A base de cupons chega do GitHub depois do boot: adotar so no boot deixava
   // a fila vazia. Adota aqui o que nunca passou por decisao (cupom novo, valido).
+  resgatarOrfaos();
   adotarPendentes();
   const eleg = elegiveis(agora);
   if (!eleg.length) {
