@@ -1114,7 +1114,7 @@ function haContaDeDisparo() {
   if (conectado && sock) return true;
   if (WA_ENVIO_CONTAS.has('principal') && waEnvioContaConectada('principal')) return true;
   for (const id of contasExtras.keys()) {
-    if (tenantDaConta(id) === TENANT_PADRAO && contaDisponivel(id)) return true;
+    if (tenantDaConta(id) === TENANT_PADRAO && !ehContaCampanha(id) && contaDisponivel(id)) return true;
   }
   return false;
 }
@@ -1642,6 +1642,16 @@ function apelidoDaConta(id) {
   return m ? m[2] : String(id || '');
 }
 function contaIdReq(req) { return contaIdDe(req.tenantId, String(req.params.id || '').trim()); }
+// ── CONTA EXCLUSIVA DE CAMPANHA ──────────────────────────────────────────────
+// Numero pareado com apelido 'camp-*' (ex.: 'camp-davi', o numero pessoal que a
+// base ja tem salvo) so envia campanha de DM. Fica FORA de toda escolha
+// automatica: substituta de disparo em grupo, reserva de leitura, "ha conta de
+// disparo" e executor de acao de admin. Sem isso, por ser admin dos grupos, ele
+// viraria remetente de oferta quando um tico caisse.
+const RE_CONTA_CAMPANHA = /^camp-/i;
+function ehContaCampanha(id) {
+  return tenantDaConta(id) === TENANT_PADRAO && RE_CONTA_CAMPANHA.test(apelidoDaConta(id));
+}
 // Primeira conta conectada de um operador — o "numero dele" para envio.
 function contaConectadaDoTenant(tenantId) {
   for (const c of contasExtras.values()) {
@@ -1785,6 +1795,9 @@ async function conectarConta(id) {
       registrarPulsoLeitor(id);
       const ctx = { contaId: id, sock: c.sock };
       for (const msg of (messages || [])) {
+        // Conta de campanha: resposta de contato na conversa direta marca
+        // 'respondido' (cancela o follow-up). So o hook — nada de pipeline extra.
+        if (ehContaCampanha(id)) campanhaMarcarResposta(msg).catch(() => {});
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
         if (!msg.message) continue;
@@ -2340,6 +2353,7 @@ async function enviarPorContaSubstituta(contaOriginal, destino, conteudo, motivo
   const candidatas = [...contasExtras.keys()]
     .filter(id => id !== contaOriginal
       && tenantDaConta(id) === TENANT_PADRAO
+      && !ehContaCampanha(id)
       && contaDisponivel(id))
     .sort((a, b) => apelidoDaConta(a).localeCompare(apelidoDaConta(b)));
   const nome = NOMES_GRUPOS.get(destino) || destino;
@@ -2522,16 +2536,19 @@ async function avisarAdminsCdv(texto) {
 // sem contato vinculado, a mensagem trava em "Aguardando mensagem" com um
 // unico check e nunca chega ao aparelho do destinatario. onWhatsApp() devolve
 // o JID que o servidor de fato reconhece — e so ele vale para sendMessage.
-async function resolverJidWhatsApp(telefone, fallback) {
+async function resolverJidWhatsApp(telefone, fallback, sockUso) {
   const digitos = String(telefone || '').replace(/\D/g, '');
   const reserva = fallback || (digitos ? digitos + '@s.whatsapp.net' : null);
   if (!digitos) return { jid: reserva, existe: false };
-  if (!conectado || !sock) {
+  // sockUso: conta que vai ENVIAR (ex.: campanha pelo numero camp-*). Consultar
+  // pela propria conta evita depender da principal estar no ar.
+  const s = sockUso || null;
+  if (!s && (!conectado || !sock)) {
     const ok = await aguardarSock(20000);
     if (!ok) throw new Error('WhatsApp nao conectado para resolver o JID.');
   }
   let r;
-  try { r = await sock.onWhatsApp(digitos); }
+  try { r = await (s || sock).onWhatsApp(digitos); }
   catch (e) { throw new Error('onWhatsApp falhou: ' + e.message); }
   const achado = Array.isArray(r) ? r.find(x => x && x.exists && x.jid) : null;
   if (achado) return { jid: achado.jid, existe: true };
@@ -7429,6 +7446,7 @@ function leituraEmReserva(jid) {
 function _contaPodeSerReservaLeitura(contaId) {
   if (!contaId || contaId === 'principal' || contaId === WM_LEITOR) return false;
   if (tenantDaConta(contaId) !== TENANT_PADRAO) return false;
+  if (ehContaCampanha(contaId)) return false;
   return _leitorVivo(contaId);
 }
 
@@ -11553,6 +11571,22 @@ async function campMidia(arquivo) {
   return _campMidiaCache.get(arquivo);
 }
 
+// Numero que envia a campanha. Vazio/'principal' = principal (comportamento
+// antigo). Qualquer outro apelido precisa ser conta exclusiva 'camp-*': uma
+// conta de disparo de grupo (tico) nao pode virar remetente de DM em massa.
+const CAMP_TETO_PRINCIPAL = 25;    // mesma trava do gestor
+const CAMP_TETO_CONTA     = 300;   // numero camp-* (base que ja tem o numero salvo)
+function campContaEnvio(cfg) {
+  const ap = String((cfg && cfg.conta) || '').trim().toLowerCase();
+  if (!ap || ap === 'principal') return null;
+  return contaIdDe(TENANT_PADRAO, ap);
+}
+function campTetoDiario(cfg) {
+  const pedido = (cfg && cfg.limiteDiario) || 15;
+  return Math.min(pedido, campContaEnvio(cfg) ? CAMP_TETO_CONTA : CAMP_TETO_PRINCIPAL);
+}
+let _campAvisoContaEm = 0;
+
 async function campPatchContato(campanhaId, contatoId, patch) {
   try {
     await campApi('/campanhas/contato', 'POST', { campanhaId, contatoId, patch });
@@ -11571,8 +11605,10 @@ async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
   // de verificarNumeroAntes: aquele flag decide se numero inexistente aborta,
   // nao se o JID deve ser confiavel.
   let jidDestino = ct.jid;
+  const contaEnvio = campContaEnvio(cfg);
+  const sockConta  = contaEnvio ? (contasExtras.get(contaEnvio) || {}).sock : null;
   {
-    const alvo = await resolverJidWhatsApp(ct.telefone, ct.jid);
+    const alvo = await resolverJidWhatsApp(ct.telefone, ct.jid, sockConta || undefined);
     if (!alvo.existe && cfg.verificarNumeroAntes !== false) {
       await campPatchContato(camp.id, ct.id, { status: 'erro', erro: 'numero sem WhatsApp' });
       CAMP_LOG('✗ ' + ct.nome + ' — numero sem WhatsApp.');
@@ -11602,8 +11638,14 @@ async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
       if (!txt) continue;
       conteudo = { text: txt };
     }
-    // Passa pela mesma cadeia da fila de ofertas: nunca dois envios ao mesmo tempo
-    await saidaSerializada(() => enviarMensagem(jidDestino, conteudo));
+    if (contaEnvio) {
+      // Numero proprio da campanha: sai SO por ele — nunca cai na principal
+      // (a pessoa receberia de um numero que nao tem salvo).
+      await enviarPelaConta(contaEnvio, jidDestino, conteudo);
+    } else {
+      // Passa pela mesma cadeia da fila de ofertas: nunca dois envios ao mesmo tempo
+      await saidaSerializada(() => enviarMensagem(jidDestino, conteudo));
+    }
     if (i < blocos.length - 1) {
       await new Promise(r => setTimeout(r, campAleatorio(dMin * 1000, dMax * 1000)));
     }
@@ -11614,7 +11656,7 @@ async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
     ? { followupEm: agora }
     : { status: 'enviado', enviadoEm: agora, erro: null, tentativasEnvio: (ct.tentativasEnvio || 0) + 1 });
 
-  ultimoEnvioMs = Date.now();       // a fila de ofertas respeita o mesmo espacamento
+  if (!contaEnvio) ultimoEnvioMs = Date.now();   // a fila de ofertas respeita o mesmo espacamento (so na principal)
   _campUltimoEnvioMs = Date.now();
   CAMP_LOG((ehFollowup ? '↻ follow-up' : '✓ enviado') + ' — ' + ct.nome);
   return { enviado: true, contabiliza: true };
@@ -11662,7 +11704,23 @@ async function campanhaCiclo() {
     if (!campDentroDaJanela(cfg)) return;
 
     const hoje = campEnviosHoje(camp);
-    if (hoje >= (cfg.limiteDiario || 15)) return;
+    if (hoje >= campTetoDiario(cfg)) return;
+
+    const contaEnvio = campContaEnvio(cfg);
+    if (contaEnvio) {
+      // Conta inexistente, fora do padrao camp-* ou desconectada: espera, sem
+      // gastar contato como erro e sem cair na principal.
+      const motivo = !ehContaCampanha(contaEnvio) ? 'nao e conta de campanha (apelido deve comecar com camp-)'
+        : !contasExtras.has(contaEnvio) ? 'nao esta pareada'
+        : !contaDisponivel(contaEnvio) ? 'desconectada' : null;
+      if (motivo) {
+        if (Date.now() - _campAvisoContaEm > 30 * 60000) {
+          _campAvisoContaEm = Date.now();
+          CAMP_LOG('Aguardando numero "' + apelidoDaConta(contaEnvio) + '": ' + motivo + '.');
+        }
+        return;
+      }
+    }
 
     // Intervalo aleatorio, sorteado uma vez por envio — cadencia regular e padrao detectavel
     if (!_campIntervaloAlvo) {
@@ -11672,7 +11730,8 @@ async function campanhaCiclo() {
     }
     if (_campUltimoEnvioMs && Date.now() - _campUltimoEnvioMs < _campIntervaloAlvo) return;
     // A fila de ofertas tambem conta: se uma oferta acabou de sair, espera
-    if (ultimoEnvioMs && Date.now() - ultimoEnvioMs < _campIntervaloAlvo) return;
+    // (so quando a campanha divide a principal com ela)
+    if (!contaEnvio && ultimoEnvioMs && Date.now() - ultimoEnvioMs < _campIntervaloAlvo) return;
 
     const alvo = campProximoAlvo(camp);
     if (!alvo) {
@@ -11683,8 +11742,10 @@ async function campanhaCiclo() {
       return;
     }
 
-    try { await aguardarConectado(120000); }
-    catch (e) { CAMP_LOG('Sem conexao:', e.message); return; }
+    if (!contaEnvio) {
+      try { await aguardarConectado(120000); }
+      catch (e) { CAMP_LOG('Sem conexao:', e.message); return; }
+    }
 
     try {
       const r = await campEnviarContato(camp, alvo.ct, alvo.mensagem, alvo.followup);
@@ -11724,12 +11785,19 @@ async function campanhaCiclo() {
 // ── Hook de resposta (chamado do messages.upsert) ────────────────────────────
 async function campanhaMarcarResposta(msg) {
   if (!CAMPANHAS_KEY) return;
-  const jid = msg?.key?.remoteJid;
-  if (!jid || msg.key.fromMe || jid.endsWith('@g.us')) return;
-  const ref = _campJids.get(jid);
+  const k = msg?.key || {};
+  const jid = k.remoteJid;
+  if (!jid || k.fromMe || jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
+  // Conversa por LID: o telefone vem em remoteJidAlt/senderPn. Sem conferir
+  // os dois, a resposta passava batida e o contato ainda levava follow-up.
+  let ref = null, jidRef = null;
+  for (const v of [jid, k.remoteJidAlt, k.senderPn]) {
+    const j = String(v || '').replace(/:\d+@/, '@');
+    if (j && _campJids.has(j)) { ref = _campJids.get(j); jidRef = j; break; }
+  }
   if (!ref) return;
-  _campJids.delete(jid);   // uma vez so: as proximas mensagens dele nao reescrevem
-  CAMP_LOG('↩ resposta de ' + jid.split('@')[0] + ' — follow-up cancelado.');
+  _campJids.delete(jidRef);   // uma vez so: as proximas mensagens dele nao reescrevem
+  CAMP_LOG('↩ resposta de ' + jidRef.split('@')[0] + ' — follow-up cancelado.');
   await campPatchContato(ref.campanhaId, ref.contatoId, {
     status: 'respondido', respondidoEm: new Date().toISOString() });
 }
@@ -11782,7 +11850,10 @@ app.get('/campanha/status', async (req, res) => {
       ativa: { id: campanha.id, nome: campanha.nome },
       contadores: por,
       enviosHoje: campEnviosHoje(campanha),
-      limiteDiario: (campanha.config || {}).limiteDiario || null,
+      limiteDiario: campTetoDiario(campanha.config || {}),
+      conta: apelidoDaConta(campContaEnvio(campanha.config || {}) || 'principal'),
+      contaConectada: campContaEnvio(campanha.config || {})
+        ? contaDisponivel(campContaEnvio(campanha.config || {})) : !!conectado,
       dentroDaJanela: campDentroDaJanela(campanha.config || {}),
       pausaLongaAte: _campPausaAte > Date.now() ? new Date(_campPausaAte).toISOString() : null,
       errosSeguidos: _campErrosSeguidos,
@@ -12432,6 +12503,7 @@ function _gaCandidatosExecutor(tenantId, idAlvo) {
   for (const c of contasExtras.values()) {
     if (tenantDaConta(c.id) !== tenantId) continue;
     if (c.id === idAlvo || !c.conectado || !c.sock) continue;
+    if (ehContaCampanha(c.id)) continue;
     lista.push({ id: apelidoDaConta(c.id), sock: c.sock });
   }
   return lista;
