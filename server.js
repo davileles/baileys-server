@@ -1536,8 +1536,8 @@ function requeueAprovadas(motivo = 'após restart') {
 }
 const bufferAgrupamento = new Map();
 
-// ── FILA DE ENVIO CDV (intervalo de 5 min, janela 08h–21h, fuso SP) ──────────
-const INTERVALO_ENVIO_MS = 10 * 60 * 1000;
+// ── FILA DE ENVIO CDV (intervalo de 9 min, janela 08h–21h, fuso SP) ──────────
+const INTERVALO_ENVIO_MS = 9 * 60 * 1000;
 // Teto de tentativas por item. Sem isto, um item que falha sempre (grupo
 // invalido, mensagem rejeitada) fica na CABECA da fila em retry eterno e
 // bloqueia todas as ofertas atras dele — a fila inteira para de andar.
@@ -2585,7 +2585,7 @@ function saidasEmVoo() { return _saidasEmVoo; }
 // nao: a mensagem aparece no grupo assinado por um numero que nao e o da
 // operacao, e o assinante ve.
 //
-// Aqui a fila espera. Ela ja guarda 10 min entre itens (INTERVALO_ENVIO_MS),
+// Aqui a fila espera. Ela ja guarda 9 min entre itens (INTERVALO_ENVIO_MS),
 // entao segurar alguns minutos pelo numero certo nao atrasa a operacao na
 // pratica. Passado o teto, segue com o fallback antigo — nao sair continua
 // sendo pior do que sair pelo numero errado.
@@ -14011,7 +14011,7 @@ app.get('/fila-envio', (req, res) => {
       previsaoHorario: prev.horario,
       // true = o worker ja esta publicando este item; nao pode ser reordenado.
       enviando:        !!item._enviando,
-      // true = marcado para "Disparar agora" (fura o intervalo de 10 min).
+      // true = marcado para "Disparar agora" (fura o intervalo de 9 min).
       agora:           !!item._agora,
     };
   });
@@ -14055,7 +14055,7 @@ app.post('/fila-envio/ordem', (req, res) => {
 });
 
 // "Disparar agora": leva o item para o topo (atras apenas do que ja esta sendo
-// publicado) e fura o intervalo de 10 min entre envios. A janela 08h–21h SP
+// publicado) e fura o intervalo de 9 min entre envios. A janela 08h–21h SP
 // continua valendo — fora dela o item fica no topo e sai na abertura.
 app.post('/fila-envio/disparar/:ofertaId', (req, res) => {
   const id  = String(req.params.ofertaId);
@@ -15358,7 +15358,7 @@ app.post('/injetar', async (req, res) => {
 });
 
 app.post('/enviar', async (req, res) => {
-  // direto:true → pula a fila de envio (intervalo de 10 min / janela 8h-21h SP).
+  // direto:true → pula a fila de envio (intervalo de 9 min / janela 8h-21h SP).
   // Usado por mensagens unicas e datadas, como o resumo diario das 20h.
   // preview: { link, titulo, descricao, imagemUrl } — opcional. Existe para a
   // mensagem montada a mao no gerador sair com o mesmo card de link das ofertas
