@@ -105,6 +105,7 @@ const CONFERIR = 'conferir';               // resposta ambigua: operador confere
 const FALHAS_MAX = 3;                      // erros seguidos da extensao que abrem o disjuntor
 const PROBLEMAS_MAX = 2;                   // "Tivemos um problema" seguidos = conta restrita
 const INVALIDOS_SEGUIDOS_MAX = 3;          // "nao existe" em serie = canal suspeito
+const PAGINA_MUDOU_MAX = 2;                // seletor ausente em visitas SEGUIDAS = pagina mudou mesmo
 const CANAL_OK_VALIDADE_MS = 24 * 60 * 60 * 1000;
 const VISITA_EXPIRA_MS = 7 * 60000;        // visita SEM ATIVIDADE ha tanto: lote volta para a fila
 const EXTENSAO_AUSENTE_MS = 30 * 60000;    // sem contato ha tanto = extensao fora do ar
@@ -126,6 +127,7 @@ let estado = {
   canalOkEm: 0,         // ultima resposta que provou o canal vivo (ok/ja tinha)
   invalidosSeguidos: 0,
   problemasSeguidos: 0,
+  paginaMudouSeguidos: 0,  // 29/09/2026: 1 falha de seletor = tropeco; so 2 seguidas desligam
   falhas: 0,
   liberaEm: {},         // chave → ms em que o cupom fica elegivel
   entrouEm: {},         // chave → ms em que entrou na fila (limite de espera)
@@ -457,14 +459,25 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
     return { ok: true };
   }
   if (veredito === 'pagina_mudou') {
+    // 29/09/2026: o disjuntor abriu com o botao "Inserir codigo" presente na
+    // pagina (conferido no Chrome logado). Seletor ausente e um tropeco de
+    // carregamento/aba em segundo plano, e nada chegou ao ML (acontece antes
+    // do clique) — entao a 1a vez so devolve a fila; a extensao encerra a
+    // visita e tenta na proxima. Duas visitas seguidas assim = mudou mesmo.
     marcar(reg, { insercaoMl: FILA });
+    estado.paginaMudouSeguidos = (estado.paginaMudouSeguidos || 0) + 1;
     salvar();
+    if (estado.paginaMudouSeguidos < PAGINA_MUDOU_MAX) {
+      console.warn('[CUPONS-ML-AUTO] Seletor ausente em ' + codigo + ' (' + msg + ') — tropeço ' + estado.paginaMudouSeguidos + '/' + PAGINA_MUDOU_MAX + ', tenta na próxima visita');
+      return { ok: true };
+    }
     await abrirDisjuntor('a página de cupons do ML mudou (seletor não encontrado: ' + msg + ')', codigo);
     return { ok: true };
   }
 
   estado.feitasHoje++;
   estado.falhas = 0;
+  estado.paginaMudouSeguidos = 0;
 
   if (veredito === 'inserido' || veredito === 'ja_tinha') {
     estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
@@ -598,7 +611,7 @@ export function estadoInsercaoMlAuto() {
 
 export async function religarInsercaoMlAuto() {
   if (!LIGADA) return { ok: false, erro: 'CUPONS_ML_INSERCAO_AUTO não está ligado no Railway' };
-  estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
+  estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0;
   estado.folgaHoje = false;   // religar a mao vale mais que o sorteio
   estado.proximaVisitaEm = 0;
   salvar();
