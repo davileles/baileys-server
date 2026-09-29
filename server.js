@@ -14346,9 +14346,11 @@ function hojeSPIso(d = new Date()) {
 
 // Uma entrada por oferta+grupo; reenvio manual da mesma oferta so atualiza o
 // texto (o lembrete replica a versao mais recente).
-function registrarEnvioParaLembrete(item) {
+// enviadoEmIso: so para registro retroativo (POST /radar/lembretes/registrar
+// com enviadoEm) — sem ele, vale o momento do registro.
+function registrarEnvioParaLembrete(item, enviadoEmIso) {
   if (!item || !item.id || String(item.id).startsWith('r_')) return;
-  const agoraIso = new Date().toISOString();
+  const agoraIso = enviadoEmIso || new Date().toISOString();
   const ex = lembretesRadar.find(x => x.id === item.id && x.grupo === item.grupo);
   if (ex) {
     ex.mensagem = item.mensagem;
@@ -14463,6 +14465,36 @@ async function checarLembretesAcabaHoje({ forcar = false } = {}) {
 }
 setInterval(() => { checarLembretesAcabaHoje().catch(() => {}); }, 10 * 60 * 1000);
 setTimeout(() => { checarLembretesAcabaHoje().catch(() => {}); }, 90 * 1000);
+
+// POST /radar/lembretes/registrar — registra para o "ACABA HOJE" uma oferta
+// que saiu SEM passar pela filaRadar: o envio manual da aba Oferta do
+// gestor-cdv manda direto (/enviar ou /enviar-imagem) e so depois publica no
+// Radar (/ofertas/publicar, que devolve o id). Sem este registro a oferta
+// nunca lembrava (caso Smiles 70%, 28-29/09/2026).
+// Body: { id, grupo, mensagem, enviadoEm? } — id = id em ofertas.json;
+// categoria/prazo continuam vindo de ofertas.json na checagem. enviadoEm (ISO)
+// so para registro retroativo. Grupo multi (apelido 'tsp') nao e aceito.
+app.post('/radar/lembretes/registrar', (req, res) => {
+  const { id, grupo, mensagem, enviadoEm } = req.body || {};
+  if (!id || !String(id).trim()) return res.status(400).json({ ok: false, erro: 'id obrigatório' });
+  if (!mensagem || !String(mensagem).trim()) return res.status(400).json({ ok: false, erro: 'mensagem obrigatória' });
+  if (grupo && ehGrupoMulti(grupo)) return res.status(400).json({ ok: false, erro: 'grupo multi não tem lembrete' });
+  const grupoId = grupo ? (GRUPOS[grupo] || resolverGrupo(grupo)) : GRUPOS['cdv_ofertas'];
+  if (!grupoId) return res.status(400).json({ ok: false, erro: 'grupo inválido: ' + grupo });
+  let quando = null;
+  if (enviadoEm) {
+    const t = new Date(enviadoEm).getTime();
+    if (isNaN(t) || t > Date.now() + 60000) return res.status(400).json({ ok: false, erro: 'enviadoEm inválido' });
+    quando = new Date(t).toISOString();
+  }
+  try {
+    registrarEnvioParaLembrete({ id: String(id).trim(), grupo: grupoId, mensagem: String(mensagem) }, quando);
+    console.log('[LEMBRETE] Registrado envio manual: ' + id + ' -> ' + (NOMES_GRUPOS.get(grupoId) || grupoId));
+    res.json({ ok: true, id: String(id).trim(), grupo: NOMES_GRUPOS.get(grupoId) || grupoId });
+  } catch (e) {
+    res.status(500).json({ ok: false, erro: e.message });
+  }
+});
 
 // GET /radar/lembretes — o que esta registrado e quando cada um lembra.
 // ?checar=1 roda a checagem agora.
