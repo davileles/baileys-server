@@ -1952,8 +1952,21 @@ export async function processarTextoMl(texto, opcoes = {}) {
       console.log('[ML] ' + (idProdutoMl(url) || url) + ' — titulo do post aceito ('
         + achado.sinal + '): "' + achado.titulo + '"');
     } else {
-      console.warn('[ML] ' + (idProdutoMl(url) || url) + ' — sem titulo: a API nao devolve nome '
-        + 'e nenhuma linha do post bateu com a categoria' + (d.trilha ? ' "' + d.trilha + '"' : ''));
+      // Link colado a mao (criar oferta): o operador revisa o nome antes de
+      // publicar, entao o slug da URL — gerado pelo proprio ML a partir do
+      // titulo — serve de ponto de partida em vez do campo vazio. No radar
+      // continua sem titulo e descartado: la ninguem revisa.
+      const doSlug = opcoes.viaNossoLink
+        ? (nomeDoSlugMl(url) || nomeDoSlugMl(urlNoPost.get(url) || ''))
+        : '';
+      if (doSlug) {
+        d.titulo = doSlug;
+        d.tituloDoSlug = true;
+        console.log('[ML] ' + (idProdutoMl(url) || url) + ' — sem nome na API; titulo do slug: "' + doSlug + '"');
+      } else {
+        console.warn('[ML] ' + (idProdutoMl(url) || url) + ' — sem titulo: a API nao devolve nome '
+          + 'e nenhuma linha do post bateu com a categoria' + (d.trilha ? ' "' + d.trilha + '"' : ''));
+      }
     }
   }
 
@@ -2456,8 +2469,11 @@ export async function resolverLinhaVitrineMl(linha) {
     url = m[0].replace(/[)\]}.,;!]+$/, '');
   }
 
+  // idProdutoMl, nao idDeUrl: idDeUrl ignora o catalogo unificado (/up/MLBU),
+  // e o link caia aqui como se fosse encurtador — cascata anonima e recusa com
+  // "nao foi possivel identificar o produto" (29/09, malas /up/MLBU).
   let alvo = url;
-  if (!idDeUrl(alvo)) {
+  if (!idProdutoMl(alvo)) {
     try { alvo = await resolverEncurtadorMl(alvo); }
     catch (e) { return { erro: 'encurtador nao respondeu: ' + e.message, linha: bruto }; }
   }
@@ -2473,7 +2489,7 @@ export async function resolverLinhaVitrineMl(linha) {
     } catch (e) { return { erro: 'perfil social: ' + e.message, linha: bruto }; }
   }
 
-  const id = idDeUrl(alvo);
+  const id = idProdutoMl(alvo);
   if (!id) return { erro: 'nao foi possivel identificar o produto', linha: bruto };
 
   // Tracking colado pelo navegador (?pdp_filters, #position) nao identifica o
