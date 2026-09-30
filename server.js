@@ -17125,7 +17125,7 @@ async function processarItemLista(id) {
     }
 
     try {
-      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista), lista.roteamento);
+      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista, asin), lista.roteamento);
       if (!execucaoVigente()) {
         console.log('[LISTA] "' + lista.nome + '" mudou durante o envio de ' + asin + ' — andamento descartado.');
         return;
@@ -17332,6 +17332,7 @@ app.post('/listas/disparo-unico', async (req, res) => {
     intervaloMin: req.body?.intervaloMin,
     cupomModo: req.body?.cupomModo,
     cupomCodigo: req.body?.cupomCodigo,
+    cuponsItem: req.body?.cuponsItem,
     roteamento: req.body?.roteamento,
     efemera: true,
     agenda: { ativo:false },
@@ -17857,6 +17858,8 @@ app.post('/vitrine/comparativo', async (req, res) => {
   try {
     const modoCupom = ['auto', 'fixo', 'nenhum'].includes(req.body?.cupomModo) ? req.body.cupomModo : 'auto';
     const codigoFixo = modoCupom === 'fixo' ? (String(req.body?.cupomCodigo || '').trim() || null) : null;
+    // Cupom por produto escolhido na montagem ({ asin: codigo }): vence o modo.
+    const cupItem = (req.body?.cuponsItem && typeof req.body.cuponsItem === 'object') ? req.body.cuponsItem : {};
     const pedidos = (Array.isArray(req.body?.asins) ? req.body.asins : String(req.body?.asins || '').split(','))
       .map(x => String(x).trim()).filter(Boolean).slice(0, 500);
     if (!pedidos.length) return res.json({ ok:true, itens:{} });
@@ -17897,7 +17900,10 @@ app.post('/vitrine/comparativo', async (req, res) => {
                   disponivel: true, fonte: 'cadastro', velho: true };
       }
       if (atual) {
-        const cp = _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, modoCupom, codigoFixo);
+        const _cItem = String(cupItem[asin] || '').trim().toUpperCase();
+        const cp = _cItem
+          ? _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, 'fixo', _cItem)
+          : _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, modoCupom, codigoFixo);
         atual.cupom = cp ? cp.codigo : null;
         atual.descontoCupom = cp && cp.desconto > 0 ? cp.desconto : 0;
         atual.avisoCupom = cp?.aviso || null;

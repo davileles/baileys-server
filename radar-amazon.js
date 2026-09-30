@@ -3704,6 +3704,20 @@ export function salvarLista(dados = {}) {
   const modo = ['auto', 'fixo', 'nenhum'].includes(dados.cupomModo)
     ? dados.cupomModo : (ant.cupomModo || 'auto');
 
+  // Cupom POR PRODUTO dentro da lista ({ asin: 'CODIGO' }). Vale por cima do
+  // modo da lista so para aquele item: numa lista 'sem cupom', o unico produto
+  // que tem cupom sai com ele e os demais seguem sem. Item que saiu da lista
+  // leva o cupom junto.
+  const _noLista = new Set(produtos.map(String));
+  const _cupItemBruto = (dados.cuponsItem !== undefined ? dados.cuponsItem : ant.cuponsItem) || {};
+  const cuponsItem = {};
+  if (_cupItemBruto && typeof _cupItemBruto === 'object' && !Array.isArray(_cupItemBruto)) {
+    for (const [a, cod] of Object.entries(_cupItemBruto)) {
+      const k = String(a), v = String(cod || '').trim().toUpperCase();
+      if (v && _noLista.has(k)) cuponsItem[k] = v;
+    }
+  }
+
   // ── ROTEAMENTO DA LISTA ──
   // O nicho curado da base de produtos so era lido pelo monitor de precos. A
   // lista montava a oferta SEM categoria, e oferta sem categoria cai nas
@@ -3748,6 +3762,7 @@ export function salvarLista(dados = {}) {
     cupomModo: modo,
     cupomCodigo: modo === 'fixo'
       ? String(dados.cupomCodigo || ant.cupomCodigo || '').trim().toUpperCase() : null,
+    cuponsItem: Object.keys(cuponsItem).length ? cuponsItem : null,
     roteamento,
     agenda,
     janelas: janelas.length ? janelas : null,
@@ -3778,8 +3793,11 @@ export function atualizarExecucaoLista(id, execucao) {
 }
 
 /** Codigo de cupom a passar para o montador, conforme o modo da lista. */
-export function cupomDaLista(lista) {
+export function cupomDaLista(lista, asin) {
   if (!lista) return null;
+  // Cupom escolhido para ESTE produto na montagem vence o modo da lista.
+  const doItem = asin != null ? lista.cuponsItem?.[String(asin)] : null;
+  if (doItem) return doItem;
   // 'nenhum' precisa ser um sinal, nao ausencia de sinal: ausencia deixava o
   // montador cair no cupom vinculado ao item — o oposto do pedido.
   if (lista.cupomModo === 'nenhum') return 'nenhum';
