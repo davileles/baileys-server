@@ -17901,7 +17901,8 @@ app.post('/vitrine/comparativo', async (req, res) => {
       }
       if (atual) {
         const _cItem = String(cupItem[asin] || '').trim().toUpperCase();
-        const cp = _cItem
+        const cp = _cItem === '__SEM__' ? null
+          : _cItem
           ? _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, 'fixo', _cItem)
           : _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, modoCupom, codigoFixo);
         atual.cupom = cp ? cp.codigo : null;

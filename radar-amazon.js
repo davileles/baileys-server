@@ -3797,6 +3797,8 @@ export function cupomDaLista(lista, asin) {
   if (!lista) return null;
   // Cupom escolhido para ESTE produto na montagem vence o modo da lista.
   const doItem = asin != null ? lista.cuponsItem?.[String(asin)] : null;
+  // '__SEM__' = operador pediu este item sem cupom nenhum, qualquer que seja o modo.
+  if (doItem === '__SEM__') return 'nenhum';
   if (doItem) return doItem;
   // 'nenhum' precisa ser um sinal, nao ausencia de sinal: ausencia deixava o
   // montador cair no cupom vinculado ao item — o oposto do pedido.
