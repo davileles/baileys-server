@@ -200,7 +200,10 @@
         "saidaSerializada(() => enviarMensagem(item.destino",
         "app.get('/cupons/auto/proximo'",
         "app.post('/cupons/auto/resultado'",
-        "app.post('/cupons/auto/visita/fim'"
+        "app.post('/cupons/auto/visita/fim'",
+        "app.get('/cupons/auto/leitura'",
+        "app.post('/cupons/auto/leitura'",
+        "function aplicarLeituraCuponsMl("
       ]
     },
     "radar-awin.js": {
@@ -334,7 +337,10 @@
         "export function tagMl",
         "export function tokenAffOk",
         "export function urlAutorizacao",
-        "export function validadeDeTexto"
+        "export function validadeDeTexto",
+        "export function extrairCuponsPaginaMl",
+        "export function juntarLeiturasCuponsMl",
+        "export function urlsLeituraCuponsMl"
       ]
     },
     "radar-shopee.js": {

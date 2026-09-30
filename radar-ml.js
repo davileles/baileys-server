@@ -2240,7 +2240,17 @@ export async function lerCuponsAtivosMl(url = URL_CUPONS_ML) {
     throw new Error('pagina de cupons bloqueada (antibot)');
   }
   registrarLogadaOkMl();
+  return extrairCuponsPaginaMl(html);
+}
 
+/**
+ * Extrai os cards de "Meus cupons" de um HTML ja em maos. Separado da leitura
+ * para servir tambem ao HTML que a extensao Captura Tica le no Chrome do
+ * operador (30/09/2026): a consulta de validade voltou sem o Railway tocar a
+ * pagina do ML. Aceita HTML ou texto puro (o regex trabalha sobre o texto).
+ */
+export function extrairCuponsPaginaMl(html) {
+  html = String(html || '');
   // Trabalha sobre o texto visivel aproximado: as classes do ML mudam com
   // frequencia, mas os rotulos ("Compra minima", "Limite de") sao estaveis.
   const texto = html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ')
@@ -2322,33 +2332,46 @@ const FILTROS_CUPONS_ML = [
 
 export async function lerTodosCuponsMl() {
   if (CUPONS_ML_PAUSADO) throw new Error(ERRO_CUPONS_PAUSADO);
+  const leituras = [];
+  for (const url of FILTROS_CUPONS_ML) {
+    try { leituras.push({ url, ...(await lerCuponsAtivosMl(url)) }); }
+    catch (e) { leituras.push({ url, erro: e.message }); }
+    await new Promise(r => setTimeout(r, 600));
+  }
+  return juntarLeiturasCuponsMl(leituras);
+}
+
+/** URLs de "Meus cupons" que, somadas, cobrem a conta (usadas pela extensao). */
+export function urlsLeituraCuponsMl() { return FILTROS_CUPONS_ML.slice(); }
+
+/**
+ * Une as leituras das paginas de filtro: [{ url, cupons, semCodigo,
+ * totalDeclarado } | { url, erro }] -> { cupons, semCodigo, totalDeclarado, fontes }.
+ */
+export function juntarLeiturasCuponsMl(leituras) {
   const porCodigo = new Map();
   let totalDeclarado = null;
   // Cards sem codigo digitavel nao entram na base, mas contam para saber se a
   // leitura da pagina veio inteira.
   let semCodigo = 0;
   const fontes = [];
-
-  for (const url of FILTROS_CUPONS_ML) {
-    try {
-      const r = await lerCuponsAtivosMl(url);
-      // So a pagina /active declara o total DOS SEUS cupons; as de filtro
-      // mostram o contador do catalogo inteiro do ML (milhares), que nao serve
-      // de referencia para saber se a leitura veio completa.
-      if (url.endsWith('/cupons/active')) {
-        if (r.totalDeclarado) totalDeclarado = r.totalDeclarado;
-        semCodigo = r.semCodigo || 0;
+  for (const r of leituras || []) {
+    if (r.erro) { fontes.push({ url: r.url, erro: r.erro }); continue; }
+    // So a pagina /active declara o total DOS SEUS cupons; as de filtro
+    // mostram o contador do catalogo inteiro do ML (milhares), que nao serve
+    // de referencia para saber se a leitura veio completa.
+    if (String(r.url || '').split('?')[0].endsWith('/cupons/active')) {
+      if (r.totalDeclarado) totalDeclarado = r.totalDeclarado;
+      semCodigo = r.semCodigo || 0;
+    }
+    for (const c of r.cupons || []) {
+      const ant = porCodigo.get(c.codigo);
+      // Mantem a versao mais informativa (com minimo/limite/expiracao).
+      if (!ant || (c.minimo != null && ant.minimo == null) || (c.expiraEm && !ant.expiraEm)) {
+        porCodigo.set(c.codigo, c);
       }
-      for (const c of r.cupons) {
-        const ant = porCodigo.get(c.codigo);
-        // Mantem a versao mais informativa (com minimo/limite/expiracao).
-        if (!ant || (c.minimo != null && ant.minimo == null) || (c.expiraEm && !ant.expiraEm)) {
-          porCodigo.set(c.codigo, c);
-        }
-      }
-      fontes.push({ url, lidos: r.cupons.length });
-    } catch (e) { fontes.push({ url, erro: e.message }); }
-    await new Promise(r => setTimeout(r, 600));
+    }
+    fontes.push({ url: r.url, lidos: (r.cupons || []).length });
   }
   return { cupons: [...porCodigo.values()], semCodigo, totalDeclarado, fontes };
 }

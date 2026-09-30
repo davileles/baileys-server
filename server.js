@@ -189,7 +189,8 @@ import {
   processarTextoMl, ehLinkMl, extrairIdsMl, buscarProdutoMl, normalizarMl,
   credenciaisMlOk, estadoMl, urlAutorizacao, trocarCodePorToken, ML_REDIRECT_URI,
   sondarMl, chamarAff, tokenAffOk, saudeAff, verificarTokenAff, inspecionarTokenAff,
-  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl, validadeDeTexto, validadeDeVencimento,
+  chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl,
+  extrairCuponsPaginaMl, juntarLeiturasCuponsMl, urlsLeituraCuponsMl, htmlLogadoBloqueado, validadeDeTexto, validadeDeVencimento,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
@@ -18496,6 +18497,88 @@ app.delete('/templates/:loja', (req, res) => {
 // Sincroniza a base com a pagina "Meus cupons" do ML: corrige valores, grava a
 // expiracao real quando o ML informa, e desativa o que saiu do ar. Sem isto a
 // validade e so o TTL de 24h, que e chute.
+// Aplica uma leitura de "Meus cupons" na base: atualiza validade/regra do que
+// esta na conta e cria o que a base ainda nao tem. NAO desativa nada — quem
+// decide o que saiu do ar e o input-code (sync antigo) ou o veredito da
+// extensao na insercao. Usada pelo /cupons/sync-ml e pela leitura que a
+// extensao Captura Tica faz no Chrome do operador (/cupons/auto/leitura).
+function aplicarLeituraCuponsMl(naPagina, { totalDeclarado = null, semCodigo = 0, criarNovos = true } = {}) {
+
+  // Leitura completa = todos os cards do ML foram vistos, somando os que tem
+  // codigo e os que nao tem (esses nunca entram na base, mas contam no total).
+  const vistos = naPagina.length + (semCodigo || 0);
+  const leituraCompleta = !totalDeclarado || vistos >= totalDeclarado;
+
+  const mapaPagina = new Map(naPagina.map(c => [c.codigo.toUpperCase(), c]));
+  const atualizados = [], criados = [];
+  // Cupom da base que o ML nao lista cai em um de tres casos: ja venceu, nunca
+  // foi ativado na conta, ou esta ativo com um card cujo rotulo nao traz o
+  // codigo digitavel (a raspagem nunca o encontra). A pagina nao distingue os
+  // tres — quem distingue e o proprio ML, no "Inserir codigo". Por isso a
+  // decisao sai do loop e vai para a verificacao autoritativa mais abaixo.
+  const ausentes = [];
+
+  // Percorre a NOSSA base e procura cada cupom na pagina — nao o contrario.
+  // Assim os cards sem codigo digitavel deixam de ser um caso especial.
+  for (const reg of listarCuponsBase()) {
+    if (reg.loja !== 'Mercado Livre') continue;
+    const naTela = mapaPagina.get(String(reg.codigo).toUpperCase());
+
+    if (!naTela) {
+      // Leitura parcial nao barra mais a verificacao. O input-code responde por
+      // cupom, individualmente, e nao depende de a pagina ter vindo inteira —
+      // um unico card que o parser nao entende travava o bloco para sempre.
+      // Quem protege contra desativacao indevida agora e o canalAtivacaoOk.
+      if (reg.ativo === false) continue;
+      ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true,
+                      observacao: reg.observacao || null, validadeAte: reg.validadeAte || null });
+      continue;
+    }
+
+    const campos = { tipo:naTela.tipo, valor:naTela.valor,
+                     minimo:naTela.minimo, limite:naTela.limite, ativo:true,
+                     confirmadoNoMl:true };
+    // Recusa antiga que o proprio sync escreveu perde o sentido no momento em
+    // que o cupom reaparece na conta. Observacao do operador nao e tocada.
+    if (/^Desativado no sync/.test(reg.observacao || '')) campos.observacao = null;
+    // Validade real: contador tem prioridade sobre o texto ("quarta-feira").
+    const validade = naTela.expiraEm || validadeDeTexto(naTela.venceTexto);
+    if (validade) campos.validadeAte = validade;
+    else {
+      // Card sem linha "Vence ...": acontece quando o ML mostra "Esta esgotando"
+      // no lugar do prazo. O cupom esta na conta AGORA, entao vale pelo menos
+      // hoje — deixar a validade congelada no TTL de 24h da captura o mata em
+      // silencio (cupomVigente reprova e ele some das ofertas).
+      const atual = Date.parse(reg.validadeAte || '');
+      if (!atual || atual < Date.now()) campos.validadeAte = validadeDeTexto('amanha');
+    }
+    atualizarCupomBase(reg.chave, campos);
+    atualizados.push({ codigo:reg.codigo, valor:naTela.valor, minimo:naTela.minimo,
+                       limite:naTela.limite,
+                       validadeAte:campos.validadeAte || reg.validadeAte || null,
+                       prazoInferido: !validade && !!campos.validadeAte,
+                       esgotando:naTela.esgotando });
+  }
+
+  // Cupom que o ML lista e a base ainda nao tem.
+  if (criarNovos) {
+    const naBase = new Set(listarCuponsBase()
+      .filter(r => r.loja === 'Mercado Livre')
+      .map(r => String(r.codigo).toUpperCase()));
+    for (const c of naPagina) {
+      if (naBase.has(c.codigo.toUpperCase())) continue;
+      const reg = registrarCupomBase({ loja:'Mercado Livre', ...c, confirmadoNoMl:true });
+      // Mesmo fallback do loop acima: card "esgotando" nao traz prazo, e um
+      // cupom recem-lido da conta nao pode nascer com validade menor que a do
+      // proprio card.
+      const validade = c.expiraEm || validadeDeTexto(c.venceTexto) || validadeDeTexto('amanha');
+      if (validade && reg) atualizarCupomBase(reg.chave, { validadeAte: validade });
+      criados.push(c.codigo);
+    }
+  }
+  return { leituraCompleta, vistos, atualizados, criados, ausentes };
+}
+
 app.post('/cupons/sync-ml', async (req, res) => {
   if (!tokenAffOk()) return res.status(400).json({ ok:false, erro:'ML_AFF_TOKEN nao configurado' });
   try {
@@ -18504,78 +18587,9 @@ app.post('/cupons/sync-ml', async (req, res) => {
       return res.json({ ok:false, erro:'nenhum cupom lido — sessao pode ter caido' });
     }
 
-    // Leitura completa = todos os cards do ML foram vistos, somando os que tem
-    // codigo e os que nao tem (esses nunca entram na base, mas contam no total).
-    const vistos = naPagina.length + (semCodigo || 0);
-    const leituraCompleta = !totalDeclarado || vistos >= totalDeclarado;
-
-    const mapaPagina = new Map(naPagina.map(c => [c.codigo.toUpperCase(), c]));
-    const atualizados = [], desativados = [], criados = [];
-    // Cupom da base que o ML nao lista cai em um de tres casos: ja venceu, nunca
-    // foi ativado na conta, ou esta ativo com um card cujo rotulo nao traz o
-    // codigo digitavel (a raspagem nunca o encontra). A pagina nao distingue os
-    // tres — quem distingue e o proprio ML, no "Inserir codigo". Por isso a
-    // decisao sai do loop e vai para a verificacao autoritativa mais abaixo.
-    const ausentes = [];
-
-    // Percorre a NOSSA base e procura cada cupom na pagina — nao o contrario.
-    // Assim os cards sem codigo digitavel deixam de ser um caso especial.
-    for (const reg of listarCuponsBase()) {
-      if (reg.loja !== 'Mercado Livre') continue;
-      const naTela = mapaPagina.get(String(reg.codigo).toUpperCase());
-
-      if (!naTela) {
-        // Leitura parcial nao barra mais a verificacao. O input-code responde por
-        // cupom, individualmente, e nao depende de a pagina ter vindo inteira —
-        // um unico card que o parser nao entende travava o bloco para sempre.
-        // Quem protege contra desativacao indevida agora e o canalAtivacaoOk.
-        if (reg.ativo === false) continue;
-        ausentes.push({ codigo: reg.codigo, chave: reg.chave, confirmado: reg.confirmadoNoMl === true,
-                        observacao: reg.observacao || null, validadeAte: reg.validadeAte || null });
-        continue;
-      }
-
-      const campos = { tipo:naTela.tipo, valor:naTela.valor,
-                       minimo:naTela.minimo, limite:naTela.limite, ativo:true,
-                       confirmadoNoMl:true };
-      // Recusa antiga que o proprio sync escreveu perde o sentido no momento em
-      // que o cupom reaparece na conta. Observacao do operador nao e tocada.
-      if (/^Desativado no sync/.test(reg.observacao || '')) campos.observacao = null;
-      // Validade real: contador tem prioridade sobre o texto ("quarta-feira").
-      const validade = naTela.expiraEm || validadeDeTexto(naTela.venceTexto);
-      if (validade) campos.validadeAte = validade;
-      else {
-        // Card sem linha "Vence ...": acontece quando o ML mostra "Esta esgotando"
-        // no lugar do prazo. O cupom esta na conta AGORA, entao vale pelo menos
-        // hoje — deixar a validade congelada no TTL de 24h da captura o mata em
-        // silencio (cupomVigente reprova e ele some das ofertas).
-        const atual = Date.parse(reg.validadeAte || '');
-        if (!atual || atual < Date.now()) campos.validadeAte = validadeDeTexto('amanha');
-      }
-      atualizarCupomBase(reg.chave, campos);
-      atualizados.push({ codigo:reg.codigo, valor:naTela.valor, minimo:naTela.minimo,
-                         limite:naTela.limite,
-                         validadeAte:campos.validadeAte || reg.validadeAte || null,
-                         prazoInferido: !validade && !!campos.validadeAte,
-                         esgotando:naTela.esgotando });
-    }
-
-    // Cupom que o ML lista e a base ainda nao tem.
-    if (req.body?.criarNovos !== false) {
-      const naBase = new Set(listarCuponsBase()
-        .filter(r => r.loja === 'Mercado Livre')
-        .map(r => String(r.codigo).toUpperCase()));
-      for (const c of naPagina) {
-        if (naBase.has(c.codigo.toUpperCase())) continue;
-        const reg = registrarCupomBase({ loja:'Mercado Livre', ...c, confirmadoNoMl:true });
-        // Mesmo fallback do loop acima: card "esgotando" nao traz prazo, e um
-        // cupom recem-lido da conta nao pode nascer com validade menor que a do
-        // proprio card.
-        const validade = c.expiraEm || validadeDeTexto(c.venceTexto) || validadeDeTexto('amanha');
-        if (validade && reg) atualizarCupomBase(reg.chave, { validadeAte: validade });
-        criados.push(c.codigo);
-      }
-    }
+    const { leituraCompleta, atualizados, criados, ausentes } =
+      aplicarLeituraCuponsMl(naPagina, { totalDeclarado, semCodigo, criarNovos: req.body?.criarNovos !== false });
+    const desativados = [];
 
     // Verificacao autoritativa do que a pagina nao mostrou. O endpoint de
     // inserir codigo responde tres coisas diferentes, e cada uma tem um destino:
@@ -18711,7 +18725,7 @@ function exigirExtensaoMl(req, res) {
 }
 app.get('/cupons/auto/estado', (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
-  try { res.json({ ok: true, ...estadoInsercaoMlAuto() }); }
+  try { res.json({ ok: true, ...estadoInsercaoMlAuto(), leitura: estadoLeituraCuponsMl() }); }
   catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 app.get('/cupons/auto/proximo', (req, res) => {
@@ -18728,6 +18742,112 @@ app.post('/cupons/auto/visita/fim', async (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
   try { res.json(await finalizarVisitaInsercaoMl(req.body || {})); }
   catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
+// ── CONSULTA DE VALIDADE PELA EXTENSAO (30/09/2026) ──────────────────────────
+// A validade real dos cupons do ML so aparece em "Meus cupons". O sync antigo
+// lia essa pagina a partir do Railway e esta parado (CUPONS_ML_PAUSADO). Agora
+// quem le e a extensao, no Chrome do operador, com a sessao logada de verdade:
+// ela pergunta aqui se a leitura esta devida, abre as paginas numa aba em
+// segundo plano e manda o HTML. O servidor so aplica — nenhuma requisicao ao ML
+// sai do Railway. Nada e desativado por ausencia na pagina (card sem codigo
+// digitavel existe); cupom vencido/esgotado sai pelo veredito da insercao.
+//   CUPONS_ML_LEITURA=0          desliga
+//   CUPONS_ML_LEITURA_MIN=120    intervalo entre leituras
+//   CUPONS_ML_LEITURA_JANELA=8-23  horas SP (inicio inclusive, fim exclusive)
+const LEITURA_ML_LIGADA = String(process.env.CUPONS_ML_LEITURA ?? '1') !== '0';
+const LEITURA_ML_PERIODO_MS = Math.max(15, Number(process.env.CUPONS_ML_LEITURA_MIN) || 120) * 60000;
+const LEITURA_ML_APOS_VISITA_MS = 15 * 60000;   // depois de inserir, le de novo se a ultima tem 15+ min
+const LEITURA_ML_RESERVA_MS = 10 * 60000;       // leitura entregue e sem retorno: libera de novo
+const [LEITURA_ML_JAN_INI, LEITURA_ML_JAN_FIM] = (() => {
+  const m = /^(\d{1,2})\s*-\s*(\d{1,2})$/.exec(String(process.env.CUPONS_ML_LEITURA_JANELA || '').trim());
+  return m && +m[2] > +m[1] ? [+m[1], +m[2]] : [8, 23];
+})();
+const LEITURA_ML_PATH = SESSAO_DIR + '/ml_leitura_cupons.json';
+let _leituraMl = (() => {
+  try { return JSON.parse(readFileSync(LEITURA_ML_PATH, 'utf-8')) || {}; } catch (_) { return {}; }
+})();
+function gravarLeituraMl() {
+  try { escreverAtomico(LEITURA_ML_PATH, JSON.stringify(_leituraMl), 'utf-8'); } catch (_) {}
+}
+function estadoLeituraCuponsMl() {
+  const agora = Date.now();
+  const hora = horaSP();
+  const ultimaEm = _leituraMl.em || 0;
+  return {
+    ligada: LEITURA_ML_LIGADA,
+    periodoMin: LEITURA_ML_PERIODO_MS / 60000,
+    janela: [LEITURA_ML_JAN_INI, LEITURA_ML_JAN_FIM],
+    naJanela: hora >= LEITURA_ML_JAN_INI && hora < LEITURA_ML_JAN_FIM,
+    ultimaEm: ultimaEm ? new Date(ultimaEm).toISOString() : null,
+    proximaEm: ultimaEm ? new Date(ultimaEm + LEITURA_ML_PERIODO_MS).toISOString() : null,
+    reservadaAte: _leituraMl.reservadaAte > agora ? new Date(_leituraMl.reservadaAte).toISOString() : null,
+    ultimo: _leituraMl.resumo || null,
+  };
+}
+app.get('/cupons/auto/leitura', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  const est = estadoLeituraCuponsMl();
+  const agora = Date.now();
+  const desde = agora - (_leituraMl.em || 0);
+  const aposVisita = String(req.query.aposVisita || '') === '1';
+  let motivo = null;
+  if (!LEITURA_ML_LIGADA) motivo = 'desligada';
+  else if (!est.naJanela) motivo = 'fora_da_janela';
+  else if ((_leituraMl.reservadaAte || 0) > agora) motivo = 'em_andamento';
+  else if (desde < (aposVisita ? LEITURA_ML_APOS_VISITA_MS : LEITURA_ML_PERIODO_MS)) motivo = 'recente';
+  if (motivo) return res.json({ ok: true, devida: false, motivo, ...est });
+  _leituraMl.reservadaAte = agora + LEITURA_ML_RESERVA_MS;
+  res.json({ ok: true, devida: true, urls: urlsLeituraCuponsMl(), ...estadoLeituraCuponsMl() });
+});
+// Body: { paginas: [{ url, html, texto? }], origem?, erro? }
+app.post('/cupons/auto/leitura', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  const agora = Date.now();
+  _leituraMl.reservadaAte = 0;
+  try {
+    const b = req.body || {};
+    if (b.erro) {
+      // A extensao nao conseguiu ler (deslogado, pagina fora do ar): tenta de
+      // novo na proxima janela, sem mexer na base.
+      _leituraMl.resumo = { em: new Date(agora).toISOString(), ok: false, erro: String(b.erro).slice(0, 200) };
+      _leituraMl.em = agora - LEITURA_ML_PERIODO_MS + 30 * 60000;   // nova tentativa em ~30 min
+      gravarLeituraMl();
+      console.warn('[CUPONS-ML] Leitura pela extensao falhou: ' + _leituraMl.resumo.erro);
+      return res.json({ ok: true, aplicado: false });
+    }
+    const paginas = Array.isArray(b.paginas) ? b.paginas.slice(0, 8) : [];
+    const leituras = paginas.map(pg => {
+      const url = String(pg.url || '');
+      const html = String(pg.html || '');
+      if (!html) return { url, erro: 'pagina vazia' };
+      if (htmlLogadoBloqueado(html)) return { url, erro: 'pagina bloqueada (antibot)' };
+      let r = extrairCuponsPaginaMl(html);
+      // Plano B: texto visivel da aba, se o HTML nao rendeu nenhum card.
+      if (!r.cupons.length && !r.semCodigo && pg.texto) r = extrairCuponsPaginaMl(String(pg.texto));
+      return { url, ...r };
+    });
+    const { cupons, semCodigo, totalDeclarado, fontes } = juntarLeiturasCuponsMl(leituras);
+    if (!cupons.length) {
+      _leituraMl.resumo = { em: new Date(agora).toISOString(), ok: false, erro: 'nenhum cupom lido', fontes };
+      _leituraMl.em = agora - LEITURA_ML_PERIODO_MS + 30 * 60000;
+      gravarLeituraMl();
+      console.warn('[CUPONS-ML] Leitura pela extensao sem nenhum cupom — sessao caiu ou a pagina mudou.', JSON.stringify(fontes));
+      return res.json({ ok: false, erro: 'nenhum cupom lido — sessão pode ter caído ou a página mudou', fontes });
+    }
+    const r = aplicarLeituraCuponsMl(cupons, { totalDeclarado, semCodigo, criarNovos: true });
+    _leituraMl.em = agora;
+    _leituraMl.resumo = { em: new Date(agora).toISOString(), ok: true, origem: String(b.origem || 'extensao').slice(0, 30),
+      naPagina: cupons.length, semCodigo, totalDeclarado, leituraCompleta: r.leituraCompleta,
+      atualizados: r.atualizados.length, criados: r.criados, ausentes: r.ausentes.length, fontes };
+    gravarLeituraMl();
+    console.log('[CUPONS-ML] Leitura pela extensao — ' + cupons.length + ' na conta, '
+      + r.atualizados.length + ' atualizado(s), ' + r.criados.length + ' novo(s), '
+      + r.ausentes.length + ' da base fora da pagina' + (r.leituraCompleta ? '' : ' [leitura parcial]') + '.');
+    res.json({ ok: true, aplicado: true, naPagina: cupons.length, semCodigo, totalDeclarado,
+               leituraCompleta: r.leituraCompleta, atualizados: r.atualizados, criados: r.criados,
+               ausentes: r.ausentes.map(a => a.codigo), fontes });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 app.get('/cupons/base', (req, res) => {
