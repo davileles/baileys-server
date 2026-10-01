@@ -15432,7 +15432,7 @@ app.post('/enviar', async (req, res) => {
   let agendarEmEf = agendarEm;
   let janelaDisp  = null;
   if (!agendarEm && quando === 'janela') {
-    janelaDisp = janelaDeDisparoManual();
+    janelaDisp = janelaDeDisparoManual(Date.now(), tipo);
     if (!janelaDisp.ok) {
       agendarEmEf = new Date(janelaDisp.proximoEm).toISOString();
     } else if (multi) {
@@ -17054,16 +17054,36 @@ const LISTA_JANELAS_PADRAO = (() => {
   return js.length ? js : [{ inicio: '08:00', fim: '20:00' }];
 })();
 
-/** Janela do envio manual "na janela" (gerador do painel): a de publicacao do
- *  monitor de precos ("Publicar das/Ate"), ou o padrao das listas sem ela. */
-function janelaDeDisparoManual(quando = Date.now()) {
+/** Janela do envio manual "na janela" (gerador do painel).
+ *  Cupom: a janela de horario dos cupons (Ajustes, com "so dias uteis").
+ *  Oferta/mensagem: a de publicacao do monitor de precos ("Publicar das/Ate"),
+ *  ou o padrao das listas sem ela. */
+function janelaDeDisparoManual(quando = Date.now(), tipo = null) {
+  if (String(tipo || '').toLowerCase() === 'cupom') {
+    const jc = janelaCupom();
+    const janelas = [{ inicio: jc.inicio, fim: jc.fim }];
+    const rotulo = jc.inicio + '-' + jc.fim + (jc.dias === 'uteis' ? ' (dias uteis)' : '');
+    let t = quando;
+    for (let i = 0; i < 5; i++) {
+      const r = janelaEnvioLista({ janelas }, t);
+      const cand = r.ok ? t : r.proximoEm;
+      const p = campPartesSP(cand);
+      if (jc.dias === 'uteis' && /^(s[áa]b|dom)/.test(p.semana)) {
+        t = cand + (1440 - p.minutos) * 60000 + 60000;   // pula para o dia seguinte
+        continue;
+      }
+      return cand === quando ? { ok: true, janelas: rotulo }
+                             : { ok: false, proximoEm: cand, janelas: rotulo };
+    }
+    return { ok: false, proximoEm: t, janelas: rotulo };
+  }
   let janelas = null;
   try { janelas = configMonitorPrecos()?.publicacao?.janelas || null; } catch (_) {}
   return janelaEnvioLista({ janelas }, quando);
 }
 
 app.get('/janela-disparos', (req, res) => {
-  const j = janelaDeDisparoManual();
+  const j = janelaDeDisparoManual(Date.now(), req.query.tipo || null);
   res.json({ ok:true, dentro: j.ok, janelas: j.janelas,
              proximaAbertura: j.ok ? null : dataHoraSP(j.proximoEm) });
 });
