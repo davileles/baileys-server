@@ -214,12 +214,12 @@ const CFG_PADRAO = {
     },
   },
 
-  // ── AVISO DE CANDIDATOS (temporario, set/2026) ──
+  // ── AVISO DE CANDIDATOS ──
   // Todo produto que passa no gatilho e avisado no bot do Telegram (@ticopromosbot,
-  // admins) e no grupo do operador — inclusive em modo sombra, que e justamente
-  // quando ninguem ve a fila. Uma mensagem consolidada por varredura, e o mesmo
-  // produto so e avisado de novo depois de cooldownHoras. Para desligar:
-  // avisos.candidatos = false em /monitor-precos/config.
+  // admins) — inclusive em modo sombra, que e justamente quando ninguem ve a
+  // fila. Uma mensagem consolidada por varredura, e o mesmo produto so e avisado
+  // de novo depois de cooldownHoras. O grupo do operador NAO recebe (out/2026:
+  // la so vai alerta grave). Para desligar: avisos.candidatos = false.
   // Selo "Menor preço dos últimos X dias" no template ({{menor_preco}}). Vale
   // para QUALQUER disparo de produto que tenha serie, nao so os do monitor.
   selo: {
@@ -234,6 +234,14 @@ const CFG_PADRAO = {
     // Quantos produtos do aviso ganham PREVIA: a mensagem montada exatamente
     // como sairia no grupo (template, cupom, preco lido agora). 0 desliga.
     previas: 5,
+    // Cada previa vira CARD DE REVISAO no bot (out/2026): o item entra na fila de
+    // aprovacao (/mkt/fila) com os botoes de sempre — Enviar agora, ajustes,
+    // trilhas, descartar. Nada sai sozinho: em modo sombra so sai o que o
+    // operador tocar. false volta a previa so de leitura.
+    cards: true,
+    // Card parado alem disto expira: o preco que justificou a oferta pode ter
+    // voltado. Antes de enviar, o preco tambem e relido na loja.
+    cardTtlHoras: 6,
   },
 
   // Regra padrao + sobrescrita por nicho. Nicho sem entrada em porNicho herda
@@ -535,6 +543,8 @@ function estruturarCfg(bruto) {
   out.avisos.candidatos    = av.candidatos !== false;
   out.avisos.cooldownHoras = limitar(av.cooldownHoras, 1, 720, CFG_PADRAO.avisos.cooldownHoras);
   out.avisos.previas       = limitar(av.previas, 0, 15, CFG_PADRAO.avisos.previas);
+  out.avisos.cards         = av.cards !== false;
+  out.avisos.cardTtlHoras  = limitar(av.cardTtlHoras, 1, 48, CFG_PADRAO.avisos.cardTtlHoras);
 
   const sl = b.selo || {};
   out.selo.ativo       = sl.ativo !== false;
@@ -1677,7 +1687,9 @@ function avisarCandidatos(aprovados) {
   });
   const extra = novos.length > MAX ? '\n\n+ ' + (novos.length - MAX) + ' outro(s) na fila do painel.' : '';
   const modo = _cfg.modo === 'on' ? 'modo on — entram na fila de envio'
-    : _cfg.modo === 'sombra' ? 'modo sombra — NAO serao enviados' : 'modo ' + _cfg.modo;
+    : _cfg.modo === 'sombra'
+      ? (usarCards() ? 'modo sombra — so sai o que voce aprovar no card' : 'modo sombra — NAO serao enviados')
+      : 'modo ' + _cfg.modo;
   const texto = '📉 Monitor de precos — ' + novos.length + ' produto(s) aptos a sair (' + modo + ')\n\n'
     + linhas.join('\n\n') + extra;
 
@@ -1695,14 +1707,26 @@ function avisarCandidatos(aprovados) {
 /**
  * Monta a mensagem de cada candidato pelo MESMO caminho do disparo real
  * (montador da loja + template + cupom vinculado) e manda so para os admins do
- * bot. Nada entra em fila e o ledger de rastreio nao e tocado (rastrear:false):
- * previa de produto que nunca sai nao pode ocupar etiqueta do pool da Amazon.
- * O link da previa e o de afiliado cru; o encurtado ir.ticapromos.com.br/...
- * e gerado so no envio, por grupo.
+ * bot.
+ *
+ * Com avisos.cards ligado (padrao), cada candidato vira CARD DE REVISAO: entra
+ * na fila de aprovacao com os botoes de sempre e so sai se o operador tocar em
+ * Enviar. Como pode sair de verdade, monta COM rastreio (igual ao disparo).
+ * Sem cards — ou se o card nao puder ser criado — cai na previa so de leitura,
+ * montada com rastrear:false: previa de produto que nunca sai nao pode ocupar
+ * etiqueta do pool da Amazon. O link encurtado ir.ticapromos.com.br/... e
+ * gerado so no envio, por grupo, nos dois casos.
  */
+function usarCards() {
+  return _cfg.avisos?.cards !== false && typeof _deps?.cardCandidato === 'function';
+}
+
 async function enviarPrevias(lista) {
-  if (!lista.length || typeof _deps?.previaCandidato !== 'function') return;
+  if (!lista.length) return;
+  const cards = usarCards();
+  if (!cards && typeof _deps?.previaCandidato !== 'function') return;
   const codigoCupom = _cfg.publicacao.aplicarCupom ? null : 'nenhum';
+  const optsMontagem = cards ? {} : { rastrear: false };
   const montados = new Map();   // asin -> { o } | { erro }
 
   // Amazon em lote (uma chamada para ate 10 ASINs).
@@ -1712,7 +1736,7 @@ async function enviarPrevias(lista) {
       for (const { av } of amz) montados.set(av.asin, { erro: 'Amazon nao configurada' });
     } else {
       try {
-        const m = await _deps.montarAmazon(amz.map(({ av }) => av.asin), codigoCupom, { rastrear: false });
+        const m = await _deps.montarAmazon(amz.map(({ av }) => av.asin), codigoCupom, optsMontagem);
         for (const o of m?.prontos || []) montados.set(o.asin, { o });
         for (const d of m?.descartados || []) montados.set(d.asin, { erro: d.motivo });
       } catch (e) { for (const { av } of amz) montados.set(av.asin, { erro: e.message }); }
@@ -1727,7 +1751,7 @@ async function enviarPrevias(lista) {
         m = credenciaisShopeeOk() ? await _deps.montarShopee([item], codigoCupom) : null;
         if (!m) { montados.set(av.asin, { erro: 'Shopee nao configurada' }); continue; }
       } else if (item.loja === 'Mercado Livre') {
-        m = tokenAffOk() ? await _deps.montarMl([item], codigoCupom, { rastrear: false }) : null;
+        m = tokenAffOk() ? await _deps.montarMl([item], codigoCupom, optsMontagem) : null;
         if (!m) { montados.set(av.asin, { erro: 'Mercado Livre nao configurado' }); continue; }
       } else { montados.set(av.asin, { erro: 'loja fora do monitor: ' + item.loja }); continue; }
       const o = m?.prontos?.[0];
@@ -1736,9 +1760,26 @@ async function enviarPrevias(lista) {
   }
 
   let i = 0;
-  for (const { av } of lista) {
+  for (const { av, item } of lista) {
     i++;
     const r = montados.get(av.asin) || { erro: 'nao montado' };
+
+    // ── CARD DE REVISAO ──
+    if (cards && r.o) {
+      try {
+        const prep = await prepararOfertaMonitor(item, av, r.o);
+        const c = await _deps.cardCandidato({
+          oferta: prep.oferta, candidato: av,
+          nichoCurado: prep.ehCurado ? String(item.nicho).trim() : null,
+          espelhouNoGeral: prep.espelhouNoGeral,
+          ttlHoras: _cfg.avisos.cardTtlHoras,
+        });
+        if (c?.ok || c?.duplicado) continue;   // card criado (ou ja havia um pendente)
+        console.warn('[PRECOS] Card ' + av.asin + ' nao criado (' + (c?.erro || '?') + ') — vai como previa.');
+      } catch (e) { console.warn('[PRECOS] Card ' + av.asin + ' falhou (' + e.message + ') — vai como previa.'); }
+    }
+    if (typeof _deps?.previaCandidato !== 'function') continue;
+
     const pctFmt = String(av.quedaPct).replace('.', ',');
     let cab = '👁 PRÉVIA ' + i + '/' + lista.length + ' — como sairia no grupo\n'
       + '[' + av.nicho + (av.curado ? ' · curado' : '') + '] queda ' + pctFmt + '% vs mediana 30d';
@@ -1940,29 +1981,36 @@ function registrarDisparo(reg) {
  * classificada, e e isso que permite o roteamento por trilha mandar bebida para
  * o grupo de bebidas em vez de jogar tudo no geral.
  */
-export async function dispararMonitorado(item, candidato = {}) {
+// Monta UM produto pelo montador da loja. `opts` so e repassado quando vem
+// (rastrear:false na releitura de preco), para o disparo seguir identico.
+async function montarItemMonitor(item, opts = null) {
   // null = o montador usa o cupom vinculado ao item (e nada alem dele);
   // 'nenhum' = sai sem cupom mesmo havendo vinculo.
   const codigoCupom = _cfg.publicacao.aplicarCupom ? null : 'nenhum';
-
   let montado;
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) return { ok: false, motivo: 'Shopee nao configurada' };
     montado = await _deps.montarShopee([item], codigoCupom);
   } else if (item.loja === 'Mercado Livre') {
     if (!tokenAffOk()) return { ok: false, motivo: 'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
-    montado = await _deps.montarMl([item], codigoCupom);
+    montado = opts ? await _deps.montarMl([item], codigoCupom, opts) : await _deps.montarMl([item], codigoCupom);
   } else if (ehItemAmazon(item)) {
     if (!credenciaisAmazonOk()) return { ok: false, motivo: 'Amazon nao configurada' };
     // A montagem da Amazon recebe ASINs, nao o objeto do item — e a unica das
     // tres com essa assinatura.
-    montado = await _deps.montarAmazon([item.asin], codigoCupom);
+    montado = opts ? await _deps.montarAmazon([item.asin], codigoCupom, opts) : await _deps.montarAmazon([item.asin], codigoCupom);
   } else {
     return { ok: false, motivo: 'loja fora do monitor: ' + item.loja };
   }
-
   const o = montado?.prontos?.[0];
   if (!o) return { ok: false, motivo: montado?.descartados?.[0]?.motivo || 'produto descartado' };
+  return { ok: true, o };
+}
+
+export async function dispararMonitorado(item, candidato = {}) {
+  const mt = await montarItemMonitor(item);
+  if (!mt.ok) return mt;
+  const o = mt.o;
 
   // Segunda trava de preco: se entre a varredura e agora o preco subiu de volta,
   // a oferta morre aqui em vez de sair com desconto que nao existe mais.
@@ -1975,6 +2023,32 @@ export async function dispararMonitorado(item, candidato = {}) {
     }
   }
 
+  const { oferta, ehCurado, espelhouNoGeral } = await prepararOfertaMonitor(item, candidato, o);
+
+  // somenteNicho corta os grupos gerais DENTRO do laco de envio: a mesma oferta,
+  // um subconjunto de destinos. Sem esta opcao o envio e indivisivel e nao ha
+  // como publicar no nicho segurando o geral.
+  const env = await _deps.enviarOferta(o.mensagem, null, oferta,
+    espelhouNoGeral ? {} : { somenteNicho: true, categoriaNicho: String(item.nicho).trim() });
+  marcarProdutoDisparado(item);
+  return { ok: true, nome: o.nome, preco: o.produto.preco, grupos: env.enviados.length,
+           cupom: o.cupom?.codigo || null, espelhouNoGeral };
+}
+
+// Marca o produto inteiro, nao so a loja que saiu: as outras lojas do mesmo
+// produto entram no cooldown junto.
+function marcarProdutoDisparado(item) {
+  const gDisp = String(item?.grupo || '').trim();
+  if (gDisp) for (const i of itensDoGrupo(gDisp)) marcarDisparo(i.asin);
+  else marcarDisparo(item.asin);
+}
+
+/**
+ * Objeto de oferta do monitor (o mesmo do disparo automatico e do card de
+ * revisao) + a decisao de roteamento: curado vai ao nicho; so espelha no geral
+ * com queda funda e cota.
+ */
+async function prepararOfertaMonitor(item, candidato, o) {
   // Curadoria vence o classificador tambem aqui: e 'categoria' + 'confianca'
   // que o roteamento por trilha le, entao e aqui que o produto curado ganha o
   // passaporte para o grupo nichado.
@@ -2018,7 +2092,10 @@ export async function dispararMonitorado(item, candidato = {}) {
                  min90: candidato.min90 ?? null, recorde: !!candidato.recorde,
                  // 'cupom' = a etiqueta nao mudou, quem caiu foi o que se paga.
                  via: candidato.via || 'preco',
-                 precoEfetivo: candidato.precoEfetivo ?? null },
+                 precoEfetivo: candidato.precoEfetivo ?? null,
+                 // Preco lido na varredura: o card compara com o da montagem.
+                 precoVarredura: Number.isFinite(candidato.preco) ? candidato.preco : null,
+                 nicho: candidato.nicho || null },
     },
     imagens: [],
   };
@@ -2028,18 +2105,48 @@ export async function dispararMonitorado(item, candidato = {}) {
     if (img) oferta.imagens = [img];
   } catch (e) {}
 
-  // somenteNicho corta os grupos gerais DENTRO do laco de envio: a mesma oferta,
-  // um subconjunto de destinos. Sem esta opcao o envio e indivisivel e nao ha
-  // como publicar no nicho segurando o geral.
-  const env = await _deps.enviarOferta(o.mensagem, null, oferta,
-    espelhouNoGeral ? {} : { somenteNicho: true, categoriaNicho: String(item.nicho).trim() });
-  // Marca o produto inteiro, nao so a loja que saiu: as outras lojas do mesmo
-  // produto entram no cooldown junto.
-  const gDisp = String(item.grupo || '').trim();
-  if (gDisp) for (const i of itensDoGrupo(gDisp)) marcarDisparo(i.asin);
-  else marcarDisparo(item.asin);
-  return { ok: true, nome: o.nome, preco: o.produto.preco, grupos: env.enviados.length,
-           cupom: o.cupom?.codigo || null, espelhouNoGeral };
+  return { oferta, ehCurado, espelhouNoGeral, cls };
+}
+
+// ── CARD DE REVISAO (bot) ────────────────────────────────────────────────────
+/**
+ * Segunda trava de preco do card: rele a loja (sem rastreio) antes do envio.
+ * `subiu` quando o preco de agora passou 3% do preco do card — a mesma folga do
+ * disparo automatico. Falha de leitura devolve ok:false e quem chama decide.
+ */
+export async function conferirPrecoCard(asin, precoCard) {
+  const item = itemVitrine(asin);
+  if (!item) return { ok: false, motivo: 'produto saiu da vitrine' };
+  if (!_deps) return { ok: false, motivo: 'monitor nao inicializado' };
+  const mt = await montarItemMonitor(item, { rastrear: false });
+  if (!mt.ok) return { ok: false, motivo: mt.motivo };
+  const agora = Number(mt.o.produto?.preco);
+  const base = Number(precoCard);
+  const subiu = Number.isFinite(agora) && Number.isFinite(base) && base > 0 && (agora - base) / base > 0.03;
+  return { ok: true, precoAgora: Number.isFinite(agora) ? agora : null, subiu };
+}
+
+/**
+ * Card aprovado no bot/painel e enviado: conta como disparo do monitor —
+ * cooldown do produto, cota (so quando saiu no geral), relogios e historico de
+ * disparos, que e o que /monitor-precos/vereditos le.
+ */
+export function registrarEnvioCard(snap = {}, { grupos = null, preco = null, cupom = null } = {}) {
+  const asin = snap.asin;
+  if (!asin) return false;
+  const item = itemVitrine(asin) || { asin, loja: snap.loja };
+  marcarProdutoDisparado(item);
+  const cand = _estado.fila.find(f => f.asin === asin) || snap;
+  if (snap.espelhouNoGeral !== false) {
+    consumirCota(item.loja || snap.loja, cand.nicho || snap.nicho);
+    _estado.ultimoEnvioEm = Date.now();
+  }
+  if (snap.curado) _estado.ultimoEnvioCuradoEm = Date.now();
+  removerDaFila(asin);
+  registrarDisparo({ ...cand, manual: true, viaCard: true, precoEnviado: preco, grupos,
+                     cupom, espelhouNoGeral: snap.espelhouNoGeral !== false, ok: true });
+  gravar(ARQ_ESTADO, _estado);
+  return true;
 }
 
 // ── SIMULACAO (modo sombra em tela) ──────────────────────────────────────────

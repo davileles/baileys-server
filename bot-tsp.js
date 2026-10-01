@@ -869,7 +869,28 @@ function blocoAtencao(o) {
 // Cabecalho compartilhado pelo card e pelas telas de ajuste (preco, cupom...):
 // o operador nunca perde de vista QUAL oferta esta editando e para onde ela vai.
 function cabecalhoCard(o) {
-  return [tituloCard(o), blocoPreco(o), blocoTrilha(o), blocoAtencao(o)].filter(Boolean).join('\n\n');
+  return [tituloCard(o), blocoMonitor(o), blocoPreco(o), blocoTrilha(o), blocoAtencao(o)].filter(Boolean).join('\n\n');
+}
+
+// Card que veio do monitor de precos: o porque da oferta logo abaixo do titulo
+// — quanto caiu contra o preco normal (mediana 30d) e se e o menor do trimestre.
+function blocoMonitor(o) {
+  const m = o.monitor;
+  if (!m) return '';
+  const pct = m.quedaPct != null ? String(m.quedaPct).replace('.', ',') + '%' : '?';
+  const linhas = ['📉 <b>Monitor de preços</b> — queda de <b>' + esc(pct) + '</b> vs mediana 30d'
+    + (m.mediana30 != null ? ' (' + esc(brlCurto(m.mediana30)) + ')' : '')];
+  const det = [];
+  if (m.recorde) det.push('menor preço em 90 dias');
+  if (m.via === 'cupom') det.push('queda pelo cupom');
+  if (m.nicho) det.push('nicho ' + m.nicho);
+  if (det.length) linhas.push('     ' + esc(det.join(' · ')));
+  const pv = Number(m.precoVarredura), pa = Number(o.dados?.preco);
+  if (m.precoVarredura != null && Number.isFinite(pv) && Number.isFinite(pa) && Math.abs(pv - pa) >= 0.01) {
+    linhas.push('     ⚠ preço mudou desde a varredura: ' + esc(brlCurto(pv)) + ' → ' + esc(brlCurto(pa)));
+  }
+  if (o.expiraEm) linhas.push('     ⏳ vale até ' + esc(horaCurta(o.expiraEm)) + ' · o preço é relido antes de enviar');
+  return linhas.join('\n');
 }
 
 // sendMessage corta em 4096 (contados DEPOIS de tirar as tags). O card carrega
@@ -945,7 +966,7 @@ function brlCurto(v) {
 // preco) vem antes do titulo.
 function rotuloItemFila(i) {
   const nicho = Array.isArray(i.nichos) && i.nichos.length ? '🎯' + i.nichos.join('+') : null;
-  const partes = ['#' + i.id, brlCurto(i.precoFinal), nicho, String(i.titulo || '').slice(0, 30)];
+  const partes = [(i.monitor ? '📉' : '') + '#' + i.id, brlCurto(i.precoFinal), nicho, String(i.titulo || '').slice(0, 30)];
   return partes.filter(Boolean).join(' · ')
     + (i.falhou ? ' 🛑' : i.aviso ? ' ⚠️' : '') + (i.ajustado ? ' ✏️' : '');
 }
@@ -963,7 +984,7 @@ async function mostrarFila(chatId, msgId) {
     linhas.push([['🔄 Atualizar', 'r:fila:0']]);
     const cabec = '📋 Ofertas de produto pendentes: ' + r.total
       + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '')
-      + '\n🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada · 🎯 = sai também em grupo de nicho';
+      + '\n📉 = monitor de preços · 🛑 = envio falhou · ⚠️ = exige atenção · ✏️ = já ajustada · 🎯 = sai também em grupo de nicho';
     res = await falarPlano(chatId, cabec, teclado(linhas), msgId);
   }
   const alvo = res?.message_id || msgId;
@@ -1099,11 +1120,27 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
   }
 
   if (acao === 'descartar') {
-    const d = await apiLocal('POST', '/painel/rejeitar/' + id, {});
+    // Card do monitor: antes de descartar, pergunta se o monitor deve aprender
+    // (nunca mais este produto / evitar a loja) — e a curadoria que aprende.
+    const como = partes[3] || '';
+    if (o.origem === 'monitor-precos' && !como) {
+      return falarHtml(chatId, cabecalhoCard(o) + '\n\n<b>Descartar?</b> Escolha se o monitor deve aprender com isso.',
+        teclado([
+          [['🙅 Só desta vez', 'r:descartar:' + id + ':so']],
+          [['🚫 Nunca mais este produto', 'r:descartar:' + id + ':produto']],
+          [['🏪 Evitar esta loja', 'r:descartar:' + id + ':loja']],
+          [['⬅️ Voltar', 'r:ver:' + id]],
+        ]), msgId);
+    }
+    const aprende = como === 'produto' || como === 'loja';
+    const d = await apiLocal('POST', '/painel/rejeitar/' + id,
+      aprende ? { aprender: como, motivo: 'descartado no card do bot (' + como + ')' } : {});
     // Falha mantem o card COM botoes: sem eles o item segue pendente na fila e
     // o operador fica sem forma de tentar de novo pelo celular.
     if (!d.ok) return falarHtml(chatId, corpoCard(o, '❌ Falha ao descartar: ' + (d.erro || d.http)), tecladoCard(id), msgId);
-    return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada:'), ctx);
+    const nota = como === 'produto' ? ' (monitor não sugere mais este produto)'
+      : como === 'loja' ? ' (monitor passa a evitar a loja)' : '';
+    return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada' + nota + ':'), ctx);
   }
 
   if (acao === 'preco' || acao === 'precode' || acao === 'titulo' || acao === 'topo' || acao === 'importante') {
@@ -1715,7 +1752,7 @@ async function tratarBotao(chatId, msgId, data, ctx) {
 // ── TRAVA DE TOQUE REPETIDO ──────────────────────────────────────────────────
 const travas = new Set();
 function chaveTrava(chatId, data) {
-  const r = /^r:(enviar|descartar):(.+)$/.exec(data);
+  const r = /^r:(enviar|descartar):([^:]+)/.exec(data);
   if (r) return chatId + ':r:' + r[2];
   // Troca de trilha: um toque por vez por item, senao o segundo redesenha a
   // tela com o estado de antes do primeiro.

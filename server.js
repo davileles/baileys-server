@@ -81,6 +81,7 @@ import {
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
   julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
+  conferirPrecoCard, registrarEnvioCard,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -15150,6 +15151,24 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     return;
   }
 
+  // Card do monitor de precos: vencido nao sai, e o preco e relido na loja —
+  // se voltou a subir, a oferta que justificou o card nao existe mais.
+  if (oferta.origem === 'monitor-precos' && oferta.monitorCard) {
+    if (oferta.expiraEm && Date.parse(oferta.expiraEm) < Date.now()) {
+      oferta.status = 'expirado'; salvarFila();
+      return res.status(410).json({ ok:false, erro:'Card do monitor expirou — o preço pode ter mudado.' });
+    }
+    if (!req.body.ignorarPreco) {
+      const base = oferta.dadosExtraidos?.preco ?? oferta.monitorCard.preco;
+      const cp = await conferirPrecoCard(oferta.monitorCard.asin, base).catch(e => ({ ok:false, motivo:e.message }));
+      if (cp?.ok && cp.subiu) {
+        return res.status(409).json({ ok:false, erro:'Preço subiu na loja: R$ ' + Number(base).toFixed(2).replace('.', ',')
+          + ' → R$ ' + Number(cp.precoAgora).toFixed(2).replace('.', ',') + '. Descarte o card.' });
+      }
+      if (cp && !cp.ok) console.warn('[PRECOS] Card #' + oferta.id + ' sem releitura de preco (' + cp.motivo + ') — segue.');
+    }
+  }
+
   if (ehOfertaMarketplace(oferta.tipoConteudo)) {
     oferta.status = 'enviando';
     oferta.enviandoDesde = new Date().toISOString();
@@ -15169,6 +15188,12 @@ app.post('/painel/aprovar/:id', async (req, res) => {
       delete oferta.enviandoDesde;
       salvarFila();
       registrarEnvioHistorico(oferta);
+      if (oferta.origem === 'monitor-precos' && oferta.monitorCard) {
+        try {
+          registrarEnvioCard(oferta.monitorCard, { grupos: r.enviados?.length ?? null,
+            preco: oferta.dadosExtraidos?.preco ?? null, cupom: oferta.dadosExtraidos?.cupom?.codigo || null });
+        } catch (e) { console.warn('[PRECOS] Disparo do card #' + oferta.id + ' nao registrado:', e.message); }
+      }
       return r;
     }, err => {
       oferta.status = 'pendente';
@@ -15271,6 +15296,15 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   oferta.status = 'rejeitado';
   salvarFila();
+  // Card do monitor descartado vira recusa da curadoria (pode aprender:
+  // 'produto' | 'loja'), igual a recusa feita na fila do painel.
+  if (oferta.origem === 'monitor-precos' && oferta.monitorCard?.asin) {
+    try {
+      const aprender = ['produto', 'loja'].includes(req.body?.aprender) ? req.body.aprender : null;
+      recusarCandidato(oferta.monitorCard.asin, {
+        motivo: String(req.body?.motivo || 'descartado no card').slice(0, 200), aprender });
+    } catch (e) { console.warn('[PRECOS] Recusa do card #' + oferta.id + ':', e.message); }
+  }
   res.json({ ok:true });
 });
 
@@ -19727,6 +19761,10 @@ function resumoOfertaFila(o) {
     rota: resumoRotaOferta(o),
     motivoFila: o.motivoFila || null,
     falhaAutoEnvio: o.falhaAutoEnvio || null,
+    // Card do monitor de precos: o porque da oferta (queda vs mediana, recorde).
+    origem: o.origem || null,
+    monitor: o.origem === 'monitor-precos' ? (d.monitor || null) : null,
+    expiraEm: o.expiraEm || null,
     revisaoDeEdicao: !!o.revisaoDeEdicao,
     cupomForaDaBase: o.cupomForaDaBase || null,
     cupomAmbiguo: o.cupomAmbiguo || null,
@@ -19827,6 +19865,7 @@ app.get('/mkt/fila', (req, res) => {
       ajustado: !!o.ajustes,
       falhou: !!o.falhaAutoEnvio,
       motivo: o.motivoFila || null,
+      monitor: o.origem === 'monitor-precos',
       // Um unico sinal para o rotulo do botao: o motivo detalhado esta no card.
       aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.precoDivergente || d.precoDeReferencia),
       timestamp: o.timestamp || null,
@@ -22719,6 +22758,71 @@ bootBotPassagens({
 }).catch(e => console.warn('[BOT-PASSAGENS] Falha no boot:', e.message));
 bootBotOfertas({ sessaoDir: SESSAO_DIR, PORT }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
 
+// ── CARDS DO MONITOR DE PRECOS ───────────────────────────────────────────────
+// Candidato do monitor entra na MESMA fila de aprovacao das ofertas capturadas
+// (painel web + card do bot com Enviar agora, ajustes, trilhas, descartar).
+// Roteamento igual ao do monitor ligado: produto curado vai as trilhas do nicho
+// e so leva junto as gerais quando a queda e funda (espelhouNoGeral). A escolha
+// vai em trilhasManuais, entao o botao Trilhas do card continua valendo.
+function criarCardMonitorPrecos({ oferta, candidato = {}, nichoCurado = null, espelhouNoGeral = true, ttlHoras = 6 } = {}) {
+  const asin = oferta?.dadosExtraidos?.asin;
+  if (!oferta || !asin) return { ok:false, erro:'oferta sem produto' };
+  const jaPendente = filaPendentes.some(x => x.status === 'pendente' && x.origem === 'monitor-precos'
+    && x.dadosExtraidos?.asin === asin);
+  if (jaPendente) return { ok:false, duplicado:true };
+
+  if (nichoCurado) {
+    try {
+      const doNicho = trilhas().filter(t => t.categoria === nichoCurado).map(t => t.id);
+      if (doNicho.length) {
+        const gerais = espelhouNoGeral
+          ? detalharRoteamento(rotaDeRoteamento(oferta)).filter(t => t.entrega && !t.categoria).map(t => t.id)
+          : [];
+        oferta.trilhasManuais = [...new Set([...doNicho, ...gerais])];
+      }
+    } catch (e) { console.warn('[PRECOS] Trilhas do card ' + asin + ':', e.message); }
+  }
+
+  const agora = Date.now();
+  oferta.status = 'pendente';
+  oferta.tenant = TENANT_PADRAO;
+  oferta.timestamp = new Date(agora).toISOString();
+  oferta.expiraEm = new Date(agora + Math.max(1, Number(ttlHoras) || 6) * 3600000).toISOString();
+  // Retrato do candidato: e o que conta o disparo no monitor quando o card sai.
+  oferta.monitorCard = {
+    asin, nome: candidato.nome || oferta.dadosExtraidos.titulo || '', loja: candidato.loja || oferta.dadosExtraidos.loja,
+    nicho: candidato.nicho || null, curado: !!candidato.curado, espelhouNoGeral: !!espelhouNoGeral,
+    preco: Number.isFinite(candidato.preco) ? candidato.preco : null,
+    quedaPct: candidato.quedaPct ?? null, mediana30: candidato.mediana30 ?? null,
+    min90: candidato.min90 ?? null, recorde: !!candidato.recorde, via: candidato.via || 'preco',
+    precoEfetivo: candidato.precoEfetivo ?? null, score: candidato.score ?? null,
+  };
+  filaPendentes.unshift(oferta);
+  salvarFila();
+  enviarCardRevisaoTelegram(oferta).catch(e =>
+    console.warn('[BOT-TSP] Card do monitor #' + oferta.id + ' falhou: ' + e.message));
+  console.log('[PRECOS] Card #' + oferta.id + ' na fila — ' + asin + ' queda ' + candidato.quedaPct + '%'
+    + (oferta.trilhasManuais ? ' (trilhas: ' + oferta.trilhasManuais.join(', ') + ')' : ''));
+  return { ok:true, id: oferta.id };
+}
+
+// Card parado alem da validade sai da fila: o preco que justificou a oferta
+// pode ter voltado. Quem tocar nele depois ve "ja resolvida (expirado)".
+setInterval(() => {
+  try {
+    const agora = Date.now();
+    let mudou = 0;
+    for (const o of filaPendentes) {
+      if (o.status !== 'pendente' || o.origem !== 'monitor-precos' || !o.expiraEm) continue;
+      if (Date.parse(o.expiraEm) > agora) continue;
+      o.status = 'expirado';
+      o.motivoFila = 'card do monitor expirou sem aprovacao';
+      mudou++;
+    }
+    if (mudou) { salvarFila(); console.log('[PRECOS] ' + mudou + ' card(s) do monitor expirado(s).'); }
+  } catch (e) { console.warn('[PRECOS] Expiracao de cards:', e.message); }
+}, 10 * 60000);
+
 // Monitor de queda de preco. As funcoes de montagem e envio sao injetadas em
 // vez de importadas: o modulo precisa do caminho REAL de envio (template, cupom,
 // rodape por nicho, roteamento por trilha) sem criar ciclo de import com este
@@ -22731,13 +22835,14 @@ iniciarMonitorPrecos({
   baixarImagem:   baixarImagemProduto,
   gerarId,
   whatsappPronto: () => !!(conectado && sock),
-  // Aviso temporario de candidatos: bot do Telegram (admins) + grupo do operador.
+  // Aviso de candidatos: so no bot do Telegram (admins). O grupo do operador
+  // saiu em out/2026 — la so vai alerta grave.
   avisarCandidatos: async (texto) => {
     try { await notificarAdminsTelegram(texto); }
     catch (e) { console.warn('[PRECOS] Aviso Telegram falhou:', e.message); }
-    try { if (conectado && sock) await enviarMensagem(GRUPOS.operador, { text: texto }); }
-    catch (e) { console.warn('[PRECOS] Aviso operador falhou:', e.message); }
   },
+  // Candidato vira card de revisao no bot, pronto para disparo.
+  cardCandidato: criarCardMonitorPrecos,
   // Previa de cada candidato (mensagem exata do grupo + foto): so no bot.
   previaCandidato: async ({ texto, imagemUrl }) => {
     try { await notificarAdminsTelegramFoto(imagemUrl, texto); }
