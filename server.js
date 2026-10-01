@@ -3163,9 +3163,23 @@ function resolverCidade(codigo, nomeIA) {
 const PROGRAMAS_CPM = {
   'Smiles':16,'Azul Fidelidade':15,'Azul pelo Mundo':15,
   'LATAM Pass':26,'Iberia Plus':58,'Privilege Club':58,
-  'Executive Club':58,'TAP':43,'AAdvantage':100,'SUMA':80,
+  'Executive Club':58,'TAP':45,'AAdvantage':100,'SUMA':80,
   'Flying Club':50,'Finnair Plus':58,'Aeroplan':50
 };
+// A IA as vezes devolve o nome comercial do programa ("TAP Miles&Go") em vez
+// do nome canonico da lista. Sem este funil o CPM e o slug do link nao casam
+// e o alerta sai com "OU -" no lugar do valor em reais.
+const PROGRAMA_ALIAS = {
+  'tap miles&go':'TAP', 'tap miles & go':'TAP', 'tap miles and go':'TAP',
+  'tap milesandgo':'TAP', 'miles&go':'TAP', 'miles & go':'TAP', 'miles and go':'TAP',
+  'tap air portugal':'TAP', 'tap':'TAP',
+};
+function programaCanonico(p) {
+  const bruto = String(p == null ? '' : p).trim();
+  if (!bruto || PROGRAMAS_CPM[bruto] !== undefined) return bruto;
+  const chave = bruto.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ');
+  return PROGRAMA_ALIAS[chave] || bruto;
+}
 // Links mascarados do Clube do Viajante. O destino real (com os parametros de
 // afiliado) vive em painel-cdv/links.json e e resolvido pelo endpoint /ir do
 // proxy. Para trocar um destino NAO mexa aqui: edite links.json.
@@ -3194,7 +3208,7 @@ const PROGRAMAS_SLUG = {
 const PROGRAMAS_COM_BUSCA = new Set(['smiles']);
 
 function linkPrograma(programa, origem, busca) {
-  const slug = PROGRAMAS_SLUG[programa];
+  const slug = PROGRAMAS_SLUG[programaCanonico(programa)];
   if (!slug) {
     console.warn('[links] programa sem slug cadastrado:', programa);
     return '';
@@ -3347,7 +3361,7 @@ function formatarMensagemCDV(d) {
   var n = '\n';
   var rodape = '`Dica de emissão encontrada por @davileles - Clube do Viajante`';
   var balcao = '`Faça parte do Balcão clicando aqui: https://pay.hub.la/TkIbYhix67evTSu1be7c`';
-  var cpm = PROGRAMAS_CPM[d.programa] || 0;
+  var cpm = PROGRAMAS_CPM[programaCanonico(d.programa)] || 0;
   // Título usa SEMPRE o MENOR valor entre os trechos. d.pontos pode vir como
   // um número só ("458600"), com separador ("102.000") ou com os dois trechos
   // ("102000 (ida) / 86600 (volta)"). Extrai todos os números e pega o mínimo.
@@ -15393,6 +15407,35 @@ app.post('/painel/reformatar/:id', async (req, res) => {
     salvarFila();
     res.json({ ok:true, mensagemFormatada: oferta.mensagemFormatada, dadosExtraidos: de });
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// Remonta e reenvia ao bot de passagens os cards pendentes de um programa
+// (ex: depois de ajustar o CPM). Mesma remontagem do /painel/reformatar, sem
+// editar campo nenhum. Body: { programa: 'TAP', desde: '2026-10-01T00:00:00-03:00' }
+app.post('/cdv/recalcular-cards', async (req, res) => {
+  const programa = programaCanonico((req.body && req.body.programa) || '');
+  const desde = Date.parse((req.body && req.body.desde) || '') || 0;
+  if (!programa) return res.status(400).json({ ok:false, erro:'Informe o programa.' });
+  const alvo = filaPendentes.filter(o =>
+       o.status === 'pendente'
+    && !ehConteudoTsp(o.tipoConteudo)
+    && (o.tenant || TENANT_PADRAO) === req.tenantId
+    && programaCanonico((o.dadosExtraidos || {}).programa) === programa
+    && (!desde || Date.parse(o.timestamp || '') >= desde));
+  const ids = [];
+  for (const oferta of alvo) {
+    const de = oferta.dadosExtraidos || {};
+    if (ehPagante(de) || !de.origem || !de.destino) continue;
+    oferta.mensagemFormatada = appendHistoricoMensagem(formatarMensagemCDV(de), oferta.hist180 || null);
+    ids.push(oferta.id);
+  }
+  salvarFila();
+  for (const id of ids) {
+    const oferta = filaPendentes.find(o => o.id === id);
+    try { await enviarCardPassagem(oferta); }
+    catch (e) { console.warn('[BOT-PASSAGENS] Reenvio do card #' + id + ' falhou: ' + e.message); }
+  }
+  res.json({ ok:true, programa, total: ids.length, ids });
 });
 
 // Reaplica links de afiliado nos cupons TSP pendentes sob demanda (sem restart)
