@@ -110,7 +110,14 @@ const CANAL_OK_VALIDADE_MS = 24 * 60 * 60 * 1000;
 const VISITA_EXPIRA_MS = 7 * 60000;        // visita SEM ATIVIDADE ha tanto: lote volta para a fila
 const EXTENSAO_AUSENTE_MS = 30 * 60000;    // sem contato ha tanto = extensao fora do ar
 const RE_CODIGO = /^[A-Za-z0-9._-]{2,23}$/;  // 23 = maxlength do campo do ML
-const VEREDITOS = new Set(['inserido', 'ja_tinha', 'esgotado', 'vencido', 'inexistente', 'problema', 'sem_login', 'pagina_mudou', 'erro']);
+const VEREDITOS = new Set(['inserido', 'ja_tinha', 'esgotado', 'vencido', 'inexistente', 'indisponivel', 'problema', 'sem_login', 'pagina_mudou', 'erro']);
+const INDISPONIVEL = 'indisponivel';       // o ML disse que o cupom nao esta disponivel PARA ESTA CONTA
+// 01/10/2026: "INVALID_5: O cupom não está disponível" (HTTP 200) chegou como
+// "problema" e abriu o disjuntor como se fosse restricao da conta. Resposta
+// com codigo INVALID_n e texto especifico e o ML julgando O CUPOM (exclusivo
+// de outro publico, campanha encerrada para a conta) — o canal esta vivo.
+// INVALID_6 fica fora: e payload que o ML nao entendeu, nao diz nada do cupom.
+const RE_INDISPONIVEL = /\bINVALID_(?![16]\b)\d+\b|n[ãa]o est[áa] dispon[íi]vel/i;
 
 let dep = null;
 let ESTADO_PATH = './sessao/insercao_ml_auto.json';
@@ -128,6 +135,7 @@ let estado = {
   invalidosSeguidos: 0,
   problemasSeguidos: 0,
   paginaMudouSeguidos: 0,  // 29/09/2026: 1 falha de seletor = tropeco; so 2 seguidas desligam
+  paginaMudouCodigos: [],  // 01/10/2026: cupons da serie de falhas de seletor (mesmo cupom = culpa do cupom)
   falhas: 0,
   liberaEm: {},         // chave → ms em que o cupom fica elegivel
   entrouEm: {},         // chave → ms em que entrou na fila (limite de espera)
@@ -442,6 +450,13 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   const codigo = String(reg.codigo || '').toUpperCase();
   const msg = String(mensagem || '').slice(0, 160);
   const st = Number(status) || 0;
+  // Recusa especifica do ML sobre o cupom, mesmo que a extensao a tenha lido
+  // como "problema": nao e restricao da conta (403/"Tivemos um problema").
+  if (veredito === 'problema' && st !== 403) {
+    const lido = String(rc || '') + ' ' + msg;
+    if (/\bINVALID_1\b/.test(lido)) veredito = 'inexistente';
+    else if (RE_INDISPONIVEL.test(lido)) veredito = 'indisponivel';
+  }
 
   // Falhas da extensao/pagina nao contam como tentativa no ML.
   if (veredito === 'erro') {
@@ -464,8 +479,23 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
     // carregamento/aba em segundo plano, e nada chegou ao ML (acontece antes
     // do clique) — entao a 1a vez so devolve a fila; a extensao encerra a
     // visita e tenta na proxima. Duas visitas seguidas assim = mudou mesmo.
-    marcar(reg, { insercaoMl: FILA });
+    // 01/10/2026: DESCONTOSMELI derrubou tudo com "campo sumiu durante a
+    // digitacao" em visitas seguidas — o problema era aquele cupom, nao a
+    // pagina. Serie so com o MESMO cupom: ele sai da fila (vai para o
+    // /inserir) e a automacao segue. So desliga quando a falha se repete
+    // em cupons DIFERENTES.
     estado.paginaMudouSeguidos = (estado.paginaMudouSeguidos || 0) + 1;
+    estado.paginaMudouCodigos = [...(estado.paginaMudouCodigos || []), codigo].slice(-5);
+    const distintos = new Set(estado.paginaMudouCodigos).size;
+    if (estado.paginaMudouSeguidos >= PAGINA_MUDOU_MAX && distintos < 2) {
+      marcar(reg, { insercaoMl: MANUAL, observacao: 'A extensão falhou na página só com este cupom (' + msg + ') — inserir à mão' });
+      registrarDesfecho(reg, '✋ só este cupom trava a página — foi para o /inserir');
+      salvar();
+      try { dep.avisarManual(); } catch (e) {}
+      console.warn('[CUPONS-ML-AUTO] Seletor ausente de novo só em ' + codigo + ' — cupom vai para o manual, automação segue');
+      return { ok: true };
+    }
+    marcar(reg, { insercaoMl: FILA });
     salvar();
     if (estado.paginaMudouSeguidos < PAGINA_MUDOU_MAX) {
       console.warn('[CUPONS-ML-AUTO] Seletor ausente em ' + codigo + ' (' + msg + ') — tropeço ' + estado.paginaMudouSeguidos + '/' + PAGINA_MUDOU_MAX + ', tenta na próxima visita');
@@ -478,6 +508,7 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   estado.feitasHoje++;
   estado.falhas = 0;
   estado.paginaMudouSeguidos = 0;
+  estado.paginaMudouCodigos = [];
 
   if (veredito === 'inserido' || veredito === 'ja_tinha') {
     estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
@@ -491,6 +522,13 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
     if (quando) campos.validadeAte = quando;
     marcar(reg, campos);
     registrarDesfecho(reg, veredito === 'esgotado' ? '🗑 esgotado' : '🗑 vencido');
+  } else if (veredito === 'indisponivel') {
+    // O ML reconheceu o codigo e respondeu sobre ele: canal vivo. O cupom nao
+    // entra nesta conta, mas pode valer para quem recebe a oferta — entao NAO
+    // e desativado; so sai da fila e nao volta para o /inserir.
+    estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
+    marcar(reg, { insercaoMl: INDISPONIVEL, observacao: 'Indisponível para a conta TSP segundo o ML: ' + (msg || rc || 'sem mensagem') });
+    registrarDesfecho(reg, '🚫 indisponível p/ a conta');
   } else if (veredito === 'inexistente') {
     estado.problemasSeguidos = 0;
     estado.invalidosSeguidos++;
@@ -611,7 +649,7 @@ export function estadoInsercaoMlAuto() {
 
 export async function religarInsercaoMlAuto() {
   if (!LIGADA) return { ok: false, erro: 'CUPONS_ML_INSERCAO_AUTO não está ligado no Railway' };
-  estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0;
+  estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0; estado.paginaMudouCodigos = [];
   estado.folgaHoje = false;   // religar a mao vale mais que o sorteio
   estado.proximaVisitaEm = 0;
   salvar();
