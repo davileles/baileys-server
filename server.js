@@ -15694,12 +15694,13 @@ app.post('/seats-alertas/email', async (req, res) => {
   const emails = Array.isArray(req.body?.emails) ? req.body.emails : [];
   if (!emails.length) return res.json({ ok:true, processados:[], enviados:0 });
   try {
-    if (!(conectado && sock)) {
-      const ok = await aguardarSock(15000);
+    if (!haContaDeDisparo()) {
+      const ok = await aguardarContaDeDisparo(15000);
       if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
     }
     const r = await processarEmailsSeats(emails, {
-      enviar:    (texto) => enviarMensagem(grupoSeatsAlertas(), { text: texto }),
+      enviar:    (texto) => enviarMensagem(grupoSeatsAlertas(), { text: texto }, 0,
+                   { conta: contaDisparoSeatsAlertas(grupoSeatsAlertas()) }),
       extrairIA: (system, texto) => chamarClaude(system, texto, 1500),
       cidades:   IATA_CIDADES,
     });
@@ -15712,6 +15713,19 @@ app.post('/seats-alertas/email', async (req, res) => {
     res.status(502).json({ ok:false, erro:e.message });
   }
 });
+
+// Quem publica no grupo: uma conta de disparo (tico-02/03), como nos demais
+// grupos — a principal fica de reserva. Ordem: numero fixo do grupo / turno;
+// sem isso, a primeira conta de disparo conectada. Se ela falhar, o
+// enviarMensagem tenta outra conta apta e so entao cai na principal.
+function contaDisparoSeatsAlertas(jid) {
+  const fixa = contaDoGrupo(jid);
+  if (fixa && fixa !== 'principal') return fixa;
+  for (const id of contasExtras.keys()) {
+    if (tenantDaConta(id) === TENANT_PADRAO && !ehContaCampanha(id) && id !== 'paulo' && contaDisponivel(id)) return id;
+  }
+  return null;
+}
 
 app.get('/seats-alertas/estado', (req, res) => res.json({ ok:true, ...estadoSeatsAlertas() }));
 

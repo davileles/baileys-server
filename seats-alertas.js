@@ -12,7 +12,8 @@
 //   2. descarta o que ja foi avisado: mesmo e-mail (id do Gmail) ou mesmo
 //      alerta/rota/data/cabine/programa/voos/pontos nas ultimas 24 h
 //   3. monta um bloco resumido por alerta e envia ao grupo "Alertas Seats.aero"
-//      na hora (fora da fila de ofertas e da janela 8h-21h)
+//      na hora (fora da fila de ofertas e da janela 8h-21h), por uma conta de
+//      disparo — a principal fica de reserva
 //
 // O estado (ids e chaves avisados) so e gravado DEPOIS do envio dar certo: se o
 // WhatsApp falhar, o Apps Script recebe erro, nao marca o e-mail e tenta de
