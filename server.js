@@ -11725,6 +11725,15 @@ async function campEnviarContato(camp, ct, mensagem, ehFollowup) {
       const m = await campMidia(b.arquivo);
       conteudo = { image: m.buffer, mimetype: m.mime };
       if (b.legenda) conteudo.caption = campResolver(b.legenda, ct);
+    } else if (b.tipo === 'audio') {
+      // Bloco de audio: o mesmo arquivo para todos. .ogg/.opus sai como mensagem
+      // de voz (ptt, bolinha com onda); outros formatos saem como arquivo de
+      // audio, porque o servidor nao converte e ptt fora de opus falha no iPhone.
+      if (!b.arquivo) continue;
+      const m = await campMidia(b.arquivo);
+      const ehOpus = /ogg|opus/.test(m.mime);
+      conteudo = { audio: m.buffer, mimetype: ehOpus ? 'audio/ogg; codecs=opus' : m.mime, ptt: ehOpus };
+      if (Number(b.segundos) > 0) conteudo.seconds = Math.round(Number(b.segundos));
     } else {
       const txt = campResolver(b.conteudo, ct).trim();
       if (!txt) continue;
