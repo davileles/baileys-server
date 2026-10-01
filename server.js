@@ -9050,42 +9050,112 @@ app.post('/cdv/oferta-ia', async (req, res) => {
 
 // ── ALERTA DE PALAVRA "BUG" EM GRUPO MONITORADO ─────────────────────────────
 // Qualquer mencao a bug (bug, bugs, bugou, bugado, bugando...) num grupo
-// monitorado do CDV ou fonte do radar gera aviso no grupo do operador com grupo,
-// hora, autor e trecho. Links sao removidos antes do teste para nao disparar
-// por URL. Throttle de 10 min por grupo: conversa sobre o mesmo bug nao inunda
-// o operador — as repeticoes somam no registro da tela (/alertas).
-const _RE_PALAVRA_BUG = /(^|[^a-z0-9\u00c0-\u024f])bug(s|ou|ado|ada|ados|adas|ando|ar|a|am|zinho)?(?![a-z0-9\u00c0-\u024f])/i;
+// monitorado do CDV ou fonte do radar gera aviso no grupo do operador com grupo
+// e hora. Links sao removidos antes do teste para nao disparar por URL.
+// Contexto: quem posta "BUG" costuma mandar a palavra SOLTA, antes ou depois da
+// oferta. Por isso o alerta junta a mensagem imediatamente anterior e a
+// imediatamente seguinte do mesmo grupo (so se estiverem a ate 5 min do "bug").
+// A seguinte ainda nao existe quando o "bug" chega: o alerta espera ate 2 min
+// por ela e sai assim que ela chega (ou ao fim da espera, sem ela).
+// Throttle de 10 min por grupo: conversa sobre o mesmo bug nao inunda o
+// operador — as repeticoes somam no registro da tela (/alertas).
+const _RE_PALAVRA_BUG = /(^|[^a-z0-9À-ɏ])bug(s|ou|ado|ada|ados|adas|ando|ar|a|am|zinho)?(?![a-z0-9À-ɏ])/i;
 const BUG_ALERTA_JANELA_MS = 10 * 60 * 1000;
+const BUG_CONTEXTO_MAX_MS  = 5 * 60 * 1000;   // distancia maxima da vizinha
+const BUG_ESPERA_SEGUINTE_MS = 2 * 60 * 1000; // quanto espera a mensagem seguinte
+const BUG_HIST_POR_GRUPO   = 6;
+const BUG_TRECHO_MAX       = 700;
+const _bugHistorico = new Map();   // jid -> [{ id, ts, autor, texto }]
+const _bugPendentes = new Map();   // jid -> { alvo, anterior, nomeGrupo, ehEdicao, timer }
 
+function _bugAutorDe(msg) {
+  if (msg.key?.fromMe) return 'você';
+  const numero = String(msg.key?.participant || msg.participant || '').split('@')[0].split(':')[0];
+  return ((msg.pushName || '') + (numero ? ' (' + numero + ')' : '')).trim() || 'desconhecido';
+}
+
+function _bugHora(ts) {
+  return new Date(ts).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+}
+
+function _bugTrecho(texto) {
+  const t = String(texto || '').trim();
+  return t.length > BUG_TRECHO_MAX ? t.slice(0, BUG_TRECHO_MAX) + '...' : t;
+}
+
+function _bugBloco(rotulo, item) {
+  if (!item) return rotulo + ':\n_(sem mensagem próxima)_';
+  return rotulo + ' (' + _bugHora(item.ts) + ' · ' + item.autor + '):\n' + _bugTrecho(item.texto);
+}
+
+function _bugDispararPendente(jid) {
+  const p = _bugPendentes.get(jid);
+  if (!p) return;
+  _bugPendentes.delete(jid);
+  clearTimeout(p.timer);
+  const quando = new Date(p.alvo.ts).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }).replace(',', ' às');
+  const corpo = '*Alerta de bug* 🐞 — *' + p.nomeGrupo + '*' + (p.ehEdicao ? ' (mensagem editada)' : '') + '\n'
+    + '🕒 ' + quando + '\n\n'
+    + _bugBloco('⬆️ *Mensagem anterior*', p.anterior) + '\n\n'
+    + _bugBloco('🎯 *Mensagem com "bug"*', p.alvo) + '\n\n'
+    + _bugBloco('⬇️ *Mensagem seguinte*', p.seguinte);
+  registrarAlerta({
+    nivel: 'atencao',
+    chave: 'bug:' + jid,
+    origem: 'bug',
+    titulo: 'Palavra "bug" citada em ' + p.nomeGrupo,
+    corpo,
+    janelaMs: BUG_ALERTA_JANELA_MS,
+  }).catch(e => console.error('[BUG] Falha ao registrar alerta:', e.message));
+}
+
+// Chamada para TODA mensagem capturada de grupo (com texto ou so imagem):
+// guarda o historico curto do grupo, completa um alerta pendente com a
+// mensagem seguinte e abre um alerta novo quando a mensagem cita "bug".
 function avisarPalavraBug(jid, msg, texto, ehEdicao) {
   try {
-    if (!texto || jid === GRUPOS.operador) return;
+    if (!jid || jid === GRUPOS.operador) return;
+    const ts = Number(msg.messageTimestamp) ? Number(msg.messageTimestamp) * 1000 : Date.now();
+    const item = {
+      id: msg.key?.id || '',
+      ts,
+      autor: _bugAutorDe(msg),
+      texto: String(texto || '').trim() || '[imagem sem legenda]',
+    };
+
+    // Mesma mensagem recebida duas vezes (outra conta / reentrega): ignora.
+    const hist = _bugHistorico.get(jid) || [];
+    if (!ehEdicao && item.id && hist.some(h => h.id === item.id)) return;
+
+    // 1) Alerta pendente esperando a mensagem seguinte: esta e ela.
+    const pend = _bugPendentes.get(jid);
+    if (pend && !ehEdicao && item.id !== pend.alvo.id) {
+      if (ts - pend.alvo.ts <= BUG_CONTEXTO_MAX_MS) pend.seguinte = item;
+      _bugDispararPendente(jid);
+    }
+
+    // 2) Anterior = ultima mensagem do historico antes desta (edicao nao entra
+    //    no historico: ela substitui uma mensagem que ja esta la).
+    const anteriores = hist.filter(h => h.id !== item.id);
+    const ult = anteriores[anteriores.length - 1];
+    const anterior = ult && (ts - ult.ts) <= BUG_CONTEXTO_MAX_MS ? ult : null;
+    if (!ehEdicao) {
+      hist.push(item);
+      if (hist.length > BUG_HIST_POR_GRUPO) hist.splice(0, hist.length - BUG_HIST_POR_GRUPO);
+      _bugHistorico.set(jid, hist);
+    }
+
+    // 3) Esta mensagem cita "bug"?
+    if (!texto) return;
     const semLinks = String(texto).replace(/https?:\/\/\S+|www\.\S+/gi, ' ');
     if (!_RE_PALAVRA_BUG.test(semLinks)) return;
+    if (_bugPendentes.has(jid)) return; // ja ha um alerta aguardando neste grupo
 
     let nomeGrupo = jid.split('@')[0];
     try { nomeGrupo = nomeMonitoradoCdv(jid) || NOMES_GRUPOS.get(jid) || nomeGrupo; } catch (e) {}
-    const ts = Number(msg.messageTimestamp) ? Number(msg.messageTimestamp) * 1000 : Date.now();
-    const quando = new Date(ts).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-    const numero = String(msg.key?.participant || msg.participant || '').split('@')[0].split(':')[0];
-    const autor = msg.key?.fromMe ? 'voce' : ((msg.pushName || '') + (numero ? ' (' + numero + ')' : '')).trim() || 'desconhecido';
-    const trecho = String(texto).replace(/\s+/g, ' ').trim();
-    const corte = trecho.length > 300 ? trecho.slice(0, 300) + '...' : trecho;
-
-    const corpo = '*Alerta de bug* \ud83d\udc1e\n\n'
-      + 'A palavra *bug* foi citada no grupo *' + nomeGrupo + '*' + (ehEdicao ? ' (mensagem editada)' : '') + '.\n\n'
-      + '\ud83d\udd52 ' + quando + '\n'
-      + '\ud83d\udc64 ' + autor + '\n\n'
-      + '_' + corte + '_';
-
-    registrarAlerta({
-      nivel: 'atencao',
-      chave: 'bug:' + jid,
-      origem: 'bug',
-      titulo: 'Palavra "bug" citada em ' + nomeGrupo,
-      corpo,
-      janelaMs: BUG_ALERTA_JANELA_MS,
-    }).catch(e => console.error('[BUG] Falha ao registrar alerta:', e.message));
+    const p = { alvo: item, anterior, seguinte: null, nomeGrupo, ehEdicao: !!ehEdicao, timer: null };
+    p.timer = setTimeout(() => _bugDispararPendente(jid), BUG_ESPERA_SEGUINTE_MS);
+    _bugPendentes.set(jid, p);
   } catch (e) {
     console.error('[BUG] Erro ao checar palavra bug:', e.message);
   }
@@ -9317,9 +9387,11 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
       return;
     }
 
-    // Palavra "bug" citada em grupo monitorado: avisa no grupo do operador para
-    // o Davi ir ver do que se trata. Nao interrompe o fluxo normal da mensagem.
-    if (texto) avisarPalavraBug(jid, msg, texto, _ehEdicao);
+    // Palavra "bug" citada em grupo monitorado: avisa no grupo do operador com
+    // a mensagem anterior e a seguinte do grupo. Roda para TODA mensagem (com
+    // ou sem texto) porque precisa do historico curto do grupo para o contexto.
+    // Nao interrompe o fluxo normal da mensagem.
+    avisarPalavraBug(jid, msg, texto, _ehEdicao);
 
     if (texto && (
       texto.includes('Dica de emissao encontrada por @davileles') ||
