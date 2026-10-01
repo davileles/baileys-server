@@ -81,7 +81,7 @@ import {
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
   julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
-  conferirPrecoCard, registrarEnvioCard,
+  conferirPrecoCard, registrarEnvioCard, cardsDaFila,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -18571,6 +18571,13 @@ app.delete('/monitor-precos/fila/:asin', (req, res) => {
 
 // Recusa COM motivo (curadoria que aprende): o motivo pode virar regra.
 // body: { motivo, aprender: 'produto'|'termo'|'loja'|null, termo }
+// Reenvia ao bot, como cards de revisao, os candidatos que estao na fila do
+// monitor (body { asins:[...] } opcional). Nada vai para grupo: so o card.
+app.post('/monitor-precos/cards', async (req, res) => {
+  try { res.json(await cardsDaFila({ asins: req.body?.asins || null })); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.post('/monitor-precos/fila/:asin/recusar', (req, res) => {
   try { res.json(recusarCandidato(req.params.asin, req.body || {})); }
   catch (e) { res.status(500).json({ ok: false, erro: e.message }); }

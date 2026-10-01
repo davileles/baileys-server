@@ -2110,6 +2110,29 @@ async function prepararOfertaMonitor(item, candidato, o) {
 
 // ── CARD DE REVISAO (bot) ────────────────────────────────────────────────────
 /**
+ * Manda AGORA para o bot, como card, o que esta na fila do monitor (ou so os
+ * ASINs pedidos) — ignora o cooldown do aviso. Serve para reaproveitar um
+ * aviso que chegou antes de os cards existirem ou que se perdeu no chat.
+ * Produto com card ja pendente nao duplica (criarCardMonitorPrecos barra).
+ */
+export async function cardsDaFila({ asins = null } = {}) {
+  if (!_deps) return { ok: false, erro: 'monitor nao inicializado' };
+  if (!usarCards()) return { ok: false, erro: 'cards desligados (avisos.cards=false)' };
+  const filtro = Array.isArray(asins) && asins.length ? new Set(asins.map(String)) : null;
+  const lista = _estado.fila
+    .filter(f => !filtro || filtro.has(String(f.asin)))
+    .map(f => ({ av: f, item: itemVitrine(f.asin) }))
+    .filter(x => x.item)
+    .slice(0, 15);
+  if (!lista.length) return { ok: true, enviados: 0, fila: _estado.fila.length };
+  const agora = Date.now();
+  for (const { av } of lista) _estado.avisados[av.asin] = agora;
+  gravar(ARQ_ESTADO, _estado);
+  await enviarPrevias(lista);
+  return { ok: true, enviados: lista.length, asins: lista.map(x => x.av.asin) };
+}
+
+/**
  * Segunda trava de preco do card: rele a loja (sem rastreio) antes do envio.
  * `subiu` quando o preco de agora passou 3% do preco do card — a mesma folga do
  * disparo automatico. Falha de leitura devolve ok:false e quem chama decide.
