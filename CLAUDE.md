@@ -237,7 +237,7 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 5. Janela 8h–21h SP no worker da fila; listas passam pelo portão.
 
 **Variáveis de ambiente principais**
-- Núcleo: `PORT`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPO_DADOS` (padrão no código ainda `davileles/cdv-tsp-dados` → funciona por redirect; ideal `davileles/dados`), `GITHUB_PASTA_DADOS` (`tsp`), `GITHUB_REPO_PUBLICO` (`davileles/tsp-site,davileles/tica-site`), `HUBLA_TOKEN`, `RESEND_API_KEY`, `ALERTA_EMAIL`, `CAMPANHAS_KEY`, `TSP_TENANT_SECRET`.
+- Núcleo: `PORT`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPO_DADOS` (padrão no código ainda `davileles/cdv-tsp-dados` → funciona por redirect; ideal `davileles/dados`), `GITHUB_PASTA_DADOS` (`tsp`), `GITHUB_REPO_PUBLICO` (`davileles/tsp-site,davileles/tica-site`), `HUBLA_TOKEN`, `RESEND_API_KEY`, `ALERTA_EMAIL`, `SEATS_ALERTA_SEGREDO`, `SEATS_ALERTA_GRUPO`, `CAMPANHAS_KEY`, `TSP_TENANT_SECRET`.
 - Telegram: `TG_API_ID`, `TG_API_HASH`, `TG_GRUPO` (canais-fonte de cupom, ex. `@juaocupons`, `@fadadoscupons`), `TG_CANAIS_IGNORADOS`, `TG_FAXINA_DIARIA`, `TELEGRAM_BOT_{TOKEN,SECRET,ADMINS}`, `TELEGRAM_BOT_PASSAGENS_*`, `TELEGRAM_BOT_OFERTAS_*`, `OFERTAS_POLL_MIN`, `BOT_TSP_URL`.
 - Flags (padrão): `AUTO_ENVIO_CUPOM` (sombra: off|sombra|on), `AUTO_ENVIO_OFERTA` (off), `AUTO_ENVIO_ALERTA` (on), `GATE_ASSIMETRICO`, `PISO_AUTO_ALERTA`; config do painel `autoEnvio.*` tem precedência.
 - ML: `ML_SO_API=1` (nenhuma leitura de página pública do ML; só API oficial; sonda diária `ML_SONDA_PAGINA_H=24`), `ML_SOCIAL`, `CUPONS_ML_PAUSADO` (sync antigo pelo Railway, segue pausado), `CUPONS_ML_LEITURA` (1; leitura de validade pela extensão), `CUPONS_ML_LEITURA_{MIN,JANELA}` (120 · 8-23), `CUPONS_ML_INSERCAO_AUTO`, `CUPONS_ML_EXTENSAO_TOKEN`, `CUPONS_ML_AUTO_{AGRUPAR_MIN,TETO,JANELA,ESPERA_MAX_MIN,SELETORES}` (as antigas `TETO_DIA/ATRASO_MIN/LOTE/PAUSA_MIN/FOLGA_PCT` são ignoradas).
@@ -259,11 +259,13 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 - Config/tenants/sync: `/config-tsp*`, `/tenants*`, `/sync*`, `/publico/{estado,publicar}`.
 - Telegram: `/tg-auth*`, `/tg/*`, `/bots/diag`, webhooks `/bot-tsp/webhook/<SECRET>` etc.
 - Hubla `POST /webhook/hubla`; campanhas `/campanha/*`; `/agendamentos*`; `/agenda-actions*`; `POST /api/claude` (proxy IA usado pelo gestor-cdv).
+- Alertas seats.aero por e-mail: `POST /seats-alertas/email` (header `X-Seats-Segredo`), `GET /seats-alertas/estado`.
 
 **Integrações**
 - Proxy CDV fixo em `CDV_PROXY_URL` (server.js e `matching-desejos.js`): `/passagens/registrar`, `/ofertas/pendentes`, `/fetch-oferta`, `/gg/*`, `/links-stats`, `/afiliados/comissoes`, `/tsp/planilha?sheet=trafego`, `/campanhas/*`, `/compras/desejos*`.
 - **Espelhos:** `PROGRAMAS_SLUG` e `IR_BASE` (`https://ir.clubedoviajante.com.br/`) devem ser iguais aos de `gestor-cdv/index.html`.
 - `sync-github.js`: baixa no boot e faz push com debounce de 10 s para `dados/tsp/` (`cupons_base.json`, `vitrine.json`, `templates.json`, `listas.json`, `radar_config.json`, `config_tsp.json`, `config_cdv.json`, `awin_config.json`, `tenants.json`, `grupos_*`, `rastreio.json`, `categorias.json`…).
+- **Alertas do seats.aero por e-mail → WhatsApp** (`seats-alertas.js`, desde 01/10/2026): Apps Script na conta Gmail do Davi (`apps-script/seats-alertas.gs`, gatilho de 5 min, controle de lido por id de e-mail nas propriedades do script) manda os e-mails de `alerts@seats.aero` para `/seats-alertas/email`. Leitura por regex do texto fixo do seats.aero (IA Haiku só de reserva; sem leitura → bloco com assunto + link). Repetição descartada por id do Gmail e por alerta+rota+data+cabine+programa+voos+pontos em 24 h. Envio direto (fora da fila e da janela) pela principal ao grupo "Alertas Seats.aero" (`SEATS_ALERTA_GRUPO`, padrão no código), até 5 alertas por mensagem. Estado em `sessao/seats_alertas.json`, gravado só depois do envio; falha de envio → 502 e o script reenvia.
 - `feed-publico.js`: publica `dados/feed.json` e `dados/cupons.json` em tica-site e tsp-site (debounce 10 min, varredura 30 min). Operação: `GET /publico/estado`, `POST /publico/publicar`.
 - Disco `./sessao` (volume), sempre `escreverAtomico` (tmp + rename).
 

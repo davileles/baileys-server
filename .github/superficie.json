@@ -203,7 +203,9 @@
         "app.post('/cupons/auto/visita/fim'",
         "app.get('/cupons/auto/leitura'",
         "app.post('/cupons/auto/leitura'",
-        "function aplicarLeituraCuponsMl("
+        "function aplicarLeituraCuponsMl(",
+        "app.post('/seats-alertas/email'",
+        "app.get('/seats-alertas/estado'"
       ]
     },
     "radar-awin.js": {
@@ -490,6 +492,14 @@
         "export async function registrarResultadoInsercaoMl",
         "export async function finalizarVisitaInsercaoMl",
         "export function tokenExtensaoMlOk"
+      ]
+    },
+    "seats-alertas.js": {
+      "minLinhas": 150,
+      "obrigatorio": [
+        "export async function processarEmailsSeats(",
+        "export function lerAlertaPorRegex(",
+        "export function segredoSeatsOk("
       ]
     }
   }

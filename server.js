@@ -126,6 +126,10 @@ import { iniciarAgendaActions, estadoAgenda, dispararAgora, agendaAtiva } from '
 import { iniciarInsercaoMlAuto, enfileirarInsercaoMl, estadoInsercaoMlAuto,
          religarInsercaoMlAuto, pausarInsercaoMlAuto, tokenExtensaoMlOk, extensaoMlConfigurada,
          proximoLoteInsercaoMl, registrarResultadoInsercaoMl, finalizarVisitaInsercaoMl } from './insercao-ml-auto.js';
+// E-mails de alerta do seats.aero (lidos por um Apps Script no Gmail) viram
+// mensagem no grupo "Alertas Seats.aero". Detalhes no cabecalho do modulo.
+import { processarEmailsSeats, estadoSeatsAlertas, segredoSeatsOk, seatsAlertasConfigurado,
+         grupoSeatsAlertas } from './seats-alertas.js';
 
 // ── REGISTRO DE OPERADORES (fase 2.1 do modelo hospedado) ─────────────────────
 import {
@@ -15678,6 +15682,39 @@ app.post('/enviar', async (req, res) => {
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
   }
 });
+
+// ── ALERTAS SEATS.AERO POR E-MAIL ─────────────────────────────────────────────
+// Chamado pelo Apps Script do Gmail (apps-script/seats-alertas.gs) a cada 5 min.
+// Corpo: { emails: [{ id, assunto, data, html, texto }] }. Header X-Seats-Segredo.
+// Responde a lista de ids "processados" — so esses o script marca como lidos.
+// Falha de envio devolve 502 sem gravar nada: o script tenta de novo depois.
+app.post('/seats-alertas/email', async (req, res) => {
+  if (!seatsAlertasConfigurado()) return res.status(503).json({ ok:false, erro:'SEATS_ALERTA_SEGREDO nao configurado.' });
+  if (!segredoSeatsOk(req.get('x-seats-segredo'))) return res.status(401).json({ ok:false, erro:'Segredo invalido.' });
+  const emails = Array.isArray(req.body?.emails) ? req.body.emails : [];
+  if (!emails.length) return res.json({ ok:true, processados:[], enviados:0 });
+  try {
+    if (!(conectado && sock)) {
+      const ok = await aguardarSock(15000);
+      if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+    }
+    const r = await processarEmailsSeats(emails, {
+      enviar:    (texto) => enviarMensagem(grupoSeatsAlertas(), { text: texto }),
+      extrairIA: (system, texto) => chamarClaude(system, texto, 1500),
+      cidades:   IATA_CIDADES,
+    });
+    console.log('[SEATS-ALERTA] ' + emails.length + ' e-mail(s): ' + r.enviados + ' enviado(s), '
+      + r.duplicados + ' repetido(s)' + (r.viaIA ? ', ' + r.viaIA + ' via IA' : '')
+      + (r.semLeitura ? ', ' + r.semLeitura + ' sem leitura' : '') + '.');
+    res.json({ ok:true, ...r });
+  } catch (e) {
+    console.error('[SEATS-ALERTA] Falha:', e.message);
+    res.status(502).json({ ok:false, erro:e.message });
+  }
+});
+
+app.get('/seats-alertas/estado', (req, res) => res.json({ ok:true, ...estadoSeatsAlertas() }));
+
 
 // ── ENVIAR ANEXO (imagem OU documento) ────────────────────────────────────────
 // Handler unico usado por /enviar-imagem (retrocompatibilidade) e /enviar-arquivo.
