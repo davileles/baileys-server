@@ -2122,8 +2122,26 @@ export async function cardsDaFila({ asins = null } = {}) {
   const lista = _estado.fila
     .filter(f => !filtro || filtro.has(String(f.asin)))
     .map(f => ({ av: f, item: itemVitrine(f.asin) }))
-    .filter(x => x.item)
-    .slice(0, 15);
+    .filter(x => x.item);
+  // ASIN pedido que ja saiu da fila (a varredura seguinte refaz a fila): o
+  // candidato e remontado pela serie — preco de agora contra mediana 30d.
+  if (filtro) {
+    for (const asin of filtro) {
+      if (lista.some(x => String(x.av.asin) === asin)) continue;
+      const item = itemVitrine(asin);
+      const st = item ? estatisticas(asin) : null;
+      if (!item || !st || !Number.isFinite(st.ultimo) || !Number.isFinite(st.mediana30) || st.mediana30 <= 0) continue;
+      const nicho = nichoDoProduto(item, _hist[asin]?.n).nicho;
+      lista.push({ item, av: {
+        asin, nome: item.nome, loja: item.loja, preco: st.ultimo,
+        mediana30: st.mediana30, min90: st.min90,
+        quedaPct: Math.round((1 - st.ultimo / st.mediana30) * 1000) / 10,
+        recorde: Number.isFinite(st.min90) && st.ultimo <= st.min90,
+        nicho, curado: !!String(item.nicho || '').trim(), via: 'preco',
+      } });
+    }
+  }
+  lista.splice(15);
   if (!lista.length) return { ok: true, enviados: 0, fila: _estado.fila.length };
   const agora = Date.now();
   for (const { av } of lista) _estado.avisados[av.asin] = agora;
