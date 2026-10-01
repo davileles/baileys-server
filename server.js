@@ -15407,7 +15407,12 @@ app.post('/enviar', async (req, res) => {
   // conta: apelido da conta secundaria que deve disparar (aba Conexao). Vazio =
   // comportamento historico (conta do turno/CDV ou principal). O concierge usa
   // este campo para fixar o numero da operacao dele.
-  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio, conta } = req.body;
+  // quando: 'janela' — envio manual que segue a janela de disparos (a mesma
+  // "Publicar das/Ate" do monitor de precos). Dentro da janela entra no portao
+  // de publicacao (respeita o espacamento com radar/monitor/listas); fora dela
+  // vira agendamento para a proxima abertura, visivel e cancelavel em Agendados.
+  // Sem o campo (ou 'agora'), comportamento historico: sai na hora.
+  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio, conta, quando } = req.body;
   const contaEnvio = contaPedida(conta);
 
   // Destino e sempre grupo (resolverGrupo nao aceita DM): qualquer conta de
@@ -15424,8 +15429,34 @@ app.post('/enviar', async (req, res) => {
   if (!multi && !grupoId) return res.status(400).json({ ok:false, erro:'Grupo invalido: '+grupo });
   if (!mensagem?.trim()) return res.status(400).json({ ok:false, erro:'Mensagem vazia.' });
 
-  if (agendarEm) {
-    const dispararEm = new Date(agendarEm).getTime();
+  let agendarEmEf = agendarEm;
+  let janelaDisp  = null;
+  if (!agendarEm && quando === 'janela') {
+    janelaDisp = janelaDeDisparoManual();
+    if (!janelaDisp.ok) {
+      agendarEmEf = new Date(janelaDisp.proximoEm).toISOString();
+    } else if (multi) {
+      // Dentro da janela: responde ja e publica em segundo plano pelo portao,
+      // para o painel nao ficar pendurado enquanto outra publicacao sai.
+      let imagem = null;
+      const mtA = String(anexo?.mimetype || '');
+      if (anexo?.base64 && (!mtA || mtA.indexOf('image/') === 0)) {
+        imagem = { imagemBase64: String(anexo.base64).replace(/^data:[^;]+;base64,/, ''), mime: mtA || 'image/jpeg' };
+      }
+      const esperaMs = esperaPrevistaMs();
+      comPortaoDePublicacao(
+        () => enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categoria, trilhasIds: trilhasEnvio }),
+        'manual na janela')
+        .then(r => console.log('[MANUAL] Na janela: enviado em ' + r.enviados.length + ' grupo(s)'
+          + (r.falhas.length ? ', ' + r.falhas.length + ' falha(s)' : '') + '.'))
+        .catch(e => console.error('[MANUAL] Na janela: falhou —', e.message));
+      return res.json({ ok:true, enfileirado:true, esperaMin: Math.round(esperaMs / 60000),
+                        janelas: janelaDisp.janelas });
+    }
+  }
+
+  if (agendarEmEf) {
+    const dispararEm = new Date(agendarEmEf).getTime();
     if (isNaN(dispararEm)) return res.status(400).json({ ok:false, erro:'Data inválida.' });
     // Anexo agendado fica guardado em base64 no proprio agendamento. Tem teto:
     // agendamentos.json e lido inteiro a cada boot, entao um arquivo grande
@@ -15454,7 +15485,8 @@ app.post('/enviar', async (req, res) => {
                         criadoEm: new Date().toISOString() });
     salvarAgendamentos();
     const horario = new Intl.DateTimeFormat('pt-BR',{timeZone:TZ_SP,dateStyle:'short',timeStyle:'short'}).format(new Date(dispararEm));
-    return res.json({ ok:true, agendado:true, id, horario });
+    return res.json({ ok:true, agendado:true, id, horario,
+                      ...(janelaDisp ? { foraDaJanela:true, janelas: janelaDisp.janelas } : {}) });
   }
 
   if (multi) {
@@ -17021,6 +17053,20 @@ const LISTA_JANELAS_PADRAO = (() => {
   }).filter(Boolean);
   return js.length ? js : [{ inicio: '08:00', fim: '20:00' }];
 })();
+
+/** Janela do envio manual "na janela" (gerador do painel): a de publicacao do
+ *  monitor de precos ("Publicar das/Ate"), ou o padrao das listas sem ela. */
+function janelaDeDisparoManual(quando = Date.now()) {
+  let janelas = null;
+  try { janelas = configMonitorPrecos()?.publicacao?.janelas || null; } catch (_) {}
+  return janelaEnvioLista({ janelas }, quando);
+}
+
+app.get('/janela-disparos', (req, res) => {
+  const j = janelaDeDisparoManual();
+  res.json({ ok:true, dentro: j.ok, janelas: j.janelas,
+             proximaAbertura: j.ok ? null : dataHoraSP(j.proximoEm) });
+});
 
 /** Janelas efetivas da lista: as proprias, ou o padrao do servidor. */
 function janelasDaLista(lista) {
