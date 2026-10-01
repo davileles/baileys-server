@@ -2669,8 +2669,9 @@ export function renderTemplate(corpo, vars) {
 let _provedorSelo = null;
 export function registrarSeloPreco(fn) { _provedorSelo = typeof fn === 'function' ? fn : null; }
 function diasMenorPreco(p, preco) {
-  if (!_provedorSelo || !p?.asin || !Number.isFinite(preco)) return null;
-  try { const n = _provedorSelo(String(p.asin), preco); return Number.isFinite(n) && n > 0 ? n : null; }
+  const chave = p?.chaveSerie || p?.asin;
+  if (!_provedorSelo || !chave || !Number.isFinite(preco)) return null;
+  try { const n = _provedorSelo(String(chave), preco); return Number.isFinite(n) && n > 0 ? n : null; }
   catch { return null; }
 }
 

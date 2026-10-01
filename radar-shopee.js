@@ -436,6 +436,10 @@ export async function montarOfertasShopeeVitrine(itens, codigoCupom = null) {
 
     const p = normalizarShopee(node);
     if (!p.preco) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'sem preço disponível' }); continue; }
+    // A serie de precos do monitor e indexada pela chave da vitrine
+    // (SHOPEE-<loja>-<item>), nao pelo itemId que fica em p.asin. Sem isto o
+    // selo "Menor preço dos últimos X dias" nunca achava a serie na Shopee.
+    p.chaveSerie = salvo.asin;
     if (p.link) await marcarRastreio(p, node);
 
     // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
