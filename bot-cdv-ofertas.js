@@ -163,6 +163,16 @@ function blocoFonte(o) {
   return '📥 Radar de conteúdo';
 }
 
+// Reenvio x campanha nova (transferencias). Calculado pelo proxy com a mesma
+// regra que grava historico-transferencias.json na aprovacao: reenvio aprovado
+// so anexa o id ao registro existente, sem distorcer media e frequencia.
+function blocoSituacao(o) {
+  const s = o.situacaoHistorico;
+  if (!s || !s.texto) return '';
+  const forte = s.tipo === 'reenvio' || s.tipo === 'duplicada_fila';
+  return forte ? '<b>' + e(s.texto) + '</b>' : e(s.texto);
+}
+
 function blocoEdicoes(id) {
   const ed = edicoesDe(id);
   const ks = Object.keys(ed);
@@ -175,6 +185,7 @@ function corpoCard(o, mensagem, extra) {
   return [
     (v.emoji || '📰') + ' <b>' + e(v.titulo || 'Oferta') + '</b>  <code>#' + e(o.id) + '</code>',
     blocoFatos(v),
+    blocoSituacao(o),
     v.resumo ? e(v.resumo) : '',
     blocoFonte(v),
     blocoEdicoes(o.id),
