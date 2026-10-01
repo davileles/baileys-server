@@ -11899,8 +11899,19 @@ async function campanhaMarcarResposta(msg) {
   if (!ref) return;
   _campJids.delete(jidRef);   // uma vez so: as proximas mensagens dele nao reescrevem
   CAMP_LOG('↩ resposta de ' + jidRef.split('@')[0] + ' — follow-up cancelado.');
+  // Um pedaco da resposta vai para o painel (lista de acompanhamento): so as
+  // primeiras letras, sem midia — o operador le o resto no celular.
+  const mm = msg?.message || {};
+  const inner = mm.ephemeralMessage?.message || mm.viewOnceMessage?.message || mm;
+  let respostaTexto = inner.conversation || inner.extendedTextMessage?.text || inner.imageMessage?.caption
+    || inner.videoMessage?.caption || '';
+  if (!respostaTexto) {
+    respostaTexto = inner.audioMessage ? '🎙️ áudio' : inner.imageMessage ? '🖼️ imagem' : inner.videoMessage ? '🎬 vídeo'
+      : inner.stickerMessage ? 'figurinha' : inner.documentMessage ? '📎 arquivo' : inner.reactionMessage ? ('reagiu ' + (inner.reactionMessage.text || '')) : '';
+  }
+  respostaTexto = String(respostaTexto).replace(/\s+/g, ' ').trim().slice(0, 120);
   await campPatchContato(ref.campanhaId, ref.contatoId, {
-    status: 'respondido', respondidoEm: new Date().toISOString() });
+    status: 'respondido', respondidoEm: new Date().toISOString(), respostaTexto });
 }
 
 if (CAMPANHAS_KEY) {
