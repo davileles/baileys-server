@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
-import { registrarSeloPreco, listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
+import { registrarSeloPreco, registrarSeloQueda, listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
@@ -226,6 +226,12 @@ const CFG_PADRAO = {
     ativo: true,
     minDias: 30,       // abaixo disso o selo nao impressiona e nao aparece
     minLeituras: 10,   // dias com leitura dentro da janela — serie rala nao sustenta a frase
+    // Fallback quando o selo de dias nao cabe (serie curta, ou ja houve preco
+    // menor): "42% abaixo do preço das últimas semanas", contra a MEDIANA do
+    // preco real nos ultimos 30 dias (sem hoje). So com queda e leituras minimas.
+    queda: true,
+    quedaMinPct: 15,
+    quedaMinLeituras: 7,
   },
 
   avisos: {
@@ -550,6 +556,9 @@ function estruturarCfg(bruto) {
   out.selo.ativo       = sl.ativo !== false;
   out.selo.minDias     = limitar(sl.minDias, 7, 120, CFG_PADRAO.selo.minDias);
   out.selo.minLeituras = limitar(sl.minLeituras, 3, 120, CFG_PADRAO.selo.minLeituras);
+  out.selo.queda            = sl.queda !== false;
+  out.selo.quedaMinPct      = limitar(sl.quedaMinPct, 5, 90, CFG_PADRAO.selo.quedaMinPct);
+  out.selo.quedaMinLeituras = limitar(sl.quedaMinLeituras, 3, 60, CFG_PADRAO.selo.quedaMinLeituras);
 
   const dz = b.desempenho || {};
   const sem = dz.semear || {}, sc = dz.score || {};
@@ -736,6 +745,27 @@ export function diasComoMenorPreco(asin, preco) {
   if (x === null) x = diffDias(dias[dias.length - 1], hoje);
   if (leituras < cfg.minLeituras || x < cfg.minDias) return null;
   return x;
+}
+
+/**
+ * Percentual abaixo do preco habitual: preco de agora contra a mediana do preco
+ * REAL dos ultimos 30 dias (hoje fora). null quando a serie e rala ou a queda
+ * nao chega ao minimo. Alimenta o fallback do selo no template.
+ */
+export function quedaVsHabitual(asin, preco) {
+  const cfg = _cfg.selo;
+  if (!cfg?.ativo || cfg.queda === false || !Number.isFinite(preco) || preco <= 0) return null;
+  const h = _hist[asin];
+  if (!h?.dias) return null;
+  const hoje = diaSP();
+  const vals = Object.keys(h.dias)
+    .filter(d => d < hoje && diffDias(d, hoje) <= 30)
+    .map(d => h.dias[d]).filter(v => Number.isFinite(v) && v > 0);
+  if (vals.length < (cfg.quedaMinLeituras ?? 7)) return null;
+  const med = medianaDe(vals);
+  if (!med) return null;
+  const pct = Math.floor((1 - preco / med) * 100);
+  return pct >= (cfg.quedaMinPct ?? 15) ? pct : null;
 }
 
 /** Estatisticas da serie de um produto. Base de toda decisao de disparo. */
@@ -2371,6 +2401,7 @@ export function iniciarMonitorPrecos(deps) {
   _deps = deps;
   carregarMonitorPrecos();
   registrarSeloPreco(diasComoMenorPreco);
+  registrarSeloQueda(quedaVsHabitual);
   // Shard tem nome dinamico e nao entra na varredura do boot do sync: num
   // volume novo do Railway o disco esta vazio e a serie inteira mora so no
   // repo. Sem esta restauracao, a primeira gravacao do mes subiria um shard

@@ -2668,6 +2668,14 @@ export function renderTemplate(corpo, vars) {
 // provedor no boot e o template so pergunta: (asin, preco) -> dias | null.
 let _provedorSelo = null;
 export function registrarSeloPreco(fn) { _provedorSelo = typeof fn === 'function' ? fn : null; }
+let _provedorQueda = null;
+export function registrarSeloQueda(fn) { _provedorQueda = typeof fn === 'function' ? fn : null; }
+function quedaHabitual(p, preco) {
+  const chave = p?.chaveSerie || p?.asin;
+  if (!_provedorQueda || !chave || !Number.isFinite(preco)) return null;
+  try { const n = _provedorQueda(String(chave), preco); return Number.isFinite(n) && n > 0 ? n : null; }
+  catch { return null; }
+}
 function diasMenorPreco(p, preco) {
   const chave = p?.chaveSerie || p?.asin;
   if (!_provedorSelo || !chave || !Number.isFinite(preco)) return null;
@@ -2728,8 +2736,13 @@ export function varsDoProduto(p, cupom) {
     // a vista com ela anunciaria um recorde que nao existe.
     ...(() => {
       const n = diasMenorPreco(p, precoPrazo);
-      return { menor_preco: n ? 'Menor preço dos últimos ' + n + ' dias' : '',
-               menor_preco_dias: n ? String(n) : '' };
+      // Sem o selo de dias (serie curta ou ja houve preco menor), a mesma linha
+      // mostra a queda contra o preco habitual — tambem pela serie propria.
+      const q = quedaHabitual(p, precoPrazo);
+      const queda = q ? q + '% abaixo do preço das últimas semanas' : '';
+      return { menor_preco: n ? 'Menor preço dos últimos ' + n + ' dias' : queda,
+               menor_preco_dias: n ? String(n) : '',
+               queda_habitual: queda };
     })(),
     desconto: descTotal > 0 ? descTotal : '',
     economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
@@ -2772,7 +2785,8 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'avista_str',    desc:'Ex: "à vista no Pix ou NuPay (28% off)" — vazio quando não há' },
   { chave:'parcelas_str',  desc:'Ex: "ou em até 4x de R$ 25,01 sem juros (total R$ 100,04)"' },
   { chave:'preco_de',      desc:'Preço de lista (vazio quando não há)' },
-  { chave:'menor_preco',   desc:'Ex: "Menor preço dos últimos 63 dias" — pela série do monitor; vazio quando não é recorde' },
+  { chave:'menor_preco',   desc:'Ex: "Menor preço dos últimos 63 dias" — pela série do monitor; sem recorde, vira "42% abaixo do preço das últimas semanas" (queda ≥ 15% contra a mediana 30d); vazio sem nenhum dos dois' },
+  { chave:'queda_habitual', desc:'Só a frase "42% abaixo do preço das últimas semanas" (vazia sem queda relevante)' },
   { chave:'menor_preco_dias', desc:'Só o número de dias do selo de menor preço' },
   { chave:'desconto',      desc:'Percentual total de desconto' },
   { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
