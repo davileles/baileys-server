@@ -379,7 +379,10 @@ function serializarShard(mes) {
     for (const [d, v] of Object.entries(h.dias || {}))   if (mesDoDia(d) === mes) dias[d.slice(8)] = v;
     for (const [d, v] of Object.entries(h.diasEf || {})) if (mesDoDia(d) === mes) diasEf[d.slice(8)] = v;
     for (const [d, v] of Object.entries(h.diasDe || {})) if (mesDoDia(d) === mes) diasDe[d.slice(8)] = v;
-    if (!Object.keys(dias).length && !Object.keys(diasEf).length) continue;
+    // Produto marcado sem oferta entra no shard corrente mesmo sem ponto no mes:
+    // sem isto a marca morreria a cada deploy e o preco velho voltaria a valer.
+    const semOferta = mes === mesSP() && h.ult?.disponivel === false && !!h.ult?.semOfertaEm;
+    if (!Object.keys(dias).length && !Object.keys(diasEf).length && !semOferta) continue;
     const reg = { n: h.n, loja: h.loja, dias, diasEf, diasDe };
     // A ultima leitura e estado corrente, nao historico: mora so no shard do
     // mes atual, senao um shard antigo restaurado sobrescreveria o preco de hoje.
@@ -403,7 +406,8 @@ function fundirShard(mes, dados) {
     for (const [d, v] of Object.entries(r.diasDe || {})) h.diasDe[mes + '-' + d] = v;
     // Vence a leitura mais recente: shards sao fundidos do mais antigo para o
     // mais novo, mas o volume pode ter um shard velho de um deploy anterior.
-    if (r.ult && (!h.ult || String(r.ult.em || '') > String(h.ult.em || ''))) h.ult = r.ult;
+    // O carimbo considera tambem a marca de sem oferta (que nao mexe em 'em').
+    if (r.ult && (!h.ult || carimboUlt(r.ult) > carimboUlt(h.ult))) h.ult = r.ult;
     _hist[asin] = h;
   }
 }
@@ -689,6 +693,39 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
   for (const d of Object.keys(h.diasEf)) if (d < corte) delete h.diasEf[d];
   for (const d of Object.keys(h.diasDe)) if (d < corte) delete h.diasDe[d];
 
+  _hist[asin] = h;
+  return h;
+}
+
+// ── PRODUTO SEM OFERTA ───────────────────────────────────────────────────────
+// A loja respondeu, mas sem preco: produto esgotado ou retirado ("Nao
+// disponivel" na pagina). registrarPreco ignora leitura sem preco — e a ultima
+// leitura BOA seguia valendo como "preco de agora": a montagem de lista mostrava
+// "agora R$ 86,28" (e ate veredito de mais barato) para um produto que a loja
+// nao vende ha dias. Aqui o preco antigo e o seu carimbo (em) ficam intactos,
+// para o operador saber quanto custava e quando; so a disponibilidade muda.
+// A proxima leitura com preco passa por registrarPreco e limpa a marca.
+function carimboUlt(u) {
+  if (!u) return '';
+  const a = String(u.em || ''), b = String(u.semOfertaEm || '');
+  return b > a ? b : a;
+}
+
+function registrarSemOferta(asin, { nome, loja, motivo } = {}) {
+  if (!asin) return null;
+  const agora = new Date().toISOString();
+  const h = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, diasDe: {}, ult: null };
+  h.n = h.n || nome || '';
+  h.loja = h.loja || loja || '';
+  const ant = h.ult || {};
+  h.ult = {
+    preco: ant.preco ?? null, precoDe: ant.precoDe ?? null, precoEfetivo: ant.precoEfetivo ?? null,
+    em: ant.em || null,
+    disponivel: false,
+    semOfertaDesde: (ant.disponivel === false && ant.semOfertaDesde) ? ant.semOfertaDesde : agora,
+    semOfertaEm: agora,
+    semOfertaMotivo: motivo || 'loja respondeu sem preco',
+  };
   _hist[asin] = h;
   return h;
 }
@@ -1427,7 +1464,8 @@ export function dinheiroNaMesa({ horas = 6 } = {}) {
       const h = _hist[f.asin];
       const ult = h?.ult || null;
       const precoAgora = ult?.preco ?? null;
-      const aindaVale = (precoAgora != null && Number.isFinite(f.preco)) ? precoAgora <= f.preco * 1.02 : null;
+      const aindaVale = ult?.disponivel === false ? false
+        : (precoAgora != null && Number.isFinite(f.preco)) ? precoAgora <= f.preco * 1.02 : null;
       return { asin: f.asin, nome: f.nome, loja: f.loja, nicho: f.nicho, preco: f.preco, precoAgora, aindaVale,
         mediana30: f.mediana30 ?? null, min90: f.min90 ?? null, quedaPct: f.quedaPct ?? null, recorde: !!f.recorde,
         score: f.score ?? null, naFilaDesde: f.em, paradoHaH: +((Date.now() - new Date(f.em).getTime()) / 3600000).toFixed(1),
@@ -1537,7 +1575,8 @@ function ehCamadaQuente(item) {
 /** Item frio ja lido dentro do intervalo da camada fria pode ser pulado. */
 function friaJaLidaHoje(item) {
   const h = _hist[item.asin];
-  const ultimo = h?.ult?.em ? Date.parse(h.ult.em) : 0;
+  const carimbo = carimboUlt(h?.ult);
+  const ultimo = carimbo ? Date.parse(carimbo) : 0;
   if (!ultimo) return false;
   return (Date.now() - ultimo) < _cfg.varredura.friaCadaDias * 86400000;
 }
@@ -1569,6 +1608,13 @@ export async function varrer({ manual = false } = {}) {
       preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
       precoEfetivo: Number.isFinite(leitura.preco) ? leitura.preco - descontoAgora : null,
     });
+    // Loja respondeu sem preco = sem oferta ativa. Marca para a ultima leitura
+    // boa parar de se passar por preco atual (ver registrarSemOferta).
+    if (!Number.isFinite(leitura.preco) || leitura.preco <= 0) {
+      registrarSemOferta(item.asin, { nome: leitura.titulo || item.nome, loja: item.loja,
+        motivo: 'loja respondeu sem preco (esgotado ou sem oferta ativa)' });
+      resumo.semOferta = (resumo.semOferta || 0) + 1;
+    }
     resumo.lidos++;
 
     // Estatistica do PRODUTO quando ha grupo: o gatilho compara contra o menor
@@ -1611,7 +1657,18 @@ export async function varrer({ manual = false } = {}) {
           const leitura = mapa.get(item.asin);
           // ASIN que a API nao devolveu e falha DAQUELE item: produto retirado,
           // sem oferta ativa ou fora do catalogo. O lote segue.
-          if (!leitura) { falhar(item, 'ASIN nao retornado pela API da Amazon'); continue; }
+          if (!leitura) {
+            // So marca sem oferta quando a API RESPONDEU o lote (ha outros itens
+            // no mapa) e este ASIN ja teve preco lido: e produto que saiu do ar.
+            // Lote vazio e falha da chamada, e ASIN nunca lido pode ser so algo
+            // que a API nao cobre — nenhum dos dois prova indisponibilidade.
+            if (mapa.size > 0 && _hist[item.asin]?.ult?.em) {
+              registrarSemOferta(item.asin, { nome: item.nome, loja: item.loja,
+                motivo: 'ASIN nao retornado pela API da Amazon' });
+              resumo.semOferta = (resumo.semOferta || 0) + 1;
+            }
+            falhar(item, 'ASIN nao retornado pela API da Amazon'); continue;
+          }
           try { processar(item, leitura); }
           catch (e) { falhar(item, e.message); }
         }
@@ -2233,7 +2290,7 @@ export function simular(regrasParciais = null) {
     const saida = { passaram: [], reprovados: {}, total: 0 };
     for (const item of itensMonitorados()) {
       const h = _hist[item.asin];
-      if (!h?.ult) continue;
+      if (!h?.ult?.em) continue;
       saida.total++;
       const stats = estatisticas(item.asin);
       const { nicho } = nichoDoProduto(item, h.n);
@@ -2266,7 +2323,7 @@ export function estadoMonitorPrecos() {
   garantirCotasDoDia();
   podarFila();
   const itens = itensMonitorados();
-  const comSerie = itens.filter(i => _hist[i.asin]?.ult).length;
+  const comSerie = itens.filter(i => _hist[i.asin]?.ult?.em).length;
   const maduros = itens.filter(i => {
     const s = estatisticas(i.asin);
     return s && s.dias >= regraDoNicho('geral').maturidadeMinDias;
@@ -2312,6 +2369,8 @@ export function listarMonitorados() {
         precoAtual: h?.ult?.preco ?? null,
         lidoEm: h?.ult?.em ?? null,
         disponivel: h?.ult?.disponivel ?? null,
+        semOfertaDesde: h?.ult?.disponivel === false ? (h.ult.semOfertaDesde || null) : null,
+        semOfertaEm: h?.ult?.disponivel === false ? (h.ult.semOfertaEm || null) : null,
         dias: s?.dias || 0,
         min90: s?.min90 ?? null,
         max90: s?.max90 ?? null,

@@ -18182,9 +18182,18 @@ app.post('/vitrine/comparativo', async (req, res) => {
         atual = { preco: h.ult.preco, precoEfetivo: h.ult.precoEfetivo ?? null, em: h.ult.em || null,
                   disponivel: h.ult.disponivel !== false, fonte: 'monitor',
                   velho: Date.now() - Date.parse(h.ult.em || 0) > COMP_LEITURA_VELHA_MS };
+        // Sem oferta na loja: 'preco' e o ULTIMO preco lido (em 'em'), nao o de agora.
+        if (!atual.disponivel) {
+          atual.semOfertaDesde = h.ult.semOfertaDesde || null;
+          atual.semOfertaEm = h.ult.semOfertaEm || null;
+        }
       } else if (Number.isFinite(Number(item?.preco)) && Number(item.preco) > 0) {
         atual = { preco: Number(item.preco), precoEfetivo: null, em: item.precoEm || item.atualizadoEm || null,
-                  disponivel: true, fonte: 'cadastro', velho: true };
+                  disponivel: h?.ult?.disponivel !== false, fonte: 'cadastro', velho: true };
+        if (!atual.disponivel) {
+          atual.semOfertaDesde = h.ult.semOfertaDesde || null;
+          atual.semOfertaEm = h.ult.semOfertaEm || null;
+        }
       }
       if (atual) {
         const _cItem = String(cupItem[asin] || '').trim().toUpperCase();
@@ -18207,6 +18216,10 @@ app.post('/vitrine/comparativo', async (req, res) => {
         veredito = variacaoPct <= -COMP_TOLERANCIA * 100 ? 'melhor'
                  : variacaoPct >=  COMP_TOLERANCIA * 100 ? 'pior' : 'igual';
       }
+      // Produto sem oferta na loja nao tem "preco de agora" para comparar:
+      // dizer que esta mais barato que no ultimo envio seria vender o que a
+      // loja nao entrega. Veredito proprio, sem variacao.
+      if (atual && atual.disponivel === false) { veredito = 'indisponivel'; variacaoPct = null; }
       const menor = todos.reduce((m, r) => (!m || _precoDivulgadoEnvio(r) < _precoDivulgadoEnvio(m)) ? r : m, null);
 
       itens[asin] = {
