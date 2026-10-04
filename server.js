@@ -5332,6 +5332,41 @@ function jidsDeNicho(gruposEnviados) {
   catch { return null; }
 }
 
+// Envios recentes de um produto (qualquer via: radar de grupo, aprovacao manual,
+// monitor), lidos dos shards do historico ja carregados em memoria. Usado pelo
+// monitor de precos para nao anunciar como "queda" um preco que ja mandamos.
+// Sincrono de proposito (o avaliar() do monitor e sincrono): os shards do mes
+// atual e do anterior sao aquecidos no boot por aquecerHistoricoEnvios().
+function _shardsHistoricoRecentes() {
+  const agora = new Date();
+  const fmt = d => new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year: 'numeric', month: '2-digit' }).format(d);
+  const atual = fmt(agora);
+  const anterior = fmt(new Date(agora.getTime() - 32 * 86400000));
+  return [...new Set([atual, anterior])].map(ym => 'historico_envios_' + ym + '.json');
+}
+async function aquecerHistoricoEnvios() {
+  for (const nome of _shardsHistoricoRecentes()) {
+    try { await _registrosDoShard(nome); } catch {}
+  }
+}
+function enviosRecentesDoProduto(asin, dias = 15) {
+  if (!asin) return [];
+  const corte = Date.now() - dias * 86400000;
+  const out = [];
+  for (const nome of _shardsHistoricoRecentes()) {
+    const regs = _histEnvioCache.get(nome);
+    if (!Array.isArray(regs)) continue;
+    for (const r of regs) {
+      if (!r || String(r.asin || '') !== String(asin)) continue;
+      const em = Date.parse(r.enviadoEm || '');
+      if (!Number.isFinite(em) || em < corte) continue;
+      const preco = Number(r.precoFinal ?? r.preco);
+      if (Number.isFinite(preco) && preco > 0) out.push({ em: r.enviadoEm, preco });
+    }
+  }
+  return out;
+}
+
 async function registrarEnvioHistorico(oferta) {
   try {
     if (!oferta || oferta.status !== 'enviado') return;
@@ -22969,6 +23004,9 @@ iniciarMonitorPrecos({
   baixarImagem:   baixarImagemProduto,
   gerarId,
   whatsappPronto: () => !!(conectado && sock),
+  // Envios do produto nos ultimos N dias (historico de envios, qualquer via):
+  // trava "mesmo preco ja enviado" do avaliar().
+  enviosRecentes: enviosRecentesDoProduto,
   // Aviso de candidatos: so no bot do Telegram (admins). O grupo do operador
   // saiu em out/2026 — la so vai alerta grave.
   avisarCandidatos: async (texto) => {
@@ -22983,6 +23021,8 @@ iniciarMonitorPrecos({
     catch (e) { console.warn('[PRECOS] Previa Telegram falhou:', e.message); }
   },
 });
+
+aquecerHistoricoEnvios().catch(e => console.warn('[PRECOS] Aquecer historico de envios:', e.message));
 
 // Relogio dos workflows do painel-cdv. Sobe cedo e independente do WhatsApp: a
 // coleta de pontuacao nao depende do socket, e nao pode ficar refem de um

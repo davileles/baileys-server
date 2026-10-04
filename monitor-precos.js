@@ -262,6 +262,7 @@ const CFG_PADRAO = {
       precoMin: 25,
       precoMax: 3000,
       reenvioMinDias: 10,     // cooldown por produto
+      reenvioMesmoPrecoDias: 15, // ja enviado (qualquer via) a preco <= atual nesta janela -> segura
       exigirDisponivel: true,
     },
     porNicho: {},
@@ -616,6 +617,7 @@ function estruturarRegra(bruto, base, parcial = false) {
   num('precoMin', 0, 1000000);
   num('precoMax', 0, 1000000);
   num('reenvioMinDias', 0, 365);
+  num('reenvioMesmoPrecoDias', 0, 365);
   if (b.exigirMinimo90d !== undefined) out.exigirMinimo90d = b.exigirMinimo90d === true;
   if (b.exigirDisponivel !== undefined) out.exigirDisponivel = b.exigirDisponivel === true;
   return out;
@@ -839,7 +841,7 @@ function estatisticasDeSerie(h, ult) {
   const e30 = paresEf.filter(([d]) => d >= corte30).map(([, v]) => v);
   const e90 = paresEf.filter(([d]) => d >= corte90).map(([, v]) => v);
 
-  return {
+  const st = {
     dias: pares.length,
     diasRecentes: v90.length,
     min90: Math.min(...v90),
@@ -874,6 +876,38 @@ function estatisticasDeSerie(h, ult) {
                max90: Math.max(...pcts) };
     })(),
   };
+  // Series de 90 dias em ordem, para o recorde ESTRITO (minAntesDoPatamar).
+  // Nao enumeraveis: o objeto de estatisticas sai em varias rotas e nao precisa
+  // carregar a serie inteira no JSON.
+  Object.defineProperty(st, 'serie90', { value: pares.filter(([d]) => d >= corte90), enumerable: false });
+  Object.defineProperty(st, 'serieEf90', { value: paresEf.filter(([d]) => d >= corte90), enumerable: false });
+  return st;
+}
+
+/**
+ * RECORDE ESTRITO (out/2026). Menor preco da serie de 90 dias ANTES do patamar
+ * atual: descarta, a partir de hoje para tras, os dias em que o preco ja estava
+ * igual ou abaixo de 'p' (e o mesmo patamar, nao historia) e pega o minimo do
+ * que sobra. Recorde = 'p' abaixo disso.
+ *
+ * O min90 cru inclui o proprio dia de hoje, entao 'p <= min90' era verdade
+ * sempre que o preco estivesse no fundo — inclusive EMPATANDO com uma oferta
+ * que ja tinhamos mandado. Caso real: escada Mor a R$ 489,99 em 24/09, subiu
+ * para R$ 667, voltou a R$ 489,99 em 03/10 e o card disse "menor preco em 90
+ * dias". Pela regra estrita, so e recorde se ficar abaixo de R$ 489,99.
+ */
+function minAntesDoPatamar(pares, p) {
+  if (!Array.isArray(pares) || !pares.length || !Number.isFinite(p)) return null;
+  let i = pares.length - 1;
+  while (i >= 0 && pares[i][1] <= p + 0.005) i--;
+  if (i < 0) return null;
+  let m = Infinity;
+  for (let j = 0; j <= i; j++) if (Number.isFinite(pares[j][1]) && pares[j][1] < m) m = pares[j][1];
+  return Number.isFinite(m) ? m : null;
+}
+function ehRecordeEstrito(pares, p) {
+  const m = minAntesDoPatamar(pares, p);
+  return m !== null && p < m - 0.005;
 }
 
 // ── SERIE DO PRODUTO (GRUPO DE LOJAS) ───────────────────────────────────────
@@ -1165,21 +1199,25 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   //          preco parado e invisivel para o monitor. E o contrario tambem —
   //          produto que TINHA cupom e nao tem mais ficou mais caro, e so a
   //          serie efetiva registra isso.
-  const medir = (p, refer, minimo) => {
+  // 'noPatamar' e o portao exigirMinimo90d (com tolerancia: empatar com o
+  // minimo conta). 'recorde' e o SELO — "menor preco em 90 dias" no card e o
+  // bonus de score — e so vale abaixo do minimo anterior ao patamar atual.
+  const medir = (p, refer, minimo, serie) => {
     if (!Number.isFinite(p) || p <= 0 || !Number.isFinite(refer) || refer <= 0) return null;
     const lim = Number.isFinite(minimo) ? minimo * (1 + (r.toleranciaMinimoPct || 0) / 100) : null;
     return {
       quedaPct: Math.round((1 - p / refer) * 1000) / 10,
       quedaRs:  Math.round((refer - p) * 100) / 100,
-      recorde:  lim === null ? false : p <= lim,
+      noPatamar: lim === null ? false : p <= lim,
+      recorde:  ehRecordeEstrito(serie, p),
     };
   };
   const aprova = (m) => m
     && m.quedaPct >= r.quedaMinPct
     && m.quedaRs  >= r.quedaMinReais
-    && (!r.exigirMinimo90d || m.recorde);
+    && (!r.exigirMinimo90d || m.noPatamar);
 
-  const mBruto = medir(preco, ref, stats.min90);
+  const mBruto = medir(preco, ref, stats.min90, stats.serie90);
 
   // A leitura efetiva so entra quando a serie efetiva ja existe E o cupom de
   // agora e real: o desconto e recalculado aqui, nao herdado do que estava
@@ -1192,7 +1230,7 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   const ef = stats.efetivo;
   const usarEfetivo = _cfg.publicacao.considerarCupom && ef && ef.dias >= r.maturidadeMinDias;
   const mEfet = usarEfetivo
-    ? medir(precoEfetivo, ef.mediana30 ?? ef.min90, ef.min90)
+    ? medir(precoEfetivo, ef.mediana30 ?? ef.min90, ef.min90, stats.serieEf90)
     : null;
 
   // Vence a leitura que APROVA. Se as duas aprovam, vence a de queda maior — e
@@ -1239,6 +1277,28 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   const diasDesde = ultimo ? (Date.now() - ultimo) / 86400000 : 999;
   if (diasDesde < r.reenvioMinDias)
     return { ...detalhe, passou: false, motivo: 'enviado ha ' + Math.floor(diasDesde) + 'd (minimo ' + r.reenvioMinDias + 'd)' };
+
+  // MESMO PRECO JA ENVIADO (out/2026). O cooldown acima so enxerga disparo do
+  // proprio monitor (ultimoDisparo da vitrine). Oferta que saiu pelo radar de
+  // grupo ou aprovada a mao fica no historico de envios e nao contava: a escada
+  // Mor saiu a R$ 489,99 em 24/09 pelo radar e o monitor quis manda-la de novo a
+  // R$ 489,99 em 04/10 como "queda". Regra: enviado nos ultimos
+  // 'reenvioMesmoPrecoDias' a preco igual ou menor (tolerancia de 1%) -> segura.
+  // So libera se o preco de agora estiver de fato abaixo do que ja mandamos.
+  if (r.reenvioMesmoPrecoDias > 0 && typeof _deps?.enviosRecentes === 'function') {
+    let envios = [];
+    try { envios = _deps.enviosRecentes(item.asin, r.reenvioMesmoPrecoDias) || []; } catch { envios = []; }
+    const pAgora = Math.min(preco, Number.isFinite(precoEfetivo) ? precoEfetivo : preco);
+    const repetido = envios
+      .filter(e => Number.isFinite(e?.preco) && e.preco > 0 && pAgora >= e.preco * 0.99)
+      .sort((a, b) => a.preco - b.preco)[0];
+    if (repetido) {
+      const dd = Math.max(0, Math.floor((Date.now() - Date.parse(repetido.em)) / 86400000));
+      return { ...detalhe, passou: false,
+               motivo: 'enviado ha ' + dd + 'd a R$ ' + repetido.preco.toFixed(2).replace('.', ',')
+                 + ' (mesmo preco ou menor; janela ' + r.reenvioMesmoPrecoDias + 'd)' };
+    }
+  }
 
   // Veto por desempenho: produto com amostra suficiente que so consome clique
   // nao sai, por mais fundo que esteja o desconto. Sem dado no ledger nao ha
@@ -2223,7 +2283,7 @@ export async function cardsDaFila({ asins = null } = {}) {
         asin, nome: item.nome, loja: item.loja, preco: st.ultimo,
         mediana30: st.mediana30, min90: st.min90,
         quedaPct: Math.round((1 - st.ultimo / st.mediana30) * 1000) / 10,
-        recorde: Number.isFinite(st.min90) && st.ultimo <= st.min90,
+        recorde: ehRecordeEstrito(st.serie90, st.ultimo),
         nicho, curado: !!String(item.nicho || '').trim(), via: 'preco',
       } });
     }
