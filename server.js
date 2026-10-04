@@ -1740,6 +1740,22 @@ async function conectarConta(id) {
     });
     c.sock = s;
     s.ev.on('creds.update', saveCreds);
+    // Presenca "offline" (unavailable) da conta secundaria. O Baileys so manda o
+    // 'unavailable' do markOnlineOnConnect:false no 'open' e IGNORA em silencio
+    // se creds.me.name (nome do perfil) ainda nao chegou — o que e comum logo
+    // apos conectar. Sem esse aviso, o WhatsApp trata o aparelho vinculado como
+    // ativo e para de notificar no celular do dono do numero (ex.: camp-davi).
+    // Reenvia quando o nome chega e a cada 10 min; 'unavailable' nunca marca online.
+    const ficarInvisivel = () => {
+      if (c.sock !== s || !c.conectado || !s.authState?.creds?.me?.name) return;
+      s.sendPresenceUpdate('unavailable').catch(() => {});
+    };
+    s.ev.on('creds.update', (u) => { if (u?.me?.name) setTimeout(ficarInvisivel, 1000); });
+    clearInterval(c.timerInvisivel);
+    c.timerInvisivel = setInterval(() => {
+      if (c.sock !== s) { clearInterval(c.timerInvisivel); return; }
+      ficarInvisivel();
+    }, 10 * 60000);
     // Sentinela de grupos: numero desta conta removido de um grupo de destino.
     // So escuta — nenhuma requisicao extra.
     if (tenantDaConta(id) === TENANT_PADRAO) {
@@ -1766,6 +1782,7 @@ async function conectarConta(id) {
       if (u.connection === 'open') {
         c.conectado = true; c.qr = null; c.conectando = false; c.tentativas = 0;
         console.log('[CONTA:' + id + '] ✓ conectada.');
+        setTimeout(ficarInvisivel, 5000);
       }
       if (u.connection === 'close') {
         if (s._closeTratado) return;                   // duplicata do mesmo socket
