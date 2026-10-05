@@ -7545,7 +7545,14 @@ function contasReservaLeitura() {
 }
 
 // Transicao entrou/saiu da reserva: log + alerta uma vez por episodio.
+// Carencia: queda curta da principal (reconexao normal do Baileys, ~1 min) nao
+// vira alerta critico. Antes, um blip de 1 min deixava no painel e no grupo do
+// operador "NENHUMA conta conectada — captura parada" sem nenhum aviso de volta,
+// e parecia que a principal seguia caida. Agora: so alerta apos a carencia e,
+// ao voltar, marca o critico como lido e registra o OK.
+const RESERVA_CARENCIA_MS = 3 * 60 * 1000;
 let _reservaLeituraDesde = 0;
+let _reservaAlertaId = null;
 setInterval(() => {
   // Leitora efetiva de cada operacao (ignora as fontes: basta saber se alguma
   // operacao depende da principal agora).
@@ -7556,21 +7563,38 @@ setInterval(() => {
   const emReserva = dependePrincipal && !_principalLendo();
   if (emReserva && !_reservaLeituraDesde) {
     _reservaLeituraDesde = Date.now();
+    console.warn('[LEITURA] Principal fora da leitura — aguardando carencia antes de alertar.');
+  } else if (emReserva && !_reservaAlertaId && (Date.now() - _reservaLeituraDesde) >= RESERVA_CARENCIA_MS) {
     const reservas = contasReservaLeitura();
     const motivo = (!conectado || !sock) ? 'desconectada' : 'surda (' + _surdezEstado + ')';
     console.warn('[LEITURA] Principal ' + motivo + ' — leitura em RESERVA por: '
       + (reservas.join(', ') || 'nenhuma conta conectada') + '.');
+    _reservaAlertaId = 'pendente';
     registrarAlerta({
-      nivel: 'critico', origem: 'whatsapp', chave: 'leitura-reserva',
+      nivel: 'critico', origem: 'whatsapp', chave: 'leitura-reserva', janelaMs: 0,
       titulo: 'Principal fora da leitura — contas de disparo assumiram',
       corpo: 'A conta principal esta ' + motivo + '. Os grupos do CDV e as fontes do TSP passam a ser lidos por: '
            + (reservas.join(', ') || 'NENHUMA conta conectada — captura parada') + '. '
            + 'So sao cobertos os grupos em que essas contas estao. A leitura volta para a principal sozinha quando ela reconectar.',
+    }).then(() => {
+      const reg = alertas.find(x => x.chave === 'leitura-reserva');
+      if (reg && _reservaAlertaId === 'pendente') _reservaAlertaId = reg.id;
     }).catch(() => {});
   } else if (!emReserva && _reservaLeituraDesde) {
     const min = Math.round((Date.now() - _reservaLeituraDesde) / 60000);
+    const alertou = !!_reservaAlertaId;
     _reservaLeituraDesde = 0;
-    console.log('[LEITURA] Principal voltou a ler — reserva encerrada apos ' + min + ' min.');
+    if (alertou) {
+      const reg = alertas.find(x => x.id === _reservaAlertaId) || alertas.find(x => x.chave === 'leitura-reserva' && !x.lido);
+      if (reg) { reg.lido = true; salvarAlertas(); }
+      registrarAlerta({
+        nivel: 'info', origem: 'whatsapp', chave: 'leitura-reserva-ok:' + Date.now(), janelaMs: 0,
+        titulo: 'OK — principal voltou a ler apos ' + min + ' min',
+        corpo: '✅ OK — a conta principal reconectou e voltou a ler os grupos do CDV e as fontes do TSP (fora por ' + min + ' min).',
+      }).catch(() => {});
+    }
+    _reservaAlertaId = null;
+    console.log('[LEITURA] Principal voltou a ler — reserva encerrada apos ' + min + ' min' + (alertou ? '' : ' (dentro da carencia, sem alerta)') + '.');
   }
 }, 60 * 1000);
 
