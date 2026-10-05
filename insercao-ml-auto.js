@@ -117,7 +117,10 @@ const INDISPONIVEL = 'indisponivel';       // o ML disse que o cupom nao esta di
 // com codigo INVALID_n e texto especifico e o ML julgando O CUPOM (exclusivo
 // de outro publico, campanha encerrada para a conta) — o canal esta vivo.
 // INVALID_6 fica fora: e payload que o ML nao entendeu, nao diz nada do cupom.
-const RE_INDISPONIVEL = /\bINVALID_(?![16]\b)\d+\b|n[ãa]o est[áa] dispon[íi]vel/i;
+// 05/10/2026: "NOT_IN_TARGET_AUDIENCE: Este cupom não se aplica a você" (HTTP
+// 200) abriu o disjuntor em 03/10 — e o mesmo caso: cupom restrito a outro
+// publico, canal vivo.
+const RE_INDISPONIVEL = /\bINVALID_(?![16]\b)\d+\b|n[ãa]o est[áa] dispon[íi]vel|\bNOT_IN_TARGET_AUDIENCE\b|n[ãa]o se aplica a voc[êe]/i;
 
 let dep = null;
 let ESTADO_PATH = './sessao/insercao_ml_auto.json';
@@ -685,6 +688,17 @@ export function iniciarInsercaoMlAuto(deps) {
     return;
   }
   virarDia();
+  // Disjuntor aberto por uma resposta que hoje e classificada como cupom
+  // indisponivel (nao restricao da conta): fecha sozinho no boot.
+  let reabertoNoBoot = false;
+  if (estado.disjuntor && RE_INDISPONIVEL.test(String(estado.disjuntor.motivo || ''))) {
+    console.log('[CUPONS-ML-AUTO] Disjuntor de ' + estado.disjuntor.em + ' fechado no boot: o motivo (' + String(estado.disjuntor.motivo).slice(0, 120)
+      + ') e recusa do ML sobre o cupom, nao restricao da conta.');
+    estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0; estado.paginaMudouCodigos = [];
+    estado.proximaVisitaEm = 0;
+    reabertoNoBoot = true;
+    salvar();
+  }
   if (!extensaoMlConfigurada()) console.warn('[CUPONS-ML-AUTO] CUPONS_ML_EXTENSAO_TOKEN vazio — a extensão não vai conseguir buscar lotes.');
   if (estado.disjuntor) {
     const n = devolverFilaAoManual();
@@ -694,7 +708,7 @@ export function iniciarInsercaoMlAuto(deps) {
   } else {
     // Redeploy no meio de uma visita: o lote volta para a fila.
     if (estado.visita) { for (const r of emVisita()) marcar(r, { insercaoMl: FILA }); estado.visita = null; }
-    const adotados = adotarPendentes();
+    const adotados = adotarPendentes(reabertoNoBoot ? { incluirDevolvidos: true, ja: true } : undefined);
     console.log('[CUPONS-ML-AUTO] Ligada (extensão, modo enxuto): agrupa ' + AGRUPAR_MIN + ' min e insere a fila inteira; trava ' + TETO_FIXO
       + '/dia, janela ' + JANELA_INI + 'h–' + JANELA_FIM + 'h. Hoje: ' + estado.feitasHoje + '. Adotados: ' + adotados + '.');
   }

@@ -1903,7 +1903,7 @@ function waEnvioContaEmQuarentena(apelido) {
   return !!(c && c.quarentena && c.quarentenaAte && Date.parse(c.quarentenaAte) > Date.now());
 }
 // Conectada E fora da quarentena de pareamento: numero recem-pareado espera
-// QUARENTENA_H (padrao 24 h, no wa-envio) antes do primeiro disparo em grupo.
+// QUARENTENA_H (no wa-envio; padrao 0 = desligada desde 05/10/2026) antes do primeiro disparo em grupo.
 // Em quarentena a conta conta como indisponivel e a escala escolhe outra.
 function waEnvioContaConectada(apelido) {
   const c = waEnvioEstadoConta(apelido);

@@ -91,7 +91,8 @@ type Conta struct {
 	recriadoEm  time.Time
 	// Momento do ultimo pareamento (PairSuccess), persistido em
 	// pareamentos.json. Base da quarentena: numero recem-pareado nao dispara
-	// em grupo ate completar QUARENTENA_H horas (padrao 24; 0 desliga).
+	// em grupo ate completar QUARENTENA_H horas (padrao 0 = desligada desde 05/10/2026,
+	// decisao do Davi; >0 liga).
 	pareadoEm time.Time
 }
 
@@ -101,9 +102,9 @@ type Conta struct {
 // "quarentena") ate completar QUARENTENA_H; o baileys-server trata a conta como
 // indisponivel e a escala escolhe outra. DM continua liberada.
 var quarentenaH = func() int {
-	n, err := strconv.Atoi(envOr("QUARENTENA_H", "24"))
+	n, err := strconv.Atoi(envOr("QUARENTENA_H", "0"))
 	if err != nil || n < 0 {
-		return 24
+		return 0
 	}
 	return n
 }()
