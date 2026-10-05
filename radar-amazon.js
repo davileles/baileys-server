@@ -510,7 +510,25 @@ export function comRodapeExtra(mensagem, ctx = {}) {
   // mensagem sem o bloco extra, nao mensagem nao enviada.
   try { extra = rodapeExtraParaGrupo(ctx); }
   catch (e) { console.log('[RODAPE] Falha ao resolver rodape extra:', e.message); }
-  return extra ? msg + '\n\n' + extra : msg;
+  if (!extra) return msg;
+  // Rodape extra que tambem e CONVITE para grupo substitui o convite que ja
+  // veio no corpo do template (rodape fixo de cupom/oferta). Sem isso a
+  // mensagem saia com dois "Convide seus amigos..." empilhados no fim.
+  if (ehLinhaDeConvite(extra)) {
+    const linhas = msg.split('\n');
+    const filtradas = linhas.filter(l => !ehLinhaDeConvite(l));
+    if (filtradas.length !== linhas.length) {
+      return filtradas.join('\n').replace(/\s+$/, '') + '\n\n' + extra;
+    }
+  }
+  return msg + '\n\n' + extra;
+}
+
+/** Linha (ou bloco) que convida para entrar em grupo: texto padrao do rodape
+ *  ou link de convite do WhatsApp / distribuidor de grupos. */
+function ehLinhaDeConvite(texto) {
+  const t = String(texto || '');
+  return /convide\s+seus\s+amigos/i.test(t) || /chat\.whatsapp\.com\//i.test(t);
 }
 
 // ── TAG DE AFILIADO POR GRUPO DE DESTINO ──────────────────────────────────
