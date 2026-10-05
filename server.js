@@ -17692,7 +17692,9 @@ async function processarItemLista(id) {
         return;
       }
       ex.bloqueios = 0;
-      if (r.ok) ex.enviados.push({ asin, nome:r.nome, cupom:r.cupom, grupos:r.grupos, nicho:r.nicho || null,
+      const _codPedido = cupomDaLista(lista, asin);
+      if (r.ok && r.aviso && _codPedido && _codPedido !== 'auto' && _codPedido !== 'nenhum') console.warn('[LISTA] "' + lista.nome + '" — ' + asin + ' saiu sem o cupom pedido: ' + r.aviso);
+      if (r.ok) ex.enviados.push({ asin, nome:r.nome, cupom:r.cupom, avisoCupom:r.aviso || null, grupos:r.grupos, nicho:r.nicho || null,
                                    origemNicho:r.origemNicho || null, em:new Date().toISOString() });
       else      ex.pulados.push({ asin, motivo:r.motivo, em:new Date().toISOString() });
     } catch (e) {

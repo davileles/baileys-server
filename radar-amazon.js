@@ -1263,12 +1263,13 @@ export function registrarCupomBase(c) {
     tipo: c.tipo === 'reais' ? 'reais' : 'pct',
     valor: Number(c.valor) || 0,
     minimo: c.minimo === null || c.minimo === undefined ? null : Number(c.minimo),
-    limite: c.limite === null || c.limite === undefined ? null : Number(c.limite),
+    limite: tetoOuNulo(c.limite),
     // 'maximo' e o teto do PRODUTO/PEDIDO elegivel ("15% em produtos ate R$700"),
     // coisa diferente de 'limite', que e o teto do DESCONTO ("15%, ate R$60").
     // Confundir os dois faz o cupom ser anunciado para uma faixa de preco em que
     // ele nem se aplica.
-    maximo: c.maximo === null || c.maximo === undefined ? null : Number(c.maximo),
+    // Campo vazio no painel chega como 0/'': teto zero nao existe, e ausencia.
+    maximo: tetoOuNulo(c.maximo),
     // Nota do operador sobrevive a recaptura. Antes qualquer reaparicao do cupom
     // num grupo apagava a anotacao — inclusive a que explicava por que ele tinha
     // sido desativado, deixando o registro sem historia.
@@ -1373,7 +1374,7 @@ export function atualizarCupomBase(chave, campos = {}) {
     throw new Error('cupom ' + (reg.codigo || chave) + ' esta expirado — ajuste a validade antes de ativar');
   }
   for (const k of ['ativo', 'valor', 'minimo', 'maximo', 'limite', 'tipo', 'validadeAte', 'observacao', 'idCampanhaLoja', 'confirmadoNoMl', 'restrito', 'insercaoMl']) {
-    if (campos[k] !== undefined) reg[k] = campos[k];
+    if (campos[k] !== undefined) reg[k] = (k === 'maximo' || k === 'limite') ? tetoOuNulo(campos[k]) : campos[k];
   }
   // Mexer na validade nao pode deixar um vencido ligado por descuido.
   if (cupomExpirado(reg)) reg.ativo = false;
@@ -1411,6 +1412,13 @@ export function definirAtivoPorLoja(loja, ativo) {
 // comentario na funcao. Religar so com decisao explicita da operacao.
 const CUPOM_AUTOMATICO = false;
 
+/** Teto (maximo/limite): vazio, zero ou invalido = sem teto (null). */
+function tetoOuNulo(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 export function cupomVigente(reg) {
   return !!reg && reg.ativo !== false && new Date(reg.validadeAte).getTime() > Date.now();
 }
@@ -1442,13 +1450,15 @@ export function cupomGeralDisponivel(reg) {
 export function calcularDesconto(reg, preco) {
   if (!reg || !preco || preco <= 0) return 0;
   if (reg.minimo != null && preco < reg.minimo) return 0;
-  if (reg.maximo != null && preco > reg.maximo) return 0;
+  // Teto 0 = campo deixado em branco, nao "vale so ate R$ 0" (05/10: LOREAL20
+  // gravado com maximo 0 saiu sem cupom no envio unico).
+  if (Number(reg.maximo) > 0 && preco > Number(reg.maximo)) return 0;
 
   let d = reg.tipo === 'reais'
     ? (Number(reg.valor) || 0)
     : preco * (Number(reg.valor) || 0) / 100;
 
-  if (reg.tipo === 'pct' && reg.limite != null) d = Math.min(d, Number(reg.limite));
+  if (reg.tipo === 'pct' && Number(reg.limite) > 0) d = Math.min(d, Number(reg.limite));
   d = Math.min(d, preco);                       // nunca zera ou inverte o preco
   return d > 0 ? Math.round(d * 100) / 100 : 0;
 }
@@ -3325,7 +3335,7 @@ export async function montarOfertasVitrine(asins, codigoCupom = null, opcoes = {
         const desconto = calcularDesconto(reg, p.preco);
         if (desconto > 0) cupom = { reg, desconto, citado: true };
         else {
-          const regra = reg.maximo != null && p.preco > reg.maximo
+          const regra = Number(reg.maximo) > 0 && p.preco > reg.maximo
             ? ' (vale só até R$ ' + brl(reg.maximo) + ')'
             : (reg.minimo != null ? ' (mínimo R$ ' + brl(reg.minimo) + ')' : '');
           avisoCupom = 'cupom ' + codigo + ' não se aplica a R$ ' + brl(p.preco) + regra;
