@@ -1055,6 +1055,45 @@ func rotas() *http.ServeMux {
 		})
 	}))
 
+	// Apagar para todos uma mensagem que ESTA conta enviou (revoke). So a
+	// propria mensagem: sender vazio = "minha". O WhatsApp aceita ate ~2 dias
+	// depois do envio; fora disso o aparelho dos membros ignora o pedido.
+	mux.HandleFunc("POST /contas/{id}/apagar", autenticado(func(w http.ResponseWriter, r *http.Request) {
+		c := contaDaRota(w, r)
+		if c == nil {
+			return
+		}
+		var p struct {
+			JID string `json:"jid"`
+			ID  string `json:"id"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&p); err != nil || p.JID == "" || p.ID == "" {
+			responder(w, 400, map[string]any{"ok": false, "fase": "validacao", "erro": "informe jid e id"})
+			return
+		}
+		jid, err := types.ParseJID(p.JID)
+		if err != nil || jid.User == "" {
+			responder(w, 400, map[string]any{"ok": false, "fase": "validacao", "erro": "jid invalido"})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		c.envioMu.Lock()
+		defer c.envioMu.Unlock()
+		cli := c.cliente()
+		if cli == nil || !cli.IsLoggedIn() || !cli.IsConnected() {
+			responder(w, 503, map[string]any{"ok": false, "fase": "conexao", "erro": "conta desconectada"})
+			return
+		}
+		if _, err := cli.SendMessage(ctx, jid, cli.BuildRevoke(jid, types.EmptyJID, types.MessageID(p.ID))); err != nil {
+			log.Printf("[APAGAR:%s] falha em %s (%s): %v", c.ID, p.JID, p.ID, err)
+			responder(w, 502, map[string]any{"ok": false, "fase": "envio", "erro": err.Error()})
+			return
+		}
+		log.Printf("[APAGAR:%s] %s apagada em %s", c.ID, p.ID, p.JID)
+		responder(w, 200, map[string]any{"ok": true})
+	}))
+
 	mux.HandleFunc("GET /contas/{id}/grupos", autenticado(func(w http.ResponseWriter, r *http.Request) {
 		c := contaDaRota(w, r)
 		if c == nil {

@@ -205,7 +205,10 @@
         "app.post('/cupons/auto/leitura'",
         "function aplicarLeituraCuponsMl(",
         "app.post('/seats-alertas/email'",
-        "app.get('/seats-alertas/estado'"
+        "app.get('/seats-alertas/estado'",
+        "app.get('/enviadas-grupos'",
+        "app.post('/enviadas-grupos/apagar'",
+        "function registrarMensagemApagavel("
       ]
     },
     "radar-awin.js": {

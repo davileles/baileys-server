@@ -18,6 +18,7 @@ import { Boom } from '@hapi/boom';
 import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync, stat as statAsync, statfs as statfsAsync } from 'fs/promises';
 import { join } from 'path';
+import { createHash } from 'crypto';
 import QRCode from 'qrcode';
 
 // ── RADAR DE MARKETPLACE (Amazon hoje; ML e Shopee entram pelo mesmo pipeline) ─
@@ -2309,6 +2310,7 @@ async function enviarPelaConta(id, destino, conteudo) {
         const cw = contasExtras.get(id);
         if (cw) { cw.ultimoEnvio = new Date().toISOString(); limparErroConta(cw); }
         registrarEnvioTelemetria(apelidoEnvio, destino, 'whatsmeow');
+        registrarMensagemApagavel(id, 'whatsmeow', destino, rw, conteudo);
         return rw;
       } catch (e) {
         if (e.semFallback) throw e;
@@ -2327,9 +2329,111 @@ async function enviarPelaConta(id, destino, conteudo) {
     }
   } catch (e) {}
   guardarMensagemEnviada(r);
+  registrarMensagemApagavel(id, 'baileys', destino, r, conteudo);
   c.ultimoEnvio = new Date().toISOString();
   limparErroConta(c);
   return r;
+}
+
+// ── MENSAGENS ENVIADAS EM GRUPO QUE AINDA DA PARA APAGAR ─────────────────────
+// Toda mensagem que sai para um grupo (por qualquer conta e motor) fica
+// registrada com a chave do WhatsApp por ~2 dias — o prazo do "apagar para
+// todos". O painel (aba Publicar > Enviadas) junta as copias da mesma
+// publicacao (texto igual tirando os links, que levam o numero do grupo) e
+// apaga de um grupo ou de todos. Persistido em sessao/ para sobreviver a
+// restart. So a propria conta que enviou consegue apagar.
+const APAGAVEIS_PATH = SESSAO_DIR + '/mensagens_apagaveis.json';
+const APAGAVEIS_TTL_MS = 50 * 3600 * 1000;      // um pouco alem do prazo do WhatsApp
+const APAGAVEIS_PRAZO_MS = 47 * 3600 * 1000;    // depois disso o painel avisa que pode nao apagar
+const APAGAVEIS_MAX = 4000;
+let _apagaveis = null;
+let _apagaveisTimer = null;
+function _carregarApagaveis() {
+  if (_apagaveis) return _apagaveis;
+  _apagaveis = [];
+  try {
+    if (existsSync(APAGAVEIS_PATH)) {
+      const l = JSON.parse(readFileSync(APAGAVEIS_PATH, 'utf-8'));
+      if (Array.isArray(l)) _apagaveis = l;
+    }
+  } catch (e) { console.warn('[APAGAR] registro ilegivel, comecando vazio:', e.message); }
+  return _apagaveis;
+}
+function _podarApagaveis() {
+  const lim = Date.now() - APAGAVEIS_TTL_MS;
+  const l = _carregarApagaveis();
+  let i = 0;
+  while (i < l.length && (l[i].em < lim)) i++;
+  if (i) l.splice(0, i);
+  if (l.length > APAGAVEIS_MAX) l.splice(0, l.length - APAGAVEIS_MAX);
+}
+function _salvarApagaveis() {
+  if (_apagaveisTimer) return;
+  _apagaveisTimer = setTimeout(() => {
+    _apagaveisTimer = null;
+    try { _podarApagaveis(); escreverAtomico(APAGAVEIS_PATH, JSON.stringify(_apagaveis)); }
+    catch (e) { console.warn('[APAGAR] falha ao gravar registro:', e.message); }
+  }, 5000);
+}
+function _resumoConteudoApagavel(conteudo) {
+  const k = conteudo || {};
+  const tipo = k.image ? 'imagem' : k.video ? 'video' : k.document ? 'arquivo'
+             : k.audio ? 'audio' : k.sticker ? 'figurinha' : 'texto';
+  const texto = String(k.text || k.caption || (k.document && k.fileName) || '').slice(0, 600);
+  return { tipo, texto };
+}
+// Chave da publicacao: tipo + texto sem URLs nem espacos repetidos. Os links
+// rastreados mudam por grupo (-<n>); o resto da mensagem e igual.
+function _chavePublicacao(tipo, texto) {
+  const base = String(texto || '').replace(/https?:\/\/\S+/gi, '').replace(/\s+/g, ' ').trim().toLowerCase();
+  return tipo + '|' + createHash('sha1').update(base).digest('hex').slice(0, 16);
+}
+function registrarMensagemApagavel(contaId, motor, destino, resultado, conteudo) {
+  try {
+    const jid = String(destino || '');
+    const msgId = resultado?.key?.id;
+    if (!jid.endsWith('@g.us') || !msgId) return;
+    if (!conteudo || conteudo.delete || conteudo.react || conteudo.edit || conteudo.protocolMessage) return;
+    const { tipo, texto } = _resumoConteudoApagavel(conteudo);
+    _carregarApagaveis().push({
+      id: msgId, conta: String(contaId || 'principal'), motor, grupo: jid,
+      em: Date.now(), tipo, texto, chave: _chavePublicacao(tipo, texto),
+    });
+    _salvarApagaveis();
+  } catch (e) {}
+}
+function _socketDaConta(contaId) {
+  if (!contaId || contaId === 'principal') return (conectado && sock) ? sock : null;
+  const c = contasExtras.get(contaId);
+  return (c && c.conectado && c.sock) ? c.sock : null;
+}
+// Apaga UMA copia (grupo). Pelo motor que enviou; se o wa-envio nao responder
+// antes de tentar (desligado, versao antiga sem a rota, conta caida), tenta
+// pelo Baileys do mesmo numero — o revoke vale de qualquer aparelho da conta.
+async function apagarMensagemRegistrada(reg) {
+  const apelido = apelidoDaConta(reg.conta);
+  let erroWm = null;
+  if (reg.motor === 'whatsmeow' && WA_ENVIO_URL && WA_ENVIO_TOKEN) {
+    try {
+      const r = await fetch(WA_ENVIO_URL + '/contas/' + encodeURIComponent(apelido) + '/apagar', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + WA_ENVIO_TOKEN },
+        body: JSON.stringify({ jid: reg.grupo, id: reg.id }),
+        signal: AbortSignal.timeout(70000),
+      });
+      let d = {}; try { d = await r.json(); } catch (e) {}
+      if (r.ok && d.ok) return 'whatsmeow';
+      erroWm = 'wa-envio: ' + (d.erro || ('HTTP ' + r.status));
+      // fase envio = o pedido pode ter saido; repetir pelo Baileys e inofensivo
+      // (apagar duas vezes nao duplica nada), entao segue para o fallback.
+    } catch (e) { erroWm = 'wa-envio: ' + (e?.message || String(e)); }
+  }
+  const s = _socketDaConta(reg.conta);
+  if (!s) throw new Error(erroWm || ('conta ' + apelido + ' desconectada'));
+  await saidaSerializada(() => _enviarComTeto(s.sendMessage(reg.grupo, {
+    delete: { remoteJid: reg.grupo, fromMe: true, id: reg.id },
+  })));
+  return 'baileys';
 }
 
 // ── CONTA SUBSTITUTA NO DISPARO ─────────────────────────────────────────────
@@ -2489,6 +2593,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
         const rw = await enviarPeloWhatsmeow('principal', destino, payload);
         registrarPublicacaoHealth(destino);
         registrarEnvioTelemetria('principal', destino, 'whatsmeow');
+        registrarMensagemApagavel('principal', 'whatsmeow', destino, rw, conteudo);
         return rw;
       } catch (e) {
         if (e.semFallback) throw e;
@@ -2506,6 +2611,7 @@ async function enviarMensagem(destino, conteudo, tentativa = 0, opcoes = {}) {
     guardarMensagemEnviada(resultado);
     registrarPublicacaoHealth(destino);
     registrarEnvioTelemetria('principal', destino, 'baileys');
+    registrarMensagemApagavel('principal', 'baileys', destino, resultado, conteudo);
     return resultado;
   } catch (err) {
     const retryable = err.message?.includes('Connection Closed') ||
@@ -15400,6 +15506,84 @@ app.delete('/agendamentos/:id', (req, res) => {
   delete agendamentos[idx].anexo;
   salvarAgendamentos();
   res.json({ ok:true });
+});
+
+// ── APAGAR MENSAGEM ENVIADA (painel TSP: Publicar > Enviadas) ───────────────
+// Lista as publicacoes das ultimas horas (copias da mesma mensagem em varios
+// grupos juntas) e apaga para todos de um grupo ou de todos. Exige login: e
+// acao destrutiva no grupo. Cada operador so ve/apaga o que as contas dele
+// enviaram.
+const APAGAR_JANELA_PUB_MS = 6 * 3600 * 1000;
+function _publicacoesApagaveis(tenantId, escopo, horas) {
+  _podarApagaveis();
+  const desde = Date.now() - Math.min(Math.max(Number(horas) || 48, 1), 50) * 3600 * 1000;
+  const pubs = [];
+  const abertas = new Map();   // chave -> publicacao mais recente com essa chave
+  for (const r of _carregarApagaveis()) {
+    if (r.em < desde) continue;
+    if (tenantDaConta(r.conta) !== tenantId) continue;
+    const tsp = ehGrupoTsp(r.grupo);
+    if (escopo === 'tsp' && !tsp) continue;
+    let p = abertas.get(r.chave);
+    if (!p || r.em - p.primeiraEm > APAGAR_JANELA_PUB_MS) {
+      p = { chave: r.chave, tipo: r.tipo, texto: r.texto, primeiraEm: r.em, ultimaEm: r.em, copias: [] };
+      abertas.set(r.chave, p);
+      pubs.push(p);
+    }
+    p.ultimaEm = r.em;
+    p.copias.push({
+      id: r.id, grupo: r.grupo, nomeGrupo: NOMES_GRUPOS.get(r.grupo) || r.grupo,
+      conta: apelidoDaConta(r.conta), motor: r.motor, em: r.em, tsp,
+      apagadaEm: r.apagadaEm || null, erro: r.erroApagar || null,
+      noPrazo: Date.now() - r.em < APAGAVEIS_PRAZO_MS,
+    });
+  }
+  return pubs.reverse();
+}
+
+app.get('/enviadas-grupos', (req, res) => {
+  if (!req.autenticado) return res.status(401).json({ ok:false, erro:'Faça login para ver as mensagens enviadas.' });
+  const escopo = req.query.escopo === 'todos' ? 'todos' : 'tsp';
+  res.json({ ok:true, prazoHoras: APAGAVEIS_PRAZO_MS / 3600000,
+    publicacoes: _publicacoesApagaveis(req.tenantId, escopo, req.query.horas) });
+});
+
+let _apagandoAgora = false;
+app.post('/enviadas-grupos/apagar', async (req, res) => {
+  if (!req.autenticado) return res.status(401).json({ ok:false, erro:'Faça login para apagar mensagens.' });
+  const pedidos = Array.isArray(req.body?.itens) ? req.body.itens.slice(0, 80) : [];
+  if (!pedidos.length) return res.status(400).json({ ok:false, erro:'Nenhuma mensagem informada.' });
+  if (_apagandoAgora) return res.status(409).json({ ok:false, erro:'Já há uma exclusão em andamento — aguarde terminar.' });
+  _apagandoAgora = true;
+  const resultados = [];
+  try {
+    const lista = _carregarApagaveis();
+    for (let i = 0; i < pedidos.length; i++) {
+      const p = pedidos[i] || {};
+      const reg = lista.find(r => r.id === String(p.id || '') && r.grupo === String(p.grupo || ''));
+      const nome = reg ? (NOMES_GRUPOS.get(reg.grupo) || reg.grupo) : String(p.grupo || '');
+      if (!reg || tenantDaConta(reg.conta) !== req.tenantId) {
+        resultados.push({ id: p.id, grupo: p.grupo, nomeGrupo: nome, ok: false, erro: 'mensagem não encontrada no registro' });
+        continue;
+      }
+      if (reg.apagadaEm) { resultados.push({ id: reg.id, grupo: reg.grupo, nomeGrupo: nome, ok: true, jaApagada: true }); continue; }
+      try {
+        const via = await apagarMensagemRegistrada(reg);
+        reg.apagadaEm = Date.now(); delete reg.erroApagar;
+        resultados.push({ id: reg.id, grupo: reg.grupo, nomeGrupo: nome, ok: true, via });
+        console.log('[APAGAR] ' + reg.id + ' apagada em ' + nome + ' (conta ' + apelidoDaConta(reg.conta) + ', via ' + via + ')');
+      } catch (e) {
+        reg.erroApagar = String(e?.message || e).slice(0, 200);
+        resultados.push({ id: reg.id, grupo: reg.grupo, nomeGrupo: nome, ok: false, erro: reg.erroApagar });
+        console.warn('[APAGAR] falhou em ' + nome + ': ' + reg.erroApagar);
+      }
+      _salvarApagaveis();
+      // Ritmo humano entre grupos: apagar em rajada e acao em massa.
+      if (i < pedidos.length - 1) await new Promise(r => setTimeout(r, 1200 + Math.floor(Math.random() * 1300)));
+    }
+  } finally { _apagandoAgora = false; }
+  const falhas = resultados.filter(r => !r.ok).length;
+  res.json({ ok: falhas === 0, apagadas: resultados.length - falhas, falhas, resultados });
 });
 
 app.post('/painel/rejeitar/:id', (req, res) => {
