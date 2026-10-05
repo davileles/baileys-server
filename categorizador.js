@@ -51,15 +51,21 @@ function norm(s) {
 
 // Plural do portugues, versao pobre de proposito: so o suficiente para que
 // "Fraldas" case com a keyword "fralda". Aplicada nos DOIS lados da comparacao,
-// entao um erro de reducao (tenis -> tenil) e inofensivo: os dois lados erram
-// igual e o casamento continua valendo.
+// entao um erro de reducao (tenis -> tenil) so e inofensivo quando singular e
+// plural caem na MESMA forma. Cortar "-es" de qualquer palavra quebrava isso:
+// "sabonetes" virava "sabonet" e o bloqueio "sabonete" nao casava (sabonete de
+// vinho da Phebo foi parar no grupo de Bebidas); "cafes" virava "caf" e nao
+// casava com "cafe". Agora "-es" so sai depois de r/s/z (flores, luzes), e o
+// singular terminado em re/se/ze perde o "e" para encontrar o plural no meio
+// do caminho (torre/torres -> torr).
 function desplural(p) {
   if (p.length <= 3) return p;
   if (p.endsWith('oes') || p.endsWith('aes')) return p.slice(0, -3) + 'ao';
   if (p.endsWith('ns')) return p.slice(0, -2) + 'm';
   if (p.endsWith('is') && p.length > 4) return p.slice(0, -2) + 'l';
-  if (p.endsWith('es') && p.length > 4) return p.slice(0, -2);
+  if (/[rsz]es$/.test(p) && p.length > 4) return p.slice(0, -2);
   if (p.endsWith('s')) return p.slice(0, -1);
+  if (/[rsz]e$/.test(p) && p.length > 4) return p.slice(0, -1);
   return p;
 }
 
