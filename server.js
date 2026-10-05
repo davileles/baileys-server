@@ -1735,7 +1735,8 @@ async function conectarConta(id) {
       // aqui roubaria a presenca dele e mudaria o comportamento de notificacao
       // no celular do operador — nao vale, ja que esta conta so envia.
       markOnlineOnConnect: false,
-      getMessage: async (key) => c.enviadas.get(key?.id) || obterMensagemEnviada(key?.id),
+      getMessage: async (key) => (mensagemRevogada(key?.id) ? undefined
+        : (c.enviadas.get(key?.id) || obterMensagemEnviada(key?.id))),
       shouldIgnoreJid: (jid) => jid === 'status@broadcast' || (typeof jid === 'string' && jid.endsWith('@newsletter')),
       keepAliveIntervalMs: 30000,
     });
@@ -1814,11 +1815,13 @@ async function conectarConta(id) {
     // resposta de campanha — tudo isso pertence ao socket principal, e disparar
     // a partir daqui derrubaria a sessao da principal por um evento que nao e
     // dela. Aqui so entra o que a operacao dona precisa: pulso e pipeline.
+    c.sock.ev.on('messages.update', (ups) => observarRevokeUpdates(ups, 'update de ' + apelidoDaConta(id)));
     c.sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify' && type !== 'append') return;
       registrarPulsoLeitor(id);
       const ctx = { contaId: id, sock: c.sock };
       for (const msg of (messages || [])) {
+        observarRevoke(msg, 'revoke visto por ' + apelidoDaConta(id));
         // Conta de campanha: resposta de contato na conversa direta marca
         // 'respondido' (cancela o follow-up). So o hook — nada de pipeline extra.
         if (ehContaCampanha(id)) campanhaMarcarResposta(msg).catch(() => {});
@@ -2411,6 +2414,9 @@ function _socketDaConta(contaId) {
 // antes de tentar (desligado, versao antiga sem a rota, conta caida), tenta
 // pelo Baileys do mesmo numero — o revoke vale de qualquer aparelho da conta.
 async function apagarMensagemRegistrada(reg) {
+  // Antes de qualquer tentativa: a intencao e apagar, entao o retry receipt ja
+  // nao pode reenviar o conteudo nem durante o revoke.
+  marcarMensagemRevogada(reg.id, 'painel');
   const apelido = apelidoDaConta(reg.conta);
   let erroWm = null;
   if (reg.motor === 'whatsmeow' && WA_ENVIO_URL && WA_ENVIO_TOKEN) {
@@ -10320,7 +10326,84 @@ function _podarThumbInPlace(m, prof = 0) {
 
 const mensagensEnviadas = new Map(); // id -> { m: mensagem, em: ms }
 
+// ── MENSAGEM APAGADA NUNCA RESSUSCITA ────────────────────────────────────────
+// O store acima responde o retry receipt devolvendo o CONTEUDO ORIGINAL. Se a
+// mensagem foi apagada para todos (pelo painel ou por um admin no celular), um
+// aparelho que ainda nao tinha decifrado pede reenvio e o Baileys mandava de
+// novo o texto apagado — para quem recebe, a oferta "saiu de novo" no grupo
+// (caso do sabonete Phebo no grupo de Bebidas, 05/10/2026, que voltou duas
+// vezes depois de apagado). Id revogado sai do store e o getMessage passa a
+// responder undefined: o retry morre ali. Persistido (sobrevive a restart) com
+// o mesmo TTL do store.
+const REVOGADAS_PATH = SESSAO_DIR + '/revogadas.json';
+const _revogadas = new Map(); // id -> em (ms)
+try {
+  if (existsSync(REVOGADAS_PATH)) {
+    const obj = JSON.parse(readFileSync(REVOGADAS_PATH, 'utf-8')) || {};
+    const agora = Date.now();
+    for (const [id, em] of Object.entries(obj)) {
+      if (agora - Number(em || 0) <= ENVIADAS_TTL_MS) _revogadas.set(id, Number(em));
+    }
+  }
+} catch (e) { console.warn('[ENTREGA] Erro ao carregar revogadas.json:', e.message); }
+
+let _revogadasSaveTimer = null;
+function _salvarRevogadas() {
+  if (_revogadasSaveTimer) return;
+  _revogadasSaveTimer = setTimeout(() => {
+    _revogadasSaveTimer = null;
+    try {
+      const agora = Date.now();
+      for (const [id, em] of _revogadas) if (agora - em > ENVIADAS_TTL_MS) _revogadas.delete(id);
+      const tmp = REVOGADAS_PATH + '.tmp';
+      writeFileSync(tmp, JSON.stringify(Object.fromEntries(_revogadas)));
+      renameSync(tmp, REVOGADAS_PATH);
+    } catch (e) { console.warn('[ENTREGA] Erro ao salvar revogadas.json:', e.message); }
+  }, 2000);
+}
+
+function mensagemRevogada(id) { return !!(id && _revogadas.has(id)); }
+
+function marcarMensagemRevogada(id, origem) {
+  try {
+    if (!id || _revogadas.has(id)) return;
+    _revogadas.set(id, Date.now());
+    const tinha = mensagensEnviadas.delete(id);
+    let extras = 0;
+    for (const c of contasExtras.values()) if (c?.enviadas?.delete(id)) extras++;
+    if (tinha || extras) {
+      console.log('[ENTREGA] Mensagem ' + id + ' apagada (' + (origem || '?') + ') — fora do store de reenvio.');
+      _agendarSalvarEnviadas();
+    }
+    _salvarRevogadas();
+  } catch (e) {}
+}
+
+// Revoke visto no socket (admin apagou no celular, ou nosso proprio revoke
+// ecoando). Formato do upsert: protocolMessage { type: REVOKE (0), key }.
+function observarRevoke(msg, origem) {
+  try {
+    const pm = msg?.message?.protocolMessage;
+    if (!pm || !pm.key?.id) return;
+    const t = pm.type;
+    if (t === 0 || t === 'REVOKE') marcarMensagemRevogada(pm.key.id, origem);
+  } catch (e) {}
+}
+
+// Revoke tambem chega como update (Baileys: message null + stub REVOKE).
+function observarRevokeUpdates(updates, origem) {
+  try {
+    for (const u of (updates || [])) {
+      const st = u?.update?.messageStubType;
+      if (u?.key?.id && u.update && u.update.message === null && (st === 1 || st === 'REVOKE')) {
+        marcarMensagemRevogada(u.key.id, origem);
+      }
+    }
+  } catch (e) {}
+}
+
 function obterMensagemEnviada(id) {
+  if (mensagemRevogada(id)) return undefined;
   const reg = id ? mensagensEnviadas.get(id) : null;
   return reg ? reg.m : undefined;
 }
@@ -10381,6 +10464,14 @@ function _agendarSalvarEnviadas() {
       }
     }
     if (n) console.log('[ENTREGA] ' + n + ' mensagens enviadas restauradas do disco (getMessage sobrevive a restart).');
+    // Uma vez so (05/10/2026): o sabonete Phebo (link rastreado 4Tp7W) foi
+    // apagado do grupo de Bebidas antes de existir o registro de revogadas e
+    // seguia ressuscitando por retry. Some sozinho quando o TTL de 48 h vencer.
+    for (const [id, r] of mensagensEnviadas) {
+      try {
+        if (JSON.stringify(r.m || {}).includes('/4Tp7W-')) marcarMensagemRevogada(id, 'limpeza Phebo 05/10');
+      } catch (e) {}
+    }
     // Reescreve ja no arranque aplicando teto de bytes e a poda de thumbnail.
     _agendarSalvarEnviadas();
   } catch {}
@@ -11647,6 +11738,7 @@ async function conectar() {
         }
       } catch(e) { console.error('[GRUPOS] Erro no handler de update:', e.message); }
     });
+    sock.ev.on('messages.update', (ups) => observarRevokeUpdates(ups, 'update da principal'));
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       // Diagnostico: registra o evento CRU, antes de qualquer filtro. Sem isso
       // nao da para distinguir "socket nao recebe nada" de "recebe e descarta".
@@ -11665,6 +11757,7 @@ async function conectar() {
           if (_debugUpserts.length > 60) _debugUpserts.shift();
           registrarSombra('baileys:principal', mm);
           registrarContatoPrivado('principal', sock, mm);
+          observarRevoke(mm, 'revoke visto pela principal');
           if (mm.messageStubType === 2) {
             _stub2Total++;
             const jid2 = mm.key?.remoteJid || '(sem jid)';
