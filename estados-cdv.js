@@ -12,7 +12,9 @@
 //   - so-ida nao inverte: inverter inventaria um voo que ninguem encontrou;
 //   - tarifa pagante nao inverte (o valor e texto livre e pode descrever o
 //     sentido) — vai so para o estado de origem;
-//   - ida e volta so inverte se as datas fecharem: para quem sai do destino, a
+//   - domestico (origem e destino no Brasil): ida e volta SEMPRE inverte, com
+//     as datas trocadas inteiras (cada trecho se emite separado);
+//   - internacional: ida e volta so inverte se as datas fecharem: para quem sai do destino, a
 //     ida passa a ser a lista de volta e a volta a lista de ida. Se toda volta
 //     for anterior a toda ida, a viagem invertida e impossivel e nao sai;
 //   - datas que nao dao para ler tambem nao invertem (na duvida, nao inventa);
@@ -160,15 +162,19 @@ function ehPagante(d) {
  * A viagem invertida existe? `extrairDatasISO` vem do server.js para nao haver
  * uma segunda copia do leitor de datas. Devolve { ok, motivo }.
  */
-export function podeInverter(d, extrairDatasISO) {
+export function podeInverter(d, extrairDatasISO, domestico) {
   if (!d) return { ok: false, motivo: 'sem dados' };
   if (ehPagante(d)) return { ok: false, motivo: 'tarifa pagante' };
   const volta = String(d.datasVolta || '').trim();
   if (!volta || volta === '-') return { ok: false, motivo: 'so ida' };
+  // Domestico (as duas pontas no Brasil): cada trecho se emite separado, entao
+  // a invertida sai sempre, com as listas de datas trocadas inteiras — quem
+  // sai do destino pode comprar so um trecho (decisao de 06/10/2026).
+  if (domestico) return { ok: true, motivo: '' };
   const idas   = extrairDatasISO(d.datasIda);
   const voltas = extrairDatasISO(d.datasVolta);
   if (!idas.length || !voltas.length) return { ok: false, motivo: 'datas ilegiveis' };
-  // Invertida: ida' = voltas, volta' = idas. Precisa de alguma volta' (ida
+  // Internacional — invertida: ida' = voltas, volta' = idas. Precisa de alguma volta' (ida
   // original) no mesmo dia ou depois de alguma ida' (volta original).
   if (idas[idas.length - 1] < voltas[0]) return { ok: false, motivo: 'datas nao fecham ao inverter' };
   // So as datas que formam viagem: ida' ate a ultima volta', volta' a partir
@@ -252,7 +258,7 @@ export function planejarCopiasEstado(dados, grupos, reservados, extrairDatasISO)
     if (!alvos.length) {
       inversao = { ok: false, motivo: 'estado ' + ufDestino + ' sem grupo' };
     } else {
-      inversao = podeInverter(d, extrairDatasISO);
+      inversao = podeInverter(d, extrairDatasISO, !!ufOrigem);
       if (inversao.ok) {
         const inv = inverterDados(d, inversao);
         for (const jid of alvos) {
