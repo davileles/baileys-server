@@ -17566,7 +17566,70 @@ function nichoDoItemLista(item, titulo) {
   return { nicho:null, origem:null };
 }
 
-async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
+// Monta a oferta de UM produto da vitrine exatamente como o disparo de lista
+// monta (mesma regra de cupom de outra loja). Usada pelo disparo e pela previa
+// do envio unico — a previa precisa mostrar o mesmo texto que vai sair.
+// previa:true = Amazon sem ocupar etiqueta do pool (o link de verdade e gerado
+// no envio e transplantado para o texto editado).
+async function montarProdutoDaLista(asin, codigoCupom, { previa = false } = {}) {
+  const item = itemVitrine(asin);
+  if (!item) return { erro:'produto nao esta mais na vitrine' };
+
+  if (codigoCupom && codigoCupom !== 'auto' && codigoCupom !== 'nenhum'
+      && !cupomPorCodigo(item.loja, codigoCupom)) {
+    const deOutraLoja = ['Mercado Livre', 'Amazon', 'Shopee', 'Magazine Luiza']
+      .some(lj => lj !== item.loja && cupomPorCodigo(lj, codigoCupom));
+    if (deOutraLoja) codigoCupom = 'auto';
+  }
+
+  let montado;
+  if (item.loja === 'Shopee') {
+    if (!credenciaisShopeeOk()) return { erro:'Shopee nao configurada' };
+    montado = await montarOfertasShopeeVitrine([item], codigoCupom);
+  } else if (item.loja === 'Mercado Livre') {
+    if (!tokenAffOk()) return { erro:'Mercado Livre nao configurado (ML_AFF_TOKEN)' };
+    montado = await montarOfertasMlVitrine([item], codigoCupom);
+  } else if (item.loja === 'Magazine Luiza') {
+    montado = await montarOfertasMagaluVitrine([item], codigoCupom);
+  } else if (String(item.asin).startsWith('AWIN-')) {
+    montado = await montarOfertasAwinVitrine([item], codigoCupom);
+  } else {
+    montado = await montarOfertasVitrine([asin], codigoCupom, previa ? { rastrear:false } : {});
+  }
+  const o = montado.prontos[0];
+  if (!o) return { erro: montado.descartados[0]?.motivo || 'produto descartado' };
+  return { item, o };
+}
+
+// Texto editado pelo operador na previa da extensao. So vale se o produto
+// ainda sai pelo mesmo preco final e com o mesmo cupom da previa (tolerancia
+// 1%): preco mudou entre a previa e o envio (envio agendado, loja mexeu) =>
+// sai o texto novo, so com o nome editado aplicado. Os links do texto editado
+// sao trocados pelos do texto novo, na ordem — a etiqueta de afiliado e o
+// rastreio sao os do momento do envio, nunca os da previa.
+const _RE_URL_EDIT = /https?:\/\/[^\s`"'<>]+/g;
+function aplicarEdicaoDisparo(o, ed) {
+  if (!ed || typeof ed !== 'object') return { mensagem: o.mensagem, usada: null };
+  const fresco = String(o.mensagem || '');
+  const nome = String(ed.nome || '').trim(), nomeOrig = String(ed.nomeOriginal || '').trim();
+  const comNome = t => (nome && nomeOrig && nome !== nomeOrig) ? t.split(nomeOrig).join(nome) : t;
+  const pf = Number(o.precoFinal ?? o.produto?.preco), pfPrev = Number(ed.precoFinal);
+  const mesmoPreco = Number.isFinite(pf) && Number.isFinite(pfPrev) && pfPrev > 0
+    ? Math.abs(pf - pfPrev) / pfPrev <= 0.01 : !(pfPrev > 0);
+  const mesmoCupom = String(o.cupom?.codigo || '').toUpperCase() === String(ed.cupom || '').toUpperCase();
+  const texto = String(ed.texto || '').trim();
+  if (!texto || !mesmoPreco || !mesmoCupom) {
+    return { mensagem: comNome(fresco), usada: texto ? 'so_nome' : 'nome',
+             motivo: !mesmoPreco ? 'preco mudou desde a previa' : !mesmoCupom ? 'cupom mudou desde a previa' : null };
+  }
+  const novos = fresco.match(_RE_URL_EDIT) || [];
+  const editados = texto.match(_RE_URL_EDIT) || [];
+  let i = 0, final = texto;
+  if (novos.length && novos.length === editados.length) final = texto.replace(_RE_URL_EDIT, () => novos[i++]);
+  return { mensagem: final, usada: 'texto' };
+}
+
+async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', edicao = null) {
   const item = itemVitrine(asin);
   if (!item) return { ok:false, motivo:'produto nao esta mais na vitrine' };
 
@@ -17614,6 +17677,15 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral') {
         + ': ' + _f.nivel + ' — ' + _f.motivo);
       if (_f?.bloqueia) return { ok:false, motivo:'filtro de preco: ' + _f.motivo + ' (serie ' + _f.diasSerie + 'd)' };
     } catch (e) { /* filtro nunca derruba a lista */ }
+  }
+
+  // Texto/nome editado no envio unico pela extensao (ver aplicarEdicaoDisparo).
+  if (edicao) {
+    const _ed = aplicarEdicaoDisparo(o, edicao);
+    if (_ed.motivo) console.warn('[LISTA] ' + asin + ' — texto editado descartado: ' + _ed.motivo + ' (sai o texto novo com o nome editado).');
+    o.mensagem = _ed.mensagem;
+    const _nm = String(edicao.nome || '').trim();
+    if (_nm) { o.nome = _nm; if (o.produto) o.produto.titulo = _nm; }
   }
 
   const oferta = {
@@ -17876,7 +17948,8 @@ async function processarItemLista(id) {
     }
 
     try {
-      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista, asin), lista.roteamento);
+      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista, asin), lista.roteamento,
+                                             lista.edicoesItem?.[String(asin)] || null);
       if (!execucaoVigente()) {
         console.log('[LISTA] "' + lista.nome + '" mudou durante o envio de ' + asin + ' — andamento descartado.');
         return;
@@ -18062,6 +18135,29 @@ app.post('/listas/:id/disparar', async (req, res) => {
 // Envio unico: mesma maquina de disparo das listas salvas, so que o registro e
 // descartavel. Cria e inicia num passo so — se nao der para iniciar, a lista e
 // desfeita, porque envio unico parado no painel vira lixo que ninguem entende.
+// Previa do envio unico (extensao Captura Tica): o texto exato que sairia agora
+// para um produto, com o cupom escolhido — sem enviar nem enfileirar. O
+// operador pode editar nome/texto e mandar a edicao em edicoesItem.
+app.post('/listas/disparo-unico/previa', async (req, res) => {
+  try {
+    const asin = String(req.body?.asin || '').trim();
+    if (!asin) return res.status(400).json({ ok:false, erro:'informe o produto' });
+    const modo = ['auto', 'fixo', 'nenhum'].includes(req.body?.cupomModo) ? req.body.cupomModo : 'auto';
+    const codigo = modo === 'fixo' ? String(req.body?.cupomCodigo || '').trim().toUpperCase() || null
+                 : modo === 'nenhum' ? 'nenhum' : 'auto';
+    const m = await montarProdutoDaLista(asin, codigo, { previa:true });
+    if (m.erro) return res.json({ ok:false, erro:m.erro });
+    const { o } = m;
+    res.json({ ok:true, asin, loja: o.produto?.loja || m.item.loja || null,
+               nome: o.nome || null, titulo: o.produto?.titulo || null,
+               preco: o.produto?.preco ?? null, precoDe: o.produto?.precoDe ?? null,
+               precoFinal: o.precoFinal ?? o.produto?.preco ?? null,
+               cupom: o.cupom?.codigo || null, avisoCupom: o.avisoCupom || null,
+               imagemUrl: o.produto?.imagemUrl || null,
+               mensagem: o.mensagem });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
 app.post('/listas/disparo-unico', async (req, res) => {
   const produtos = Array.isArray(req.body?.produtos) ? req.body.produtos.filter(Boolean) : [];
   if (!produtos.length) return res.status(400).json({ ok:false, erro:'selecione ao menos um produto' });
@@ -18086,6 +18182,7 @@ app.post('/listas/disparo-unico', async (req, res) => {
     cupomModo: req.body?.cupomModo,
     cupomCodigo: req.body?.cupomCodigo,
     cuponsItem: req.body?.cuponsItem,
+    edicoesItem: req.body?.edicoesItem,
     roteamento: req.body?.roteamento,
     efemera: true,
     agenda: { ativo:false },

@@ -210,7 +210,9 @@
         "app.post('/enviadas-grupos/apagar'",
         "function registrarMensagemApagavel(",
         "async function copiarEmissaoEstados(",
-        "app.post('/cdv/estados/simular'"
+        "app.post('/cdv/estados/simular'",
+        "app.post('/listas/disparo-unico/previa'",
+        "function aplicarEdicaoDisparo("
       ]
     },
     "radar-awin.js": {

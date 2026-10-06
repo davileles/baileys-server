@@ -3761,6 +3761,24 @@ export function salvarLista(dados = {}) {
     }
   }
 
+  // Texto/nome editado por produto (envio unico pela extensao):
+  // { asin: { texto, nome, nomeOriginal, precoFinal, cupom } }.
+  const _edBruto = (dados.edicoesItem !== undefined ? dados.edicoesItem : ant.edicoesItem) || {};
+  const edicoesItem = {};
+  if (_edBruto && typeof _edBruto === 'object' && !Array.isArray(_edBruto)) {
+    for (const [a, ed] of Object.entries(_edBruto)) {
+      if (!_noLista.has(String(a)) || !ed || typeof ed !== 'object') continue;
+      const e = {
+        texto: String(ed.texto || '').slice(0, 4000),
+        nome: String(ed.nome || '').trim().slice(0, 300),
+        nomeOriginal: String(ed.nomeOriginal || '').trim().slice(0, 300),
+        precoFinal: Number.isFinite(Number(ed.precoFinal)) ? Number(ed.precoFinal) : null,
+        cupom: ed.cupom ? String(ed.cupom).trim().toUpperCase() : null,
+      };
+      if (e.texto || e.nome) edicoesItem[String(a)] = e;
+    }
+  }
+
   // ── ROTEAMENTO DA LISTA ──
   // O nicho curado da base de produtos so era lido pelo monitor de precos. A
   // lista montava a oferta SEM categoria, e oferta sem categoria cai nas
@@ -3806,6 +3824,7 @@ export function salvarLista(dados = {}) {
     cupomCodigo: modo === 'fixo'
       ? String(dados.cupomCodigo || ant.cupomCodigo || '').trim().toUpperCase() : null,
     cuponsItem: Object.keys(cuponsItem).length ? cuponsItem : null,
+    edicoesItem: Object.keys(edicoesItem).length ? edicoesItem : null,
     roteamento,
     agenda,
     janelas: janelas.length ? janelas : null,
