@@ -13548,7 +13548,7 @@ function _gmResumoJob(j) {
   return { id: j.id, tipo: j.tipo, acao: j.acao, alvo: j.alvo, origem: j.origem, estado: j.estado,
     total: j.total, feitos: j.feitos, pulados: j.pulados, falhas: j.falhas, atual: j.atual,
     proximaEm: j.proximaEm, iniciadoEm: j.iniciadoEm, terminadoEm: j.terminadoEm, erro: j.erro,
-    resultados: j.resultados };
+    resultados: j.resultados, grupo: j.grupo || null };
 }
 
 function _gmNovoJob(dados) {
@@ -13753,6 +13753,253 @@ async function _gmRodarInfo(j, { pedidos, nome, descricao }) {
   _gmFimJob(j);
 }
 
+// ── Criar grupo e trocar foto (06/10/2026) ─────────────────────────────────
+// Mesmo motor de tarefa (uma por vez, passos espacados). Quem e de FORA passa
+// pela mesma trava da inclusao: mandou mensagem no privado de uma conta nossa
+// nas ultimas GM_CONTATO_JANELA_MS, teto diario por conta, e so essa conta
+// inclui — e ela precisa estar no grupo novo como admin (a que cria, ou um
+// numero da casa marcado para entrar). Quem nao passa recebe o link de convite
+// na tela. Numeros da casa (contas conectadas) entram direto e viram admin.
+const GM_PASSO_CRIAR = [6000, 14000];          // entre os passos do grupo novo
+const GM_CRIAR_MAX_PART = 30;
+const GM_FOTO_MAX_BYTES = 5 * 1024 * 1024;
+
+async function _gmPrepararFoto(dataUrl) {
+  if (dataUrl == null || dataUrl === '') return { buf: null };
+  const m = /^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=\s]+)$/i.exec(String(dataUrl));
+  if (!m) return { erro: 'imagem invalida — use JPG, PNG ou WEBP' };
+  const bruto = Buffer.from(m[2], 'base64');
+  if (!bruto.length) return { erro: 'imagem vazia' };
+  if (bruto.length > GM_FOTO_MAX_BYTES) return { erro: 'a imagem passa de 5 MB' };
+  const sh = await carregarSharp();
+  if (!sh) return { buf: bruto };              // o Baileys tenta processar sozinho
+  try {
+    const buf = await sh(bruto).rotate().resize(640, 640, { fit: 'cover', position: 'centre' }).jpeg({ quality: 85 }).toBuffer();
+    return { buf };
+  } catch (e) { return { erro: 'nao consegui ler a imagem: ' + e.message }; }
+}
+
+// Conta conectada dona deste telefone (comparando variantes do nono digito).
+function _gmContaDoNumero(digitos) {
+  const v = _reVariantes(digitos);
+  return _gmContas().find(c => c.numero && [..._reVariantes(c.numero)].some(n => v.has(n))) || null;
+}
+
+// Plano da criacao, sem tocar no WhatsApp: quem cria, quais contas da casa
+// entram, e como cada participante de fora entra (inclusao direta ou convite).
+async function _gmPlanoCriar({ conta, participantes, contasCasa }) {
+  const contas = _gmContas();
+  const criador = contas.find(c => c.id === conta);
+  if (!criador) return { erro: 'a conta ' + (conta || '?') + ' nao esta conectada' };
+
+  const casa = new Map();                       // id -> { id, numero }
+  for (const id of (Array.isArray(contasCasa) ? contasCasa : [])) {
+    const c = contas.find(x => x.id === String(id));
+    if (c && c.id !== criador.id && c.numero) casa.set(c.id, { id: c.id, numero: c.numero });
+  }
+  const externos = [];
+  const vistos = new Set();
+  const avisos = [];
+  for (const p of (Array.isArray(participantes) ? participantes : [])) {
+    let d = String(p?.telefone || '').replace(/\D/g, '');
+    if (d.length === 10 || d.length === 11) d = '55' + d;
+    if (!d) continue;
+    if (d.length < 12 || d.length > 15) return { erro: 'telefone invalido: ' + p.telefone + ' — informe com DDI e DDD' };
+    if (vistos.has(d)) continue;
+    vistos.add(d);
+    const dona = _gmContaDoNumero(d);
+    if (dona) {
+      if (dona.id === criador.id) avisos.push(d + ' e a propria conta que cria o grupo');
+      else casa.set(dona.id, { id: dona.id, numero: dona.numero });
+      continue;
+    }
+    externos.push({ telefone: d, admin: !!p.admin });
+  }
+  if (externos.length + casa.size > GM_CRIAR_MAX_PART) return { erro: 'no maximo ' + GM_CRIAR_MAX_PART + ' participantes por grupo criado aqui' };
+
+  const quemInclui = new Set([criador.id, ...casa.keys()]);
+  const usados = {};                            // conta -> numeros novos hoje neste plano
+  for (const e of externos) {
+    const c = await _gmContatoRecente(e.telefone);
+    if (!c) { e.modo = 'convite'; e.motivo = 'nao mandou mensagem para um numero nosso nas ultimas ' + Math.round(GM_CONTATO_JANELA_MS / 3600e3) + 'h'; continue; }
+    if (!quemInclui.has(c.conta)) {
+      e.modo = 'convite';
+      e.motivo = 'mandou mensagem para ' + c.conta + ', que nao vai estar no grupo — marque essa conta em "numeros da casa" para incluir direto';
+      continue;
+    }
+    const hoje = _gmAdicoesHoje(c.conta);
+    const ja = hoje.includes(e.telefone);
+    const conta = usados[c.conta] || (usados[c.conta] = []);
+    if (!ja && hoje.length + conta.length >= GM_ADD_MAX_DIA) {
+      e.modo = 'convite'; e.motivo = 'a conta ' + c.conta + ' ja chegou ao limite de ' + GM_ADD_MAX_DIA + ' inclusoes hoje';
+      continue;
+    }
+    if (!ja) conta.push(e.telefone);
+    e.modo = 'incluir'; e.por = c.conta;
+  }
+  return { criador: { id: criador.id, numero: criador.numero }, casa: [...casa.values()], externos, avisos };
+}
+
+async function _gmRodarCriar(j, { nome, descricao, foto, soAdminsEnviam, soAdminsEditam, plano }) {
+  const contas = () => _gmContas();
+  const sockDe = (id) => contas().find(c => c.id === id)?.sock || null;
+  const criador = sockDe(plano.criador.id);
+  if (!criador) return _gmFimJob(j, 'a conta ' + plano.criador.id + ' desconectou antes de comecar');
+  const passo = (rotulo, x) => { j.resultados.push({ jid: j.grupo?.jid || null, nome: rotulo, ...x }); };
+  const ok = (rotulo, detalhe, por) => { j.feitos++; passo(rotulo, { estado: 'ok', detalhe, por: por || plano.criador.id }); };
+  const falha = (rotulo, detalhe, por) => { j.falhas++; passo(rotulo, { estado: 'falha', detalhe, por: por || plano.criador.id }); };
+  const pausa = () => _gmPausa(j, GM_PASSO_CRIAR);
+
+  // 1. Cria ja com os numeros da casa (nossos — nao ha risco de spam ai).
+  j.atual = 'criando o grupo';
+  const jidCasa = plano.casa.map(c => c.numero + '@s.whatsapp.net');
+  let md;
+  try { md = await criador.groupCreate(nome, jidCasa); }
+  catch (e) { return _gmFimJob(j, 'o WhatsApp recusou a criacao: ' + e.message); }
+  const jid = md?.id;
+  if (!jid) return _gmFimJob(j, 'o WhatsApp nao devolveu o id do grupo novo');
+  j.grupo = { jid, nome, link: null };
+  NOMES_GRUPOS.set(jid, nome);
+  ok('Criar grupo', 'grupo "' + nome + '" criado');
+
+  // Participante de uma conta nossa, por telefone ou LID (o v7 pode devolver so LID).
+  const idsCasa = (c) => { const s = new Set(_reVariantes(c.numero)); const sk = sockDe(c.id); if (sk) for (const n of _idsDaContaSock(sk)) s.add(n); return s; };
+  const partDe = (meta, c) => { const ids = idsCasa(c); return (meta?.participants || []).find(p => _gmIdsParticipante(p).some(n => ids.has(n))) || null; };
+
+  let codigo = null;
+  const pegarConvite = async () => {
+    if (codigo) return codigo;
+    codigo = await criador.groupInviteCode(jid);
+    j.grupo.link = 'https://chat.whatsapp.com/' + codigo;
+    return codigo;
+  };
+
+  // 2. Foto.
+  if (foto) {
+    await pausa(); j.atual = 'colocando a foto';
+    try { await criador.updateProfilePicture(jid, foto); ok('Foto', 'foto do grupo colocada'); }
+    catch (e) { falha('Foto', e.message); }
+  }
+  // 3. Descricao.
+  if (descricao) {
+    await pausa(); j.atual = 'colocando a descricao';
+    try { await criador.groupUpdateDescription(jid, descricao); ok('Descricao', 'descricao colocada'); }
+    catch (e) { falha('Descricao', e.message); }
+  }
+  // 4. Permissoes.
+  for (const [quer, valor, rotulo] of [[soAdminsEnviam, 'announcement', 'so admins enviam mensagens'], [soAdminsEditam, 'locked', 'so admins editam os dados']]) {
+    if (!quer) continue;
+    await pausa(); j.atual = 'ajustando permissoes';
+    try { await criador.groupSettingUpdate(jid, valor); ok('Permissoes', rotulo); }
+    catch (e) { falha('Permissoes', e.message); }
+  }
+
+  // 5. Numeros da casa: quem nao entrou na criacao (privacidade) entra pelo
+  //    convite com o proprio socket. Depois todos viram admin numa chamada so.
+  const casaNoGrupo = [];
+  let entrouPorConvite = false;
+  for (const c of plano.casa) {
+    if (partDe(md, c)) { casaNoGrupo.push(c); continue; }
+    await pausa(); j.atual = 'incluindo ' + c.id;
+    const s = sockDe(c.id);
+    try {
+      if (!s) throw new Error('a conta desconectou');
+      await s.groupAcceptInvite(await pegarConvite());
+      casaNoGrupo.push(c);
+      entrouPorConvite = true;
+      ok('Numero da casa', c.id + ' entrou por convite', c.id);
+    } catch (e) { falha('Numero da casa', c.id + ' nao entrou: ' + e.message); }
+  }
+  if (casaNoGrupo.length) {
+    await pausa(); j.atual = 'promovendo numeros da casa';
+    try {
+      let meta = md;
+      if (entrouPorConvite) { try { meta = await criador.groupMetadata(jid); } catch (e) {} }
+      const alvos = casaNoGrupo.map(c => partDe(meta, c)?.id || (c.numero + '@s.whatsapp.net'));
+      const r = await criador.groupParticipantsUpdate(jid, alvos, 'promote');
+      const okN = (r || []).filter(x => String(x?.status) === '200').length;
+      if (okN === casaNoGrupo.length) ok('Admins da casa', casaNoGrupo.map(c => c.id).join(', ') + ' agora admin');
+      else falha('Admins da casa', okN + ' de ' + casaNoGrupo.length + ' promovidos — confira na lista de membros');
+    } catch (e) { falha('Admins da casa', e.message); }
+  }
+  const adminsCasa = new Set([plano.criador.id, ...casaNoGrupo.map(c => c.id)]);
+
+  // 6. Participantes de fora: inclusao direta so por quem recebeu a mensagem.
+  const incluidos = [];
+  const convidar = [];
+  for (const e of plano.externos) {
+    const rot = 'Participante +' + e.telefone;
+    if (e.modo !== 'incluir') { convidar.push({ e, motivo: e.motivo }); continue; }
+    if (!adminsCasa.has(e.por)) { convidar.push({ e, motivo: e.por + ' nao ficou admin do grupo' }); continue; }
+    const hoje = _gmAdicoesHoje(e.por);
+    if (!hoje.includes(e.telefone) && hoje.length >= GM_ADD_MAX_DIA) { convidar.push({ e, motivo: 'limite diario de ' + e.por + ' atingido' }); continue; }
+    const s = sockDe(e.por);
+    if (!s) { convidar.push({ e, motivo: e.por + ' desconectou' }); continue; }
+    await _gmPausa(j, incluidos.length ? GM_PAUSA.add : GM_PASSO_CRIAR);
+    j.atual = 'incluindo +' + e.telefone;
+    try {
+      const w = await s.onWhatsApp(e.telefone);
+      const achado = Array.isArray(w) ? w.find(x => x && x.exists && x.jid) : null;
+      if (!achado) { falha(rot, 'este numero nao tem WhatsApp', e.por); continue; }
+      const r = await s.groupParticipantsUpdate(jid, [achado.jid], 'add');
+      const stt = String(r?.[0]?.status || '');
+      if (stt === '200' || stt === '409') {
+        _gmContarAdicao(e.por, e.telefone);
+        incluidos.push({ e, jidP: r?.[0]?.jid || achado.jid });
+        ok(rot, 'incluido', e.por);
+      } else if (stt === '403' || stt === '408' || stt === '401') {
+        convidar.push({ e, motivo: 'a privacidade da pessoa nao deixou incluir direto (status ' + stt + ')' });
+      } else { falha(rot, 'WhatsApp retornou status ' + (stt || '?'), e.por); }
+    } catch (err) { falha(rot, err.message, e.por); }
+  }
+
+  // 7. Admins de fora (so quem entrou).
+  const promover = incluidos.filter(x => x.e.admin);
+  if (promover.length) {
+    await pausa(); j.atual = 'promovendo admins';
+    try {
+      const r = await criador.groupParticipantsUpdate(jid, promover.map(x => x.jidP), 'promote');
+      const okN = (r || []).filter(x => String(x?.status) === '200').length;
+      if (okN === promover.length) ok('Admins', promover.map(x => '+' + x.e.telefone).join(', ') + ' agora admin');
+      else falha('Admins', okN + ' de ' + promover.length + ' promovidos — confira na lista de membros');
+    } catch (err) { falha('Admins', err.message); }
+  }
+
+  // 8. Convites: link na tela, nunca no privado.
+  if (convidar.length) {
+    let link = null, erroLink = null;
+    try { await pegarConvite(); link = j.grupo.link; } catch (err) { erroLink = err.message; }
+    for (const { e, motivo } of convidar) {
+      j.falhas++;
+      passo('Participante +' + e.telefone, { estado: 'convite', link,
+        detalhe: (link ? 'mande o link pelo seu celular — ' : 'convite falhou (' + erroLink + ') — ') + motivo
+          + (e.admin ? '. Depois que entrar, torne admin pela lista de membros.' : '') });
+    }
+  } else {
+    try { await pegarConvite(); } catch (err) {}
+  }
+  _gmFimJob(j);
+}
+
+async function _gmRodarFoto(j, { pedidos, foto }) {
+  const retratos = await _gmRetratos(true);
+  if (!retratos.length) return _gmFimJob(j, 'nenhuma conta conseguiu ler os grupos agora');
+  for (let i = 0; i < pedidos.length; i++) {
+    const jid = pedidos[i];
+    const md = _gmMeta(retratos, jid);
+    const rotulo = md?.subject || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+    j.atual = rotulo;
+    const push = (x) => { j.resultados.push({ jid, nome: rotulo, ...x }); };
+    if (!md) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada participa deste grupo' }); continue; }
+    const exec = retratos.find(r => _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin);
+    if (!exec) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada e admin deste grupo' }); continue; }
+    try { await exec.sock.updateProfilePicture(jid, foto); j.feitos++; push({ estado: 'ok', por: exec.id, detalhe: 'foto atualizada' }); }
+    catch (e) { j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: e.message }); }
+    if (i < pedidos.length - 1) await _gmPausa(j, GM_PAUSA.info);
+  }
+  _gmFimJob(j);
+}
+
 // Interface compartilhada pelos dois paineis.
 app.get('/grupos-gestao/ui.js', (req, res) => {
   try {
@@ -13859,6 +14106,53 @@ app.post('/grupos-gestao/info', async (req, res) => {
   const j = _gmNovoJob({ tipo: 'info', acao: nome != null ? (descricao != null ? 'nome+descricao' : 'nome') : 'descricao',
     alvo: null, origem: 'painel-' + (b.operacao || '?'), total: pedidos.length });
   _gmRodarInfo(j, { pedidos, nome, descricao }).catch(e => _gmFimJob(j, e.message));
+  res.status(202).json({ ok: true, jobId: j.id, total: pedidos.length });
+});
+
+// Body: { conta, nome, descricao?, imagem? (data URL), participantes: [{ telefone, admin }],
+//         contasCasa: [ids], soAdminsEnviam?, soAdminsEditam?, simular? }
+// Com simular:true devolve so o plano (quem entra direto, quem recebe convite).
+app.post('/grupos-gestao/criar', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const st = _gm();
+  const b = req.body || {};
+  const simular = b.simular === true;
+  if (!simular && st.ativo) return res.status(409).json({ ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo });
+  if (!_gmContas().length) return res.status(503).json({ ok: false, erro: 'nenhuma conta do WhatsApp conectada' });
+  const nome = String(b.nome || '').trim();
+  if (!nome || nome.length > 100) return res.status(400).json({ ok: false, erro: 'o nome precisa ter entre 1 e 100 caracteres' });
+  const descricao = String(b.descricao || '').trim();
+  if (descricao.length > 2048) return res.status(400).json({ ok: false, erro: 'a descricao passa de 2048 caracteres' });
+  const foto = await _gmPrepararFoto(b.imagem);
+  if (foto.erro) return res.status(400).json({ ok: false, erro: foto.erro });
+  const plano = await _gmPlanoCriar({ conta: String(b.conta || ''), participantes: b.participantes, contasCasa: b.contasCasa });
+  if (plano.erro) return res.status(400).json({ ok: false, erro: plano.erro });
+  const soAdminsEnviam = b.soAdminsEnviam === true, soAdminsEditam = b.soAdminsEditam === true;
+  if (simular) return res.json({ ok: true, simulado: true, plano, limiteInclusoesDia: GM_ADD_MAX_DIA });
+
+  const incluir = plano.externos.filter(e => e.modo === 'incluir');
+  const total = 1 + (foto.buf ? 1 : 0) + (descricao ? 1 : 0) + (soAdminsEnviam ? 1 : 0) + (soAdminsEditam ? 1 : 0)
+    + (plano.casa.length ? 1 : 0) + plano.externos.length + (incluir.some(e => e.admin) ? 1 : 0);
+  const j = _gmNovoJob({ tipo: 'criar', acao: 'criar', alvo: nome, origem: 'painel-' + (b.operacao || '?'), total, grupo: null });
+  _gmRodarCriar(j, { nome, descricao, foto: foto.buf, soAdminsEnviam, soAdminsEditam, plano }).catch(e => _gmFimJob(j, e.message));
+  res.status(202).json({ ok: true, jobId: j.id, total, plano });
+});
+
+// Body: { jids: [], imagem (data URL) } — troca a foto de grupos existentes.
+app.post('/grupos-gestao/foto', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const st = _gm();
+  if (st.ativo) return res.status(409).json({ ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo });
+  const b = req.body || {};
+  const pedidos = [...new Set((Array.isArray(b.jids) ? b.jids : []).map(j => String(j || '').trim()).filter(j => j.endsWith('@g.us')))];
+  if (!pedidos.length) return res.status(400).json({ ok: false, erro: 'escolha ao menos um grupo' });
+  if (pedidos.length > GM_MAX_GRUPOS_POR_TAREFA) return res.status(400).json({ ok: false, erro: 'no maximo ' + GM_MAX_GRUPOS_POR_TAREFA + ' grupos por tarefa' });
+  const foto = await _gmPrepararFoto(b.imagem);
+  if (foto.erro) return res.status(400).json({ ok: false, erro: foto.erro });
+  if (!foto.buf) return res.status(400).json({ ok: false, erro: 'envie a imagem' });
+  if (!_gmContas().length) return res.status(503).json({ ok: false, erro: 'nenhuma conta do WhatsApp conectada' });
+  const j = _gmNovoJob({ tipo: 'info', acao: 'foto', alvo: null, origem: 'painel-' + (b.operacao || '?'), total: pedidos.length });
+  _gmRodarFoto(j, { pedidos, foto: foto.buf }).catch(e => _gmFimJob(j, e.message));
   res.status(202).json({ ok: true, jobId: j.id, total: pedidos.length });
 });
 

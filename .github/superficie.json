@@ -115,6 +115,8 @@
         "app.post('/enviar-imagem'",
         "app.post('/fila-envio/marcar-enviado/:ofertaId'",
         "app.post('/fila-envio/marcar-todas-enviado'",
+        "app.post('/grupos-gestao/criar'",
+        "app.post('/grupos-gestao/foto'",
         "app.post('/grupos-gestao/info'",
         "app.post('/grupos-gestao/participante'",
         "app.post('/grupos/censo/atualizar'",
@@ -482,8 +484,11 @@
       "minLinhas": 300,
       "obrigatorio": [
         "window.GG = {",
+        "Tela.prototype.confirmarCriar",
         "Tela.prototype.porNumero",
-        "Tela.prototype.salvarDesc"
+        "Tela.prototype.revisarCriar",
+        "Tela.prototype.salvarDesc",
+        "Tela.prototype.salvarFoto"
       ]
     },
     "insercao-ml-auto.js": {

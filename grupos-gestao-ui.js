@@ -39,7 +39,11 @@
     + '.gg-tarefa{border:1px solid rgba(47,111,237,.5);background:rgba(47,111,237,.08)}'
     + '.gg-res{font-size:12px;padding:4px 0;border-bottom:1px solid rgba(127,127,127,.12)}'
     + '.gg-res a{color:#7aa5ff;word-break:break-all}'
-    + '.gg-cont{font-size:11.5px;opacity:.6;text-align:right}';
+    + '.gg-cont{font-size:11.5px;opacity:.6;text-align:right}'
+    + '.gg-foto{display:flex;gap:10px;align-items:center;margin:0 0 10px}'
+    + '.gg-foto img{width:56px;height:56px;border-radius:50%;object-fit:cover;border:1px solid rgba(127,127,127,.35)}'
+    + '.gg-plano{border:1px dashed rgba(127,127,127,.4);border-radius:8px;padding:10px;margin:10px 0}'
+    + '.gg-plano div{padding:2px 0}';
 
   function injetarCss() {
     if (document.getElementById('gg-css')) return;
@@ -69,7 +73,34 @@
     try { return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return ''; }
   }
   var ROT_ACAO = { add: 'Incluir', remove: 'Excluir', promote: 'Tornar admin', demote: 'Tirar admin',
-    nome: 'Trocar nome', descricao: 'Trocar descrição', 'nome+descricao': 'Trocar nome e descrição' };
+    nome: 'Trocar nome', descricao: 'Trocar descrição', 'nome+descricao': 'Trocar nome e descrição',
+    criar: 'Criar grupo', foto: 'Trocar foto' };
+
+  // Le a imagem escolhida e reduz no navegador (lado maior 1024) antes de
+  // mandar — o servidor ainda recorta em 640x640 para a foto do grupo.
+  function lerImagem(arquivo) {
+    return new Promise(function (ok, erro) {
+      if (!arquivo) return ok(null);
+      if (!/^image\/(png|jpe?g|webp)$/i.test(arquivo.type)) return erro(new Error('use uma imagem JPG, PNG ou WEBP'));
+      var fr = new FileReader();
+      fr.onerror = function () { erro(new Error('não consegui ler o arquivo')); };
+      fr.onload = function () {
+        var img = new Image();
+        img.onerror = function () { erro(new Error('imagem inválida')); };
+        img.onload = function () {
+          var k = Math.min(1, 1024 / Math.max(img.width, img.height));
+          var cv = document.createElement('canvas');
+          cv.width = Math.round(img.width * k); cv.height = Math.round(img.height * k);
+          var cx = cv.getContext('2d');
+          cx.fillStyle = '#fff'; cx.fillRect(0, 0, cv.width, cv.height);
+          cx.drawImage(img, 0, 0, cv.width, cv.height);
+          ok(cv.toDataURL('image/jpeg', 0.9));
+        };
+        img.src = fr.result;
+      };
+      fr.readAsDataURL(arquivo);
+    });
+  }
   var COR_EST = { ok: 'gg-ok', pulado: '', convite: 'gg-aviso', bloqueado: 'gg-erro', falha: 'gg-erro' };
 
   function Tela(el, opt) {
@@ -86,6 +117,10 @@
     this.tarefaId = null;
     this.timer = null;
     this.contatoOk = null;
+    this.novos = [];          // participantes do grupo novo: { telefone, admin }
+    this.fotoNova = null;     // data URL da foto do grupo novo
+    this.fotoTroca = null;    // data URL da foto para o grupo selecionado
+    this.planoCriar = null;   // corpo revisado, pronto para confirmar
     this.render();
     this.carregar(false);
     this.retomarTarefa();
@@ -108,6 +143,31 @@
       + '<div class="gg" id="' + id + '">'
       +   '<div class="gg-card gg-tarefa" data-r="tarefa" style="display:none"></div>'
       +   '<div class="gg-card">'
+      +     '<div class="gg-tit">🆕 Criar grupo</div>'
+      +     '<div class="gg-linha">'
+      +       '<div class="gg-campo"><label>Conta que cria (fica como criadora)</label><select data-r="cr-conta"></select></div>'
+      +       '<div class="gg-campo"><label>Nome do grupo</label><input type="text" data-r="cr-nome" maxlength="100"/></div>'
+      +     '</div>'
+      +     '<div class="gg-foto"><img data-r="cr-foto-ver" alt="" style="display:none"/>'
+      +       '<div class="gg-campo" style="margin:0"><label>Foto do grupo (opcional)</label><input type="file" accept="image/jpeg,image/png,image/webp" data-r="cr-foto"/></div></div>'
+      +     '<div class="gg-campo"><label>Descrição (opcional) <span data-r="cr-desc-cont"></span></label><textarea data-r="cr-desc" maxlength="2048"></textarea></div>'
+      +     '<label class="gg-ajuda" style="display:flex;gap:6px;align-items:center;margin:0 0 4px"><input type="checkbox" data-r="cr-anuncio"/> Só admins enviam mensagens</label>'
+      +     '<label class="gg-ajuda" style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-r="cr-trava"/> Só admins editam nome, foto e descrição</label>'
+      +     '<p class="gg-ajuda" style="margin-top:8px"><b>Números da casa</b> que entram e viram admin (sem trava de mensagem):</p>'
+      +     '<div class="gg-lista" data-r="cr-casa" style="max-height:160px"></div>'
+      +     '<p class="gg-ajuda"><b>Participantes</b> — com DDI e DDD. Entra direto quem mandou mensagem nas últimas 24h para a conta que cria '
+      +       'ou para um número da casa marcado acima; os demais recebem o link de convite na tela.</p>'
+      +     '<div class="gg-linha" style="align-items:flex-end">'
+      +       '<div class="gg-campo"><label>Telefone</label><input type="text" data-r="cr-tel" placeholder="55 31 99999-8888" autocomplete="off"/></div>'
+      +       '<label class="gg-ajuda" style="display:flex;gap:6px;align-items:center;margin-bottom:18px"><input type="checkbox" data-r="cr-tel-adm"/> admin</label>'
+      +       '<button class="gg-btn" data-a="cr-add" style="margin-bottom:10px">➕ Adicionar</button>'
+      +     '</div>'
+      +     '<div class="gg-lista" data-r="cr-parts" style="max-height:200px"></div>'
+      +     '<button class="gg-btn pri" data-a="cr-revisar">🔎 Revisar</button>'
+      +     '<div data-r="cr-plano"></div>'
+      +   '</div>'
+
+      +   '<div class="gg-card">'
       +     '<div class="gg-linha">'
       +       '<div class="gg-campo" style="margin:0"><label>Grupo</label><select data-r="grupo"></select></div>'
       +       '<button class="gg-btn" data-a="atualizar" style="align-self:flex-end">🔄 Atualizar</button>'
@@ -118,7 +178,10 @@
       +   '</div>'
 
       +   '<div class="gg-card">'
-      +     '<div class="gg-tit">✏️ Nome e descrição</div>'
+      +     '<div class="gg-tit">✏️ Nome, foto e descrição</div>'
+      +     '<div class="gg-foto"><img data-r="tr-foto-ver" alt="" style="display:none"/>'
+      +       '<div class="gg-campo" style="margin:0"><label>Nova foto do grupo</label><input type="file" accept="image/jpeg,image/png,image/webp" data-r="tr-foto"/></div>'
+      +       '<button class="gg-btn pri" data-a="salvar-foto" style="align-self:flex-end">Trocar foto</button></div>'
       +     '<div class="gg-linha" style="align-items:flex-end">'
       +       '<div class="gg-campo"><label>Nome do grupo</label><input type="text" data-r="nome" maxlength="100"/></div>'
       +       '<button class="gg-btn pri" data-a="salvar-nome" style="margin-bottom:10px">Salvar nome</button>'
@@ -168,6 +231,13 @@
     me.$('[data-r=desc]').addEventListener('input', function () { me.contarDesc(); });
     me.$('[data-r=mem-filtro]').addEventListener('input', function () { me.renderMembros(); });
     me.$('[data-r=tel]').addEventListener('input', function () { me.contatoOk = null; me.pintarContato(null); });
+    me.$('[data-r=cr-desc]').addEventListener('input', function () { me.$('[data-r=cr-desc-cont]').textContent = '(' + this.value.length + '/2048)'; me.descartarPlano(); });
+    me.$('[data-r=cr-nome]').addEventListener('input', function () { me.descartarPlano(); });
+    me.$('[data-r=cr-conta]').addEventListener('change', function () { me.renderCasa(); me.descartarPlano(); });
+    me.$('[data-r=cr-tel]').addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { ev.preventDefault(); me.addNovo(); } });
+    me.$('[data-r=cr-foto]').addEventListener('change', function () { me.escolherFoto(this, 'cr'); });
+    me.$('[data-r=tr-foto]').addEventListener('change', function () { me.escolherFoto(this, 'tr'); });
+    me.renderNovos();
     me.el.addEventListener('click', function (ev) {
       var b = ev.target.closest('[data-a]');
       if (!b || !me.el.contains(b)) return;
@@ -177,6 +247,8 @@
       var t = ev.target;
       if (t.matches('[data-desc]')) me.descMarcados[t.getAttribute('data-desc')] = t.checked;
       if (t.matches('[data-num]')) me.marcados[t.getAttribute('data-num')] = t.checked;
+      if (t.matches('[data-casa]') || t.matches('[data-r=cr-anuncio]') || t.matches('[data-r=cr-trava]')) me.descartarPlano();
+      if (t.matches('[data-novo-adm]')) { var n = me.novos[+t.getAttribute('data-novo-adm')]; if (n) n.admin = t.checked; me.descartarPlano(); }
     });
   };
 
@@ -191,6 +263,11 @@
     if (a.indexOf('num-') === 0) return me.porNumero(a.slice(4));
     if (a === 'mem-atualizar') return me.carregarMembros(true);
     if (a === 'mem-acao') return me.acaoMembro(b.getAttribute('data-acao'), b.getAttribute('data-id'), b.getAttribute('data-rot'));
+    if (a === 'salvar-foto') return me.salvarFoto();
+    if (a === 'cr-add') return me.addNovo();
+    if (a === 'cr-tirar') { me.novos.splice(+b.getAttribute('data-i'), 1); me.descartarPlano(); return me.renderNovos(); }
+    if (a === 'cr-revisar') return me.revisarCriar();
+    if (a === 'cr-confirmar') return me.confirmarCriar();
     if (a === 'copiar') { try { navigator.clipboard.writeText(b.getAttribute('data-link')); b.textContent = 'Copiado'; } catch (e) {} }
   };
 
@@ -206,6 +283,7 @@
       var bloq = me.grupos.filter(function (g) { return g.bloqueado; }).length;
       est.textContent = me.grupos.length + ' grupo(s)' + (bloq ? ' — ' + bloq + ' sem número nosso como admin' : '')
         + '. Contas conectadas: ' + me.contas.map(function (c) { return c.id + (c.numero ? ' (' + telFmt(c.numero) + ')' : ''); }).join(', ') + '.';
+      me.renderCasa();
       var sel = me.$('[data-r=grupo]');
       sel.innerHTML = me.grupos.map(function (g) {
         return '<option value="' + esc(g.jid) + '">' + esc(g.nome || g.jid) + (g.bloqueado ? ' — sem admin nosso' : '') + '</option>';
@@ -394,6 +472,139 @@
     me.iniciarTarefa('/grupos-gestao/info', { operacao: me.op, jids: jids, descricao: desc });
   };
 
+  // ── Criar grupo ──────────────────────────────────────────────────────────
+  Tela.prototype.contasOrdenadas = function () {
+    return this.contas.slice().sort(function (a, b) { return String(a.id).localeCompare(String(b.id), 'pt-BR'); });
+  };
+
+  Tela.prototype.renderCasa = function () {
+    var me = this;
+    var sel = me.$('[data-r=cr-conta]');
+    var atual = sel.value;
+    var contas = me.contasOrdenadas();
+    sel.innerHTML = contas.map(function (c) {
+      return '<option value="' + esc(c.id) + '">' + esc(c.id) + (c.numero ? ' — ' + esc(telFmt(c.numero)) : '') + '</option>';
+    }).join('') || '<option value="">Nenhuma conta conectada</option>';
+    if (atual && contas.some(function (c) { return c.id === atual; })) sel.value = atual;
+    var marcadas = {};
+    me.el.querySelectorAll('[data-casa]').forEach(function (x) { if (x.checked) marcadas[x.getAttribute('data-casa')] = true; });
+    me.$('[data-r=cr-casa]').innerHTML = contas.filter(function (c) { return c.id !== sel.value; }).map(function (c) {
+      return '<label class="gg-item"><input type="checkbox" data-casa="' + esc(c.id) + '"' + (marcadas[c.id] ? ' checked' : '') + '/>'
+        + '<span class="gg-nome">' + esc(c.id) + ' <span class="gg-sub">' + esc(telFmt(c.numero)) + '</span></span></label>';
+    }).join('') || '<div class="gg-estado">Nenhuma outra conta conectada.</div>';
+  };
+
+  Tela.prototype.addNovo = function () {
+    var inp = this.$('[data-r=cr-tel]');
+    var tel = telNormal(inp.value);
+    if (tel.length < 12 || tel.length > 15) return alert('Informe o telefone com DDI e DDD.');
+    var adm = this.$('[data-r=cr-tel-adm]').checked;
+    var ja = this.novos.filter(function (n) { return n.telefone === tel; })[0];
+    if (ja) ja.admin = ja.admin || adm; else this.novos.push({ telefone: tel, admin: adm });
+    inp.value = ''; this.$('[data-r=cr-tel-adm]').checked = false; inp.focus();
+    this.descartarPlano();
+    this.renderNovos();
+  };
+
+  Tela.prototype.renderNovos = function () {
+    this.$('[data-r=cr-parts]').innerHTML = this.novos.map(function (n, i) {
+      return '<div class="gg-item"><span class="gg-nome">' + esc(telFmt(n.telefone)) + '</span>'
+        + '<label class="gg-ajuda" style="display:flex;gap:4px;align-items:center;margin:0"><input type="checkbox" data-novo-adm="' + i + '"' + (n.admin ? ' checked' : '') + '/> admin</label>'
+        + '<button class="gg-btn mini perigo" data-a="cr-tirar" data-i="' + i + '">Tirar</button></div>';
+    }).join('') || '<div class="gg-estado">Nenhum participante ainda.</div>';
+  };
+
+  Tela.prototype.escolherFoto = async function (inp, qual) {
+    var me = this;
+    var ver = me.$('[data-r=' + qual + '-foto-ver]');
+    try {
+      var url = await lerImagem(inp.files && inp.files[0]);
+      if (qual === 'cr') { me.fotoNova = url; me.descartarPlano(); } else me.fotoTroca = url;
+      ver.src = url || ''; ver.style.display = url ? 'block' : 'none';
+    } catch (e) {
+      inp.value = '';
+      if (qual === 'cr') me.fotoNova = null; else me.fotoTroca = null;
+      ver.style.display = 'none';
+      alert('Foto: ' + e.message);
+    }
+  };
+
+  Tela.prototype.corpoCriar = function () {
+    var me = this;
+    var casa = [];
+    me.el.querySelectorAll('[data-casa]').forEach(function (x) { if (x.checked) casa.push(x.getAttribute('data-casa')); });
+    return { operacao: me.op, conta: me.$('[data-r=cr-conta]').value, nome: me.$('[data-r=cr-nome]').value.trim(),
+      descricao: me.$('[data-r=cr-desc]').value, imagem: me.fotoNova || null,
+      participantes: me.novos.slice(), contasCasa: casa,
+      soAdminsEnviam: me.$('[data-r=cr-anuncio]').checked, soAdminsEditam: me.$('[data-r=cr-trava]').checked };
+  };
+
+  Tela.prototype.descartarPlano = function () {
+    if (!this.planoCriar) return;
+    this.planoCriar = null;
+    this.$('[data-r=cr-plano]').innerHTML = '';
+  };
+
+  Tela.prototype.revisarCriar = async function () {
+    var me = this;
+    var corpo = me.corpoCriar();
+    var box = me.$('[data-r=cr-plano]');
+    if (!corpo.conta) return alert('Nenhuma conta conectada para criar o grupo.');
+    if (!corpo.nome) return alert('Dê um nome ao grupo.');
+    var pend = digitos(me.$('[data-r=cr-tel]').value);
+    if (pend.length >= 10 && !confirm('O telefone digitado ainda não foi adicionado à lista. Revisar mesmo assim?')) return;
+    box.innerHTML = '<div class="gg-estado">Conferindo…</div>';
+    try {
+      var j = await me.api('/grupos-gestao/criar', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({}, corpo, { simular: true })) });
+      var p = j.plano;
+      var linhas = [];
+      linhas.push('<div><b>' + esc(corpo.nome) + '</b> — criado por <b>' + esc(p.criador.id) + '</b> (' + esc(telFmt(p.criador.numero)) + ')</div>');
+      linhas.push('<div>' + (corpo.imagem ? '🖼️ com foto' : 'sem foto') + ' • ' + (corpo.descricao.trim() ? '📝 com descrição' : 'sem descrição')
+        + (corpo.soAdminsEnviam ? ' • só admins enviam' : '') + (corpo.soAdminsEditam ? ' • só admins editam' : '') + '</div>');
+      p.casa.forEach(function (c) { linhas.push('<div class="gg-ok">⭐ ' + esc(c.id) + ' (' + esc(telFmt(c.numero)) + ') — número da casa, entra como admin</div>'); });
+      p.externos.forEach(function (e) {
+        linhas.push(e.modo === 'incluir'
+          ? '<div class="gg-ok">➕ ' + esc(telFmt(e.telefone)) + (e.admin ? ' ⭐ admin' : '') + ' — entra direto por ' + esc(e.por) + '</div>'
+          : '<div class="gg-aviso">🔗 ' + esc(telFmt(e.telefone)) + (e.admin ? ' ⭐ admin' : '') + ' — recebe convite: ' + esc(e.motivo) + '</div>');
+      });
+      (p.avisos || []).forEach(function (a) { linhas.push('<div class="gg-sub">' + esc(a) + '</div>'); });
+      if (!p.casa.length && !p.externos.length) linhas.push('<div class="gg-sub">Sem participantes: o grupo nasce só com a conta que cria.</div>');
+      linhas.push('<div class="gg-sub" style="margin-top:6px">Roda em segundo plano, um passo por vez com pausas. Você pode fechar a aba.</div>');
+      me.planoCriar = corpo;
+      box.innerHTML = '<div class="gg-plano">' + linhas.join('') + '</div><button class="gg-btn pri" data-a="cr-confirmar">✅ Confirmar e criar</button>';
+    } catch (e) {
+      me.planoCriar = null;
+      box.innerHTML = '<div class="gg-estado gg-erro">' + esc(e.message) + '</div>';
+    }
+  };
+
+  Tela.prototype.confirmarCriar = function () {
+    if (!this.planoCriar) return this.revisarCriar();
+    var corpo = this.planoCriar;
+    this.descartarPlano();
+    this.iniciarTarefa('/grupos-gestao/criar', corpo);
+  };
+
+  Tela.prototype.limparCriar = function () {
+    this.novos = []; this.fotoNova = null; this.planoCriar = null;
+    ['cr-nome', 'cr-desc', 'cr-tel', 'cr-foto'].forEach(function (k) { var x = this.$('[data-r=' + k + ']'); if (x) x.value = ''; }, this);
+    ['cr-anuncio', 'cr-trava'].forEach(function (k) { this.$('[data-r=' + k + ']').checked = false; }, this);
+    this.el.querySelectorAll('[data-casa]').forEach(function (x) { x.checked = false; });
+    this.$('[data-r=cr-foto-ver]').style.display = 'none';
+    this.$('[data-r=cr-desc-cont]').textContent = '';
+    this.$('[data-r=cr-plano]').innerHTML = '';
+    this.renderNovos();
+  };
+
+  Tela.prototype.salvarFoto = function () {
+    var g = this.grupo(this.sel);
+    if (!g) return;
+    if (!this.fotoTroca) return alert('Escolha a imagem primeiro.');
+    if (!confirm('Trocar a foto de "' + (g.nome || g.jid) + '"?')) return;
+    this.iniciarTarefa('/grupos-gestao/foto', { operacao: this.op, jids: [g.jid], imagem: this.fotoTroca });
+  };
+
   Tela.prototype.iniciarTarefa = async function (caminho, corpo) {
     var me = this;
     try {
@@ -424,7 +635,18 @@
         var j = await me.api('/grupos-gestao/tarefa/' + encodeURIComponent(id) + '?t=' + Date.now());
         me.pintarTarefa(j.tarefa);
         if (j.tarefa.estado === 'rodando') { me.timer = setTimeout(passo, 3000); }
-        else { me.carregar(true); }
+        else {
+          var t = j.tarefa;
+          if (t.tipo === 'criar' && t.grupo && t.grupo.jid && me.ultimoCriado !== t.grupo.jid) {
+            // Grupo novo nao e da lista da operacao: liga "todos" e ja seleciona.
+            me.ultimoCriado = t.grupo.jid;
+            me.todos = true; me.$('[data-r=todos]').checked = true;
+            me.sel = t.grupo.jid; me.marcados = {}; me.descMarcados = {};
+            me.limparCriar();
+          }
+          if (t.acao === 'foto' && t.feitos) { me.fotoTroca = null; me.$('[data-r=tr-foto]').value = ''; me.$('[data-r=tr-foto-ver]').style.display = 'none'; }
+          me.carregar(true);
+        }
       } catch (e) {
         var box = me.$('[data-r=tarefa]');
         box.style.display = 'block';
@@ -438,10 +660,11 @@
     var box = this.$('[data-r=tarefa]');
     box.style.display = 'block';
     var feitos = t.resultados.length;
+    var criar = t.tipo === 'criar';
     var cab;
     if (t.estado === 'rodando') {
-      cab = '⏳ <b>' + esc(ROT_ACAO[t.acao] || t.acao) + '</b>' + (t.alvo ? ' ' + esc(/^\d+$/.test(t.alvo) ? telFmt(t.alvo) : 'membro') : '')
-        + ' — ' + feitos + '/' + t.total + ' grupo(s)'
+      cab = '⏳ <b>' + esc(ROT_ACAO[t.acao] || t.acao) + '</b>' + (t.alvo ? ' ' + esc(criar ? '"' + t.alvo + '"' : /^\d+$/.test(t.alvo) ? telFmt(t.alvo) : 'membro') : '')
+        + ' — ' + (criar ? Math.min(feitos, t.total) + '/' + t.total + ' passo(s)' : feitos + '/' + t.total + ' grupo(s)')
         + (t.proximaEm ? ' • próximo às ' + hora(t.proximaEm) : t.atual ? ' • agora em ' + esc(t.atual) : '');
     } else if (t.estado === 'erro') {
       cab = '<span class="gg-erro">✗ Tarefa interrompida: ' + esc(t.erro) + '</span>';
@@ -455,11 +678,15 @@
           + '<button class="gg-btn mini" data-a="copiar" data-link="' + esc(x.link) + '">Copiar</button></div>' : '')
         + '</div>';
     }).join('');
+    if (criar && t.grupo && t.grupo.link) {
+      cab += '<div style="margin-top:4px">Convite do grupo: <a href="' + esc(t.grupo.link) + '" target="_blank" rel="noopener">' + esc(t.grupo.link) + '</a> '
+        + '<button class="gg-btn mini" data-a="copiar" data-link="' + esc(t.grupo.link) + '">Copiar</button></div>';
+    }
     box.innerHTML = '<div style="margin-bottom:6px">' + cab + '</div>' + res;
   };
 
   window.GG = {
-    versao: 1,
+    versao: 2,
     montar: function (el, opt) {
       if (!el) return null;
       injetarCss();
