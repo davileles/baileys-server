@@ -114,9 +114,10 @@ import {
   grupoOfertasCdv, grupoEmissaoCdv, grupoAvisosCdv, grupoExecutivaCdv,
   redirectCdv, gruposMonitoradosCdv, monitoradosCdv, ehMonitoradoCdv, ehMonitoradoOfertaCdv, nomeMonitoradoCdv,
   contaEnvioCdv, contaLeitoraCdv, ehGrupoCdv, adminsCdv, telefonesAvisoCdv, papeisDoEmailCdv,
-  entradaCdv, gruposEntradaCdv,
+  entradaCdv, gruposEntradaCdv, estadosCdv, gruposEstadoCdv,
   CATEGORIAS_OFERTA_CDV, categoriasBloqueadasCdv, ehCategoriaOfertaBloqueadaCdv,
 } from './config-cdv.js';
+import { UFS, planejarCopiasEstado, rotaDoTitulo } from './estados-cdv.js';
 
 // ── AGENDA DE WORKFLOWS DO GITHUB ACTIONS ────────────────────────────────────
 // O cron do Actions degradou na conta (de 15 disparos/dia para 2-5, em horarios
@@ -2793,6 +2794,93 @@ async function copiarEmissaoExecutiva(destinoOriginal, mensagem, dados, rotulo) 
   }
 }
 
+// ── COPIA DAS EMISSOES PARA OS GRUPOS POR ESTADO ────────────────────────────
+// Toda emissao que sai no grupo de emissoes tambem sai no grupo do estado de
+// origem (texto identico) e, quando e ida e volta e as datas fecham, INVERTIDA
+// no grupo do estado de destino (BH -> SP vira SP -> BH, ida e volta trocadas).
+// Regra e tabela de aeroportos em estados-cdv.js; config na aba Config do
+// gestor (config-cdv.js, secao `estados`). Mesmo gancho da copia de executiva.
+//
+// A versao invertida e REGERADA pelo formatador a partir dos dados (e nao por
+// troca no texto) para o link de busca do programa sair no sentido certo. Por
+// isso so existe quando ha dados estruturados com programa e cia; envio antigo
+// so com texto recebe apenas a copia fiel no estado de origem (lido do titulo).
+// Nenhuma copia grava passagens.json: o registro e so o da emissao principal.
+const PAUSA_COPIA_ESTADO_MS = 25 * 1000;
+
+function planoCopiasEstado(mensagem, dados) {
+  let base = (dados && dados.origem && dados.destino) ? dados : null;
+  let semDados = false;
+  if (!base) {
+    const r = rotaDoTitulo(mensagem);
+    if (!r) return null;
+    base = { origem: r.origem, destino: r.destino };
+    semDados = true;
+  }
+  const reservados = [grupoEmissaoCdv(), grupoExecutivaCdv(), grupoOfertasCdv(), grupoAvisosCdv()];
+  const plano = planejarCopiasEstado(base, gruposEstadoCdv(), reservados, extrairDatasISO);
+  plano.copias = plano.copias.filter((c) => {
+    if (c.tipo !== 'invertida') return true;
+    if (semDados) return false;
+    if (!ehPagante(c.dados) && (!c.dados.programa || !c.dados.cia)) {
+      plano.inversao = { ok: false, motivo: 'sem programa/cia para regerar a mensagem' };
+      return false;
+    }
+    return true;
+  });
+  for (const c of plano.copias) {
+    c.mensagem = c.tipo === 'original' ? mensagem : formatarMensagemCDV(c.dados);
+  }
+  plano.semDados = semDados;
+  return plano;
+}
+
+async function copiarEmissaoEstados(destinoOriginal, mensagem, dados, rotulo) {
+  try {
+    if (destinoOriginal !== grupoEmissaoCdv()) return 0;
+    if (!gruposEstadoCdv().length) return 0;
+    const plano = planoCopiasEstado(mensagem, dados);
+    const tag = '[ESTADO] Emissao ' + (rotulo || '');
+    if (!plano) { console.log(tag + ': rota nao identificada — sem copia por estado.'); return 0; }
+    console.log(tag + ': ' + (plano.ufOrigem || 'exterior/?') + ' -> ' + (plano.ufDestino || 'exterior/?')
+      + ' | ' + plano.copias.length + ' copia(s)'
+      + (plano.inversao.ok ? '' : ' | sem invertida: ' + plano.inversao.motivo)
+      + (plano.semDados ? ' | sem dados estruturados' : ''));
+    if (!plano.copias.length) return 0;
+    const falhas = [];
+    let ok = 0;
+    for (const cp of plano.copias) {
+      // Respiro entre as mensagens do mesmo numero: a emissao ja pode estar
+      // saindo em 3-4 grupos (emissoes, executiva, estados).
+      await new Promise(r => setTimeout(r, PAUSA_COPIA_ESTADO_MS));
+      try {
+        await saidaSerializada(() => enviarMensagem(cp.jid, { text: cp.mensagem }));
+        ok++;
+        console.log(tag + ': ✓ copia ' + cp.tipo + ' enviada ao grupo de ' + cp.uf + '.');
+      } catch (e) {
+        falhas.push(cp.uf + ' (' + cp.tipo + '): ' + e.message);
+        console.error(tag + ': ✗ falha na copia ' + cp.tipo + ' para ' + cp.uf + ':', e.message);
+      }
+    }
+    // Falha na copia NUNCA desfaz nem repete a emissao principal. So avisa.
+    if (falhas.length) {
+      avisarAdminsCdv('⚠️ CDV — a emissão ' + (rotulo || '') + ' saiu no grupo de emissões, mas '
+        + falhas.length + ' cópia(s) para grupos de estado falharam.\n\n' + falhas.join('\n'))
+        .catch(() => {});
+    }
+    return ok;
+  } catch (e) {
+    console.error('[ESTADO] Erro ao copiar emissao ' + (rotulo || '') + ':', e.message);
+    return 0;
+  }
+}
+
+// Copias derivadas de uma emissao (executiva, depois estados), na ordem.
+async function copiarDerivadasEmissao(destinoOriginal, mensagem, dados, rotulo) {
+  await copiarEmissaoExecutiva(destinoOriginal, mensagem, dados, rotulo);
+  await copiarEmissaoEstados(destinoOriginal, mensagem, dados, rotulo);
+}
+
 // Espera do intervalo entre envios que pode ser encurtada por _acordarWorker().
 let _acordarWorker = null;
 function dormirFila(ms) {
@@ -2895,7 +2983,7 @@ async function workerFila() {
       // Copia para o grupo de executiva (so emissao em executiva no grupo de
       // emissoes). Conteudo TSP nunca cai aqui: o destino tem que ser o CDV.
       if (ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
-        await copiarEmissaoExecutiva(item.destino, item.mensagem, de, '#' + item.ofertaId);
+        await copiarDerivadasEmissao(item.destino, item.mensagem, de, '#' + item.ofertaId);
       }
     } catch(e) {
       item._enviando = false;
@@ -13428,6 +13516,7 @@ function _gmGruposOperacao(op) {
     if (op === 'cdv') {
       lista.push(grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv(), grupoExecutivaCdv());
       for (const g of entradaCdv()) lista.push(g.jid);
+      for (const g of estadosCdv()) lista.push(g.jid);
     } else if (op === 'tsp') {
       lista.push(grupoOperadorTsp(), ...(gruposTspCupons() || []), ...(radarDestinos() || []));
       for (const t of trilhas()) lista.push(...(t.destinos || []));
@@ -16050,7 +16139,7 @@ app.post('/enviar', async (req, res) => {
       res.json({ ok:true, comPreview: !!lp });
       // Emissao direta (direto:true) nao passa pela fila: copia aqui, depois de
       // responder, para o cliente HTTP nao esperar a pausa entre as mensagens.
-      if (isEmissao) copiarEmissaoExecutiva(grupoId, mensagem, dados || null, 'direta').catch(() => {});
+      if (isEmissao) copiarDerivadasEmissao(grupoId, mensagem, dados || null, 'direta').catch(() => {});
     }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }
   }
@@ -16500,6 +16589,8 @@ app.get('/config-cdv', async (req, res) => {
     // fila de ofertas. Vem do servidor para nao existir uma segunda copia da
     // lista dentro do HTML, que envelheceria em silencio.
     categoriasOferta: CATEGORIAS_OFERTA_CDV,
+    // Estados para o seletor dos grupos por estado (ja em ordem alfabetica).
+    ufs: UFS,
     // Nome atual de cada grupo monitorado, direto do WhatsApp: o cadastro
     // guarda o nome do dia em que foi salvo, e grupo renomeado ficaria com um
     // rotulo velho na tela para sempre.
@@ -16520,6 +16611,25 @@ app.get('/config-cdv', async (req, res) => {
     // cada operacao manda na propria leitura.
     leitores: estadoLeitores(),
   });
+});
+
+// Simula para onde uma emissao iria nos grupos por estado, sem enviar nada.
+// Body: { dados:{origem,destino,datasIda,datasVolta,...}, mensagem? }. Serve
+// para a tela de Config mostrar a previa e para conferir a regra de inversao.
+app.post('/cdv/estados/simular', (req, res) => {
+  try {
+    const dados = req.body?.dados || null;
+    const mensagem = String(req.body?.mensagem || (dados && dados.origem && dados.destino ? formatarMensagemCDV(dados) : ''));
+    const plano = planoCopiasEstado(mensagem, dados);
+    if (!plano) return res.json({ ok: true, copias: [], motivo: 'rota nao identificada' });
+    const nomes = new Map(estadosCdv().map(e => [e.jid, e.nome]));
+    res.json({
+      ok: true,
+      ufOrigem: plano.ufOrigem, ufDestino: plano.ufDestino, inversao: plano.inversao,
+      copias: plano.copias.map(c => ({ uf: c.uf, jid: c.jid, nome: nomes.get(c.jid) || NOMES_GRUPOS.get(c.jid) || '',
+                                       tipo: c.tipo, mensagem: c.mensagem })),
+    });
+  } catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
 });
 
 app.post('/config-cdv', (req, res) => {
@@ -16577,7 +16687,8 @@ app.get('/config-cdv/conta/:id/grupos', async (req, res) => {
     .filter(j => !noGrupo.has(j))
     .map(j => ({ jid:j, nome: NOMES_GRUPOS.get(j) || null }));
 
-  const destinos = [grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv(), grupoExecutivaCdv()].filter(Boolean);
+  const destinos = [grupoOfertasCdv(), grupoEmissaoCdv(), grupoAvisosCdv(), grupoExecutivaCdv(),
+                    ...gruposEstadoCdv().map(e => e.jid)].filter(Boolean);
   const monitorados = gruposMonitoradosCdv();
   res.json({
     ok: true,

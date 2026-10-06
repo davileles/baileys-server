@@ -19,6 +19,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush } from './sync-github.js';
+import { SIGLAS_UF } from './estados-cdv.js';
 
 const SESSAO_DIR = './sessao';
 const CAMINHO    = SESSAO_DIR + '/config_cdv.json';
@@ -115,6 +116,12 @@ const CFG_CDV_PADRAO = {
   // sumir tambem da reentrada. `ativo:false` tira da reentrada sem perder o
   // cadastro, igual aos monitorados.
   entrada: [],
+  // Grupos de emissao POR ESTADO: [{ uf, jid, nome, ativo }]. Toda emissao do
+  // grupo de emissoes tambem sai no grupo do estado de origem e, invertida
+  // (ida e volta trocadas), no do estado de destino — ver estados-cdv.js.
+  // Um estado pode ter mais de um grupo e um grupo pode cobrir mais de um
+  // estado (a copia sai uma vez por grupo). Vazio = recurso desligado.
+  estados: [],
   // REDIRECIONAMENTO: copia fiel de toda mensagem dos grupos de origem para o
   // grupo destino (ver redirecionarSeOrigem no server.js). Destino vazio =
   // desligado pela tela; sem nada gravado aqui vale o legado por env
@@ -180,6 +187,7 @@ function estruturar(bruto) {
   out.monitorados = normalizarMonitorados(out.monitorados);
   out.ofertas.categoriasBloqueadas = normalizarCategoriasOferta(out.ofertas.categoriasBloqueadas);
   out.entrada     = normalizarEntrada(out.entrada);
+  out.estados     = normalizarEstados(out.estados);
   out.redirect.ativo   = out.redirect.ativo !== false;
   out.redirect.destino = String(out.redirect.destino || '').trim();
   if (out.redirect.destino && !RE_JID_GRUPO.test(out.redirect.destino)) out.redirect.destino = '';
@@ -261,6 +269,34 @@ function normalizarEntrada(bruto) {
   return [...porJid.values()];
 }
 
+// Grupo de estado com UF desconhecida ou JID torto e DESCARTADO. A chave e
+// UF+JID: o mesmo grupo pode cobrir dois estados, e um estado pode ter dois
+// grupos. Duplicata fica com a ultima ocorrencia (a tela manda a lista toda).
+function normalizarEstados(bruto) {
+  const lista = Array.isArray(bruto) ? bruto : [];
+  const porChave = new Map();
+  for (const item of lista) {
+    const o = (item && typeof item === 'object') ? item : {};
+    const uf  = String(o.uf || '').trim().toUpperCase();
+    const jid = String(o.jid || '').trim();
+    if (!SIGLAS_UF.includes(uf)) {
+      if (uf || jid) console.log('[CFG-CDV] Grupo de estado ignorado (UF invalida): ' + (uf || '?') + ' ' + jid);
+      continue;
+    }
+    if (!RE_JID_GRUPO.test(jid)) {
+      if (jid) console.log('[CFG-CDV] Grupo de estado ignorado (JID invalido): ' + uf + ' ' + jid);
+      continue;
+    }
+    porChave.set(uf + '|' + jid, {
+      uf,
+      jid,
+      nome:  String(o.nome || '').trim(),
+      ativo: o.ativo !== false,
+    });
+  }
+  return [...porChave.values()];
+}
+
 // Admin sem nenhum identificador util (sem telefone e sem e-mail) nao
 // administra nada: sai da lista. Papel desconhecido e descartado em vez de
 // gravado — papel que nao existe no codigo nunca vira permissao.
@@ -328,6 +364,7 @@ export function salvarConfigCdv(parcial = {}) {
     leitura:     { ...atual.leitura, ...(parcial.leitura || {}) },
     monitorados: parcial.monitorados !== undefined ? parcial.monitorados : atual.monitorados,
     entrada:     parcial.entrada     !== undefined ? parcial.entrada     : atual.entrada,
+    estados:     parcial.estados     !== undefined ? parcial.estados     : atual.estados,
     redirect:    { ...atual.redirect, ...(parcial.redirect || {}) },
     ofertas:     { ...atual.ofertas, ...(parcial.ofertas || {}) },
     admins:      parcial.admins      !== undefined ? parcial.admins      : atual.admins,
@@ -352,6 +389,19 @@ export function salvarConfigCdv(parcial = {}) {
   }
   if (novo.grupos.operador && !RE_JID_GRUPO.test(novo.grupos.operador)) {
     throw new Error('Grupo de avisos invalido: informe um JID de grupo (…@g.us) ou deixe vazio.');
+  }
+  // Grupo de estado nao pode ser um dos destinos fixos: a emissao sairia duas
+  // vezes no mesmo grupo (uma como emissao, outra como copia do estado).
+  {
+    const fixos = new Map([
+      [novo.grupos.ofertas, 'ofertas'], [novo.grupos.emissao, 'emissoes'],
+      [novo.grupos.executiva, 'emissoes em executiva'], [novo.grupos.operador, 'avisos'],
+    ]);
+    for (const e of novo.estados) {
+      if (e.jid && fixos.has(e.jid)) {
+        throw new Error('O grupo de ' + e.uf + ' nao pode ser o mesmo grupo de ' + fixos.get(e.jid) + '.');
+      }
+    }
   }
   if (novo.redirect.destino && novo.redirect.origens.some(o => o.jid === novo.redirect.destino)) {
     throw new Error('O grupo de destino do redirecionamento nao pode estar entre os grupos de origem.');
@@ -441,7 +491,20 @@ export function ehGrupoCdv(jid) {
   const g = configCdv().grupos;
   // A copia de executiva e destino do CDV como os outros: sai pela conta de
   // envio do CDV e fica fora da marca d'agua/tag do TSP.
-  return j === g.ofertas || j === g.emissao || (!!g.executiva && j === g.executiva);
+  if (j === g.ofertas || j === g.emissao || (!!g.executiva && j === g.executiva)) return true;
+  // Grupos de estado tambem sao destino do CDV (conta de envio do CDV, sem
+  // marca d'agua do TSP). Desligado tambem conta: o JID continua sendo do CDV.
+  return configCdv().estados.some(e => e.jid === j);
+}
+
+/** Cadastro completo dos grupos por estado, ligados e desligados — para a tela. */
+export function estadosCdv() {
+  return configCdv().estados.map(e => ({ ...e }));
+}
+
+/** Grupos por estado que recebem copia AGORA. Desligado nao entra. */
+export function gruposEstadoCdv() {
+  return configCdv().estados.filter(e => e.ativo).map(e => ({ ...e }));
 }
 
 /** Redirecionamento gravado pela tela: { ativo, destino, origens[] }. */

@@ -208,7 +208,9 @@
         "app.get('/seats-alertas/estado'",
         "app.get('/enviadas-grupos'",
         "app.post('/enviadas-grupos/apagar'",
-        "function registrarMensagemApagavel("
+        "function registrarMensagemApagavel(",
+        "async function copiarEmissaoEstados(",
+        "app.post('/cdv/estados/simular'"
       ]
     },
     "radar-awin.js": {
