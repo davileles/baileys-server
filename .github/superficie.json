@@ -116,6 +116,7 @@
         "app.post('/fila-envio/marcar-enviado/:ofertaId'",
         "app.post('/fila-envio/marcar-todas-enviado'",
         "app.post('/grupos-gestao/criar'",
+        "app.post('/grupos-gestao/criar-lote'",
         "app.post('/grupos-gestao/foto'",
         "app.post('/grupos-gestao/info'",
         "app.post('/grupos-gestao/participante'",

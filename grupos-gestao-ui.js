@@ -74,7 +74,7 @@
   }
   var ROT_ACAO = { add: 'Incluir', remove: 'Excluir', promote: 'Tornar admin', demote: 'Tirar admin',
     nome: 'Trocar nome', descricao: 'Trocar descrição', 'nome+descricao': 'Trocar nome e descrição',
-    criar: 'Criar grupo', foto: 'Trocar foto' };
+    criar: 'Criar grupo', foto: 'Trocar foto', 'criar-lote': 'Criar grupos em lote' };
 
   // Le a imagem escolhida e reduz no navegador (lado maior 1024) antes de
   // mandar — o servidor ainda recorta em 640x640 para a foto do grupo.
@@ -661,10 +661,13 @@
     box.style.display = 'block';
     var feitos = t.resultados.length;
     var criar = t.tipo === 'criar';
+    var lote = t.tipo === 'criar-lote';
     var cab;
     if (t.estado === 'rodando') {
       cab = '⏳ <b>' + esc(ROT_ACAO[t.acao] || t.acao) + '</b>' + (t.alvo ? ' ' + esc(criar ? '"' + t.alvo + '"' : /^\d+$/.test(t.alvo) ? telFmt(t.alvo) : 'membro') : '')
-        + ' — ' + (criar ? Math.min(feitos, t.total) + '/' + t.total + ' passo(s)' : feitos + '/' + t.total + ' grupo(s)')
+        + ' — ' + (criar ? Math.min(feitos, t.total) + '/' + t.total + ' passo(s)'
+          : lote ? (t.criados || []).length + '/' + t.total + ' grupo(s) criados'
+          : feitos + '/' + t.total + ' grupo(s)')
         + (t.proximaEm ? ' • próximo às ' + hora(t.proximaEm) : t.atual ? ' • agora em ' + esc(t.atual) : '');
     } else if (t.estado === 'erro') {
       cab = '<span class="gg-erro">✗ Tarefa interrompida: ' + esc(t.erro) + '</span>';
@@ -678,6 +681,11 @@
           + '<button class="gg-btn mini" data-a="copiar" data-link="' + esc(x.link) + '">Copiar</button></div>' : '')
         + '</div>';
     }).join('');
+    if (lote && (t.criados || []).length) {
+      cab += '<div style="margin-top:4px">' + t.criados.map(function (g) {
+        return '<div>✓ ' + esc(g.nome) + (g.link ? ' — <a href="' + esc(g.link) + '" target="_blank" rel="noopener">' + esc(g.link) + '</a>' : '') + '</div>';
+      }).join('') + '</div>';
+    }
     if (criar && t.grupo && t.grupo.link) {
       cab += '<div style="margin-top:4px">Convite do grupo: <a href="' + esc(t.grupo.link) + '" target="_blank" rel="noopener">' + esc(t.grupo.link) + '</a> '
         + '<button class="gg-btn mini" data-a="copiar" data-link="' + esc(t.grupo.link) + '">Copiar</button></div>';
@@ -686,7 +694,7 @@
   };
 
   window.GG = {
-    versao: 2,
+    versao: 3,
     montar: function (el, opt) {
       if (!el) return null;
       injetarCss();

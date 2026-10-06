@@ -13552,7 +13552,7 @@ function _gmResumoJob(j) {
   return { id: j.id, tipo: j.tipo, acao: j.acao, alvo: j.alvo, origem: j.origem, estado: j.estado,
     total: j.total, feitos: j.feitos, pulados: j.pulados, falhas: j.falhas, atual: j.atual,
     proximaEm: j.proximaEm, iniciadoEm: j.iniciadoEm, terminadoEm: j.terminadoEm, erro: j.erro,
-    resultados: j.resultados, grupo: j.grupo || null };
+    resultados: j.resultados, grupo: j.grupo || null, criados: j.criados || null };
 }
 
 function _gmNovoJob(dados) {
@@ -13853,12 +13853,15 @@ async function _gmPlanoCriar({ conta, participantes, contasCasa }) {
   return { criador: { id: criador.id, numero: criador.numero }, casa: [...casa.values()], externos, avisos };
 }
 
-async function _gmRodarCriar(j, { nome, descricao, foto, soAdminsEnviam, soAdminsEditam, plano }) {
+// Cria UM grupo dentro de uma tarefa. Devolve { jid } ou { erro } — quem chama
+// decide se encerra a tarefa (criacao avulsa) ou segue para o proximo (lote).
+async function _gmCriarUm(j, { nome, descricao, foto, soAdminsEnviam, soAdminsEditam, plano, prefixo }) {
+  const pre = prefixo ? prefixo + ' — ' : '';
   const contas = () => _gmContas();
   const sockDe = (id) => contas().find(c => c.id === id)?.sock || null;
   const criador = sockDe(plano.criador.id);
-  if (!criador) return _gmFimJob(j, 'a conta ' + plano.criador.id + ' desconectou antes de comecar');
-  const passo = (rotulo, x) => { j.resultados.push({ jid: j.grupo?.jid || null, nome: rotulo, ...x }); };
+  if (!criador) return { erro: 'a conta ' + plano.criador.id + ' desconectou antes de comecar' };
+  const passo = (rotulo, x) => { j.resultados.push({ jid: j.grupo?.jid || null, nome: pre + rotulo, ...x }); };
   const ok = (rotulo, detalhe, por) => { j.feitos++; passo(rotulo, { estado: 'ok', detalhe, por: por || plano.criador.id }); };
   const falha = (rotulo, detalhe, por) => { j.falhas++; passo(rotulo, { estado: 'falha', detalhe, por: por || plano.criador.id }); };
   const pausa = () => _gmPausa(j, GM_PASSO_CRIAR);
@@ -13868,9 +13871,9 @@ async function _gmRodarCriar(j, { nome, descricao, foto, soAdminsEnviam, soAdmin
   const jidCasa = plano.casa.map(c => c.numero + '@s.whatsapp.net');
   let md;
   try { md = await criador.groupCreate(nome, jidCasa); }
-  catch (e) { return _gmFimJob(j, 'o WhatsApp recusou a criacao: ' + e.message); }
+  catch (e) { return { erro: 'o WhatsApp recusou a criacao: ' + e.message }; }
   const jid = md?.id;
-  if (!jid) return _gmFimJob(j, 'o WhatsApp nao devolveu o id do grupo novo');
+  if (!jid) return { erro: 'o WhatsApp nao devolveu o id do grupo novo' };
   j.grupo = { jid, nome, link: null };
   NOMES_GRUPOS.set(jid, nome);
   ok('Criar grupo', 'grupo "' + nome + '" criado');
@@ -13991,6 +13994,81 @@ async function _gmRodarCriar(j, { nome, descricao, foto, soAdminsEnviam, soAdmin
   } else {
     try { await pegarConvite(); } catch (err) {}
   }
+  return { jid };
+}
+
+async function _gmRodarCriar(j, opts) {
+  const r = await _gmCriarUm(j, opts);
+  _gmFimJob(j, r.erro || undefined);
+}
+
+// ── Criar grupos em lote a partir de um MODELO (06/10/2026) ─────────────────
+// Copia do grupo-modelo a foto e as permissoes (so admins enviam / editam); o
+// nome e a descricao vem prontos por item. Um grupo por vez, com pausa LONGA
+// entre eles: criar dezenas de grupos em rajada e pedir bloqueio. Cada item
+// pode trazer `uf`: o grupo novo entra na hora em config-cdv.estados (ativo).
+const GM_PAUSA_LOTE = [240000, 480000];        // 4–8 min entre grupos novos
+const GM_LOTE_MAX = 30;
+
+async function _gmPrepararFotoBuffer(bruto) {
+  if (!bruto || !bruto.length) return { buf: null };
+  if (bruto.length > GM_FOTO_MAX_BYTES) return { erro: 'a imagem passa de 5 MB' };
+  const sh = await carregarSharp();
+  if (!sh) return { buf: bruto };
+  try { return { buf: await sh(bruto).rotate().resize(640, 640, { fit: 'cover', position: 'centre' }).jpeg({ quality: 85 }).toBuffer() }; }
+  catch (e) { return { erro: 'nao consegui ler a imagem: ' + e.message }; }
+}
+
+// Foto e permissoes do grupo-modelo, lidas por uma conta nossa que esteja nele.
+async function _gmLerModelo(jid) {
+  const retratos = await _gmRetratos(true);
+  const md = _gmMeta(retratos, jid);
+  if (!md) return { erro: 'nenhuma conta conectada participa do grupo-modelo' };
+  const r = retratos.find(x => x.mapa[jid]);
+  let foto = null, avisoFoto = null;
+  try {
+    const url = await r.sock.profilePictureUrl(jid, 'image');
+    if (url) {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('download da foto deu ' + resp.status);
+      const p = await _gmPrepararFotoBuffer(Buffer.from(await resp.arrayBuffer()));
+      if (p.erro) throw new Error(p.erro);
+      foto = p.buf;
+    }
+  } catch (e) { avisoFoto = 'sem foto do modelo: ' + e.message; }
+  return { nome: md.subject || '', descricao: md.desc || '', soAdminsEnviam: !!md.announce, soAdminsEditam: !!md.restrict, foto, avisoFoto };
+}
+
+function _gmRegistrarEstado(uf, jid, nome) {
+  const atual = configCdv().estados || [];
+  if (atual.some(e => e.uf === uf && e.jid === jid)) return;
+  salvarConfigCdv({ estados: [...atual, { uf, jid, nome, ativo: true }] });
+  console.log('[GESTAO] Grupo de estado ' + uf + ' cadastrado: ' + jid);
+}
+
+async function _gmRodarLote(j, { itens, modelo, plano }) {
+  for (let i = 0; i < itens.length; i++) {
+    const it = itens[i];
+    j.grupo = null;
+    const r = await _gmCriarUm(j, { nome: it.nome, descricao: it.descricao, foto: modelo.foto,
+      soAdminsEnviam: modelo.soAdminsEnviam, soAdminsEditam: modelo.soAdminsEditam, plano, prefixo: it.nome });
+    if (r.erro) {
+      j.falhas++;
+      j.resultados.push({ jid: null, nome: it.nome, estado: 'falha', detalhe: r.erro });
+      // Recusa de criacao costuma ser limite do WhatsApp: insistir piora.
+      if (/rate|limit|429|forbidden|403/i.test(r.erro)) return _gmFimJob(j, 'parei no ' + it.nome + ': ' + r.erro);
+      // O primeiro ja falhou: o problema e geral (conta, permissao), nao do item.
+      if (!j.criados.length) return _gmFimJob(j, 'o primeiro grupo falhou, parei o lote: ' + r.erro);
+    } else {
+      j.criados.push({ uf: it.uf || null, jid: r.jid, nome: it.nome, link: j.grupo?.link || null });
+      if (it.uf) {
+        try { _gmRegistrarEstado(it.uf, r.jid, it.nome); j.resultados.push({ jid: r.jid, nome: it.nome + ' — Config', estado: 'ok', detalhe: 'cadastrado como grupo de ' + it.uf }); }
+        catch (e) { j.falhas++; j.resultados.push({ jid: r.jid, nome: it.nome + ' — Config', estado: 'falha', detalhe: 'nao cadastrou o estado: ' + e.message }); }
+      }
+    }
+    if (i < itens.length - 1) await _gmPausa(j, GM_PAUSA_LOTE);
+  }
+  j.grupo = null;
   _gmFimJob(j);
 }
 
@@ -14153,6 +14231,51 @@ app.post('/grupos-gestao/criar', async (req, res) => {
   const j = _gmNovoJob({ tipo: 'criar', acao: 'criar', alvo: nome, origem: 'painel-' + (b.operacao || '?'), total, grupo: null });
   _gmRodarCriar(j, { nome, descricao, foto: foto.buf, soAdminsEnviam, soAdminsEditam, plano }).catch(e => _gmFimJob(j, e.message));
   res.status(202).json({ ok: true, jobId: j.id, total, plano });
+});
+
+// Body: { conta, modelo (jid), itens: [{ nome, descricao, uf? }], participantes?, contasCasa?,
+//         registrarModeloUf?, simular? } — cria varios grupos copiando foto e
+// permissoes do modelo. Com simular:true so devolve o que seria feito.
+app.post('/grupos-gestao/criar-lote', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const st = _gm();
+  const b = req.body || {};
+  const simular = b.simular === true;
+  if (!simular && st.ativo) return res.status(409).json({ ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo });
+  if (!_gmContas().length) return res.status(503).json({ ok: false, erro: 'nenhuma conta do WhatsApp conectada' });
+  const jidModelo = String(b.modelo || '').trim();
+  if (!jidModelo.endsWith('@g.us')) return res.status(400).json({ ok: false, erro: 'informe o grupo-modelo' });
+  const itens = [];
+  for (const x of (Array.isArray(b.itens) ? b.itens : [])) {
+    const nome = String(x?.nome || '').trim(), descricao = String(x?.descricao || '').trim();
+    const uf = x?.uf ? String(x.uf).trim().toUpperCase() : null;
+    if (!nome || nome.length > 100) return res.status(400).json({ ok: false, erro: 'nome invalido: ' + (nome || '(vazio)') });
+    if (descricao.length > 2048) return res.status(400).json({ ok: false, erro: 'descricao de ' + nome + ' passa de 2048 caracteres' });
+    if (uf && !UFS.some(u => u.sigla === uf)) return res.status(400).json({ ok: false, erro: 'UF invalida: ' + uf });
+    itens.push({ nome, descricao, uf });
+  }
+  if (!itens.length) return res.status(400).json({ ok: false, erro: 'nenhum grupo para criar' });
+  if (itens.length > GM_LOTE_MAX) return res.status(400).json({ ok: false, erro: 'no maximo ' + GM_LOTE_MAX + ' grupos por lote' });
+  const modelo = await _gmLerModelo(jidModelo);
+  if (modelo.erro) return res.status(400).json({ ok: false, erro: modelo.erro });
+  const plano = await _gmPlanoCriar({ conta: String(b.conta || ''), participantes: b.participantes, contasCasa: b.contasCasa });
+  if (plano.erro) return res.status(400).json({ ok: false, erro: plano.erro });
+  const resumoModelo = { nome: modelo.nome, foto: !!modelo.foto, avisoFoto: modelo.avisoFoto,
+    soAdminsEnviam: modelo.soAdminsEnviam, soAdminsEditam: modelo.soAdminsEditam };
+  const minutos = Math.round((itens.length - 1) * (GM_PAUSA_LOTE[0] + GM_PAUSA_LOTE[1]) / 2 / 60000);
+  if (simular) return res.json({ ok: true, simulado: true, modelo: resumoModelo, plano, itens, minutosEstimados: minutos });
+
+  // O proprio modelo pode ser cadastrado no estado dele junto (ex.: MG ja criado a mao).
+  const ufModelo = b.registrarModeloUf ? String(b.registrarModeloUf).trim().toUpperCase() : null;
+  if (ufModelo) {
+    if (!UFS.some(u => u.sigla === ufModelo)) return res.status(400).json({ ok: false, erro: 'UF do modelo invalida' });
+    try { _gmRegistrarEstado(ufModelo, jidModelo, modelo.nome); }
+    catch (e) { return res.status(400).json({ ok: false, erro: 'nao consegui cadastrar o modelo: ' + e.message }); }
+  }
+  const j = _gmNovoJob({ tipo: 'criar-lote', acao: 'criar-lote', alvo: itens.length + ' grupos', origem: 'painel-' + (b.operacao || '?'),
+    total: itens.length, grupo: null, criados: [] });
+  _gmRodarLote(j, { itens, modelo, plano }).catch(e => _gmFimJob(j, e.message));
+  res.status(202).json({ ok: true, jobId: j.id, total: itens.length, minutosEstimados: minutos, modelo: resumoModelo });
 });
 
 // Body: { jids: [], imagem (data URL) } — troca a foto de grupos existentes.
