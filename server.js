@@ -13433,7 +13433,10 @@ function _gmContas() {
 
 // Mensagem recente desse telefone para alguma conta nossa. Compara variantes do
 // numero (nono digito) e, se preciso, o LID que o WhatsApp associa ao telefone.
-async function _gmContatoRecente(telefone) {
+// contasValidas (Set de apelidos, opcional): so considera mensagens recebidas
+// por essas contas — a inclusao ignora a conta de campanha (camp-*), que nunca
+// executa acao de admin.
+async function _gmContatoRecente(telefone, contasValidas) {
   const variantes = _reVariantes(telefone);
   if (!variantes.size) return null;
   const corte = Date.now() - GM_CONTATO_JANELA_MS;
@@ -13441,6 +13444,7 @@ async function _gmContatoRecente(telefone) {
     let melhor = null;
     for (const c of _gm().contatos) {
       if (c.em < corte) continue;
+      if (contasValidas && !contasValidas.has(c.conta)) continue;
       if (![...ids].some(n => c.ids.has(n))) continue;
       if (!melhor || c.em > melhor.em) melhor = c;
     }
@@ -13604,8 +13608,17 @@ async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, 
   let contato = null;
   if (acao === 'add') {
     if (!digitos) return { status: 400, body: { ok: false, erro: 'para incluir, informe o telefone' } };
-    contato = await _gmContatoRecente(digitos);
+    const aptas = new Set(_gmContas().map(c => c.id));
+    contato = await _gmContatoRecente(digitos, aptas);
     if (!contato) {
+      const qualquer = await _gmContatoRecente(digitos);
+      if (qualquer && !aptas.has(qualquer.conta)) {
+        const nums = _gmContas().map(c => c.id + (c.numero ? ' (' + c.numero + ')' : '')).join(', ');
+        return { status: 412, body: { ok: false, codigo: 'so-conta-campanha',
+          erro: 'a pessoa so mandou mensagem para ' + qualquer.conta + ', que e conta de campanha e nao adiciona em grupos. '
+            + 'Peca para ela mandar um "oi" para a conta principal' + (nums ? ': ' + nums : '') + '.',
+          contas: _gmContas().map(c => ({ id: c.id, numero: c.numero })) } };
+      }
       return { status: 412, body: { ok: false, codigo: 'sem-mensagem',
         erro: 'a pessoa ainda nao mandou mensagem para nenhum numero nosso nas ultimas '
           + Math.round(GM_CONTATO_JANELA_MS / 3600e3) + 'h. Peca para ela salvar o contato e mandar um "oi".',
@@ -13820,7 +13833,7 @@ async function _gmPlanoCriar({ conta, participantes, contasCasa }) {
   const quemInclui = new Set([criador.id, ...casa.keys()]);
   const usados = {};                            // conta -> numeros novos hoje neste plano
   for (const e of externos) {
-    const c = await _gmContatoRecente(e.telefone);
+    const c = (await _gmContatoRecente(e.telefone, quemInclui)) || (await _gmContatoRecente(e.telefone));
     if (!c) { e.modo = 'convite'; e.motivo = 'nao mandou mensagem para um numero nosso nas ultimas ' + Math.round(GM_CONTATO_JANELA_MS / 3600e3) + 'h'; continue; }
     if (!quemInclui.has(c.conta)) {
       e.modo = 'convite';
@@ -14072,9 +14085,13 @@ app.get('/grupos-gestao/contato', async (req, res) => {
   if (!_gmSoPadrao(req, res)) return;
   const digitos = String(req.query.telefone || '').replace(/\D/g, '');
   if (digitos.length < 12) return res.status(400).json({ ok: false, erro: 'informe o telefone com DDI e DDD' });
-  const c = await _gmContatoRecente(digitos);
+  const aptas = new Set(_gmContas().map(x => x.id));
+  const c = await _gmContatoRecente(digitos, aptas);
+  // Falou so com a conta de campanha (camp-*): nao libera, mas diz o motivo.
+  const soCampanha = c ? null : await _gmContatoRecente(digitos);
   const contas = _gmContas().map(x => ({ id: x.id, numero: x.numero, inclusoesHoje: _gmAdicoesHoje(x.id).length }));
   res.json({ ok: true, telefone: digitos, recebida: !!c, conta: c ? c.conta : null,
+    contaCampanha: soCampanha ? soCampanha.conta : null,
     em: c ? new Date(c.em).toISOString() : null, janelaHoras: Math.round(GM_CONTATO_JANELA_MS / 3600e3),
     limiteInclusoesDia: GM_ADD_MAX_DIA, contas });
 });
