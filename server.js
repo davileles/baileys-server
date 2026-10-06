@@ -14005,6 +14005,40 @@ async function _gmRodarCriar(j, opts) {
 // pode trazer `uf`: o grupo novo entra na hora em config-cdv.estados (ativo).
 const GM_PAUSA_LOTE = [240000, 480000];        // 4–8 min entre grupos novos
 const GM_LOTE_MAX = 30;
+// O lote dura horas e um deploy reinicia o servidor no meio: o que falta fica
+// em disco e e retomado no boot. Grupo que ja existe com o mesmo nome (numa
+// conta nossa) e pulado — relancar nunca duplica.
+const GM_LOTE_PATH = SESSAO_DIR + '/gm_lote.json';
+
+function _gmLoteSalvar(estado) {
+  try { if (estado) escreverAtomico(GM_LOTE_PATH, JSON.stringify(estado), 'utf-8'); else if (existsSync(GM_LOTE_PATH)) unlinkSync(GM_LOTE_PATH); }
+  catch (e) { console.warn('[GESTAO] Nao gravei o lote pendente: ' + e.message); }
+}
+
+async function _gmLoteRetomar() {
+  let est = null;
+  try { if (existsSync(GM_LOTE_PATH)) est = JSON.parse(readFileSync(GM_LOTE_PATH, 'utf-8')); } catch (e) { est = null; }
+  if (!est || !Array.isArray(est.itens) || !est.itens.length) return;
+  if (_gm().ativo) return setTimeout(_gmLoteRetomar, 5 * 60e3);
+  if (!_gmContas().some(c => c.id === est.conta)) return setTimeout(_gmLoteRetomar, 2 * 60e3);
+  const modelo = await _gmLerModelo(est.modelo);
+  if (modelo.erro) { console.warn('[GESTAO] Lote pendente: modelo ilegivel agora (' + modelo.erro + '), tento de novo em 5 min.'); return setTimeout(_gmLoteRetomar, 5 * 60e3); }
+  const plano = await _gmPlanoCriar({ conta: est.conta, participantes: est.participantes, contasCasa: est.contasCasa });
+  if (plano.erro) { console.warn('[GESTAO] Lote pendente descartado: ' + plano.erro); return _gmLoteSalvar(null); }
+  console.log('[GESTAO] Retomando lote de grupos: faltam ' + est.itens.length + '.');
+  const j = _gmNovoJob({ tipo: 'criar-lote', acao: 'criar-lote', alvo: est.itens.length + ' grupos (retomado)', origem: est.origem || 'retomada',
+    total: est.itens.length, grupo: null, criados: [] });
+  _gmRodarLote(j, { itens: est.itens, modelo, plano, estado: est }).catch(e => _gmFimJob(j, e.message));
+}
+setTimeout(() => { _gmLoteRetomar().catch(e => console.warn('[GESTAO] Retomada do lote falhou: ' + e.message)); }, 3 * 60e3);
+
+// Grupo com este nome exato em que uma conta nossa ja esta.
+async function _gmGrupoPorNome(nome) {
+  for (const r of await _gmRetratos(true)) {
+    for (const [jid, md] of Object.entries(r.mapa || {})) if ((md?.subject || '').trim() === nome) return jid;
+  }
+  return null;
+}
 
 async function _gmPrepararFotoBuffer(bruto) {
   if (!bruto || !bruto.length) return { buf: null };
@@ -14042,19 +14076,32 @@ function _gmRegistrarEstado(uf, jid, nome) {
   console.log('[GESTAO] Grupo de estado ' + uf + ' cadastrado: ' + jid);
 }
 
-async function _gmRodarLote(j, { itens, modelo, plano }) {
+async function _gmRodarLote(j, { itens, modelo, plano, estado }) {
+  let pausar = false;
   for (let i = 0; i < itens.length; i++) {
     const it = itens[i];
     j.grupo = null;
+    if (estado) _gmLoteSalvar({ ...estado, itens: itens.slice(i) });
+    let existente = null;
+    try { existente = await _gmGrupoPorNome(it.nome); } catch (e) {}
+    if (existente) {
+      j.pulados++;
+      j.criados.push({ uf: it.uf || null, jid: existente, nome: it.nome, link: null, jaExistia: true });
+      j.resultados.push({ jid: existente, nome: it.nome, estado: 'pulado', detalhe: 'ja existia — nao criei de novo' });
+      if (it.uf) { try { _gmRegistrarEstado(it.uf, existente, it.nome); } catch (e) {} }
+      continue;
+    }
+    if (pausar) await _gmPausa(j, GM_PAUSA_LOTE);
+    pausar = true;
     const r = await _gmCriarUm(j, { nome: it.nome, descricao: it.descricao, foto: modelo.foto,
       soAdminsEnviam: modelo.soAdminsEnviam, soAdminsEditam: modelo.soAdminsEditam, plano, prefixo: it.nome });
     if (r.erro) {
       j.falhas++;
       j.resultados.push({ jid: null, nome: it.nome, estado: 'falha', detalhe: r.erro });
       // Recusa de criacao costuma ser limite do WhatsApp: insistir piora.
-      if (/rate|limit|429|forbidden|403/i.test(r.erro)) return _gmFimJob(j, 'parei no ' + it.nome + ': ' + r.erro);
+      if (/rate|limit|429|forbidden|403/i.test(r.erro)) { _gmLoteSalvar(null); return _gmFimJob(j, 'parei no ' + it.nome + ': ' + r.erro); }
       // O primeiro ja falhou: o problema e geral (conta, permissao), nao do item.
-      if (!j.criados.length) return _gmFimJob(j, 'o primeiro grupo falhou, parei o lote: ' + r.erro);
+      if (!j.criados.length) { _gmLoteSalvar(null); return _gmFimJob(j, 'o primeiro grupo falhou, parei o lote: ' + r.erro); }
     } else {
       j.criados.push({ uf: it.uf || null, jid: r.jid, nome: it.nome, link: j.grupo?.link || null });
       if (it.uf) {
@@ -14062,9 +14109,9 @@ async function _gmRodarLote(j, { itens, modelo, plano }) {
         catch (e) { j.falhas++; j.resultados.push({ jid: r.jid, nome: it.nome + ' — Config', estado: 'falha', detalhe: 'nao cadastrou o estado: ' + e.message }); }
       }
     }
-    if (i < itens.length - 1) await _gmPausa(j, GM_PAUSA_LOTE);
   }
   j.grupo = null;
+  _gmLoteSalvar(null);
   _gmFimJob(j);
 }
 
@@ -14270,7 +14317,10 @@ app.post('/grupos-gestao/criar-lote', async (req, res) => {
   }
   const j = _gmNovoJob({ tipo: 'criar-lote', acao: 'criar-lote', alvo: itens.length + ' grupos', origem: 'painel-' + (b.operacao || '?'),
     total: itens.length, grupo: null, criados: [] });
-  _gmRodarLote(j, { itens, modelo, plano }).catch(e => _gmFimJob(j, e.message));
+  const estado = { conta: String(b.conta || ''), modelo: jidModelo, itens, participantes: b.participantes || [], contasCasa: b.contasCasa || [],
+    origem: 'painel-' + (b.operacao || '?'), criadoEm: new Date().toISOString() };
+  _gmLoteSalvar(estado);
+  _gmRodarLote(j, { itens, modelo, plano, estado }).catch(e => _gmFimJob(j, e.message));
   res.status(202).json({ ok: true, jobId: j.id, total: itens.length, minutosEstimados: minutos, modelo: resumoModelo });
 });
 
