@@ -394,8 +394,10 @@
   Tela.prototype.pintarContato = function (j, erro) {
     var el = this.$('[data-r=contato]');
     var bt = this.$('[data-a=num-add]');
-    if (erro) { el.className = 'gg-estado gg-erro'; el.textContent = erro; bt.disabled = true; return; }
-    if (!j) { el.className = 'gg-estado'; el.textContent = ''; bt.disabled = true; return; }
+    // Incluir nao depende mais de mensagem previa: basta o telefone completo.
+    var telOk = telNormal(this.$('[data-r=tel]').value).length >= 12;
+    if (erro) { el.className = 'gg-estado gg-erro'; el.textContent = erro; bt.disabled = !telOk; return; }
+    if (!j) { el.className = 'gg-estado'; el.textContent = ''; bt.disabled = !telOk; return; }
     if (j.recebida) {
       var c = (j.contas || []).filter(function (x) { return x.id === j.conta; })[0];
       el.className = 'gg-estado gg-ok';
@@ -404,11 +406,9 @@
         + (c ? ' — ' + c.inclusoesHoje + '/' + j.limiteInclusoesDia + ' inclusões hoje.' : '.');
       bt.disabled = false;
     } else {
-      el.className = 'gg-estado gg-aviso';
-      el.innerHTML = 'Ainda não chegou mensagem desse número nas últimas ' + j.janelaHoras + 'h. Peça para a pessoa salvar e mandar um "oi" para: '
-        + (j.contas || []).map(function (x) { return '<b>' + esc(telFmt(x.numero)) + '</b> (' + esc(x.id) + ')'; }).join(' ou ')
-        + '. A inclusão sai pela conta que receber a mensagem, e só nos grupos em que ela é admin.';
-      bt.disabled = true;
+      el.className = 'gg-estado';
+      el.textContent = 'Nenhuma mensagem desse número nas últimas ' + j.janelaHoras + 'h. Pode incluir mesmo assim: sai pela principal (ou por um tico admin do grupo).';
+      bt.disabled = !telOk;
     }
   };
 
@@ -436,7 +436,6 @@
     if (tel.length < 12) return me.pintarContato(null, 'Informe o telefone com DDI e DDD.');
     var jids = me.selecionados(me.marcados);
     if (!jids.length) return alert('Marque ao menos um grupo.');
-    if (acao === 'add' && me.contatoOk !== tel) return me.pintarContato(null, 'Clique em "Verificar mensagem" antes de incluir.');
     var pausa = acao === 'add' ? 70 : 30;
     var min = Math.max(1, Math.round((jids.length - 1) * pausa / 60));
     if (!confirm(ROT_ACAO[acao] + ' ' + telFmt(tel) + ' em ' + jids.length + ' grupo(s)?\n\nRoda um grupo por vez, com pausa entre eles'

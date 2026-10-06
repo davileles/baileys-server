@@ -13608,28 +13608,14 @@ async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, 
   let contato = null;
   if (acao === 'add') {
     if (!digitos) return { status: 400, body: { ok: false, erro: 'para incluir, informe o telefone' } };
-    const aptas = new Set(_gmContas().map(c => c.id));
-    contato = await _gmContatoRecente(digitos, aptas);
-    if (!contato) {
-      const qualquer = await _gmContatoRecente(digitos);
-      if (qualquer && !aptas.has(qualquer.conta)) {
-        const nums = _gmContas().map(c => c.id + (c.numero ? ' (' + c.numero + ')' : '')).join(', ');
-        return { status: 412, body: { ok: false, codigo: 'so-conta-campanha',
-          erro: 'a pessoa so mandou mensagem para ' + qualquer.conta + ', que e conta de campanha e nao adiciona em grupos. '
-            + 'Peca para ela mandar um "oi" para a conta principal' + (nums ? ': ' + nums : '') + '.',
-          contas: _gmContas().map(c => ({ id: c.id, numero: c.numero })) } };
-      }
-      return { status: 412, body: { ok: false, codigo: 'sem-mensagem',
-        erro: 'a pessoa ainda nao mandou mensagem para nenhum numero nosso nas ultimas '
-          + Math.round(GM_CONTATO_JANELA_MS / 3600e3) + 'h. Peca para ela salvar o contato e mandar um "oi".',
-        contas: _gmContas().map(c => ({ id: c.id, numero: c.numero })) } };
-    }
-    if (!_gmContas().some(c => c.id === contato.conta)) {
-      return { status: 503, body: { ok: false, erro: 'a conta que recebeu a mensagem (' + contato.conta + ') nao esta conectada agora' } };
-    }
-    const hoje = _gmAdicoesHoje(contato.conta);
-    if (!hoje.includes(digitos) && hoje.length >= GM_ADD_MAX_DIA) {
-      return { status: 429, body: { ok: false, erro: 'limite de ' + GM_ADD_MAX_DIA + ' numeros incluidos hoje pela conta ' + contato.conta + ' atingido — continue amanha.' } };
+    // Mensagem previa NAO e mais exigida (decisao do Davi, out/2026: a pessoa ja
+    // e orientada a mandar "oi" e ele controla isso). Se houver mensagem recente
+    // para uma conta apta, essa conta tem preferencia para incluir; senao vai a
+    // principal (ou o primeiro tico admin do grupo).
+    contato = await _gmContatoRecente(digitos, new Set(_gmContas().map(c => c.id)));
+    if (contato) {
+      const hoje = _gmAdicoesHoje(contato.conta);
+      if (!hoje.includes(digitos) && hoje.length >= GM_ADD_MAX_DIA) contato = null;
     }
   }
 
@@ -13660,11 +13646,14 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
   }
 
   let jidAdd = null;
-  const fixo = contato ? retratos.find(r => r.id === contato.conta) : null;
+  const fixo = contato ? retratos.find(r => r.id === contato.conta) || null : null;
+  // Ordem de preferencia para incluir: quem recebeu a mensagem, a principal, os ticos.
+  const ordemAdd = [...(fixo ? [fixo] : []), ...retratos.filter(r => r !== fixo && r.id === 'principal'),
+    ...retratos.filter(r => r !== fixo && r.id !== 'principal')];
+  const podeIncluirHoje = (id) => { const h = _gmAdicoesHoje(id); return h.includes(digitos) || h.length < GM_ADD_MAX_DIA; };
   if (acao === 'add') {
-    if (!fixo) return _gmFimJob(j, 'a conta ' + contato.conta + ' nao conseguiu ler os grupos');
     try {
-      const w = await fixo.sock.onWhatsApp(digitos);
+      const w = await ordemAdd[0].sock.onWhatsApp(digitos);
       const achado = Array.isArray(w) ? w.find(x => x && x.exists && x.jid) : null;
       if (!achado) return _gmFimJob(j, 'este numero nao tem WhatsApp — confira DDI, DDD e o nono digito');
       jidAdd = achado.jid;
@@ -13691,12 +13680,19 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
       j.falhas++; push({ estado: 'falha', detalhe: 'e o criador do grupo — o WhatsApp nao deixa tirar' }); continue;
     }
 
-    // Executor: na inclusao, SO a conta que recebeu a mensagem. Nas demais,
-    // qualquer conta admin ali que nao seja o proprio alvo.
+    // Executor: na inclusao, a primeira admin da ordemAdd com limite do dia livre.
+    // Nas demais, qualquer conta admin ali que nao seja o proprio alvo.
     let exec = null;
     if (acao === 'add') {
-      exec = _gmEuNoGrupo(fixo.sock, fixo.mapa[jid])?.admin ? fixo : null;
-      if (!exec) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'a conta ' + fixo.id + ' (que recebeu a mensagem) nao e admin deste grupo' }); continue; }
+      const admins = ordemAdd.filter(r => _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin);
+      exec = admins.find(r => podeIncluirHoje(r.id)) || null;
+      if (!exec) {
+        j.falhas++;
+        push({ estado: 'bloqueado', detalhe: admins.length
+          ? 'limite de ' + GM_ADD_MAX_DIA + ' inclusoes hoje atingido nas contas admin deste grupo'
+          : 'nenhuma conta conectada e admin deste grupo' });
+        continue;
+      }
     } else {
       exec = retratos.find(r => {
         const eu = _gmEuNoGrupo(r.sock, r.mapa[jid]);
