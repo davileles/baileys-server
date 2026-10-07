@@ -173,18 +173,74 @@ async function houveRunRecente(job) {
   }
 }
 
-async function dispararWorkflow(job) {
+// 5xx e erro de rede sao instabilidade do GitHub (07/10/2026: HTTP 500 com
+// corpo vazio no slot das 12h, com o mesmo token disparando normal antes e
+// depois). Nesses casos tenta de novo com espera crescente; 4xx (403 de
+// permissao, 404 de workflow, 422 de ref) falha na hora, porque repetir nao
+// muda nada.
+const ESPERAS_RETRY_MS = [15000, 45000, 90000];
+const dormir = ms => new Promise(res => setTimeout(res, ms));
+
+async function tentarDispatch(job) {
   const url = 'https://api.github.com/repos/' + job.repo
     + '/actions/workflows/' + job.workflow + '/dispatches';
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { ...cabecalhos(), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ref: job.ref || 'main' }),
-  });
-  if (r.status !== 204) {
-    const corpo = await r.text().catch(() => '');
-    throw new Error('HTTP ' + r.status + ' — ' + corpo.slice(0, 300));
+  let r;
+  try {
+    r = await fetch(url, {
+      method: 'POST',
+      headers: { ...cabecalhos(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: job.ref || 'main' }),
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch (e) {
+    return { ok: false, transitorio: true, erro: 'rede — ' + e.message };
   }
+  if (r.status === 204) return { ok: true };
+  const corpo = await r.text().catch(() => '');
+  return {
+    ok: false,
+    transitorio: r.status >= 500 || r.status === 429,
+    erro: 'HTTP ' + r.status + ' — ' + (corpo.slice(0, 300) || '(sem corpo)'),
+  };
+}
+
+// O GitHub as vezes responde 5xx e cria o run mesmo assim. Antes de cada
+// nova tentativa (e antes de desistir), confere se apareceu run nos ultimos
+// minutos — senao o retry viraria coleta dupla.
+async function runApareceu(job, desdeMs) {
+  try {
+    const url = 'https://api.github.com/repos/' + job.repo
+      + '/actions/workflows/' + job.workflow + '/runs?per_page=5&event=workflow_dispatch';
+    const r = await fetch(url, { headers: cabecalhos(), signal: AbortSignal.timeout(20000) });
+    if (!r.ok) return false;
+    const j = await r.json();
+    return (j.workflow_runs || []).some(x => {
+      const t = Date.parse(x.created_at);
+      return Number.isFinite(t) && t >= desdeMs - 60000;
+    });
+  } catch { return false; }
+}
+
+async function dispararWorkflow(job) {
+  const inicio = Date.now();
+  let ultimo = null;
+  for (let i = 0; i <= ESPERAS_RETRY_MS.length; i++) {
+    if (i > 0) {
+      await dormir(ESPERAS_RETRY_MS[i - 1]);
+      if (await runApareceu(job, inicio)) {
+        console.log('[AGENDA] ' + job.id + ': run apareceu apesar do erro (' + ultimo.erro + ') — ok.');
+        return { tentativas: i };
+      }
+      console.warn('[AGENDA] ' + job.id + ': tentativa ' + (i + 1) + ' apos ' + ultimo.erro);
+    }
+    ultimo = await tentarDispatch(job);
+    if (ultimo.ok) return { tentativas: i + 1 };
+    if (!ultimo.transitorio) break;
+  }
+  if (ultimo.transitorio && await runApareceu(job, inicio)) return { tentativas: ESPERAS_RETRY_MS.length + 1 };
+  const err = new Error(ultimo.erro + (ultimo.transitorio ? ' (apos ' + (ESPERAS_RETRY_MS.length + 1) + ' tentativas)' : ''));
+  err.transitorio = !!ultimo.transitorio;
+  throw err;
 }
 
 function registrarHistorico(entrada) {
@@ -215,10 +271,10 @@ export async function dispararAgora(idJob, { ignorarRunRecente = false } = {}) {
     return { ok: true, pulado: true, motivo: 'ja rodou nos ultimos ' + job.jaRodouMin + ' min' };
   }
   try {
-    await dispararWorkflow(job);
-    return { ok: true, pulado: false };
+    const d = await dispararWorkflow(job);
+    return { ok: true, pulado: false, tentativas: d.tentativas };
   } catch (e) {
-    return { ok: false, erro: e.message };
+    return { ok: false, erro: e.message, transitorio: !!e.transitorio };
   }
 }
 
@@ -252,8 +308,9 @@ async function ciclo() {
         console.log('[AGENDA] ' + job.id + ' slot ' + slot + ' — pulado (' + r.motivo + ').');
       } else if (r.ok) {
         _estado.jobs[job.id] = { ..._estado.jobs[job.id], ultimoResultado: 'ok', ultimoEm: em, ultimoSucessoEm: em };
-        registrarHistorico({ job: job.id, slot, em, resultado: 'disparado' });
-        console.log('[AGENDA] ' + job.id + ' slot ' + slot + ' — disparado.');
+        const obs = r.tentativas > 1 ? ' (tentativa ' + r.tentativas + ')' : '';
+        registrarHistorico({ job: job.id, slot, em, resultado: 'disparado' + obs });
+        console.log('[AGENDA] ' + job.id + ' slot ' + slot + ' — disparado' + obs + '.');
       } else {
         _estado.jobs[job.id] = { ..._estado.jobs[job.id], ultimoResultado: 'erro', ultimoEm: em, ultimoErro: r.erro };
         registrarHistorico({ job: job.id, slot, em, resultado: 'erro: ' + r.erro });
@@ -265,8 +322,11 @@ async function ciclo() {
           'Agenda Actions: falha ao disparar ' + job.id,
           'Nao consegui disparar o workflow ' + job.workflow + ' (' + job.repo + ').\n'
           + 'Erro: ' + r.erro + '\n\n'
-          + 'Se for 403, o GITHUB_TOKEN do Railway precisa de "Actions: read and write" '
-          + 'no repositorio. Ate resolver, a coleta so roda pelo cron do GitHub, que esta atrasando.');
+          + (r.transitorio
+            ? 'Erro 5xx/rede e instabilidade do lado do GitHub (o token esta ok). '
+              + 'O proximo slot tenta de novo sozinho; o cron do .yml segue como rede de seguranca.'
+            : 'Se for 403, o GITHUB_TOKEN do Railway precisa de "Actions: read and write" '
+              + 'no repositorio. Ate resolver, a coleta so roda pelo cron do GitHub, que esta atrasando.'));
       }
       salvarEstado();
     }
