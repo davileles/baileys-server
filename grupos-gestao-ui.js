@@ -101,7 +101,8 @@
       fr.readAsDataURL(arquivo);
     });
   }
-  var COR_EST = { ok: 'gg-ok', pulado: '', convite: 'gg-aviso', bloqueado: 'gg-erro', falha: 'gg-erro' };
+  var COR_EST = { ok: 'gg-ok', pulado: '', convite: 'gg-aviso', 'convite-enviado': 'gg-ok', bloqueado: 'gg-erro', falha: 'gg-erro' };
+  var ROT_EST = { 'convite-enviado': 'convite enviado' };
 
   function Tela(el, opt) {
     this.el = el;
@@ -155,7 +156,7 @@
       +     '<label class="gg-ajuda" style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-r="cr-trava"/> Só admins editam nome, foto e descrição</label>'
       +     '<p class="gg-ajuda" style="margin-top:8px"><b>Números da casa</b> que entram e viram admin (sem trava de mensagem):</p>'
       +     '<div class="gg-lista" data-r="cr-casa" style="max-height:160px"></div>'
-      +     '<p class="gg-ajuda"><b>Participantes</b> — com DDI e DDD. Entra direto quem mandou mensagem nas últimas 24h para a conta que cria '
+      +     '<p class="gg-ajuda"><b>Participantes</b> — com DDI e DDD. Entra direto quem mandou mensagem nos últimos 3 dias para a conta que cria '
       +       'ou para um número da casa marcado acima; os demais recebem o link de convite na tela.</p>'
       +     '<div class="gg-linha" style="align-items:flex-end">'
       +       '<div class="gg-campo"><label>Telefone</label><input type="text" data-r="cr-tel" placeholder="55 31 99999-8888" autocomplete="off"/></div>'
@@ -213,7 +214,8 @@
       +       '<button class="gg-btn" data-a="num-demote">↩️ Tirar admin</button>'
       +     '</div>'
       +     '<p class="gg-ajuda" style="margin-top:8px">Para <b>incluir</b>: peça para a pessoa salvar o número que vai adicioná-la e mandar uma mensagem. '
-      +       'Depois clique em Verificar. Sem essa mensagem o servidor recusa a inclusão.</p>'
+      +       'Depois clique em Verificar. Sem essa mensagem o servidor recusa a inclusão (vale por 3 dias). '
+      +       'Se a privacidade da pessoa não deixar incluir direto, o convite do grupo vai sozinho na conversa dela com esse número.</p>'
       +   '</div>'
 
       +   '<div class="gg-card">'
@@ -394,21 +396,32 @@
   Tela.prototype.pintarContato = function (j, erro) {
     var el = this.$('[data-r=contato]');
     var bt = this.$('[data-a=num-add]');
-    // Incluir nao depende mais de mensagem previa: basta o telefone completo.
-    var telOk = telNormal(this.$('[data-r=tel]').value).length >= 12;
-    if (erro) { el.className = 'gg-estado gg-erro'; el.textContent = erro; bt.disabled = !telOk; return; }
-    if (!j) { el.className = 'gg-estado'; el.textContent = ''; bt.disabled = !telOk; return; }
-    if (j.recebida) {
+    // Incluir so libera para quem escreveu para um numero nosso (ou numero da
+    // casa). A trava saiu em 06/10/2026 e voltou em 07/10: sem ela a principal
+    // tentou incluir quem nao a tinha salva e o WhatsApp deslogou a conta.
+    if (erro) { el.className = 'gg-estado gg-erro'; el.textContent = erro; bt.disabled = true; return; }
+    if (!j) { el.className = 'gg-estado'; el.textContent = ''; bt.disabled = true; return; }
+    var dias = Math.max(1, Math.round((j.janelaHoras || 72) / 24));
+    if (j.casa && !j.recebida) {
+      el.className = 'gg-estado gg-ok';
+      el.textContent = '✓ Número da casa (conta nossa ou admin cadastrado): pode incluir sem mensagem.';
+      bt.disabled = false;
+    } else if (j.recebida) {
       var c = (j.contas || []).filter(function (x) { return x.id === j.conta; })[0];
       el.className = 'gg-estado gg-ok';
-      el.textContent = '✓ Mensagem recebida às ' + hora(j.em) + ' pela conta ' + j.conta
+      el.textContent = '✓ Mensagem recebida em ' + new Date(j.em).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) + ' pela conta ' + j.conta
         + (c && c.numero ? ' (' + telFmt(c.numero) + ')' : '') + '. A inclusão sai por ela'
         + (c ? ' — ' + c.inclusoesHoje + '/' + j.limiteInclusoesDia + ' inclusões hoje.' : '.');
       bt.disabled = false;
     } else {
-      el.className = 'gg-estado';
-      el.textContent = 'Nenhuma mensagem desse número nas últimas ' + j.janelaHoras + 'h. Pode incluir mesmo assim: sai pela principal (ou por um tico admin do grupo).';
-      bt.disabled = !telOk;
+      el.className = 'gg-estado gg-aviso';
+      var nums = (j.contas || []).map(function (x) { return '<b>' + esc(telFmt(x.numero)) + '</b> (' + esc(x.id) + ')'; }).join(' ou ');
+      el.innerHTML = (j.contaCampanha ? 'A pessoa só escreveu para ' + esc(j.contaCampanha) + ', que é conta de campanha e não inclui em grupos. '
+          : j.contaDesconectada ? 'A pessoa escreveu para ' + esc(j.contaDesconectada) + ', que está desconectada agora. '
+          : 'Ainda não chegou mensagem desse número nos últimos ' + dias + ' dias. ')
+        + 'Peça para a pessoa salvar e mandar um "oi" para: ' + nums
+        + '. A inclusão sai só pela conta que receber a mensagem — incluir quem não escreveu foi o que deslogou a principal em 07/10.';
+      bt.disabled = true;
     }
   };
 
@@ -420,7 +433,7 @@
     me.$('[data-r=contato]').textContent = 'Verificando…';
     try {
       var j = await me.api('/grupos-gestao/contato?telefone=' + tel + '&t=' + Date.now());
-      me.contatoOk = j.recebida ? tel : null;
+      me.contatoOk = (j.recebida || j.casa) ? tel : null;
       me.pintarContato(j);
     } catch (e) { me.pintarContato(null, 'Não consegui verificar: ' + e.message); }
   };
@@ -436,6 +449,7 @@
     if (tel.length < 12) return me.pintarContato(null, 'Informe o telefone com DDI e DDD.');
     var jids = me.selecionados(me.marcados);
     if (!jids.length) return alert('Marque ao menos um grupo.');
+    if (acao === 'add' && me.contatoOk !== tel) return me.pintarContato(null, 'Clique em "Verificar mensagem" antes de incluir.');
     var pausa = acao === 'add' ? 70 : 30;
     var min = Math.max(1, Math.round((jids.length - 1) * pausa / 60));
     if (!confirm(ROT_ACAO[acao] + ' ' + telFmt(tel) + ' em ' + jids.length + ' grupo(s)?\n\nRoda um grupo por vez, com pausa entre eles'
@@ -611,7 +625,10 @@
       me.acompanhar(j.jobId);
     } catch (e) {
       if (e.dados && e.dados.jobId) { alert(e.message); return me.acompanhar(e.dados.jobId); }
-      if (e.dados && e.dados.codigo === 'sem-mensagem') { me.contatoOk = null; return me.pintarContato({ recebida: false, janelaHoras: 24, contas: e.dados.contas || [] }); }
+      if (e.dados && (e.dados.codigo === 'sem-mensagem' || e.dados.codigo === 'so-conta-campanha' || e.dados.codigo === 'conta-desconectada')) {
+        me.contatoOk = null;
+        return me.verificar();
+      }
       alert('Não deu: ' + e.message);
     }
   };
@@ -671,10 +688,11 @@
     } else if (t.estado === 'erro') {
       cab = '<span class="gg-erro">✗ Tarefa interrompida: ' + esc(t.erro) + '</span>';
     } else {
-      cab = '✓ <b>' + esc(ROT_ACAO[t.acao] || t.acao) + '</b> concluído — ' + t.feitos + ' feito(s), ' + t.pulados + ' pulado(s), ' + t.falhas + ' pendência(s).';
+      cab = '✓ <b>' + esc(ROT_ACAO[t.acao] || t.acao) + '</b> concluído — ' + t.feitos + ' feito(s), ' + t.pulados + ' pulado(s), '
+        + (t.convites ? t.convites + ' convite(s) enviado(s) no privado, ' : '') + t.falhas + ' pendência(s).';
     }
     var res = t.resultados.map(function (x) {
-      return '<div class="gg-res"><b>' + esc(x.nome || x.jid) + '</b> — <span class="' + (COR_EST[x.estado] || '') + '">' + esc(x.estado) + '</span>: '
+      return '<div class="gg-res"><b>' + esc(x.nome || x.jid) + '</b> — <span class="' + (COR_EST[x.estado] || '') + '">' + esc(ROT_EST[x.estado] || x.estado) + '</span>: '
         + esc(x.detalhe || '') + (x.por ? ' <span class="gg-sub">(por ' + esc(x.por) + ')</span>' : '')
         + (x.link ? '<div><a href="' + esc(x.link) + '" target="_blank" rel="noopener">' + esc(x.link) + '</a> '
           + '<button class="gg-btn mini" data-a="copiar" data-link="' + esc(x.link) + '">Copiar</button></div>' : '')

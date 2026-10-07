@@ -215,7 +215,9 @@
         "async function copiarEmissaoEstados(",
         "app.post('/cdv/estados/simular'",
         "app.post('/listas/disparo-unico/previa'",
-        "function aplicarEdicaoDisparo("
+        "function aplicarEdicaoDisparo(",
+        "codigo: 'sem-mensagem'",
+        "function _gmNumeroDaCasa("
       ]
     },
     "radar-awin.js": {

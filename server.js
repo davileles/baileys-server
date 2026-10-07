@@ -1795,6 +1795,8 @@ async function conectarConta(id) {
         c.conectado = false; c.conectando = false; c.sock = null;
         const codigo = new Boom(u.lastDisconnect?.error)?.output?.statusCode;
         console.log('[CONTA:' + id + '] conexao fechada. Codigo: ' + codigo);
+        const _detQueda = detalheDaQueda(apelidoDaConta(id), u.lastDisconnect?.error);
+        if (_detQueda) console.log('[CONTA:' + id + '] queda — ' + _detQueda);
         if (codigo === DisconnectReason.loggedOut) {
           registrarErroConta(c, 'deslogada — escaneie o QR de novo');
           c.precisaPareamento = true;
@@ -11671,7 +11673,9 @@ async function conectar() {
         if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
         const codigo = new Boom(lastDisconnect?.error)?.output?.statusCode;
         console.log('[WA] Conexão fechada. Código:', codigo);
-        registrarEventoEntrega('principal-caiu', 'codigo ' + codigo);
+        const _detQueda = detalheDaQueda('principal', lastDisconnect?.error);
+        if (_detQueda) console.log('[WA] Queda da principal — ' + _detQueda);
+        registrarEventoEntrega('principal-caiu', 'codigo ' + codigo + (_detQueda ? ' — ' + _detQueda.slice(0, 300) : ''));
         if (codigo === DisconnectReason.loggedOut) {
           // ── LOGOUT (401) ────────────────────────────────────────────────
           // Ate 22/08/2026 este ramo era so um console.log, e por isso o
@@ -13179,7 +13183,18 @@ app.post('/contas/:id/grupos-acao', async (req, res) => {
 // Todas as acoes rodam como TAREFA em segundo plano, uma de cada vez no servidor
 // inteiro, em serie e com pausa longa entre grupos. Rajada de alteracao de
 // participante e o caminho mais curto para outro bloqueio.
-const GM_CONTATO_JANELA_MS = 24 * 3600e3;
+//
+// 07/10/2026: a trava da mensagem previa tinha saido em 06/10 e, na primeira
+// reentrada depois disso, a principal tentou incluir quem nao a tinha salva: o
+// WhatsApp respondeu 403 (privacidade) e 11 s depois REVOGOU o aparelho
+// conectado (401). A trava voltou — e os dois atritos que levaram a tira-la
+// foram resolvidos: a lista de quem escreveu agora fica em disco (um deploy nao
+// "esquece" o oi) e vale por 3 dias em vez de 24 h. Numero da casa (conta nossa
+// ou admin cadastrado na Config do CDV) segue sem trava. Quando o WhatsApp
+// recusa a inclusao direta de quem escreveu, o servidor manda o CONVITE
+// PARTICULAR do grupo na propria conversa (o mesmo do app) — o link publico nao
+// serve para quem um admin removeu.
+const GM_CONTATO_JANELA_MS = 72 * 3600e3;
 const GM_ADD_MAX_DIA       = 10;                 // numeros distintos por conta/dia
 const GM_RETRATO_TTL_MS    = 2 * 60e3;
 const GM_PAUSA = {                               // [min, max] entre grupos
@@ -13195,8 +13210,63 @@ const GM_ACOES = new Set(['add', 'remove', 'promote', 'demote']);
 // Estado em propriedade de funcao, e nao em const de modulo: os handlers de
 // mensagem chamam isto e nao podem cair em TDZ se um evento chegar cedo.
 function _gm() {
-  if (!_gm.s) _gm.s = { contatos: [], retratos: new WeakMap(), jobs: new Map(), ativo: null, seq: 0 };
+  if (!_gm.s) _gm.s = { contatos: [], contatosLidos: false, retratos: new WeakMap(), jobs: new Map(), ativo: null, seq: 0, ultimaAcao: new Map() };
+  if (!_gm.s.contatosLidos) _gmContatosCarregar(_gm.s);
   return _gm.s;
+}
+
+// Quem escreveu no privado de uma conta nossa, em disco. Era so memoria, e cada
+// deploy (ha varios por dia) apagava a lista: a pessoa tinha mandado o "oi" de
+// manha e a tela dizia que nao. Caminho montado aqui dentro, e nao em const de
+// modulo, pelo mesmo motivo do _gm(): evento cedo nao pode cair em TDZ.
+function _gmContatosCarregar(st) {
+  try {
+    const caminho = SESSAO_DIR + '/gm_contatos.json';
+    const corte = Date.now() - GM_CONTATO_JANELA_MS;
+    st.contatosLidos = true;
+    if (!existsSync(caminho)) return;
+    const lidos = JSON.parse(readFileSync(caminho, 'utf-8'));
+    for (const c of (Array.isArray(lidos) ? lidos : [])) {
+      if (!c || !c.conta || !(c.em >= corte) || !Array.isArray(c.ids) || !c.ids.length) continue;
+      st.contatos.push({ conta: String(c.conta), em: Number(c.em), ids: new Set(c.ids.map(String)), jid: c.jid ? String(c.jid) : null });
+    }
+  } catch (e) {
+    // ReferenceError = modulo ainda carregando (TDZ): tenta de novo na proxima.
+    if (e instanceof ReferenceError) st.contatosLidos = false;
+    else console.warn('[GESTAO] Nao li gm_contatos.json: ' + e.message);
+  }
+}
+function _gmContatosGravar() {
+  const st = _gm();
+  clearTimeout(st.timerContatos);
+  st.timerContatos = setTimeout(() => {
+    try {
+      const corte = Date.now() - GM_CONTATO_JANELA_MS;
+      const linhas = st.contatos.filter(c => c.em >= corte).map(c => ({ conta: c.conta, em: c.em, ids: [...c.ids], jid: c.jid || null }));
+      escreverAtomico(SESSAO_DIR + '/gm_contatos.json', JSON.stringify(linhas), 'utf-8');
+    } catch (e) { console.warn('[GESTAO] Nao gravei gm_contatos.json: ' + e.message); }
+  }, 5000);
+  if (st.timerContatos && st.timerContatos.unref) st.timerContatos.unref();
+}
+
+// Caixa-preta: a ultima acao de participante de cada conta. Quando uma conta
+// cai, o log passa a dizer o motivo real da queda E o que ela tinha acabado de
+// fazer — ate 07/10/2026 so saia "Codigo: 401", sem pista nenhuma.
+function _gmMarcarAcao(conta, acao, alvo, grupo, status) {
+  try { _gm().ultimaAcao.set(conta, { acao, alvo, grupo, status, em: Date.now() }); } catch (e) {}
+}
+function detalheDaQueda(conta, erro) {
+  const partes = [];
+  try {
+    if (erro?.message) partes.push('motivo: ' + erro.message);
+    if (erro?.data) { const d = JSON.stringify(erro.data); if (d && d !== '{}') partes.push('dados: ' + d.slice(0, 400)); }
+    const u = _gm().ultimaAcao.get(conta);
+    if (u && Date.now() - u.em < 10 * 60e3) {
+      partes.push('ultima acao de grupo ha ' + Math.round((Date.now() - u.em) / 1000) + 's: ' + u.acao + ' de ' + u.alvo
+        + ' em "' + u.grupo + '" (status ' + u.status + ')');
+    }
+  } catch (e) {}
+  return partes.join(' | ');
 }
 
 function _gmDigitos(v) { return String(v || '').split(':')[0].split('@')[0].replace(/\D/g, ''); }
@@ -13207,8 +13277,9 @@ function _gmTsMsg(msg) {
   return Number.isFinite(n) && n > 0 ? n * 1000 : Date.now();
 }
 
-// Mensagem PRIVADA recebida por uma conta nossa. So memoria: a janela e curta e
-// o fluxo e "a pessoa manda, a gente adiciona em seguida".
+// Mensagem PRIVADA recebida por uma conta nossa. Uma linha por pessoa e por
+// conta (mensagem nova atualiza a anterior), gravada em disco. Guarda o JID da
+// conversa: e por ele que o convite particular e respondido.
 function registrarContatoPrivado(apelido, s, msg) {
   try {
     const k = msg?.key;
@@ -13219,16 +13290,24 @@ function registrarContatoPrivado(apelido, s, msg) {
     if (Date.now() - em > GM_CONTATO_JANELA_MS) return;
     const ids = new Set();
     for (const v of [rj, k.remoteJidAlt, k.senderPn]) { const d = _gmDigitos(v); if (d) ids.add(d); }
-    const reg = { conta: apelido, em, ids };
+    if (!ids.size) return;
     const st = _gm();
-    st.contatos.push(reg);
+    let reg = st.contatos.find(c => c.conta === apelido && [...ids].some(n => c.ids.has(n))) || null;
+    if (reg) {
+      for (const n of ids) reg.ids.add(n);
+      if (em >= reg.em) { reg.em = em; reg.jid = rj; }
+    } else {
+      reg = { conta: apelido, em, ids, jid: rj };
+      st.contatos.push(reg);
+    }
     const corte = Date.now() - GM_CONTATO_JANELA_MS;
-    st.contatos = st.contatos.filter(c => c.em >= corte).slice(-800);
+    st.contatos = st.contatos.filter(c => c.em >= corte).slice(-4000);
+    _gmContatosGravar();
     // Conversa por LID sem o telefone junto: o mapa local do Baileys costuma ter.
     const lids = [rj, k.remoteJidAlt].filter(v => String(v || '').endsWith('@lid'));
     for (const l of lids) {
       Promise.resolve(s?.signalRepository?.lidMapping?.getPNForLID?.(l))
-        .then(pn => { const d = _gmDigitos(pn); if (d) reg.ids.add(d); })
+        .then(pn => { const d = _gmDigitos(pn); if (d && !reg.ids.has(d)) { reg.ids.add(d); _gmContatosGravar(); } })
         .catch(() => {});
     }
   } catch (e) {}
@@ -13467,6 +13546,21 @@ async function _gmContatoRecente(telefone, contasValidas) {
   return ids.size > variantes.size ? achar(ids) : null;
 }
 
+// Numero DA CASA: uma conta nossa pareada (inclusive camp-*) ou telefone de
+// admin cadastrado na Config do CDV. Ja e contato das contas que incluem — nao
+// passa pela trava da mensagem previa.
+function _gmNumeroDaCasa(telefone) {
+  const v = _reVariantes(telefone);
+  if (!v.size) return false;
+  const bate = (num) => [..._reVariantes(String(num || '').replace(/\D/g, ''))].some(n => v.has(n));
+  try {
+    if (sock && bate(telefoneDaConta(sock))) return true;
+    for (const c of contasExtras.values()) if (c.sock && bate(telefoneDaConta(c.sock))) return true;
+    for (const a of adminsCdv()) if (a.telefone && bate(a.telefone)) return true;
+  } catch (e) {}
+  return false;
+}
+
 function _gmHoje() { return _fmtDataSP(new Date()); }
 function _fmtDataSP(d) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
@@ -13551,7 +13645,7 @@ function _gmSoPadrao(req, res) {
 
 function _gmResumoJob(j) {
   return { id: j.id, tipo: j.tipo, acao: j.acao, alvo: j.alvo, origem: j.origem, estado: j.estado,
-    total: j.total, feitos: j.feitos, pulados: j.pulados, falhas: j.falhas, atual: j.atual,
+    total: j.total, feitos: j.feitos, pulados: j.pulados, falhas: j.falhas, convites: j.convites || 0, atual: j.atual,
     proximaEm: j.proximaEm, iniciadoEm: j.iniciadoEm, terminadoEm: j.terminadoEm, erro: j.erro,
     resultados: j.resultados, grupo: j.grupo || null, criados: j.criados || null };
 }
@@ -13584,7 +13678,8 @@ function _gmFimJob(j, erro) {
   if (st.ativo === j.id) st.ativo = null;
   _gmInvalidarRetratos();
   console.log('[GESTAO] ' + j.tipo + '/' + (j.acao || '-') + ' ' + (j.alvo || '') + ' — ' + j.feitos + ' feito(s), '
-    + j.pulados + ' pulado(s), ' + j.falhas + ' falha(s) em ' + j.total + ' grupo(s).' + (erro ? ' ERRO: ' + erro : ''));
+    + j.pulados + ' pulado(s), ' + j.falhas + ' falha(s)' + (j.convites ? ', ' + j.convites + ' convite(s) enviado(s)' : '')
+    + ' em ' + j.total + ' grupo(s).' + (erro ? ' ERRO: ' + erro : ''));
 }
 
 // Cria (e dispara) a tarefa de participante. Devolve { status, body } para o
@@ -13606,29 +13701,52 @@ async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, 
     return { status: 400, body: { ok: false, erro: 'telefone invalido — informe com DDI e DDD (ex.: 5531999998888)' } };
   }
 
-  let contato = null;
+  let contato = null, casa = false;
   if (acao === 'add') {
     if (!digitos) return { status: 400, body: { ok: false, erro: 'para incluir, informe o telefone' } };
-    // Mensagem previa NAO e mais exigida (decisao do Davi, out/2026: a pessoa ja
-    // e orientada a mandar "oi" e ele controla isso). Se houver mensagem recente
-    // para uma conta apta, essa conta tem preferencia para incluir; senao vai a
-    // principal (ou o primeiro tico admin do grupo).
-    contato = await _gmContatoRecente(digitos, new Set(_gmContas().map(c => c.id)));
+    // TRAVA (voltou em 07/10/2026 — ver o cabecalho da gestao): so inclui quem
+    // escreveu no privado de uma conta nossa, e so por essa conta. Numero da
+    // casa e a unica excecao. Nao ha parametro para pular: sem a trava, a conta
+    // que inclui e deslogada pelo WhatsApp.
+    casa = _gmNumeroDaCasa(digitos);
+    const aptas = new Set(_gmContas().map(c => c.id));
+    const dias = Math.round(GM_CONTATO_JANELA_MS / 86400e3);
+    contato = await _gmContatoRecente(digitos, aptas);
+    if (!contato && !casa) {
+      const contas = _gmContas().map(c => ({ id: c.id, numero: c.numero }));
+      const nums = contas.map(c => c.id + (c.numero ? ' (' + c.numero + ')' : '')).join(', ');
+      const outra = await _gmContatoRecente(digitos);
+      if (outra && RE_CONTA_CAMPANHA.test(outra.conta)) {
+        return { status: 412, body: { ok: false, codigo: 'so-conta-campanha', contas,
+          erro: 'a pessoa so mandou mensagem para ' + outra.conta + ', que e conta de campanha e nao adiciona em grupos. '
+            + 'Peca para ela mandar um "oi" para um destes numeros' + (nums ? ': ' + nums : '') + '.' } };
+      }
+      if (outra) {
+        return { status: 503, body: { ok: false, codigo: 'conta-desconectada', contas,
+          erro: 'a pessoa mandou mensagem para ' + outra.conta + ', que nao esta conectada agora. Reconecte essa conta ou peca um "oi" para outro numero nosso.' } };
+      }
+      return { status: 412, body: { ok: false, codigo: 'sem-mensagem', contas,
+        erro: 'a pessoa ainda nao mandou mensagem para nenhum numero nosso nos ultimos ' + dias + ' dias. '
+          + 'Peca para ela salvar o contato e mandar um "oi"' + (nums ? ' para: ' + nums : '') + '.' } };
+    }
     if (contato) {
       const hoje = _gmAdicoesHoje(contato.conta);
-      if (!hoje.includes(digitos) && hoje.length >= GM_ADD_MAX_DIA) contato = null;
+      if (!hoje.includes(digitos) && hoje.length >= GM_ADD_MAX_DIA) {
+        if (!casa) return { status: 429, body: { ok: false, erro: 'limite de ' + GM_ADD_MAX_DIA + ' numeros incluidos hoje pela conta ' + contato.conta + ' atingido — continue amanha.' } };
+        contato = null;
+      }
     }
   }
 
   const j = _gmNovoJob({ tipo: 'participante', acao, alvo: digitos || partId, origem: origem || 'painel',
     total: pedidos.length, executorFixo: contato ? contato.conta : null });
-  _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato })
+  _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa })
     .catch(e => _gmFimJob(j, e.message));
   return { status: 202, body: { ok: true, jobId: j.id, total: pedidos.length, executor: j.executorFixo,
     contatoEm: contato ? new Date(contato.em).toISOString() : null } };
 }
 
-async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato }) {
+async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa }) {
   const variantes = digitos ? _reVariantes(digitos) : new Set();
   let retratos = await _gmRetratos(true);
   if (!retratos.length) return _gmFimJob(j, 'nenhuma conta conseguiu ler os grupos agora');
@@ -13648,11 +13766,18 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
 
   let jidAdd = null;
   const fixo = contato ? retratos.find(r => r.id === contato.conta) || null : null;
-  // Ordem de preferencia para incluir: quem recebeu a mensagem, a principal, os ticos.
-  const ordemAdd = [...(fixo ? [fixo] : []), ...retratos.filter(r => r !== fixo && r.id === 'principal'),
-    ...retratos.filter(r => r !== fixo && r.id !== 'principal')];
+  // Quem inclui: SO a conta que recebeu a mensagem da pessoa. Numero da casa nao
+  // tem essa trava — ai vale a ordem principal, depois os ticos.
+  const ordemAdd = [...(fixo ? [fixo] : []),
+    ...(casa ? [...retratos.filter(r => r !== fixo && r.id === 'principal'), ...retratos.filter(r => r !== fixo && r.id !== 'principal')] : [])];
   const podeIncluirHoje = (id) => { const h = _gmAdicoesHoje(id); return h.includes(digitos) || h.length < GM_ADD_MAX_DIA; };
+  // A conta ainda e a mesma sessao viva de quando a tarefa comecou?
+  const viva = (r) => _gmContas().some(c => c.id === r.id && c.sock === r.sock);
   if (acao === 'add') {
+    if (!ordemAdd.length) {
+      return _gmFimJob(j, contato ? 'a conta ' + contato.conta + ' (que recebeu a mensagem) nao conseguiu ler os grupos agora'
+                                  : 'nenhuma conta conectada para incluir este numero');
+    }
     try {
       const w = await ordemAdd[0].sock.onWhatsApp(digitos);
       const achado = Array.isArray(w) ? w.find(x => x && x.exists && x.jid) : null;
@@ -13703,9 +13828,18 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
       if (!exec) { j.falhas++; push({ estado: 'bloqueado', detalhe: 'nenhuma conta conectada e admin deste grupo' }); continue; }
     }
 
+    // Conta caiu no meio da tarefa: para aqui. Seguir tentando os outros grupos
+    // (ou passar a vez para outra conta) so repetiria o que derrubou a primeira.
+    if (!viva(exec)) {
+      j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: 'a conta caiu antes deste grupo — nao tentei' });
+      return _gmFimJob(j, 'a conta ' + exec.id + ' caiu no meio da tarefa — parei aqui. Confira a conexao dela antes de tentar de novo.');
+    }
+
     try {
+      _gmMarcarAcao(exec.id, acao, digitos || partId, nome, 'enviando');
       const r = await exec.sock.groupParticipantsUpdate(jid, [acao === 'add' ? jidAdd : alvoP.id], acao);
       const stt = String(r?.[0]?.status || '');
+      _gmMarcarAcao(exec.id, acao, digitos || partId, nome, stt || '?');
       if (stt === '200') {
         j.feitos++;
         push({ estado: 'ok', por: exec.id, detalhe: { add: 'incluido', remove: 'removido', promote: 'agora e admin', demote: 'deixou de ser admin' }[acao] });
@@ -13713,18 +13847,61 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
       } else if (stt === '409') {
         j.pulados++; push({ estado: 'pulado', por: exec.id, detalhe: 'o WhatsApp respondeu que ja estava assim' });
       } else if (acao === 'add' && (stt === '403' || stt === '408' || stt === '401')) {
-        let link = null, erroLink = null;
-        try { link = 'https://chat.whatsapp.com/' + await exec.sock.groupInviteCode(jid); }
-        catch (e2) { erroLink = e2.message; }
-        j.falhas++;
-        push({ estado: 'convite', por: exec.id, link,
-          detalhe: link ? 'o WhatsApp nao deixou incluir direto (status ' + stt + ') — mande o link pelo seu celular'
-                        : 'status ' + stt + ' e o convite tambem falhou: ' + erroLink });
+        // 403 = a privacidade da pessoa nao deixa incluir direto (408 = saiu do
+        // grupo ha pouco). Junto vem o CONVITE PARTICULAR (add_request): e o
+        // que o app manda em "Convidar para o grupo" e o unico que serve para
+        // quem um admin removeu — o link publico do grupo e recusado para essa
+        // pessoa. So vai para quem escreveu para esta conta (a conversa ja
+        // existe) ou para numero da casa; 401 (a pessoa bloqueou a conta) nunca.
+        const filhos = Array.isArray(r?.[0]?.content?.content) ? r[0].content.content : [];
+        const pedido = filhos.find(n => n && n.tag === 'add_request') || null;
+        const codigo = pedido?.attrs?.code || null;
+        const expira = Number(pedido?.attrs?.expiration) || 0;
+        let enviado = false, erroConvite = null;
+        if (codigo && stt !== '401' && ((contato && exec === fixo) || casa)) {
+          const destino = (contato && exec === fixo && contato.jid) || jidAdd;
+          try {
+            _gmMarcarAcao(exec.id, 'convite particular', digitos, nome, 'enviando');
+            await saidaSerializada(() => _enviarComTeto(exec.sock.sendMessage(destino, { groupInvite: {
+              jid, inviteCode: codigo, inviteExpiration: expira, subject: nome,
+              text: 'Convite para o grupo ' + nome + '. É só tocar em "Entrar no grupo".',
+            } })));
+            _gmMarcarAcao(exec.id, 'convite particular', digitos, nome, 'enviado');
+            enviado = true;
+          } catch (e2) { erroConvite = e2.message; }
+        }
+        if (enviado) {
+          j.convites = (j.convites || 0) + 1;
+          push({ estado: 'convite-enviado', por: exec.id,
+            detalhe: 'a privacidade da pessoa nao deixa incluir direto — mandei o convite do grupo na conversa dela com ' + exec.id
+              + (expira ? ' (vale ate ' + new Date(expira * 1000).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit' }) + ')' : '')
+              + '. Ela entra tocando em "Entrar no grupo".' });
+        } else {
+          let link = null, erroLink = null;
+          if (viva(exec)) {
+            try { link = 'https://chat.whatsapp.com/' + await exec.sock.groupInviteCode(jid); }
+            catch (e2) { erroLink = e2.message; }
+          }
+          j.falhas++;
+          push({ estado: 'convite', por: exec.id, link,
+            detalhe: 'o WhatsApp nao deixou incluir direto (status ' + stt + ')'
+              + (erroConvite ? ' e o convite particular nao saiu (' + erroConvite + ')' : stt === '401' ? ' — a pessoa bloqueou este numero' : '')
+              + (link ? ' — sobra o link do grupo, que NAO funciona para quem foi removido por um admin'
+                      : erroLink ? ' e o link do grupo tambem falhou: ' + erroLink : '') });
+        }
       } else {
         j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: 'WhatsApp retornou status ' + (stt || '?') });
       }
     } catch (e) {
       j.falhas++; push({ estado: 'falha', por: exec.id, detalhe: e.message });
+      if (!viva(exec)) {
+        return _gmFimJob(j, 'a conta ' + exec.id + ' caiu no meio da tarefa — parei aqui. Confira a conexao dela antes de tentar de novo.');
+      }
+    }
+    // O WhatsApp pode derrubar a conta segundos DEPOIS de responder (foi assim
+    // em 07/10/2026): confere de novo antes de gastar a pausa e ir ao proximo.
+    if (i < pedidos.length - 1 && !viva(exec)) {
+      return _gmFimJob(j, 'a conta ' + exec.id + ' caiu logo depois de "' + nome + '" — parei aqui. Confira a conexao dela antes de tentar de novo.');
     }
 
     if (i < pedidos.length - 1) await _gmPausa(j, GM_PAUSA[acao]);
@@ -14209,11 +14386,14 @@ app.get('/grupos-gestao/contato', async (req, res) => {
   if (digitos.length < 12) return res.status(400).json({ ok: false, erro: 'informe o telefone com DDI e DDD' });
   const aptas = new Set(_gmContas().map(x => x.id));
   const c = await _gmContatoRecente(digitos, aptas);
-  // Falou so com a conta de campanha (camp-*): nao libera, mas diz o motivo.
-  const soCampanha = c ? null : await _gmContatoRecente(digitos);
+  // Falou so com a conta de campanha (camp-*) ou com uma conta que esta fora do
+  // ar: nao libera, mas diz o motivo.
+  const outra = c ? null : await _gmContatoRecente(digitos);
+  const campanha = outra && RE_CONTA_CAMPANHA.test(outra.conta) ? outra.conta : null;
   const contas = _gmContas().map(x => ({ id: x.id, numero: x.numero, inclusoesHoje: _gmAdicoesHoje(x.id).length }));
   res.json({ ok: true, telefone: digitos, recebida: !!c, conta: c ? c.conta : null,
-    contaCampanha: soCampanha ? soCampanha.conta : null,
+    casa: _gmNumeroDaCasa(digitos),
+    contaCampanha: campanha, contaDesconectada: outra && !campanha ? outra.conta : null,
     em: c ? new Date(c.em).toISOString() : null, janelaHoras: Math.round(GM_CONTATO_JANELA_MS / 3600e3),
     limiteInclusoesDia: GM_ADD_MAX_DIA, contas });
 });
@@ -14477,9 +14657,11 @@ app.post('/cdv/entrada/adicionar', async (req, res) => {
   // links de grupo no privado de quem nao tinha o numero salvo — a conta
   // principal foi bloqueada logo depois. Agora a reentrada passa pela gestao de
   // grupos: exige que a pessoa tenha mandado mensagem antes, sai so pela conta
-  // que recebeu essa mensagem, roda como tarefa com pausa longa e nao manda
-  // nada no privado. Resposta: { ok, jobId } — acompanhar em
-  // GET /grupos-gestao/tarefa/:id.
+  // que recebeu essa mensagem e roda como tarefa com pausa longa. No privado so
+  // vai o convite particular do grupo, e so quando o WhatsApp recusa a inclusao
+  // direta (na conversa que a propria pessoa abriu). Sem mensagem previa a
+  // resposta e 412 (codigo 'sem-mensagem'). Resposta: { ok, jobId } —
+  // acompanhar em GET /grupos-gestao/tarefa/:id.
   const ativos = gruposEntradaCdv();
   const pedidos = Array.isArray(req.body?.jids) && req.body.jids.length
     ? req.body.jids.map(j => String(j).trim()).filter(j => ativos.includes(j))
