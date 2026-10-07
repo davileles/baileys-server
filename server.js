@@ -2959,6 +2959,9 @@ async function workerFila() {
       // só emissões efetivamente enviadas entram no histórico divulgado.
       // Fallback em item.dados cobre agendamentos cuja oferta já saiu da fila.
       const de = ofertaEnviada?.dadosExtraidos || item.dados || {};
+      // Trava de repetida: marca que saiu (e cobre a oferta aprovada antes de
+      // um restart, que volta para a fila sem passar por enfileirarEnvio).
+      if (item.destino === grupoEmissaoCdv()) registrarEmissaoRecente(item.ofertaId, de, true);
       if (item.registrar !== false && de.origem && de.destino && de.programa && !ehPagante(de) && ofertaEnviada?.tipoConteudo !== 'cupom_tsp') {
         registrarPassagemProxy({
           origem:      de.origem,
@@ -3014,6 +3017,123 @@ async function workerFila() {
   console.log('[FILA] Worker encerrado (fila vazia).');
 }
 
+// ── TRAVA DE EMISSAO REPETIDA ────────────────────────────────────────────────
+// A mesma emissao chega mais de uma vez: o mesmo alerta em dois grupos de
+// origem (cada grupo tem seu buffer), a mesma oportunidade repostada horas
+// depois por outra fonte, ou duas vezes no mesmo lote com listas de datas
+// diferentes. Sem comparar com o que ja saiu, as duas eram aprovadas sozinhas
+// e iam para o grupo de emissoes (e dai para executiva e estados) — em
+// 07/10/2026 isso era 11,5% do que saia.
+//
+// Regra (decidida em 07/10/2026): alerta novo com a MESMA rota (cidade, nao
+// aeroporto), programa, cabine e tipo (so ida / ida e volta) de uma emissao
+// que esta na fila de envio ou saiu nas ultimas 12 h, com pontos dentro de
+// ±2%, nao entra na fila: vira descarte "emissão repetida" (GET /cdv/descartes).
+// Mais barata que isso sai normalmente — preco melhor e noticia nova.
+// O registro e feito em enfileirarEnvio e no envio, entao vale para auto-envio,
+// aprovacao manual, agendamento e aba Emissao do gestor. Aprovacao manual
+// nunca e barrada: a trava so age na ENTRADA do alerta (entregarOfertaAlerta).
+// Tarifa pagante fica de fora (sem pontos para comparar).
+// EMISSAO_REPETIDA_HORAS muda a janela; 0 desliga.
+const EMISSAO_REPETIDA_JANELA_MS = (() => {
+  const h = Number(process.env.EMISSAO_REPETIDA_HORAS);
+  return (process.env.EMISSAO_REPETIDA_HORAS !== undefined && Number.isFinite(h) && h >= 0 ? h : 12) * 3600000;
+})();
+const EMISSAO_REPETIDA_TOL = 0.02;
+const EMISSOES_RECENTES_PATH = SESSAO_DIR + '/emissoes_recentes.json';
+const EMISSOES_RECENTES_MAX = 500;
+// [{ id, chave, pontos, em, enviadoEm }] — em = quando entrou na fila de envio.
+let _emissoesRecentes = [];
+try {
+  if (existsSync(EMISSOES_RECENTES_PATH)) {
+    const lidas = JSON.parse(readFileSync(EMISSOES_RECENTES_PATH, 'utf-8'));
+    if (Array.isArray(lidas)) _emissoesRecentes = lidas.filter(e => e && e.id && e.chave && e.pontos > 0);
+  }
+} catch (e) { console.warn('[REPETIDA] Erro ao carregar emissoes_recentes:', e.message); }
+
+function salvarEmissoesRecentes() {
+  try {
+    const agora = Date.now();
+    // Enviada: vale pela janela. So enfileirada: fica ate 48 h (aprovada expira
+    // em 24 h na fila; o que passar disso nunca saiu).
+    _emissoesRecentes = _emissoesRecentes.filter(e => e.enviadoEm
+      ? agora - e.enviadoEm <= Math.max(EMISSAO_REPETIDA_JANELA_MS, 3600000)
+      : agora - e.em <= 48 * 3600000);
+    if (_emissoesRecentes.length > EMISSOES_RECENTES_MAX) {
+      _emissoesRecentes = _emissoesRecentes.slice(-EMISSOES_RECENTES_MAX);
+    }
+    escreverAtomico(EMISSOES_RECENTES_PATH, JSON.stringify(_emissoesRecentes), 'utf-8');
+  } catch (e) { console.warn('[REPETIDA] Erro ao salvar emissoes_recentes:', e.message); }
+}
+
+// Chave da emissao para a trava. Cidade e nao aeroporto, porque e a cidade que
+// vai no titulo da mensagem (GRU e CGH saem os dois como "São Paulo").
+function chaveEmissaoRepetida(d) {
+  if (!d || ehPagante(d)) return null;
+  const cid = (s) => {
+    const k = normalizarCidade(String(s || '').replace(/\([^)]*\)/g, ' '));
+    return normalizarCidade(CIDADE_ALIAS[k] || k);
+  };
+  const origem = cid(d.origem), destino = cid(d.destino);
+  const programa = normalizarCidade(d.programa);
+  if (!origem || !destino || !programa) return null;
+  const cabine = normalizarCidade(d.cabine || 'Economica');
+  const volta = String(d.datasVolta || '').trim();
+  return [origem, destino, programa, cabine, (volta && volta !== '-') ? 'ida-volta' : 'ida'].join('|');
+}
+
+// Anota a emissao como "na fila" (enviada=false) ou "saiu" (enviada=true).
+// Mesmo id atualiza o registro: a oferta requeue/editada nao vira duas linhas.
+function registrarEmissaoRecente(ofertaId, dados, enviada) {
+  try {
+    if (!EMISSAO_REPETIDA_JANELA_MS) return;
+    const chave = chaveEmissaoRepetida(dados);
+    const pontos = Number(dados && dados.pontos) || 0;
+    if (!chave || pontos <= 0) return;
+    const id = String(ofertaId);
+    const agora = Date.now();
+    let reg = _emissoesRecentes.find(e => e.id === id);
+    if (!reg) { reg = { id, chave, pontos, em: agora, enviadoEm: null }; _emissoesRecentes.push(reg); }
+    reg.chave = chave;
+    reg.pontos = pontos;
+    if (enviada) reg.enviadoEm = agora;
+    salvarEmissoesRecentes();
+  } catch (e) { console.warn('[REPETIDA] Falha ao registrar emissao #' + ofertaId + ':', e.message); }
+}
+
+// A emissao ja esta na fila de envio ou saiu dentro da janela? Devolve
+// { id, pontos, situacao } da que ja existe, ou null. Qualquer erro = null:
+// a trava nunca pode segurar um alerta por defeito dela mesma.
+function emissaoRepetida(dados) {
+  try {
+    if (!EMISSAO_REPETIDA_JANELA_MS) return null;
+    const chave = chaveEmissaoRepetida(dados);
+    const pontos = Number(dados && dados.pontos) || 0;
+    if (!chave || pontos <= 0) return null;
+    const agora = Date.now();
+    const naFila = new Set(filaEnvio.map(i => String(i.ofertaId)));
+    for (let i = _emissoesRecentes.length - 1; i >= 0; i--) {
+      const e = _emissoesRecentes[i];
+      if (e.chave !== chave) continue;
+      if (Math.abs(pontos - e.pontos) > e.pontos * EMISSAO_REPETIDA_TOL) continue;
+      if (e.enviadoEm) {
+        const idade = agora - e.enviadoEm;
+        if (idade > EMISSAO_REPETIDA_JANELA_MS) continue;
+        const min = Math.round(idade / 60000);
+        return { id: e.id, pontos: e.pontos,
+                 situacao: 'enviada há ' + (min < 60 ? min + ' min' : Math.floor(min / 60) + 'h' + String(min % 60).padStart(2, '0')) };
+      }
+      // Enfileirada e ainda la. Saiu da fila sem enviar (cancelada, falhou e
+      // voltou para aprovacao) = nao conta.
+      if (naFila.has(e.id)) return { id: e.id, pontos: e.pontos, situacao: 'na fila de envio' };
+    }
+    return null;
+  } catch (e) {
+    console.warn('[REPETIDA] Falha na checagem:', e.message);
+    return null;
+  }
+}
+
 function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados, opts) {
   const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
   const posicao = filaEnvio.length;
@@ -3031,6 +3151,8 @@ function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados, opts) {
                    fonte: o.fonte || null,
                    captura: o.captura || null,
                    registrar: o.registrar === false ? false : true });
+  // Trava de repetida: a partir daqui um alerta igual nao entra de novo.
+  if (destino === grupoEmissaoCdv()) registrarEmissaoRecente(ofertaId, dados, false);
   console.log('[FILA] Oferta #' + ofertaId + ' enfileirada na posição ' + (posicao + 1));
   workerFila().catch(e => {
     console.error('[FILA] Worker encerrou com erro:', e.message);
@@ -3854,6 +3976,23 @@ function avaliarAutoEnvioAlerta(oferta, hist180) {
 // passagens.json (único ponto de gravação definitiva), exatamente como na
 // aprovação manual.
 function entregarOfertaAlerta(oferta, hist180) {
+  // Trava de repetida (ver TRAVA DE EMISSAO REPETIDA): mesma rota, programa,
+  // cabine e pontos (±2%) de algo que esta na fila de envio ou saiu na janela
+  // nao entra na fila nem vira card — fica so no registro de descartes.
+  if (!ehConteudoTsp(oferta.tipoConteudo)) {
+    const rep = emissaoRepetida(oferta.dadosExtraidos);
+    if (rep) {
+      const deRep = oferta.dadosExtraidos || {};
+      const ptsRep = (Number(deRep.pontos) || 0).toLocaleString('pt-BR');
+      const detalhe = 'igual à #' + rep.id + ' (' + rep.situacao + ', '
+        + Number(rep.pontos).toLocaleString('pt-BR') + ' pts); esta veio com ' + ptsRep + ' pts';
+      console.log('[REPETIDA] Emissão descartada: ' + (deRep.origem || '?') + '->' + (deRep.destino || '?')
+        + ' ' + (deRep.programa || '') + '/' + (deRep.cabine || '') + ' — ' + detalhe);
+      registrarDescarteCdv({ jid: oferta.grupoOrigem, motivo: 'emissão repetida', detalhe,
+        dados: deRep, texto: oferta.conteudoOriginal });
+      return;
+    }
+  }
   filaPendentes.unshift(oferta);
   // Guardado na oferta porque o card do Telegram precisa mostrar o numero que
   // o gate usou. Sem isso o operador ve "acima do teto" sem saber de que teto
@@ -7863,6 +8002,7 @@ const PRESERVAR_NO_RESET = new Set([
   'cupons_vistos.json',     // dedup de cupons
   'radar_vistos.json',      // dedup do radar
   'msgs-enviadas.json',     // dedup de mensagens enviadas
+  'emissoes_recentes.json', // trava de emissao repetida (o que esta na fila/saiu nas ultimas horas)
   'publicadas.json',        // historico da vitrine publica
   'rastreio.json',          // ledger ref -> produto (rastreio de desempenho)
   'health.json',            // marcos de saude do inbound (regua do watchdog)
@@ -16802,6 +16942,7 @@ app.post('/enviar', async (req, res) => {
       res.json({ ok:true, comPreview: !!lp });
       // Emissao direta (direto:true) nao passa pela fila: copia aqui, depois de
       // responder, para o cliente HTTP nao esperar a pausa entre as mensagens.
+      if (isEmissao && grupoId === grupoEmissaoCdv()) registrarEmissaoRecente('dir-' + Date.now().toString(36), dados || null, true);
       if (isEmissao) copiarDerivadasEmissao(grupoId, mensagem, dados || null, 'direta').catch(() => {});
     }
     catch(err) { res.status(500).json({ ok:false, erro:err.message }); }

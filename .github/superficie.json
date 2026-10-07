@@ -217,7 +217,9 @@
         "app.post('/listas/disparo-unico/previa'",
         "function aplicarEdicaoDisparo(",
         "codigo: 'sem-mensagem'",
-        "function _gmNumeroDaCasa("
+        "function _gmNumeroDaCasa(",
+        "function emissaoRepetida(",
+        "function registrarEmissaoRecente("
       ]
     },
     "radar-awin.js": {
