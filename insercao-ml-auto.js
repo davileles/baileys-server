@@ -107,6 +107,14 @@ const PROBLEMAS_MAX = 2;                   // "Tivemos um problema" seguidos = c
 const INVALIDOS_SEGUIDOS_MAX = 3;          // "nao existe" em serie = canal suspeito
 const PAGINA_MUDOU_MAX = 2;                // seletor ausente em visitas SEGUIDAS = pagina mudou mesmo
 const CANAL_OK_VALIDADE_MS = 24 * 60 * 60 * 1000;
+// 07/10/2026 — REVERIFICACAO: cupom confirmado na conta que a leitura de "Meus
+// cupons" nao encontrou (venceu, esgotou, foi usado ou e card sem codigo
+// digitavel) pega carona na proxima visita de insercao: a extensao "insere" o
+// codigo de novo e a resposta do ML (ja tinha / vencido / esgotado) atualiza a
+// base. So vai junto quando ja existe cupom NOVO para inserir — nenhuma visita
+// e aberta so para reverificar.
+const REVERIF_POR_VISITA = 10;             // no maximo tantos por visita
+const REVERIF_INTERVALO_MS = 24 * 60 * 60 * 1000;  // o mesmo cupom no maximo 1x por dia
 const VISITA_EXPIRA_MS = 7 * 60000;        // visita SEM ATIVIDADE ha tanto: lote volta para a fila
 const EXTENSAO_AUSENTE_MS = 30 * 60000;    // sem contato ha tanto = extensao fora do ar
 const RE_CODIGO = /^[A-Za-z0-9._-]{2,23}$/;  // 23 = maxlength do campo do ML
@@ -142,7 +150,9 @@ let estado = {
   falhas: 0,
   liberaEm: {},         // chave → ms em que o cupom fica elegivel
   entrouEm: {},         // chave → ms em que entrou na fila (limite de espera)
-  visita: null,         // { id, chaves, iniciadaEm } — lote em andamento
+  visita: null,         // { id, chaves, reverificar, iniciadaEm } — lote em andamento
+  reverificar: {},      // chave → ms: confirmado na conta mas ausente da ultima leitura de "Meus cupons"
+  reverificadoEm: {},   // chave → ms da ultima reverificacao (resposta do ML)
   tetoAvisadoEm: null,  // dia em que o excedente ja foi devolvido ao manual
   folgaAvisadaEm: null,
   ausenteAvisadaEm: null,
@@ -183,6 +193,8 @@ function carregar() {
     if (existsSync(ESTADO_PATH)) estado = { ...estado, ...JSON.parse(readFileSync(ESTADO_PATH, 'utf-8')) };
     if (!estado.liberaEm || typeof estado.liberaEm !== 'object') estado.liberaEm = {};
     if (!estado.entrouEm || typeof estado.entrouEm !== 'object') estado.entrouEm = {};
+    if (!estado.reverificar || typeof estado.reverificar !== 'object') estado.reverificar = {};
+    if (!estado.reverificadoEm || typeof estado.reverificadoEm !== 'object') estado.reverificadoEm = {};
   } catch (e) { console.warn('[CUPONS-ML-AUTO] Estado ilegivel, comecando do zero:', e.message); }
 }
 function salvar() {
@@ -224,6 +236,20 @@ function naFila() { return inseriveis().filter(r => r.insercaoMl === FILA).sort(
 function emVisita() { return inseriveis().filter(r => r.insercaoMl === VISITA); }
 function elegiveis(agora = Date.now()) {
   return naFila().filter(r => (estado.liberaEm[r.chave] || 0) <= agora);
+}
+/** Confirmados na conta, ativos, ausentes da ultima leitura e nao reverificados hoje. */
+function paraReverificar(agora = Date.now()) {
+  const base = dep.listarCuponsBase() || [];
+  const out = [];
+  for (const chave of Object.keys(estado.reverificar || {})) {
+    const r = base.find(x => x.chave === chave);
+    if (!r || !ehMl(r) || !r.codigo || r.ativo === false || r.confirmadoNoMl !== true
+        || !RE_CODIGO.test(String(r.codigo))) { delete estado.reverificar[chave]; continue; }
+    if (agora - (estado.reverificadoEm[chave] || 0) < REVERIF_INTERVALO_MS) continue;
+    out.push(r);
+  }
+  // Quem esta ha mais tempo sem prova vai primeiro.
+  return out.sort((a, b) => (estado.reverificadoEm[a.chave] || 0) - (estado.reverificadoEm[b.chave] || 0));
 }
 function marcar(reg, campos) {
   try { return dep.atualizarCupomBase(reg.chave, campos); }
@@ -427,14 +453,21 @@ export function proximoLoteInsercaoMl({ espiar = false } = {}) {
   const lote = todos.slice(0, tamanho);
   if (espiar) { salvar(); return { ...base, motivo: 'pronto', espiar: true, lote: lote.map(r => ({ chave: r.chave, codigo: String(r.codigo).trim().toUpperCase() })) }; }
 
+  // Carona: cupons ja confirmados que sumiram de "Meus cupons" vao no fim do
+  // lote para o ML dizer se ainda valem (cabem nas vagas da trava do dia).
+  const sobra = Math.max(0, vagas - lote.length);
+  const rever = paraReverificar(agora).slice(0, Math.min(REVERIF_POR_VISITA, sobra));
   const id = randomBytes(6).toString('hex');
   const chaves = [];
   for (const r of lote) if (marcar(r, { insercaoMl: VISITA })) chaves.push(r.chave);
-  estado.visita = { id, chaves, iniciadaEm: agora, ativoEm: agora };
+  const reverificar = rever.map(r => r.chave);
+  estado.visita = { id, chaves, reverificar, iniciadaEm: agora, ativoEm: agora };
   salvar();
-  console.log('[CUPONS-ML-AUTO] Visita ' + id + ' entregue a extensao: ' + lote.map(r => r.codigo).join(', '));
+  console.log('[CUPONS-ML-AUTO] Visita ' + id + ' entregue a extensao: ' + lote.map(r => r.codigo).join(', ')
+    + (rever.length ? ' | reverificar: ' + rever.map(r => r.codigo).join(', ') : ''));
+  const item = r => ({ chave: r.chave, codigo: String(r.codigo).trim().toUpperCase() });
   return { ...base, motivo: 'pronto', visitaId: id,
-    lote: lote.filter(r => chaves.includes(r.chave)).map(r => ({ chave: r.chave, codigo: String(r.codigo).trim().toUpperCase() })) };
+    lote: [...lote.filter(r => chaves.includes(r.chave)).map(item), ...rever.map(item)] };
 }
 
 /**
@@ -448,6 +481,7 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   if (!estado.visita || estado.visita.id !== visitaId) { salvar(); return { ok: false, erro: 'visita desconhecida ou expirada' }; }
   if (!VEREDITOS.has(veredito)) { salvar(); return { ok: false, erro: 'veredito inválido' }; }
   const reg = (dep.listarCuponsBase() || []).find(r => r.chave === chave);
+  if (reg && (estado.visita.reverificar || []).includes(chave)) return registrarReverificacao(reg, { veredito, rc, status, mensagem, venceuEm });
   if (!reg || !estado.visita.chaves.includes(chave)) { salvar(); return { ok: false, erro: 'cupom não pertence a esta visita' }; }
   estado.visita.ativoEm = Date.now();
   const codigo = String(reg.codigo || '').toUpperCase();
@@ -567,6 +601,122 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   return { ok: true };
 }
 
+/**
+ * Resposta do ML para um cupom JA CONFIRMADO que sumiu de "Meus cupons".
+ * Mesmos contadores de seguranca da insercao (disjuntor), mas o cupom nunca
+ * entra na fila nem vai para o /inserir: ou o ML prova que vale, ou que acabou,
+ * ou fica como esta e tenta de novo amanha.
+ */
+async function registrarReverificacao(reg, { veredito, rc, status, mensagem, venceuEm }) {
+  estado.visita.ativoEm = Date.now();
+  estado.visita.reverificar = (estado.visita.reverificar || []).filter(k => k !== reg.chave);
+  const codigo = String(reg.codigo || '').toUpperCase();
+  const msg = String(mensagem || '').slice(0, 160);
+  const st = Number(status) || 0;
+  if (veredito === 'problema' && st !== 403) {
+    const lido = String(rc || '') + ' ' + msg;
+    if (/\bINVALID_1\b/.test(lido)) veredito = 'inexistente';
+    else if (RE_INDISPONIVEL.test(lido)) veredito = 'indisponivel';
+  }
+  const tentar = () => { estado.reverificadoEm[reg.chave] = Date.now(); };
+
+  if (veredito === 'erro') {
+    estado.falhas++; salvar();
+    if (estado.falhas >= FALHAS_MAX) await abrirDisjuntor(FALHAS_MAX + ' erros seguidos na extensão (' + msg + ')', codigo);
+    return { ok: true };
+  }
+  if (veredito === 'sem_login') {
+    salvar();
+    await abrirDisjuntor('a extensão encontrou o Mercado Livre deslogado — faça login no Chrome e religue', codigo);
+    return { ok: true };
+  }
+  if (veredito === 'pagina_mudou') {
+    // Mesmo cupom travando a pagina: so ele sai da reverificacao do dia.
+    estado.paginaMudouSeguidos = (estado.paginaMudouSeguidos || 0) + 1;
+    estado.paginaMudouCodigos = [...(estado.paginaMudouCodigos || []), codigo].slice(-5);
+    tentar(); salvar();
+    if (estado.paginaMudouSeguidos >= PAGINA_MUDOU_MAX && new Set(estado.paginaMudouCodigos).size >= 2) {
+      await abrirDisjuntor('a página de cupons do ML mudou (seletor não encontrado: ' + msg + ')', codigo);
+    }
+    return { ok: true };
+  }
+
+  estado.feitasHoje++;
+  estado.falhas = 0;
+  estado.paginaMudouSeguidos = 0;
+  estado.paginaMudouCodigos = [];
+  tentar();
+
+  if (veredito === 'inserido' || veredito === 'ja_tinha') {
+    estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
+    // Vale AGORA: validade vencida na base nao pode derruba-lo na proxima hora.
+    const campos = { ativo: true, confirmadoNoMl: true };
+    if (!(Date.parse(reg.validadeAte || '') > Date.now()) && dep.validadeDeTexto) {
+      try { const v = dep.validadeDeTexto('amanha'); if (v) campos.validadeAte = v; } catch (e) {}
+    }
+    marcar(reg, campos);
+    delete estado.reverificar[reg.chave];
+    registrarDesfecho(reg, veredito === 'ja_tinha' ? '🔎 segue na conta' : '🔎 voltou para a conta');
+  } else if (veredito === 'esgotado' || veredito === 'vencido') {
+    estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
+    const campos = { ativo: false, insercaoMl: 'recusado', observacao: 'Reverificado pela extensão: ' + (msg || rc || veredito) };
+    let quando = venceuEm && !isNaN(Date.parse(venceuEm)) ? new Date(venceuEm).toISOString() : null;
+    if (!quando && veredito === 'vencido' && dep.validadeDeVencimento) { try { quando = dep.validadeDeVencimento(msg); } catch (e) {} }
+    if (quando) campos.validadeAte = quando;
+    marcar(reg, campos);
+    delete estado.reverificar[reg.chave];
+    registrarDesfecho(reg, veredito === 'esgotado' ? '🔎🗑 esgotou' : '🔎🗑 venceu');
+  } else if (veredito === 'indisponivel') {
+    estado.canalOkEm = Date.now(); estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0;
+    marcar(reg, { observacao: 'Indisponível para a conta TSP segundo o ML: ' + (msg || rc || 'sem mensagem') });
+    delete estado.reverificar[reg.chave];
+    registrarDesfecho(reg, '🔎🚫 indisponível p/ a conta');
+  } else if (veredito === 'inexistente') {
+    estado.problemasSeguidos = 0;
+    estado.invalidosSeguidos++;
+    if (estado.invalidosSeguidos >= INVALIDOS_SEGUIDOS_MAX) {
+      salvar();
+      await abrirDisjuntor(INVALIDOS_SEGUIDOS_MAX + ' códigos seguidos recusados como inexistentes — o ML pode estar respondendo "inválido" para tudo', codigo);
+      return { ok: true };
+    }
+    if (Date.now() - (estado.canalOkEm || 0) < CANAL_OK_VALIDADE_MS) {
+      marcar(reg, { ativo: false, insercaoMl: 'recusado', observacao: 'Código inexistente segundo o ML (reverificação pela extensão)' });
+      delete estado.reverificar[reg.chave];
+      registrarDesfecho(reg, '🔎🗑 não existe mais');
+    }
+    // Sem prova recente de canal vivo: fica como esta e tenta amanha.
+  } else if (veredito === 'problema') {
+    estado.problemasSeguidos++;
+    salvar();
+    if (st === 403 || estado.problemasSeguidos >= PROBLEMAS_MAX) {
+      await abrirDisjuntor('o ML respondeu com erro genérico' + (st ? ' (HTTP ' + st + ')' : '') + (msg ? ' — ' + msg : '') + ' — cheira a restrição da conta', codigo);
+      return { ok: true };
+    }
+  }
+  salvar();
+  return { ok: true };
+}
+
+/**
+ * Leitura de "Meus cupons" aplicada (server.js): os confirmados que a pagina nao
+ * mostrou viram candidatos a reverificacao; os que apareceram saem da lista.
+ */
+export function marcarAusentesLeituraMl(ausentes = []) {
+  const agora = Date.now();
+  const novo = {};
+  for (const a of ausentes) {
+    if (!a || !a.chave || a.confirmado !== true) continue;
+    novo[a.chave] = (estado.reverificar && estado.reverificar[a.chave]) || agora;
+  }
+  estado.reverificar = novo;
+  const vivas = new Set(Object.keys(novo));
+  for (const k of Object.keys(estado.reverificadoEm || {})) {
+    if (!vivas.has(k) && agora - estado.reverificadoEm[k] > 7 * REVERIF_INTERVALO_MS) delete estado.reverificadoEm[k];
+  }
+  salvar();
+  return Object.keys(novo).length;
+}
+
 /** Fim da visita: o que sobrou volta para a fila; sorteia a proxima. */
 export async function finalizarVisitaInsercaoMl({ visitaId, motivo } = {}) {
   estado.ultimoContatoExt = Date.now();
@@ -639,6 +789,7 @@ export function estadoInsercaoMlAuto() {
     lote: LOTE, pausaMin: PAUSA_MIN, agruparMin: AGRUPAR_MIN,
     naFila: dep ? naFila().map(r => r.codigo) : [],
     emVisita: dep ? emVisita().map(r => r.codigo) : [],
+    aReverificar: Object.keys(estado.reverificar || {}).length,
     visita: estado.visita,
     proximaEm: estado.proximaVisitaEm || null,
     proximaHora: hhmm(estado.proximaVisitaEm),
@@ -673,7 +824,7 @@ export async function pausarInsercaoMlAuto(motivo = 'pausada pelo operador') {
 }
 
 /**
- * deps: { listarCuponsBase, atualizarCupomBase, avisarManual, validadeDeVencimento(txt),
+ * deps: { listarCuponsBase, atualizarCupomBase, avisarManual, validadeDeVencimento(txt), validadeDeTexto(txt),
  *         avisarTelegram(texto), avisarOperador(texto), sessaoDir }
  */
 export function iniciarInsercaoMlAuto(deps) {

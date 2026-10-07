@@ -127,7 +127,8 @@ import { UFS, planejarCopiasEstado, rotaDoTitulo } from './estados-cdv.js';
 import { iniciarAgendaActions, estadoAgenda, dispararAgora, agendaAtiva } from './agenda-actions.js';
 import { iniciarInsercaoMlAuto, enfileirarInsercaoMl, estadoInsercaoMlAuto,
          religarInsercaoMlAuto, pausarInsercaoMlAuto, tokenExtensaoMlOk, extensaoMlConfigurada,
-         proximoLoteInsercaoMl, registrarResultadoInsercaoMl, finalizarVisitaInsercaoMl } from './insercao-ml-auto.js';
+         proximoLoteInsercaoMl, registrarResultadoInsercaoMl, finalizarVisitaInsercaoMl,
+         marcarAusentesLeituraMl } from './insercao-ml-auto.js';
 // E-mails de alerta do seats.aero (lidos por um Apps Script no Gmail) viram
 // mensagem no grupo "Alertas Seats.aero". Detalhes no cabecalho do modulo.
 import { processarEmailsSeats, estadoSeatsAlertas, segredoSeatsOk, seatsAlertasConfigurado,
@@ -20185,6 +20186,10 @@ app.post('/cupons/auto/leitura', (req, res) => {
       return res.json({ ok: false, erro: 'nenhum cupom lido — sessão pode ter caído ou a página mudou', fontes });
     }
     const r = aplicarLeituraCuponsMl(cupons, { totalDeclarado, semCodigo, criarNovos: true });
+    // 07/10/2026: confirmados que a pagina nao mostrou vao de carona na proxima
+    // visita de insercao para o ML dizer se ainda valem (insercao-ml-auto.js).
+    let aReverificar = 0;
+    try { aReverificar = marcarAusentesLeituraMl(r.ausentes); } catch (e) { console.warn('[CUPONS-ML] Falha ao marcar reverificacao:', e.message); }
     _leituraMl.em = agora;
     _leituraMl.resumo = { em: new Date(agora).toISOString(), ok: true, origem: String(b.origem || 'extensao').slice(0, 30),
       naPagina: cupons.length, semCodigo, totalDeclarado, leituraCompleta: r.leituraCompleta,
@@ -20192,7 +20197,7 @@ app.post('/cupons/auto/leitura', (req, res) => {
     gravarLeituraMl();
     console.log('[CUPONS-ML] Leitura pela extensao — ' + cupons.length + ' na conta, '
       + r.atualizados.length + ' atualizado(s), ' + r.criados.length + ' novo(s), '
-      + r.ausentes.length + ' da base fora da pagina' + (r.leituraCompleta ? '' : ' [leitura parcial]') + '.');
+      + r.ausentes.length + ' da base fora da pagina (' + aReverificar + ' confirmados a reverificar)' + (r.leituraCompleta ? '' : ' [leitura parcial]') + '.');
     res.json({ ok: true, aplicado: true, naPagina: cupons.length, semCodigo, totalDeclarado,
                leituraCompleta: r.leituraCompleta, atualizados: r.atualizados, criados: r.criados,
                ausentes: r.ausentes.map(a => a.codigo), fontes });
@@ -23919,6 +23924,7 @@ iniciarInsercaoMlAuto({
   listarCuponsBase,
   atualizarCupomBase,
   validadeDeVencimento,
+  validadeDeTexto,
   avisarManual: () => avisarInsercaoMlTelegram(),
   avisarTelegram: (texto) => notificarAdminsTelegram(texto),
   avisarOperador: (texto) => enviarMensagem(GRUPOS.operador, { text: texto }),
