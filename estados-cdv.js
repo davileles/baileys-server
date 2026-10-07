@@ -46,7 +46,7 @@ const AEROPORTOS_BR = {
   // AP
   MCP:['AP','Macapá'],
   // AM
-  MAO:['AM','Manaus'], TBT:['AM','Tabatinga'], PIN:['AM','Parintins'],
+  MAO:['AM','Manaus'], TFF:['AM','Tefé'], TBT:['AM','Tabatinga'], PIN:['AM','Parintins'],
   // BA
   SSA:['BA','Salvador'], BPS:['BA','Porto Seguro'], IOS:['BA','Ilhéus'],
   VDC:['BA','Vitória da Conquista'], LEC:['BA','Lençóis'], BRA:['BA','Barreiras'],
@@ -75,7 +75,7 @@ const AEROPORTOS_BR = {
   POO:['MG','Poços de Caldas'], DIQ:['MG','Divinópolis'],
   // PA
   BEL:['PA','Belém'], STM:['PA','Santarém'], MAB:['PA','Marabá'], ATM:['PA','Altamira'],
-  CKS:['PA','Parauapebas', 'Carajás'],
+  CKS:['PA','Parauapebas', 'Carajás'], ITB:['PA','Itaituba'],
   // PB
   JPA:['PB','João Pessoa'], CPV:['PB','Campina Grande'],
   // PE
@@ -119,6 +119,7 @@ const APELIDOS_CIDADE = {
   'rj': 'RJ', 'rio de janeiro galeao': 'RJ',
   'brasilia df': 'DF', 'florianopolis navegantes': 'SC', 'floripa navegantes': 'SC',
   'joao pessoa campina grande': 'PB',
+  'caixias do sul': 'RS',
 };
 
 function normalizar(s) {
