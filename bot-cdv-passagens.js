@@ -253,9 +253,15 @@ function registrarCard(chatId, msgId, ofertaId) {
   if (msgId) cardsAbertos.set(String(chatId) + ':' + msgId, String(ofertaId));
 }
 
+// Card aberto A PARTIR da lista reusa a mensagem da lista (o toque no item
+// edita a propria lista para virar card). Trocar essa mensagem pelo recibo
+// levava a fila embora e o proximo item exigia /start de novo. Ali a mensagem
+// volta a ser a lista, ja sem o item resolvido e com o desfecho no topo.
+// Card que chegou por push (mensagem propria) segue virando recibo de uma linha.
 async function encerrarCard(chatId, msgId, texto) {
   cardsAbertos.delete(String(chatId) + ':' + msgId);
   sessoes.delete(String(chatId));
+  if (msgId && msgDaFila.get(String(chatId)) === msgId) return mostrarFila(chatId, msgId, texto);
   return bot.falarHtml(chatId, texto, null, msgId);
 }
 
@@ -324,20 +330,33 @@ function rotuloItemFila(i) {
   return ['#' + i.id, rota].concat(preco).filter(Boolean).join(' · ');
 }
 
-async function mostrarFila(chatId, msgId) {
+// desfecho: recibo do card que acabou de ser resolvido a partir desta lista
+// (HTML ja escapado, vem de recibo()). Vai no topo, acima do cabecalho — a
+// confirmacao do envio nao pode sumir junto com o card.
+async function mostrarFila(chatId, msgId, desfecho) {
   const r = await apiLocal('GET', '/cdv/fila');
-  if (!r.ok) return bot.falarPlano(chatId, '❌ Não consegui ler a fila: ' + (r.erro || r.http), null, msgId);
+  if (!r.ok) {
+    // Sem a fila, o desfecho ainda precisa aparecer: e a unica confirmacao.
+    if (desfecho) {
+      return bot.falarHtml(chatId, desfecho + '\n\n❌ Não consegui reler a fila: ' + e(String(r.erro || r.http)),
+        bot.teclado([[['📋 Fila', 'p:fila:0']]]), msgId);
+    }
+    return bot.falarPlano(chatId, '❌ Não consegui ler a fila: ' + (r.erro || r.http), null, msgId);
+  }
   const itens = r.itens || [];
+  const falar = (texto, kb) => desfecho
+    ? bot.falarHtml(chatId, desfecho + '\n\n' + e(texto), kb, msgId)
+    : bot.falarPlano(chatId, texto, kb, msgId);
   let res;
   if (!itens.length) {
-    res = await bot.falarPlano(chatId, '📋 Nenhuma passagem esperando decisão.',
-      bot.teclado([[['🔄 Atualizar', 'p:fila:0']]]), msgId);
+    res = await falar('📋 Nenhuma passagem esperando decisão.',
+      bot.teclado([[['🔄 Atualizar', 'p:fila:0']]]));
   } else {
     const linhas = itens.map(i => [[rotuloItemFila(i), 'p:ver:' + i.id]]);
     linhas.push([['🔄 Atualizar', 'p:fila:0']]);
     const cabec = '📋 Passagens esperando decisão: ' + r.total
       + (r.total > itens.length ? ' (mostrando as ' + itens.length + ' mais recentes)' : '');
-    res = await bot.falarPlano(chatId, cabec, bot.teclado(linhas), msgId);
+    res = await falar(cabec, bot.teclado(linhas));
   }
   const alvo = res?.message_id || msgId;
   if (alvo) msgDaFila.set(String(chatId), alvo);
@@ -471,6 +490,16 @@ async function tratarAcao(chatId, msgId, partes, callbackId) {
       const min = Math.round((env.esperaSeg || 0) / 60);
       const quando = (env.esperaSeg || 0) < 90 ? 'em instantes' : 'em ~' + min + ' min';
       return encerrarCard(chatId, msgId, recibo(o, '🕒 Na fila de publicação (' + env.posicao + 'º, sai ' + quando + '):'));
+    }
+    // Passagem aprovada nao sai na hora: entra na fila de envio e a rota
+    // devolve posicao/horario (sem 'enviados'). Dizer "enviada em ? grupo(s)"
+    // era afirmar um envio que ainda nao aconteceu.
+    if (env.horario) {
+      const naFrente = Number(env.posicao) || 0;
+      const quando = (naFrente === 0 && (Number(env.tempoMin) || 0) <= 1)
+        ? 'sai em instantes'
+        : 'sai às ' + env.horario + (naFrente ? ' · ' + naFrente + ' na frente' : '');
+      return encerrarCard(chatId, msgId, recibo(o, '✅ Aprovada — ' + quando + ':'));
     }
     return encerrarCard(chatId, msgId, recibo(o, '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'));
   }
