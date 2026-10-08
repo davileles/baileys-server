@@ -141,6 +141,7 @@
         "app.post('/ml/testar'",
         "app.post('/ml/webhook'",
         "app.post('/monitor-precos/fila/:asin/recusar'",
+        "app.post('/monitor-precos/produto/:asin/expurgar'",
         "app.post('/monitor/:jid'",
         "app.post('/painel/aprovar/:id'",
         "app.post('/painel/limpar'",
@@ -326,6 +327,7 @@
       "minLinhas": 927,
       "obrigatorio": [
         "export async function ativarCupomMl",
+        "export async function avaliarOfertaCatalogoMl",
         "export async function buscarDadosProdutoMl",
         "export async function buscarProdutoMl",
         "export async function chamarAff",

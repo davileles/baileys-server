@@ -692,6 +692,112 @@ function idsCatalogoMl(urlResolvida, urlOriginal, opcoes = {}) {
   return [...new Set([daUrl, dica].filter(Boolean))];
 }
 
+// ── OFERTA SUSPEITA NO CATALOGO (08/10/2026) ────────────────────────────────
+// /products/{id}/items lista as ofertas e o pipeline usava a 1a como "o preco
+// do produto". Qualquer vendedor pode pendurar um anuncio no catalogo: em
+// 07/10 entrou na escada Mor de 5 degraus (MLB41432913) uma oferta de R$ 99,50
+// — vendedor com 20 vendas, envio fora do Mercado Envios, sem carrinho — num
+// catalogo cujas outras ofertas iam de R$ 245 a R$ 284. A API a devolveu em
+// primeiro, o monitor gravou R$ 99,50 na serie e a lista publicou "De 99,50
+// Por 89,55 · 63% abaixo do preco das ultimas semanas".
+//
+// Regra: a oferta que daria o preco e SUSPEITA quando custa menos de 60% da
+// mediana das outras ofertas do mesmo catalogo E nao tem lastro:
+//   - loja oficial                                   -> confiavel, fim
+//   - sem Mercado Envios e sem carrinho              -> suspeita
+//   - com Mercado Envios/carrinho, mas vendedor de
+//     reputacao vermelha/laranja, sem reputacao ou
+//     com poucas vendas (e sem selo MercadoLider)    -> suspeita
+// Queda real de loja grande nao cai aqui (as duas quedas de 40%+ medidas no
+// mesmo dia eram de loja oficial, com Mercado Envios e preco riscado).
+//
+// Oferta suspeita NAO vira preco: a divulgacao descarta o produto (o link abre
+// o catalogo, e la o comprador pode cair justamente nesse anuncio) e o monitor
+// le a proxima oferta confiavel, para a serie seguir com o preco de verdade.
+// ML_OFERTA_SUSPEITA=0 desliga; ML_SUSPEITA_RAZAO e ML_SUSPEITA_VENDAS_MIN ajustam.
+const SUSPEITA_ML_ATIVA  = String(process.env.ML_OFERTA_SUSPEITA ?? '1') !== '0';
+const SUSPEITA_ML_RAZAO  = Number(process.env.ML_SUSPEITA_RAZAO) > 0 ? Number(process.env.ML_SUSPEITA_RAZAO) : 0.6;
+const SUSPEITA_ML_VENDAS = Number.isFinite(Number(process.env.ML_SUSPEITA_VENDAS_MIN ?? NaN))
+  ? Number(process.env.ML_SUSPEITA_VENDAS_MIN) : 100;
+
+function medianaMl(v) {
+  if (!v.length) return null;
+  const o = [...v].sort((a, b) => a - b);
+  return o.length % 2 ? o[(o.length - 1) / 2] : (o[o.length / 2 - 1] + o[o.length / 2]) / 2;
+}
+
+// Reputacao do vendedor: /users/{id} responde 200 para terceiros. So e
+// consultada para oferta que ja e ponto fora da curva, e fica 6 h em memoria.
+const _repVendedorMl = new Map();   // sellerId -> { em, dados }
+async function reputacaoVendedorMl(sellerId) {
+  const id = String(sellerId || '');
+  if (!/^\d+$/.test(id)) return null;
+  const c = _repVendedorMl.get(id);
+  if (c && Date.now() - c.em < 6 * 3600000) return c.dados;
+  let dados = null;
+  try {
+    const u = await apiMl('/users/' + id);
+    const rep = u?.seller_reputation || {};
+    dados = { nivel: rep.level_id || null, selo: rep.power_seller_status || null,
+              vendas: Number(rep.transactions?.total) || 0 };
+  } catch (e) {
+    console.warn('[ML] Reputacao do vendedor ' + id + ' nao lida: ' + e.message);
+    return null;                      // falha de rede nao fica em cache
+  }
+  if (_repVendedorMl.size > 500) _repVendedorMl.clear();
+  _repVendedorMl.set(id, { em: Date.now(), dados });
+  return dados;
+}
+
+/**
+ * Julga a oferta `venc` contra as `demais` do mesmo catalogo.
+ * Devolve null (confiavel / sem base de comparacao) ou o laudo da suspeita.
+ * `opcoes.reputacao` injeta o leitor de reputacao (teste); padrao = API.
+ */
+export async function avaliarOfertaCatalogoMl(venc, demais, opcoes = {}) {
+  if (!SUSPEITA_ML_ATIVA || !venc) return null;
+  const preco = Number(venc.price);
+  const outros = (demais || []).filter(r => r && r !== venc).map(r => Number(r.price)).filter(v => v > 0);
+  if (!(preco > 0) || !outros.length) return null;
+  const med = medianaMl(outros);
+  if (!(med > 0) || preco >= med * SUSPEITA_ML_RAZAO) return null;
+  if (venc.official_store_id) return null;
+
+  const tags = Array.isArray(venc.tags) ? venc.tags : [];
+  const mercadoEnvios = String(venc.shipping?.mode || '') === 'me2';
+  const carrinho = tags.includes('cart_eligible');
+  let motivo = null;
+  if (!mercadoEnvios && !carrinho) {
+    motivo = 'vendedor sem loja oficial, sem Mercado Envios e sem carrinho';
+  } else {
+    const ler = typeof opcoes.reputacao === 'function' ? opcoes.reputacao : reputacaoVendedorMl;
+    const rep = await ler(venc.seller_id);
+    if (rep) {
+      if (/^(1_red|2_orange)$/.test(String(rep.nivel || ''))) {
+        motivo = 'vendedor com reputacao ' + (rep.nivel === '1_red' ? 'vermelha' : 'laranja');
+      } else if (!rep.selo && (!rep.nivel || rep.vendas < SUSPEITA_ML_VENDAS)) {
+        motivo = 'vendedor sem lastro (' + rep.vendas + ' venda(s), sem selo MercadoLider)';
+      }
+    }
+  }
+  if (!motivo) return null;
+  return {
+    preco, medianaDemais: Math.round(med * 100) / 100, ofertasDemais: outros.length,
+    pctAbaixo: Math.round((1 - preco / med) * 100),
+    itemId: venc.item_id || null, vendedor: venc.seller_id ? String(venc.seller_id) : null, motivo,
+  };
+}
+
+/** Erro marcado: quem chama testa `e.ofertaSuspeita` para nao tentar outro caminho. */
+function erroOfertaSuspeitaMl(catalogo, s) {
+  const brl = v => 'R$ ' + Number(v).toFixed(2).replace('.', ',');
+  const e = new Error('oferta suspeita no catalogo ' + catalogo + ': ' + brl(s.preco) + ' (' + s.pctAbaixo
+    + '% abaixo da mediana de ' + brl(s.medianaDemais) + ' das outras ' + s.ofertasDemais + ' oferta(s)) — ' + s.motivo
+    + '. Preco nao divulgado');
+  e.ofertaSuspeita = { catalogoId: catalogo, ...s };
+  return e;
+}
+
 /**
  * O item que o LINK aponta — que nem sempre e o vencedor do catalogo.
  *
@@ -775,6 +881,19 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
       itemId = opcoes.card?.itemId || itemId;
       freteGratis = !!opcoes.card?.freteGratis;
       fontePreco = FONTE_SOCIAL;
+    }
+
+    // Oferta suspeita (ver OFERTA SUSPEITA NO CATALOGO): so julga quando o
+    // preco que vai sair e mesmo o desta oferta da API — o do card do perfil
+    // social e renderizado pelo proprio ML para o item do link.
+    if (fontePreco === FONTE_API) {
+      const susp = await avaliarOfertaCatalogoMl(venc, lista);
+      if (susp) {
+        console.warn('[ML] ' + catalogo + ' — OFERTA SUSPEITA barrada: item ' + susp.itemId + ' a R$ ' + susp.preco
+          + ' (' + susp.pctAbaixo + '% abaixo da mediana R$ ' + susp.medianaDemais + ' de ' + susp.ofertasDemais
+          + ' oferta(s)) — ' + susp.motivo);
+        throw erroOfertaSuspeitaMl(catalogo, susp);
+      }
     }
 
     const precoDe = original && original > preco ? original : null;
@@ -872,19 +991,38 @@ export async function precoCatalogoApiMl(id) {
   const cat = /^MLBU?\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;
   if (!cat || !apiMlAutorizada()) return null;
   let ofertas;
-  try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=1'); }
+  // limit=20 (era 1): a 1a oferta sozinha nao diz se e ponto fora da curva. E a
+  // mesma chamada de antes, so com as vizinhas para comparar.
+  try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=20'); }
   catch (e) {
     if (/\b404\b/.test(e.message)) return null;      // id de anuncio, nao de catalogo
     throw e;
   }
-  const venc = (ofertas?.results || []).find(r => Number(r?.price) > 0) || null;
-  if (!venc) return null;
+  let resto = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
+  // Oferta suspeita nao entra na serie: pula para a proxima confiavel (ate 3
+  // saltos). A primeira descartada viaja no retorno para o monitor expurgar
+  // leituras antigas que ja tenham gravado esse preco.
+  let descartada = null, venc = null;
+  for (let salto = 0; salto <= 3 && resto.length; salto++) {
+    const susp = await avaliarOfertaCatalogoMl(resto[0], resto.slice(1));
+    if (!susp) { venc = resto[0]; break; }
+    console.warn('[ML] ' + cat + ' — oferta suspeita ignorada na leitura do monitor: item ' + susp.itemId
+      + ' a R$ ' + susp.preco + ' (' + susp.pctAbaixo + '% abaixo da mediana R$ ' + susp.medianaDemais + ') — ' + susp.motivo);
+    if (!descartada) descartada = { catalogoId: cat, ...susp };
+    resto = resto.slice(1);
+  }
+  if (!venc) {
+    // Quatro suspeitas em fila: catalogo tomado, nao ha preco confiavel para ler.
+    if (descartada) throw erroOfertaSuspeitaMl(cat, descartada);
+    return null;
+  }
   const preco = Number(venc.price);
   const original = Number(venc.original_price) || null;
   return {
     preco, precoDe: original && original > preco ? original : null, disponivel: true,
     itemId: venc.item_id || null, catalogoId: cat,
     freteGratis: !!venc.shipping?.free_shipping, fonte: 'api',
+    ofertaSuspeita: descartada,
   };
 }
 
@@ -1915,6 +2053,9 @@ export async function processarTextoMl(texto, opcoes = {}) {
     try { dadosPorUrl.set(url, await buscarDadosProdutoMl(url, {
             id: dicasMlb.get(url) || null, card: cardsSocial.get(url) || null })); }
     catch (e) {
+      // Oferta suspeita no catalogo nao tenta o nosso link (mesmo catalogo,
+      // mesmo anuncio): vira descarte com o laudo.
+      if (e?.ofertaSuspeita) { falhaDados.set(url, e.message); continue; }
       // Link colado a mao no painel (/mkt/montar): nao passou por perfil de
       // terceiro, entao nao ha card — e anuncio classico nao tem catalogo na
       // API nem pagina para ler. Sobra passar pelo NOSSO proprio link, cujo
@@ -2596,6 +2737,12 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     let dados;
     try { dados = await buscarDadosProdutoMl(bruta, { id: salvo.asin }); }
     catch (e) {
+      // Oferta suspeita no catalogo: descarta de vez. O card do nosso link abre
+      // o MESMO catalogo e mostraria o mesmo anuncio — nao e caminho alternativo.
+      if (e?.ofertaSuspeita) {
+        descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: e.message, ofertaSuspeita: e.ofertaSuspeita });
+        continue;
+      }
       // Anuncio classico colado a mao: sem perfil de terceiro para ler, sem
       // catalogo na API e sem pagina. Sobra passar pelo nosso proprio link.
       try {

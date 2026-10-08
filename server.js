@@ -82,7 +82,7 @@ import {
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
   julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
-  conferirPrecoCard, registrarEnvioCard, cardsDaFila,
+  conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie,
 } from './monitor-precos.js';
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
@@ -18761,9 +18761,28 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', e
     try {
       const _f = filtroDisparo({ asin: o.asin || asin, loja: o.produto.loja, nome: o.produto.titulo,
         preco: Number(o.produto.preco), precoDe: Number(o.produto.precoDe), cupom: o.cupom?.codigo || null });
-      if (_f?.veto) console.log('[FILTRO] Lista ' + asin + ' — ' + (_f.bloqueia ? 'PULADO' : 'vetaria (sombra)')
-        + ': ' + _f.nivel + ' — ' + _f.motivo);
-      if (_f?.bloqueia) return { ok:false, motivo:'filtro de preco: ' + _f.motivo + ' (serie ' + _f.diasSerie + 'd)' };
+      // Trava de queda anormal (50%+ contra a mediana): nao sai por lista nem
+      // por envio unico de varios itens — vira card de revisao no bot, onde o
+      // operador confere o preco e envia com um toque. Unica excecao: item cujo
+      // TEXTO o operador ja revisou na previa da extensao (edicao.texto) — ali
+      // ele viu exatamente o preco que vai sair, e a decisao e dele.
+      if (_f?.quedaAnormal) {
+        if (edicao?.texto) {
+          console.log('[FILTRO] Lista ' + asin + ' — queda anormal (' + _f.motivo + '), mas o texto foi revisado na previa: segue.');
+        } else {
+          console.warn('[FILTRO] Lista ' + asin + ' — PULADO: ' + _f.motivo + ' — indo para card de revisao.');
+          let _card = '';
+          try {
+            const c = await cardsDaFila({ asins: [String(o.asin || asin)] });
+            _card = c?.enviados ? ' — card de revisao enviado ao bot' : ' — card nao criado (' + (c?.erro || 'sem candidato na serie') + ')';
+          } catch (e) { _card = ' — card nao criado (' + e.message + ')'; }
+          return { ok:false, motivo: _f.motivo + _card };
+        }
+      } else {
+        if (_f?.veto) console.log('[FILTRO] Lista ' + asin + ' — ' + (_f.bloqueia ? 'PULADO' : 'vetaria (sombra)')
+          + ': ' + _f.nivel + ' — ' + _f.motivo);
+        if (_f?.bloqueia) return { ok:false, motivo:'filtro de preco: ' + _f.motivo + ' (serie ' + _f.diasSerie + 'd)' };
+      }
     } catch (e) { /* filtro nunca derruba a lista */ }
   }
 
@@ -20192,6 +20211,19 @@ app.get('/monitor-precos/produto/:asin', (req, res) => {
   const h = historicoDe(req.params.asin);
   if (!h) return res.status(404).json({ ok:false, erro:'sem serie para este produto' });
   res.json({ ok:true, ...h });
+});
+
+// Expurgo de leitura contaminada: tira da serie os dias em que o preco gravado
+// era um valor que se provou falso (oferta suspeita no catalogo do ML).
+// body: { preco } (valor exato) e/ou { dias:['AAAA-MM-DD'] }; so os ultimos
+// janelaDias (padrao 14). Devolve o que saiu e a serie como ficou.
+app.post('/monitor-precos/produto/:asin/expurgar', (req, res) => {
+  try {
+    const r = expurgarLeiturasDaSerie(String(req.params.asin), {
+      preco: req.body?.preco ?? null, dias: req.body?.dias ?? null, janelaDias: req.body?.janelaDias ?? 14 });
+    if (!r.ok) return res.status(400).json(r);
+    res.json({ ...r, produto: historicoDe(String(req.params.asin)) });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 // Varredura sob demanda. Sincrona de proposito: o operador clicou para VER o

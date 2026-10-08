@@ -283,6 +283,20 @@ const CFG_PADRAO = {
     modo: 'sombra',
     vetar: 'semQuedaReal',
   },
+
+  // TRAVA DE QUEDA ANORMAL (08/10/2026): queda de 'pct'% ou mais contra a
+  // mediana de 30 dias nao sai sozinha em NENHUMA loja — vira card de revisao
+  // no bot. Queda desse tamanho e, quase sempre, preco lido errado (oferta
+  // falsa no catalogo, variacao trocada, erro da loja) e nao promocao: a escada
+  // de R$ 245 anunciada a R$ 99,50 teria parado aqui. Vale mesmo com o filtro
+  // de disparo em 'sombra' ou 'off' — sao decisoes separadas. So julga produto
+  // com 'minDias' de serie; o custo assumido e que uma queda real desse
+  // tamanho espera o toque do operador.
+  travaQueda: {
+    ativo: true,
+    pct: 50,
+    minDias: 5,
+  },
 };
 
 // ── ESTADO EM MEMORIA ────────────────────────────────────────────────────────
@@ -599,6 +613,11 @@ function estruturarCfg(bruto) {
   const fd = b.filtroDisparo || {};
   out.filtroDisparo.modo  = ['off', 'sombra', 'ativo'].includes(fd.modo) ? fd.modo : CFG_PADRAO.filtroDisparo.modo;
   out.filtroDisparo.vetar = ['falsoDesconto', 'semQuedaReal'].includes(fd.vetar) ? fd.vetar : CFG_PADRAO.filtroDisparo.vetar;
+
+  const tq = b.travaQueda || {};
+  out.travaQueda.ativo   = tq.ativo !== false;
+  out.travaQueda.pct     = limitar(tq.pct, 20, 95, CFG_PADRAO.travaQueda.pct);
+  out.travaQueda.minDias = limitar(tq.minDias, 1, 90, CFG_PADRAO.travaQueda.minDias);
   return out;
 }
 
@@ -805,6 +824,68 @@ export function quedaVsHabitual(asin, preco) {
   if (!med) return null;
   const pct = Math.floor((1 - preco / med) * 100);
   return pct >= (cfg.quedaMinPct ?? 15) ? pct : null;
+}
+
+// ── EXPURGO DE LEITURA CONTAMINADA ───────────────────────────────────────────
+// Tira da serie os dias cujo preco gravado e um valor que se provou falso
+// (oferta suspeita no catalogo do ML). Sem isto a leitura ruim ficava para
+// sempre como "menor preco de 90 dias" e puxava a mediana para baixo: produto
+// que voltasse ao preco normal pareceria caro, e o falso viraria referencia.
+//   preco  valor exato a remover (tolerancia de 1 centavo)   } ao menos um
+//   dias   lista de dias 'AAAA-MM-DD' a remover               } dos dois
+// So olha os ultimos 'janelaDias' (padrao 14): contaminacao e coisa recente, e
+// um preco igual de meses atras e historia, nao erro. Se a ultima leitura era o
+// valor expurgado, ela volta para o ultimo dia bom que sobrou.
+export function expurgarLeiturasDaSerie(asin, { preco = null, dias = null, janelaDias = 14, gravarAgora = true } = {}) {
+  const h = _hist[asin];
+  if (!h?.dias) return { ok: false, erro: 'sem serie para este produto', removidos: [] };
+  const p = Number(preco);
+  const temPreco = Number.isFinite(p) && p > 0;
+  const lista = Array.isArray(dias) ? new Set(dias.map(String)) : null;
+  if (!temPreco && !lista) return { ok: false, erro: 'informe preco ou dias', removidos: [] };
+  const corte = diaSP(Date.now() - Math.max(1, Number(janelaDias) || 14) * 86400000);
+  const removidos = [];
+  for (const d of Object.keys(h.dias).sort()) {
+    if (d < corte) continue;
+    if (lista && !lista.has(d)) continue;
+    if (temPreco && Math.abs(h.dias[d] - p) > 0.011) continue;
+    removidos.push({ d, v: h.dias[d] });
+    delete h.dias[d];
+    if (h.diasEf) delete h.diasEf[d];
+    if (h.diasDe) delete h.diasDe[d];
+  }
+  if (!removidos.length) return { ok: true, removidos };
+  const eraUlt = h.ult && removidos.some(r => Math.abs(Number(h.ult.preco) - r.v) <= 0.011);
+  if (eraUlt) {
+    const ultimoBom = Object.keys(h.dias).sort().pop();
+    h.ult = ultimoBom
+      ? { preco: h.dias[ultimoBom], precoDe: h.diasDe?.[ultimoBom] ?? null, disponivel: true,
+          precoEfetivo: h.diasEf?.[ultimoBom] ?? h.dias[ultimoBom], em: ultimoBom + 'T15:00:00.000Z' }
+      : null;
+  }
+  console.log('[PRECOS] Expurgo — ' + asin + ': ' + removidos.length + ' leitura(s) removida(s) da serie ('
+    + removidos.map(r => r.d.slice(5) + ' R$ ' + r.v).join(', ') + ').');
+  if (gravarAgora) {
+    // O mes corrente sempre; mes fechado so se algum dia removido era dele.
+    const meses = new Set([mesSP(), ...removidos.map(r => mesDoDia(r.d))]);
+    for (const m of meses) gravar(nomeShard(m), serializarShard(m));
+  }
+  return { ok: true, removidos };
+}
+
+// ── TRAVA DE QUEDA ANORMAL ───────────────────────────────────────────────────
+// Ver CFG_PADRAO.travaQueda. Compara o preco de ETIQUETA (sem cupom) com a
+// mediana de 30 dias: o que se desconfia e da leitura do preco, e o cupom e um
+// desconto conhecido que nao diz nada sobre ela.
+export function quedaAnormal({ asin, preco }) {
+  const cfg = _cfg.travaQueda || CFG_PADRAO.travaQueda;
+  const base = { anormal: false, limitePct: cfg.pct };
+  const p = Number(preco);
+  if (cfg.ativo === false || !asin || !Number.isFinite(p) || p <= 0) return base;
+  const st = estatisticas(String(asin));
+  if (!st || !(st.dias >= cfg.minDias) || !Number.isFinite(st.mediana30) || st.mediana30 <= 0) return base;
+  const quedaPct = Math.round((1 - p / st.mediana30) * 1000) / 10;
+  return { ...base, anormal: quedaPct >= cfg.pct, quedaPct, mediana30: st.mediana30, diasSerie: st.dias };
 }
 
 /** Estatisticas da serie de um produto. Base de toda decisao de disparo. */
@@ -1030,8 +1111,14 @@ async function lerPreco(item) {
     // ~3-5% em quem tem esse desconto e segue consistente dali em diante.
     let viaApi = null;
     try { viaApi = await precoCatalogoApiMl(item.asin); }
-    catch (e) { console.warn('[MONITOR] API oficial ML falhou para ' + item.asin + ': ' + e.message + ' — tentando a pagina'); }
-    if (viaApi) return { preco: viaApi.preco, precoDe: viaApi.precoDe, disponivel: true, titulo: null, fonte: 'api' };
+    catch (e) {
+      // Catalogo so com oferta suspeita: nao ha preco confiavel, e a pagina
+      // mostraria o mesmo anuncio — falha deste item, com o laudo.
+      if (e?.ofertaSuspeita) throw e;
+      console.warn('[MONITOR] API oficial ML falhou para ' + item.asin + ': ' + e.message + ' — tentando a pagina');
+    }
+    if (viaApi) return { preco: viaApi.preco, precoDe: viaApi.precoDe, disponivel: true, titulo: null, fonte: 'api',
+                         ofertaSuspeita: viaApi.ofertaSuspeita || null };
     if (!tokenAffOk()) throw new Error('Mercado Livre nao configurado (ML_AFF_TOKEN) e sem cobertura da API oficial para este item');
     const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin), { id: item.asin });
     return { preco: d.preco, precoDe: d.precoDe, disponivel: d.disponivel !== false, titulo: d.titulo };
@@ -1469,6 +1556,17 @@ function classificarFiltro(av, stats, nicho) {
 export function filtroDisparo({ asin, loja, nome, preco, precoDe, cupom = null }) {
   const cfg = _cfg.filtroDisparo || CFG_PADRAO.filtroDisparo;
   const base = { modo: cfg.modo, vetar: cfg.vetar, julgavel: false, nivel: null, veto: false, bloqueia: false };
+  // Trava de queda anormal: independente do modo do filtro (ate 'off'). Bloqueia
+  // de verdade — quem chama manda para a revisao manual.
+  try {
+    const tq = quedaAnormal({ asin, preco });
+    if (tq.anormal) {
+      return { ...base, julgavel: true, nivel: 'quedaAnormal', veto: true, bloqueia: true, quedaAnormal: true,
+               quedaPct: tq.quedaPct, diasSerie: tq.diasSerie, mediana30: tq.mediana30,
+               motivo: 'queda anormal de ' + String(tq.quedaPct).replace('.', ',') + '% contra a mediana de 30 dias ('
+                 + brl(tq.mediana30) + ' -> ' + brl(Number(preco)) + '); ' + tq.limitePct + '% ou mais so sai com revisao' };
+    }
+  } catch (e) { /* trava nunca derruba envio por erro */ }
   if (cfg.modo === 'off' || !asin || !Number.isFinite(Number(preco)) || Number(preco) <= 0) return base;
   try {
     const item = { ...(itemVitrine(asin) || { asin, loja, nome: nome || '' }) };
@@ -1663,6 +1761,16 @@ export async function varrer({ manual = false } = {}) {
       try { descontoAgora = cupomVinculado(item, leitura.preco)?.desconto || 0; }
       catch (e) { descontoAgora = 0; }
     }
+    // A loja tem uma oferta suspeita na frente (ML): o preco dela pode ja estar
+    // na serie, de varreduras anteriores a trava. Sai antes de a leitura boa
+    // entrar — registrarPreco guarda o MINIMO do dia e manteria o falso.
+    if (leitura.ofertaSuspeita?.preco) {
+      try {
+        const ex = expurgarLeiturasDaSerie(item.asin, { preco: leitura.ofertaSuspeita.preco });
+        if (ex.removidos?.length) resumo.expurgadas = (resumo.expurgadas || 0) + ex.removidos.length;
+      } catch (e) { console.warn('[PRECOS] Expurgo de ' + item.asin + ' falhou:', e.message); }
+      resumo.suspeitas = (resumo.suspeitas || 0) + 1;
+    }
     registrarPreco(item.asin, {
       nome: leitura.titulo || item.nome, loja: item.loja,
       preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
@@ -1744,7 +1852,13 @@ export async function varrer({ manual = false } = {}) {
     for (let i = 0; i < outros.length; i++) {
       const item = outros[i];
       try { processar(item, await lerPreco(item)); }
-      catch (e) { falhar(item, e.message); }
+      catch (e) {
+        if (e?.ofertaSuspeita?.preco) {
+          resumo.suspeitas = (resumo.suspeitas || 0) + 1;
+          try { expurgarLeiturasDaSerie(item.asin, { preco: e.ofertaSuspeita.preco }); } catch (e2) {}
+        }
+        falhar(item, e.message);
+      }
       // Pausa a cada lote: as APIs limitam por janela curta e nao adianta
       // correr — a varredura tem uma hora inteira para terminar.
       if ((i + 1) % _cfg.varredura.lote === 0) {
@@ -2043,14 +2157,19 @@ function escolherDaFila() {
   const geralLiberado  = (agora - (_estado.ultimoEnvioEm || 0)) >= _cfg.publicacao.intervaloMin * 60000;
 
   const bloqueios = [];
+  // Queda anormal (travaQueda) nunca sai pelo publicador automatico: fica na
+  // fila para o card de revisao do bot, onde o operador confere o preco.
+  const tq = _cfg.travaQueda || CFG_PADRAO.travaQueda;
+  const anormal = f => tq.ativo !== false && Number(f.quedaPctBruto ?? f.quedaPct) >= tq.pct;
   // Curados primeiro: sao os que tem hora marcada com um grupo que os espera.
   if (curadoLiberado) {
-    const c = _estado.fila.find(f => f.curado);
+    const c = _estado.fila.find(f => f.curado && !anormal(f));
     if (c) return { escolhido: c, viaCurado: true, bloqueios };
   }
   if (geralLiberado) {
     for (const f of _estado.fila) {
       if (f.curado) continue;   // curado nunca ocupa o slot do geral
+      if (anormal(f)) { bloqueios.push('queda anormal (' + f.asin + ') aguardando revisao'); continue; }
       const c = cotaDisponivel(f.loja, f.nicho);
       if (c.ok) return { escolhido: f, viaCurado: false, bloqueios };
       bloqueios.push(c.motivo);
