@@ -3696,7 +3696,7 @@ function formatarMensagemPaganteCDV(d) {
   msg += '💵 *TARIFA PAGANTE* — emissão em dinheiro direto no site da companhia, sem uso de pontos ou milhas.'+n+n;
   msg += '✈️ *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
   msg += '🛬 *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
-  msg += '✈️ *CIA AÉREA* '+(d.cia||'-')+n+n;
+  msg += '✈️ *CIA AÉREA* '+(normalizarCia(d.cia)||'-')+n+n;
   msg += '🔗 *LINK* '+(String(d.link||'').trim()||'-')+n+n;
   msg += rodape;
   return msg;
@@ -3729,7 +3729,7 @@ function formatarMensagemCDV(d) {
   msg += '✈️ *DATAS DE IDA*'+n+formatarDatas(d.datasIda)+n+n;
   msg += '🛬 *DATAS DE VOLTA*'+n+formatarDatas(d.datasVolta)+n+n;
   msg += '🎟️ *PROGRAMA* '+d.programa+n+n;
-  msg += '✈️ *CIA AÉREA* '+d.cia+n+n;
+  msg += '✈️ *CIA AÉREA* '+normalizarCia(d.cia)+n+n;
   msg += '🔗 *LINK* '+link+n+n;
   msg += rodape;
   return msg;
@@ -6903,6 +6903,9 @@ const ALIAS_CIA = {
   'ib plus':'Iberia', 'iberia express':'Iberia',
   'vs':'Virgin Atlantic', 'virgin atlantic':'Virgin Atlantic',
   'af/klm':'Air France', 'airfrance':'Air France',
+  'at':'Royal Air Maroc', 'ram':'Royal Air Maroc', 'royal air maroc':'Royal Air Maroc', 'air maroc':'Royal Air Maroc',
+  'royal maroc':'Royal Air Maroc', 'royal air marroc':'Royal Air Maroc', 'air marroc':'Royal Air Maroc',
+  'royal air morocco':'Royal Air Maroc', 'air morocco':'Royal Air Maroc',
 };
 
 function normalizarCia(cia) {
