@@ -606,11 +606,21 @@ let _encerrando = false;
 async function encerrarComFlush(sinal, codigo = 0) {
   if (_encerrando) return;                 // SIGTERM seguido de SIGINT nao reentra
   _encerrando = true;
+  const _t0Enc = Date.now();
   // Primeiro a sessao Signal, sempre: e o unico estado que, perdido, corrompe
   // entregas futuras (replay -> "Aguardando mensagem"). Teto curto: 3s cobrem
   // qualquer rajada de gravacoes e cabem folgados no draining de 25s.
   try { await _flushTodasSessoes(3000); }
   catch (e) { console.error('[AUTH] Falha ao drenar sessao no encerramento:', e.message); }
+  // O flush do GitHub abaixo pode levar ate 20 s, e nesse intervalo o processo
+  // segue enviando e recebendo: as chaves gravadas depois do dreno acima se
+  // perdiam no exit. Segundo dreno imediatamente antes de sair, dentro do que
+  // sobra dos 25 s de draining.
+  const _drenoFinal = async () => {
+    const sobra = 24000 - (Date.now() - _t0Enc);
+    if (sobra < 300) return;
+    try { await _flushTodasSessoes(Math.min(3000, sobra)); } catch (e) {}
+  };
   const pendentes = pushesPendentes();
   if (!pendentes.length) { console.log('[SYNC] ' + sinal + ' — nada no debounce.'); process.exit(codigo); }
 
@@ -627,6 +637,7 @@ async function encerrarComFlush(sinal, codigo = 0) {
     if (r === estourou) console.error('[SYNC] Flush nao terminou em 20s — pode haver perda: ' + pendentes.join(', '));
     else console.log('[SYNC] Flush concluido no encerramento.');
   } catch (e) { console.error('[SYNC] Falha no flush de encerramento:', e.message); }
+  await _drenoFinal();
   process.exit(codigo);
 }
 process.on('SIGTERM', () => encerrarComFlush('SIGTERM'));
@@ -1037,7 +1048,11 @@ async function _flushTodasSessoes(maxMs = 3000) {
   if (!fns.length) return;
   const t0 = Date.now();
   await Promise.all(fns.map(f => f(maxMs).catch(() => {})));
-  console.log('[AUTH] Sessao(oes) drenada(s) antes do exit em ' + (Date.now() - t0) + ' ms (' + fns.length + ' pasta(s)).');
+  const ms = Date.now() - t0;
+  console.log('[AUTH] Sessao(oes) drenada(s) antes do exit em ' + ms + ' ms (' + fns.length + ' pasta(s)).');
+  // Bateu no teto = ainda havia chave para gravar: o proximo boot cifra com
+  // contador repetido para esses aparelhos ("Aguardando mensagem").
+  if (ms >= maxMs - 50) console.warn('[AUTH] Dreno da sessao ESTOUROU o teto de ' + maxMs + ' ms — pode ter ficado chave sem gravar.');
 }
 
 const app    = express();
@@ -2053,6 +2068,82 @@ function registrarEnvioTelemetria(apelido, destino, motor) {
     _salvarHealth();
   } catch (e) {}
 }
+// Raio-x de cada ocorrencia. A contagem por hora nao distingue as duas coisas
+// que mais importam para achar a causa: "o grupo inteiro nao decifrou UMA
+// mensagem" (onda) de "poucos aparelhos chegando com fila atrasada". Por conta e
+// por dia, guarda: tipo de aparelho (celular x vinculado), idade da mensagem
+// quando o aparelho reclamou, se ela saiu antes do boot atual / nos 10 min
+// seguintes a ele, e as mensagens que juntaram muitos pedidos (ondas).
+// Contexto (08/10/2026): desde 04-05/10 os pedidos de reenvio de tico-02/03
+// subiram de ~400 para 1.100-1.900 por mil envios; nas horas com deploy a
+// mediana e ~3x a das outras. So contagem — nao muda nada do envio.
+const _retryPorMsg = new Map();   // apelido|msgId -> { n, cel, vinc, primeiroEm, ultimoEm } (so memoria)
+const RETRY_ONDA_MIN  = 25;       // pedidos da MESMA mensagem para ela contar como onda
+const RETRY_ONDAS_MAX = 25;       // ondas guardadas por conta e por dia
+function _raioXRetry(c, apelido, node, filho, grupo) {
+  try {
+    const agora = Date.now();
+    const usuario = String(node?.attrs?.participant || '').split('@')[0];
+    // Sem ':<n>' (ou ':0') e o aparelho principal — o celular do membro.
+    const ehCelular = !usuario.includes(':') || /:0$/.test(usuario);
+    if (!c.aparelho) c.aparelho = { cel: 0, vinc: 0 };
+    if (ehCelular) c.aparelho.cel++; else c.aparelho.vinc++;
+
+    // 't' do filho 'retry' = carimbo da mensagem original; 't' do no = do pedido.
+    const tMsg = Number(filho?.attrs?.t || 0) * 1000;
+    const tPed = Number(node?.attrs?.t || 0) * 1000 || agora;
+    if (!c.atraso) c.atraso = { m1: 0, m10: 0, h1: 0, h6: 0, mais: 0, semT: 0 };
+    if (!tMsg) c.atraso.semT++;
+    else {
+      const d = tPed - tMsg;
+      if (d < 60e3) c.atraso.m1++;
+      else if (d < 600e3) c.atraso.m10++;
+      else if (d < 3600e3) c.atraso.h1++;
+      else if (d < 6 * 3600e3) c.atraso.h6++;
+      else c.atraso.mais++;
+    }
+
+    let boot = 0;
+    try { boot = _bootEm; } catch (e) {}
+    if (!c.boot) c.boot = { antes: 0, ate10min: 0, depois: 0 };
+    if (tMsg && boot) {
+      if (tMsg < boot) c.boot.antes++;
+      else if (tMsg - boot < 600e3) c.boot.ate10min++;
+      else c.boot.depois++;
+    }
+
+    const id = String(node?.attrs?.id || '');
+    if (!id) return;
+    const chave = apelido + '|' + id;
+    let m = _retryPorMsg.get(chave);
+    if (!m) {
+      if (_retryPorMsg.size > 6000) {   // poda: o Map preserva a ordem de entrada
+        let k = 0;
+        for (const key of _retryPorMsg.keys()) { _retryPorMsg.delete(key); if (++k >= 2000) break; }
+      }
+      m = { n: 0, cel: 0, vinc: 0, primeiroEm: agora, ultimoEm: agora };
+      _retryPorMsg.set(chave, m);
+    }
+    m.n++; m.ultimoEm = agora;
+    if (ehCelular) m.cel++; else m.vinc++;
+    if (m.n < RETRY_ONDA_MIN) return;
+    if (!Array.isArray(c.ondas)) c.ondas = [];
+    let o = c.ondas.find(x => x.id === id);
+    if (!o) {
+      if (c.ondas.length >= RETRY_ONDAS_MAX) return;
+      o = { id, grupo,
+        enviadaEm: tMsg ? new Date(tMsg).toISOString() : null,
+        primeiroEm: new Date(m.primeiroEm).toISOString(),
+        aposBootS: (tMsg && boot && tMsg >= boot) ? Math.round((tMsg - boot) / 1000) : null };
+      c.ondas.push(o);
+      console.warn('[ENTREGA] Onda de pedidos de reenvio em ' + (NOMES_GRUPOS.get(grupo) || grupo)
+        + ' (' + apelido + '): ' + m.n + ' aparelhos pediram a mensagem ' + id
+        + (tMsg ? ', enviada ' + _fmtHoraMinSP.format(new Date(tMsg)) : '')
+        + (o.aposBootS !== null ? ' — ' + o.aposBootS + ' s depois do boot' : (tMsg && boot ? ' — antes do boot atual' : '')) + '.');
+    }
+    o.n = m.n; o.cel = m.cel; o.vinc = m.vinc; o.ultimoEm = new Date(agora).toISOString();
+  } catch (e) {}
+}
 function registrarRetryTelemetria(apelido, node) {
   try {
     const de = String(node?.attrs?.from || '');
@@ -2073,6 +2164,7 @@ function registrarRetryTelemetria(apelido, node) {
       if (!g.h) g.h = {};
       const hh = _fmtHoraSP.format(new Date());
       g.h[hh] = (g.h[hh] || 0) + 1;
+      _raioXRetry(c, String(apelido || 'principal'), node, filho, de);
     }
     try {
       _amostrasRetry.push({
@@ -11392,10 +11484,16 @@ function avaliarTravas() {
   else if (_surdezEstado !== 'ok') atuais['principal:surdez'] = { nivel: 'critico', soRegistrar: true,
     titulo: 'Principal surda (escada: ' + _surdezEstado + ')' };
 
+  // Sonda do wa-envio viva e sem erro: so assim "a conta nao aparece no /health"
+  // quer dizer que ela nao esta pareada la (e nao que o servico esta mudo).
+  const motorWmLigado = !!(WA_ENVIO_URL && WA_ENVIO_TOKEN);
+  const sondaWmOk = motorWmLigado && !_waEnvio.erro && (agora - _waEnvio.em) < 90000;
+
   for (const [id, cx] of contasExtras) {
     if (!cx || cx.removida) continue;
     const ap = apelidoDaConta(id);
-    const wm = (tenantDaConta(id) === TENANT_PADRAO && WA_ENVIO_CONTAS.has(ap)) ? waEnvioEstadoConta(ap) : null;
+    const noMotorWm = motorWmLigado && tenantDaConta(id) === TENANT_PADRAO && WA_ENVIO_CONTAS.has(ap);
+    const wm = noMotorWm ? waEnvioEstadoConta(ap) : null;
     if (wm) {
       if (!wm.logado) atuais['conta:' + id + ':logout'] = { nivel: 'critico',
         titulo: 'Remetente ' + ap + ' deslogado no wa-envio — precisa parear de novo' + (wm.ultimoErro ? ' (' + wm.ultimoErro + ')' : '') };
@@ -11412,6 +11510,20 @@ function avaliarTravas() {
         if (agora - cx._foraDesde >= TRAVA_DESCONEXAO_MS) atuais['conta:' + id + ':fora'] = { nivel: 'atencao',
           titulo: 'Remetente ' + ap + ' desconectado ha ' + Math.round((agora - cx._foraDesde) / 60000) + ' min' };
       } else cx._foraDesde = 0;
+      // Conta ligada no motor (WA_ENVIO_CONTAS) que o wa-envio nem lista: nao
+      // esta pareada la. Em 05/10/2026 o tico-02 foi deslogado do wa-envio, a
+      // trava disparou e SUMIU no restart do servico — depois dele o /health
+      // deixou de listar a conta, este laco caia no ramo do Baileys (conectado)
+      // e dava a trava por resolvida. O disparo seguiu pelo Baileys do mesmo
+      // numero por dias sem ninguem saber. Mesmo id da trava de logout, para
+      // ser a MESMA trava antes e depois do restart.
+      const idWm = 'conta:' + id + ':logout';
+      if (noMotorWm && !atuais[idWm]) {
+        if (sondaWmOk) atuais[idWm] = { nivel: 'critico',
+          titulo: 'Remetente ' + ap + ' sem pareamento no wa-envio — o disparo esta saindo pelo Baileys do mesmo numero; pareie de novo no wa-envio ou tire a conta de WA_ENVIO_CONTAS' };
+        // Sonda cega (boot, wa-envio mudo): nao da a trava por resolvida.
+        else if (_travas[idWm]) atuais[idWm] = { nivel: _travas[idWm].nivel, titulo: _travas[idWm].titulo };
+      }
     }
   }
 
@@ -15169,6 +15281,12 @@ app.get('/entrega/grupos', async (req, res) => {
             porMilEnviosSemInstaveis: w.resumoAparelhos ? porMil(w.resumoAparelhos.ocorrenciasSemInstaveis, w.envios) : null,
             aparelhos: w.resumoAparelhos || null,
             tentativas: w.tentativas || {}, horas: w.horas || {}, eventos: w.eventos || [] } : null,
+          // Raio-x das ocorrencias vistas pelo Baileys (ver _raioXRetry).
+          raioX: (b && (b.aparelho || b.atraso || b.boot || b.ondas)) ? {
+            aparelho: b.aparelho || null, atraso: b.atraso || null, boot: b.boot || null,
+            ondas: (b.ondas || []).slice().sort((x, y) => (y.n || 0) - (x.n || 0))
+              .map(o => ({ ...o, nome: nome(o.grupo) })),
+          } : null,
           gruposBaileys: b ? Object.entries(b.grupos || {}).filter(([, g]) => g.oc > 0)
             .sort((x, y) => y[1].oc - x[1].oc).slice(0, 8)
             .map(([jid, g]) => ({ jid, nome: nome(jid), ocorrencias: g.oc, envios: g.b, horas: g.h || {} })) : [],
