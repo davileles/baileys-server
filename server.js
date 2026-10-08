@@ -10997,6 +10997,30 @@ let _ecoAguardando = null;               // { id, em } do eco em transito
 let _ecoFalhas     = 0;                  // ecos enviados e nao recebidos, seguidos
 let _ecoUpsertRef  = 0;                  // ultimoUpsertEm no momento do envio
 
+// Limpeza do eco. "Apagar para todos" (revoke) deixava um "Mensagem apagada"
+// por eco na conversa do numero consigo mesmo — dezenas por madrugada. O
+// "apagar so para mim" (patch de app state, o mesmo do botao do celular) some
+// sem deixar rastro. Se o patch falhar (chave de app state ausente, socket
+// trocado no meio), cai no revoke de antes: melhor o rastro do que o "·"
+// ficar acumulando na conversa.
+async function _limparEco(jid, msg) {
+  const s = sock;
+  if (!s || !conectado || !msg?.key?.id) return;
+  const ts = msg.messageTimestamp;
+  const quando = (ts && typeof ts === 'object' && typeof ts.toNumber === 'function' ? ts.toNumber() : Number(ts))
+    || Math.floor(Date.now() / 1000);
+  try {
+    await Promise.race([
+      s.chatModify({ deleteForMe: { deleteMedia: false, key: msg.key, timestamp: quando } }, jid),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('sem resposta em 20s')), 20 * 1000)),
+    ]);
+    return;
+  } catch (e) {
+    console.warn('[ECO] Apagar so para mim falhou (' + (e?.message || e) + ') — usando apagar para todos.');
+  }
+  try { await s.sendMessage(jid, { delete: msg.key }); } catch (e) {}
+}
+
 setInterval(async () => {
   try {
     if (!conectado || !sock) { _ecoAguardando = null; return; }
@@ -11020,8 +11044,8 @@ setInterval(async () => {
     const r = await _enviarComTeto(sock.sendMessage(jidProprio, { text: '\u00b7' }));
     _ecoAguardando = { id: r?.key?.id || null, em: Date.now() };
     console.log('[ECO] Silencio de ' + Math.round(silencio / 60000) + ' min — eco de inbound enviado para o proprio numero.');
-    // Limpeza best-effort: apaga o eco da conversa consigo mesmo dali a pouco.
-    if (r?.key) setTimeout(() => { try { sock?.sendMessage(jidProprio, { delete: r.key }); } catch (e) {} }, 90 * 1000);
+    // Limpeza best-effort: tira o eco da conversa consigo mesmo dali a pouco.
+    if (r?.key) setTimeout(() => { _limparEco(jidProprio, r).catch(() => {}); }, 90 * 1000);
   } catch (e) { console.warn('[ECO] Falha ao enviar eco:', e.message); }
 }, 60 * 1000).unref?.();
 
