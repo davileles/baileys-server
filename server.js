@@ -6370,10 +6370,107 @@ async function enfileirarLoteCupomTSP(lista, ctx = {}) {
 // duplicada no grupo de clientes. Uma cadeia de promises basta (processo unico).
 let _tgChain = Promise.resolve();
 
-function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null, postadoEm = null) {
+// ── CAIXA DE ENTRADA DURAVEL DO TELEGRAM ─────────────────────────────────────
+// O corte do polling (tg_ultimos_ids.json) avanca quando a mensagem e ACEITA,
+// mas o processamento roda nesta cadeia em memoria — e a cadeia espera a
+// distribuicao do cupom anterior terminar (minutos, com 30+ grupos). Um
+// redeploy nesse intervalo matava a cadeia e, no boot, o corte ja tinha passado
+// da mensagem: ela nunca mais era lida, sem log nem aviso. Foi assim que a
+// lista do @juaocupons das 12:03 de 08/10/2026 sumiu (3 mensagens aceitas
+// atras de um cupom em envio, deploy as 12:04).
+// Agora toda mensagem aceita vai para o disco ANTES de entrar na cadeia e so
+// sai de la quando o processamento termina; o que sobrar e retomado no boot.
+// Reprocessar e seguro: o dedup (cupons_vistos, gravado antes de qualquer
+// envio) descarta o que ja tinha sido tratado, e a idade real da publicacao
+// continua decidindo se sai sozinho ou vai para aprovacao manual.
+const TG_PENDENTES_PATH          = SESSAO_DIR + '/tg_pendentes.json';
+const TG_PENDENTES_TTL_MS        = 24 * 60 * 60 * 1000;  // mesma vida do cupom capturado
+const TG_PENDENTES_MAX_RETOMADAS = 2;                    // mensagem que derruba o processo nao vira loop de boot
+const TG_PENDENTES_RETOMADA_MS   = 90 * 1000;            // espera contas, config e sync do boot
+let _tgPendSeq = 0;
+// Carregado ja na subida do modulo: se a lista comecasse vazia, a primeira
+// mensagem nova gravaria por cima do que o processo anterior deixou pendente.
+let _tgPendentes = tgPendentesCarregar();
+
+function tgPendentesCarregar() {
+  try {
+    if (!existsSync(TG_PENDENTES_PATH)) return [];
+    const lista = JSON.parse(readFileSync(TG_PENDENTES_PATH, 'utf-8'));
+    if (!Array.isArray(lista)) return [];
+    const validos = lista.filter(x => x && typeof x.texto === 'string' && x.texto.trim());
+    for (const x of validos) x.herdado = true;   // veio do processo anterior
+    if (validos.length) console.warn(`[TG-PENDENTES] ${validos.length} mensagem(ns) aceita(s) e nao concluida(s) antes do restart — retomada em ${Math.round(TG_PENDENTES_RETOMADA_MS / 1000)}s.`);
+    return validos;
+  } catch (e) { console.warn('[TG-PENDENTES] Erro ao carregar:', e.message); return []; }
+}
+
+function tgPendentesSalvar() {
+  try {
+    if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
+    escreverAtomico(TG_PENDENTES_PATH, JSON.stringify(_tgPendentes), 'utf-8');
+  } catch (e) { console.warn('[TG-PENDENTES] Erro ao salvar:', e.message); }
+}
+
+function tgPendenteRegistrar(texto, canal, postadoEm, retomadas = 0) {
+  const item = {
+    id: Date.now().toString(36) + '-' + (++_tgPendSeq),
+    texto, canal,
+    postadoEm: postadoEm || null,
+    aceitoEm: Date.now(),
+    tenant: tenantContexto() || null,
+    retomadas,
+  };
+  _tgPendentes.push(item);
+  tgPendentesSalvar();
+  return item.id;
+}
+
+// Marca a vez da mensagem na cadeia. So quem ja tinha comecado conta retomada:
+// as que estavam atras, na espera, nao tem culpa do restart e nao gastam tentativa.
+function tgPendenteIniciar(id) {
+  const x = _tgPendentes.find(y => y.id === id);
+  if (!x || x.iniciado) return;
+  x.iniciado = true;
+  tgPendentesSalvar();
+}
+
+function tgPendenteConcluir(id) {
+  const i = _tgPendentes.findIndex(x => x.id === id);
+  if (i < 0) return;
+  _tgPendentes.splice(i, 1);
+  tgPendentesSalvar();
+}
+
+// Boot: devolve para a cadeia o que o processo anterior aceitou e nao concluiu.
+function tgPendentesRetomar() {
+  const herdados = _tgPendentes.filter(x => x.herdado);
+  if (!herdados.length) return;
+  _tgPendentes = _tgPendentes.filter(x => !x.herdado);
+  tgPendentesSalvar();
+  for (const x of herdados) {
+    const trecho = String(x.texto).slice(0, 60).replace(/\s+/g, ' ');
+    if (Date.now() - (x.aceitoEm || 0) > TG_PENDENTES_TTL_MS) {
+      console.warn(`[TG-PENDENTES] Descartada (mais de 24 h parada) @${x.canal}: ${trecho}`);
+      continue;
+    }
+    if ((x.retomadas || 0) >= TG_PENDENTES_MAX_RETOMADAS) {
+      console.error(`[TG-PENDENTES] Descartada apos ${x.retomadas} retomada(s) sem concluir @${x.canal}: ${trecho}`);
+      continue;
+    }
+    console.warn(`[TG-PENDENTES] Retomando @${x.canal} (aceita ha ${Math.round((Date.now() - (x.aceitoEm || Date.now())) / 60000)} min): ${trecho}`);
+    const rodar = () => processarMensagemTelegram(x.texto, x.canal, null, x.postadoEm || null, { retomadas: (x.retomadas || 0) + (x.iniciado ? 1 : 0) });
+    if (x.tenant && x.tenant !== TENANT_PADRAO) comContextoTenant(x.tenant, rodar);
+    else rodar();
+  }
+}
+setTimeout(tgPendentesRetomar, TG_PENDENTES_RETOMADA_MS);
+
+function processarMensagemTelegram(texto, canalUsername = 'desconhecido', imagemBase64 = null, postadoEm = null, opcoes = {}) {
+  const pendId = texto?.trim() ? tgPendenteRegistrar(texto, canalUsername, postadoEm, opcoes.retomadas || 0) : null;
   _tgChain = _tgChain
-    .then(() => _processarMensagemTelegram(texto, canalUsername, imagemBase64, postadoEm))
-    .catch(e => console.error('[TG] Erro na cadeia:', e.message));
+    .then(() => { if (pendId) tgPendenteIniciar(pendId); return _processarMensagemTelegram(texto, canalUsername, imagemBase64, postadoEm); })
+    .catch(e => console.error('[TG] Erro na cadeia:', e.message))
+    .then(() => { if (pendId) tgPendenteConcluir(pendId); });
   return _tgChain;
 }
 
@@ -12703,6 +12800,48 @@ app.get('/tg/estado', (req, res) => {
   }
   const st = tgEstadoTenant(req.tenantId);
   res.json({ ok:true, tenant: req.tenantId, conectado: st.conectado, authState: st.authState, conta: st.conta, erro: st.erro });
+});
+
+// Caixa de entrada duravel do Telegram: o que foi aceito e ainda nao concluiu.
+app.get('/tg/pendentes', (req, res) => {
+  const meu = req.tenantId === TENANT_PADRAO ? null : req.tenantId;
+  const lista = _tgPendentes.filter(x => (x.tenant && x.tenant !== TENANT_PADRAO ? x.tenant : null) === meu);
+  res.json({ ok:true, total: lista.length, pendentes: lista.map(x => ({
+    canal: x.canal, aceitoEm: new Date(x.aceitoEm).toISOString(),
+    postadoEm: x.postadoEm ? new Date(x.postadoEm).toISOString() : null,
+    retomadas: x.retomadas || 0, herdado: !!x.herdado, emProcessamento: !!x.iniciado && !x.herdado,
+    trecho: String(x.texto).slice(0, 120),
+  })) });
+});
+
+// Buraco de captura: rele mensagens especificas de um canal MONITORADO e as
+// devolve a esteira normal de cupons. Nada aqui fura regra: o dedup descarta o
+// que ja foi tratado e a idade real da publicacao decide o destino (mais de
+// 45 min = retida para aprovacao manual, nunca sai sozinha).
+app.post('/tg/reprocessar', async (req, res) => {
+  if (req.tenantId !== TENANT_PADRAO) return res.status(403).json({ ok:false, erro:'disponivel so para a operacao padrao' });
+  if (!tgClient || !tgConectado) return res.status(503).json({ ok:false, erro:'Telegram desconectado' });
+  const canal = String(req.body?.canal || '').replace('@', '').trim().toLowerCase();
+  const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map(Number)
+    .filter(n => Number.isInteger(n) && n > 0))].slice(0, 10);
+  if (!TG_CANAIS_MONITORADOS.includes(canal)) return res.status(400).json({ ok:false, erro:'canal nao esta entre os monitorados (TG_GRUPO)' });
+  if (!ids.length) return res.status(400).json({ ok:false, erro:'informe ids: [msgId, ...] (ate 10)' });
+  try {
+    const ent  = await tgClient.getInputEntity(canal);
+    const msgs = await tgClient.getMessages(ent, { ids });
+    const aceitas = [];
+    for (const msg of (msgs || [])) {
+      if (!msg?.message?.trim()) continue;
+      console.log(`[TG] Reprocessar @${canal} msgId=${msg.id}: ${msg.message.slice(0, 60)}`);
+      const postadoEm = msgDateMs(msg);
+      // Sem await: a cadeia cuida da ordem; a resposta nao espera a distribuicao.
+      processarMensagemTelegram(msg.message, canal, null, postadoEm);
+      aceitas.push({ id: msg.id, postadoEm: postadoEm ? new Date(postadoEm).toISOString() : null, trecho: msg.message.slice(0, 80) });
+    }
+    res.json({ ok:true, canal, aceitas, naoEncontradas: ids.filter(i => !aceitas.some(a => a.id === i)) });
+  } catch (e) {
+    res.status(500).json({ ok:false, erro: e.message });
+  }
 });
 
 app.post('/tg/conectar', (req, res) => {
