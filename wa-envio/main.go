@@ -42,6 +42,7 @@ import (
 	"time"
 	_ "time/tzdata"
 
+	qrcode "github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -84,6 +85,13 @@ type Conta struct {
 	qr        string
 	qrEm      time.Time
 	pareando  bool
+	// Tentativa de pareamento em curso (ver janelaPareamento): quando o
+	// primeiro QR dela chegou, como parar o leitor do canal de QR e o codigo
+	// de 8 digitos ja gerado nela (e para qual numero).
+	pareandoDesde time.Time
+	pararPar      context.CancelFunc
+	codigoPar     string
+	codigoNumero  string
 
 	ultimoErro  string
 	ultimoEnvio time.Time
@@ -319,7 +327,8 @@ func (c *Conta) onEvento(evt any) {
 	case *events.Connected:
 		registrarEvento(c.ID, "conectou", "")
 		c.mu.Lock()
-		c.conectadoEm, c.qr, c.pareando, c.ultimoErro = time.Now(), "", false, ""
+		c.limparPar()
+		c.conectadoEm, c.ultimoErro = time.Now(), ""
 		c.mu.Unlock()
 		log.Printf("[CONTA:%s] conectada", c.ID)
 	case *events.PairSuccess:
@@ -359,13 +368,70 @@ func (c *Conta) descartar(motivo string) {
 	if c.container != nil {
 		_ = c.container.Close()
 	}
-	c.cli, c.container, c.qr, c.pareando = nil, nil, "", false
+	c.limparPar()
+	c.cli, c.container = nil, nil
 	c.ultimoErro = motivo
 	c.pareadoEm = time.Time{}
 	registrarPareamento(c.ID, time.Time{}, true)
 	for _, suf := range []string{"", "-wal", "-shm"} {
 		_ = os.Remove(caminhoDB(c.ID) + suf)
 	}
+}
+
+// ── JANELA DE PAREAMENTO ─────────────────────────────────────────────────────
+// O socket de login do WhatsApp fecha quando acabam os QR codes que ele mesmo
+// entrega: 60 s o primeiro e 20 s cada um dos outros cinco, 160 s no total. O
+// codigo de 8 digitos vive no MESMO socket — nao ha como estender. Em
+// 08/10/2026 isso derrubou tres tentativas seguidas de reparear o tico-02:
+// duas porque o codigo foi digitado depois dos 160 s ("pareamento: timeout") e
+// uma porque um segundo pedido de codigo no mesmo socket invalidou o primeiro
+// ("pairing ref mismatch"); a insistencia terminou em 429 do WhatsApp. Por
+// isso: cada codigo novo abre um socket novo (janela inteira), pedir de novo
+// dentro da janela devolve o MESMO codigo, e a tela mostra quanto tempo resta.
+const janelaPareamento = 160 * time.Second
+
+// restantePar: segundos que restam da tentativa em curso. Chamar com c.mu travado.
+func (c *Conta) restantePar() int {
+	if !c.pareando || c.pareandoDesde.IsZero() {
+		return 0
+	}
+	r := int((janelaPareamento - time.Since(c.pareandoDesde)).Seconds())
+	if r < 0 {
+		return 0
+	}
+	return r
+}
+
+// limparPar zera o estado da tentativa de pareamento. Chamar com c.mu travado.
+func (c *Conta) limparPar() {
+	if c.pararPar != nil {
+		c.pararPar()
+		c.pararPar = nil
+	}
+	c.qr, c.pareando, c.pareandoDesde = "", false, time.Time{}
+	c.codigoPar, c.codigoNumero = "", ""
+}
+
+// recomecarPareamento descarta a tentativa em curso e sobe um socket novo, para
+// a proxima comecar com os 160 s inteiros. Monta um Client novo: o canal de QR
+// do antigo so se desfaz por dentro do whatsmeow, e um resto dele derrubaria a
+// conexao nova. Conta ja pareada nao e tocada (so conecta).
+func (c *Conta) recomecarPareamento(ctx context.Context) error {
+	c.mu.Lock()
+	if c.cli != nil && c.cli.Store.ID == nil {
+		c.limparPar()
+		c.cli.Disconnect()
+		if c.container != nil {
+			dev, err := c.container.GetFirstDevice(ctx)
+			if err != nil {
+				c.mu.Unlock()
+				return fmt.Errorf("ler aparelho: %w", err)
+			}
+			c.cli = novoCliente(c, dev)
+		}
+	}
+	c.mu.Unlock()
+	return c.conectar(ctx)
 }
 
 // conectar sobe o socket. Sem pareamento, abre o canal de QR (necessario
@@ -381,19 +447,38 @@ func (c *Conta) conectar(ctx context.Context) error {
 		return nil
 	}
 	if c.cli.Store.ID == nil {
+		c.limparPar()
 		qrChan, err := c.cli.GetQRChannel(context.Background())
 		if err != nil {
 			return fmt.Errorf("canal de QR: %w", err)
 		}
-		c.pareando = true
+		tentativa, parar := context.WithCancel(context.Background())
+		c.pareando, c.pararPar = true, parar
 		go func() {
-			for item := range qrChan {
+			for {
+				var item whatsmeow.QRChannelItem
+				var aberto bool
+				select {
+				case <-tentativa.Done():
+					return
+				case item, aberto = <-qrChan:
+					if !aberto {
+						return
+					}
+				}
 				c.mu.Lock()
+				if tentativa.Err() != nil { // ja ha outra tentativa: o estado e dela
+					c.mu.Unlock()
+					return
+				}
 				switch item.Event {
 				case whatsmeow.QRChannelEventCode:
 					c.qr, c.qrEm = item.Code, time.Now()
+					if c.pareandoDesde.IsZero() {
+						c.pareandoDesde = time.Now()
+					}
 				default:
-					c.qr, c.pareando = "", false
+					c.limparPar()
 					if item.Error != nil {
 						c.ultimoErro = item.Error.Error()
 					}
@@ -407,13 +492,15 @@ func (c *Conta) conectar(ctx context.Context) error {
 }
 
 type estadoConta struct {
-	ID          string `json:"id"`
-	Conectado   bool   `json:"conectado"`
-	Logado      bool   `json:"logado"`
-	Pareando    bool   `json:"pareando"`
-	Numero      string `json:"numero,omitempty"`
-	UltimoEnvio string `json:"ultimoEnvio,omitempty"`
-	UltimoErro  string `json:"ultimoErro,omitempty"`
+	ID        string `json:"id"`
+	Conectado bool   `json:"conectado"`
+	Logado    bool   `json:"logado"`
+	Pareando  bool   `json:"pareando"`
+	// Segundos que restam da tentativa de pareamento em curso (janelaPareamento).
+	PareandoRestaS int    `json:"pareandoRestaS,omitempty"`
+	Numero         string `json:"numero,omitempty"`
+	UltimoEnvio    string `json:"ultimoEnvio,omitempty"`
+	UltimoErro     string `json:"ultimoErro,omitempty"`
 	// Heartbeat: quando a conexao atual abriu e ha quantos segundos.
 	ConectadoEm  string `json:"conectadoEm,omitempty"`
 	ConectadoHaS int64  `json:"conectadoHaS,omitempty"`
@@ -426,7 +513,7 @@ type estadoConta struct {
 func (c *Conta) estado(comNumero bool) estadoConta {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e := estadoConta{ID: c.ID, Pareando: c.pareando, UltimoErro: c.ultimoErro}
+	e := estadoConta{ID: c.ID, Pareando: c.pareando, PareandoRestaS: c.restantePar(), UltimoErro: c.ultimoErro}
 	if c.cli != nil {
 		e.Conectado = c.cli.IsConnected() && c.cli.IsLoggedIn()
 		e.Logado = c.cli.Store.ID != nil
@@ -962,7 +1049,31 @@ func rotas() *http.ServeMux {
 		responder(w, 200, map[string]any{"ok": true, "qr": qr, "conta": c.estado(false)})
 	}))
 
-	// Pareamento por codigo de 8 digitos (sem camera).
+	// O QR da tentativa em curso como imagem, para a tela /pair. E o caminho
+	// que nao depende do pedido de codigo (o que o WhatsApp limita com 429).
+	mux.HandleFunc("GET /contas/{id}/qr.png", autenticado(func(w http.ResponseWriter, r *http.Request) {
+		c := contaDaRota(w, r)
+		if c == nil {
+			return
+		}
+		c.mu.Lock()
+		qr := c.qr
+		c.mu.Unlock()
+		if qr == "" {
+			responder(w, 404, map[string]any{"ok": false, "erro": "sem QR no momento"})
+			return
+		}
+		png, err := qrcode.Encode(qr, qrcode.Medium, 384)
+		if err != nil {
+			responder(w, 500, map[string]any{"ok": false, "erro": err.Error()})
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(png)
+	}))
+
+	// Pareamento por codigo de 8 digitos (sem camera). Ver janelaPareamento.
 	mux.HandleFunc("POST /contas/{id}/pair", autenticado(func(w http.ResponseWriter, r *http.Request) {
 		c := contaDaRota(w, r)
 		if c == nil {
@@ -981,7 +1092,18 @@ func rotas() *http.ServeMux {
 			log.Printf("[CONTA:%s] pareamento: %s sem o nono digito — usando %s", c.ID, numero, n)
 			numero = n
 		}
-		if err := c.conectar(r.Context()); err != nil {
+		// Segundo clique dentro da janela: devolve o MESMO codigo. Outro
+		// PairPhone no mesmo socket invalidaria o que ja esta na mao do operador.
+		c.mu.Lock()
+		if resta := c.restantePar(); c.codigoPar != "" && c.codigoNumero == numero && resta > 45 {
+			codigo := c.codigoPar
+			c.mu.Unlock()
+			responder(w, 200, map[string]any{"ok": true, "codigo": codigo, "numero": numero, "expiraEmS": resta, "mesmoCodigo": true})
+			return
+		}
+		c.mu.Unlock()
+		// Codigo novo = socket novo, para valer a janela inteira.
+		if err := c.recomecarPareamento(r.Context()); err != nil {
 			responder(w, 500, map[string]any{"ok": false, "erro": err.Error()})
 			return
 		}
@@ -1004,10 +1126,19 @@ func rotas() *http.ServeMux {
 		}
 		codigo, err := cli.PairPhone(r.Context(), numero, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
-			responder(w, 500, map[string]any{"ok": false, "erro": err.Error()})
+			msg := err.Error()
+			if strings.Contains(msg, "429") || strings.Contains(msg, "rate-overlimit") {
+				log.Printf("[CONTA:%s] pareamento: WhatsApp limitou os pedidos de codigo (429)", c.ID)
+				msg = "o WhatsApp limitou os pedidos de codigo para este numero (429). Nao insista: espere algumas horas ou use o QR code."
+			}
+			responder(w, 500, map[string]any{"ok": false, "erro": msg})
 			return
 		}
-		responder(w, 200, map[string]any{"ok": true, "codigo": codigo, "numero": numero})
+		c.mu.Lock()
+		c.codigoPar, c.codigoNumero = codigo, numero
+		resta := c.restantePar()
+		c.mu.Unlock()
+		responder(w, 200, map[string]any{"ok": true, "codigo": codigo, "numero": numero, "expiraEmS": resta})
 	}))
 
 	mux.HandleFunc("POST /contas/{id}/logout", autenticado(func(w http.ResponseWriter, r *http.Request) {
@@ -1159,23 +1290,83 @@ const paginaPair = `<!doctype html><html lang="pt-BR"><meta charset="utf-8"><met
 <title>wa-envio · parear</title>
 <style>body{font-family:system-ui;background:#0a0c12;color:#e8e8ea;max-width:420px;margin:40px auto;padding:0 16px}
 input,button{width:100%;box-sizing:border-box;padding:12px;margin:6px 0;border-radius:8px;border:1px solid #2a2d38;background:#12151d;color:#e8e8ea;font-size:15px}
-button{background:#1f6f4a;border:0;font-weight:600}#saida{font-size:28px;letter-spacing:4px;text-align:center;margin:20px 0;white-space:pre-wrap}small{color:#8a8d98}</style>
+button{background:#1f6f4a;border:0;font-weight:600}button.sec{background:#2a2d38}button:disabled{opacity:.5}
+#codigo{font-size:30px;letter-spacing:4px;text-align:center;margin:18px 0 4px;font-weight:700}
+#msg{text-align:center;margin:8px 0;min-height:22px;white-space:pre-wrap}#tempo{text-align:center;color:#f0b429;font-weight:600;min-height:22px}
+#qr{display:block;margin:14px auto;background:#fff;padding:10px;border-radius:10px;width:300px;height:300px}
+small{color:#8a8d98;display:block;margin-top:6px}h3{margin:22px 0 4px;font-size:15px;color:#8a8d98;font-weight:600}</style>
 <h2>Parear conta (whatsmeow)</h2>
 <input id="tk" type="password" placeholder="WA_ENVIO_TOKEN">
 <input id="conta" placeholder="conta (ex.: tico-02)">
+<h3>Opção 1 · QR code (recomendada)</h3>
+<button id="bqr" onclick="porQr()">Mostrar QR code</button>
+<small>No celular: WhatsApp → Dispositivos conectados → Conectar dispositivo → aponte a câmera. O QR se renova sozinho.</small>
+<h3>Opção 2 · Código de 8 dígitos</h3>
 <input id="num" placeholder="numero com DDI (5531...)">
-<button onclick="parear()">Gerar código de 8 dígitos</button>
-<button onclick="estado()" style="background:#2a2d38">Ver estado</button>
-<div id="saida"></div>
-<small>WhatsApp → Dispositivos conectados → Conectar dispositivo → Conectar com número de telefone.</small>
+<button id="bcod" onclick="porCodigo()">Gerar código de 8 dígitos</button>
+<small>Deixe ANTES o celular na tela do código: Dispositivos conectados → Conectar dispositivo → Conectar com número de telefone. O código vale cerca de 2 minutos e meio; clicar de novo nesse tempo mostra o mesmo código.</small>
+<img id="qr" hidden alt="QR code">
+<div id="codigo"></div><div id="tempo"></div><div id="msg"></div>
+<button class="sec" onclick="estado()">Ver estado</button>
 <script>
-function h(){return{'Authorization':'Bearer '+document.getElementById('tk').value,'Content-Type':'application/json'}}
-function c(){return encodeURIComponent(document.getElementById('conta').value.trim().toLowerCase())}
-async function parear(){var s=document.getElementById('saida');s.textContent='gerando…';
- var r=await fetch('/contas/'+c()+'/pair',{method:'POST',headers:h(),body:JSON.stringify({numero:document.getElementById('num').value})});
- var d=await r.json();s.textContent=d.ok?(d.codigo+'\n'+'('+d.numero+')'):('erro: '+d.erro)}
-async function estado(){var r=await fetch('/contas/'+c(),{headers:h()});var d=await r.json();
- document.getElementById('saida').textContent=d.ok?JSON.stringify(d.conta,null,1):('erro: '+d.erro)}
+var laco=null,relogio=null,expira=0,ciclos=0,ultimoQr='',urlQr='';
+function el(i){return document.getElementById(i)}
+function h(){return{'Authorization':'Bearer '+el('tk').value,'Content-Type':'application/json'}}
+function c(){return encodeURIComponent(el('conta').value.trim().toLowerCase())}
+function msg(t){el('msg').textContent=t||''}
+function parar(){if(laco){clearInterval(laco);laco=null}if(relogio){clearInterval(relogio);relogio=null}el('tempo').textContent='';el('bqr').disabled=false;el('bcod').disabled=false}
+function limpar(){parar();el('codigo').textContent='';el('qr').hidden=true;ultimoQr='';msg('')}
+function contar(s){expira=Date.now()+s*1000;if(relogio)clearInterval(relogio);relogio=setInterval(pintar,500);pintar()}
+function pintar(){var r=Math.max(0,Math.round((expira-Date.now())/1000));el('tempo').textContent=r>0?('expira em '+r+' s'):''}
+function pronto(){limpar();msg('✅ Conectado. Pode fechar esta página.')}
+async function ler(url,opc){var r=await fetch(url,opc);var d={};try{d=await r.json()}catch(e){}if(!d.ok&&!d.erro)d.erro='HTTP '+r.status;return d}
+function checar(){if(!el('tk').value||!el('conta').value.trim()){msg('Preencha o token e a conta.');return false}return true}
+
+async function porCodigo(){
+ if(!checar())return;
+ limpar();el('bcod').disabled=true;el('bqr').disabled=true;msg('gerando… (até 20 s, não clique de novo)');
+ var d=await ler('/contas/'+c()+'/pair',{method:'POST',headers:h(),body:JSON.stringify({numero:el('num').value})}).catch(function(e){return{erro:String(e)}});
+ el('bcod').disabled=false;el('bqr').disabled=false;
+ if(!d.ok){msg('erro: '+d.erro);return}
+ el('codigo').textContent=d.codigo;msg('('+d.numero+')'+(d.mesmoCodigo?' · mesmo código, ainda válido':''));
+ contar(d.expiraEmS||150);
+ laco=setInterval(async function(){
+  var e=await ler('/contas/'+c(),{headers:h()}).catch(function(){return{}});
+  if(e.ok&&e.conta.logado){pronto();return}
+  if(e.ok&&!e.conta.pareando){parar();el('codigo').textContent='';msg('O código expirou. Gere outro só quando o celular estiver na tela do código.')}
+ },3000);
+}
+
+async function abrirSessao(){ciclos++;return ler('/contas/'+c()+'/conectar',{method:'POST',headers:h()}).catch(function(e){return{erro:String(e)}})}
+async function porQr(){
+ if(!checar())return;
+ limpar();ciclos=0;el('bqr').disabled=true;el('bcod').disabled=true;msg('abrindo…');
+ var d=await abrirSessao();
+ if(!d.ok){parar();msg('erro: '+d.erro);return}
+ if(d.conta&&d.conta.logado){pronto();return}
+ laco=setInterval(passoQr,2500);passoQr();
+}
+async function passoQr(){
+ var d=await ler('/contas/'+c()+'/qr',{headers:h()}).catch(function(){return{}});
+ if(!d.ok)return;
+ if(d.conta.logado){pronto();return}
+ if(d.qr){
+  if(d.qr!==ultimoQr){
+   ultimoQr=d.qr;
+   var r=await fetch('/contas/'+c()+'/qr.png',{headers:h()});
+   if(r.ok){var b=await r.blob();if(urlQr)URL.revokeObjectURL(urlQr);urlQr=URL.createObjectURL(b);el('qr').src=urlQr;el('qr').hidden=false}
+  }
+  msg('Aponte a câmera do WhatsApp para o QR.');
+  if(d.conta.pareandoRestaS)contar(d.conta.pareandoRestaS);
+ }else if(!d.conta.pareando){
+  // A sessão de login fecha em ~160 s: abre outra, até 5 vezes (uns 13 min).
+  el('qr').hidden=true;ultimoQr='';
+  if(ciclos<5){msg('renovando o QR…');await abrirSessao()}
+  else{parar();msg('Tempo esgotado. Clique em "Mostrar QR code" de novo.')}
+ }
+}
+async function estado(){if(!checar())return;var d=await ler('/contas/'+c(),{headers:h()}).catch(function(e){return{erro:String(e)}});
+ msg(d.ok?JSON.stringify(d.conta,null,1):('erro: '+d.erro))}
 </script></html>`
 
 // ── BOOT ─────────────────────────────────────────────────────────────────────

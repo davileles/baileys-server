@@ -3,6 +3,7 @@ module github.com/davileles/baileys-server/wa-envio
 go 1.26.0
 
 require (
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	go.mau.fi/whatsmeow v0.0.0-20260909164725-b25a56d63729
 	golang.org/x/image v0.46.0
 	google.golang.org/protobuf v1.36.12

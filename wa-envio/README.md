@@ -24,16 +24,25 @@ Serviço `wa-envio` neste repositório, configurado **pelo painel** (Config as C
 No `baileys-server`: `WA_ENVIO_URL=http://wa-envio.railway.internal:8080`, `WA_ENVIO_TOKEN=${{wa-envio.WA_ENVIO_TOKEN}}`,
 `WA_ENVIO_CONTAS` (liga o motor por conta) e `WA_ENVIO_GRUPOS` (opcional, restringe a grupos).
 
+## Pareamento: a janela é de 160 s
+
+O socket de login do WhatsApp fecha quando acabam os QR codes que ele entrega (60 s + 5 × 20 s). O código de 8 dígitos
+vive no mesmo socket e morre junto — não há como estender. Por isso cada código novo abre um socket novo (janela inteira),
+um segundo pedido dentro da janela devolve o **mesmo** código (outro `PairPhone` no mesmo socket invalida o anterior:
+`pairing ref mismatch`) e a tela mostra o tempo que resta. Pedidos de código em sequência levam a `429 rate-overlimit`
+do WhatsApp para aquele número: **não insistir**; o QR code não passa por esse pedido.
+
 ## Rotas
 
 | Método | Rota | Auth | |
 |---|---|---|---|
 | GET | `/health` | não | estado das contas, sem número: `conectado`, `conectadoEm`/`conectadoHaS` (heartbeat), `quarentena`/`quarentenaAte`, `ultimoErro` |
-| GET | `/pair` | não | tela para parear por código |
-| GET | `/contas/{id}` | sim | estado com número |
+| GET | `/pair` | não | tela para parear: QR code (recomendado, renova sozinho) ou código de 8 dígitos, com contador |
+| GET | `/contas/{id}` | sim | estado com número; `pareandoRestaS` = segundos que restam da tentativa de pareamento |
 | POST | `/contas/{id}/conectar` | sim | sobe o socket (abre QR se não pareada) |
 | GET | `/contas/{id}/qr` | sim | QR bruto |
-| POST | `/contas/{id}/pair` | sim | `{numero}` → código de 8 dígitos |
+| GET | `/contas/{id}/qr.png` | sim | o mesmo QR como imagem (404 sem tentativa em curso) |
+| POST | `/contas/{id}/pair` | sim | `{numero}` → código de 8 dígitos + `expiraEmS`; pedir de novo dentro da janela devolve o mesmo código (`mesmoCodigo`) |
 | POST | `/contas/{id}/logout` | sim | desloga e apaga a sessão |
 | POST | `/contas/{id}/enviar` | sim | `{jid, texto, linkPreview?, imagem?}` |
 | GET | `/contas/{id}/grupos` | sim | grupos, participantes, só-admins, sou admin |
