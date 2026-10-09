@@ -16,6 +16,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
 import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp, tagAmazonDoGrupo, trocasDeLinkDoGrupo } from './config-tsp.js';
@@ -2397,7 +2398,8 @@ export function formatarOfertaAmazon(p, opcoes = {}) {
   // precisa marcar o rastreio. `rastrear: false` serve ao preview de template,
   // que monta a mensagem com um produto de exemplo e nao deve sujar o ledger.
   const vars  = varsDoProduto(opcoes.rastrear === false ? p : comRastreio(p), cupom);
-  if (opcoes.gatilho ?? E().cfg.gatilhoPadrao) vars.gatilho = opcoes.gatilho ?? E().cfg.gatilhoPadrao;
+  // Gatilho digitado na extensao (ajustes da oferta) vence o padrao da config.
+  if (!ajustesOfertaAtivos()?.gatilho && (opcoes.gatilho ?? E().cfg.gatilhoPadrao)) vars.gatilho = opcoes.gatilho ?? E().cfg.gatilhoPadrao;
   return renderTemplate(tpl?.corpo || TEMPLATE_PADRAO, vars);
 }
 
@@ -2712,7 +2714,94 @@ function diasMenorPreco(p, preco) {
 }
 
 /** Variaveis disponiveis no template, a partir do produto ja normalizado. */
+// ── AJUSTES DA OFERTA (extensao Captura Tica, disparo direto) ─────────────────
+// O operador preenche na extensao os mesmos campos da aba "Criar oferta" do
+// painel: gatilho, nome, De, Por (sem cupom), cupom digitado a mao (codigo +
+// tipo + valor) e IMPORTANTE. Os ajustes valem para UMA montagem e chegam ate
+// varsDoProduto por AsyncLocalStorage — assim todo formatador de loja (Amazon,
+// ML, Shopee, Magalu, Awin) os aplica sem mudar a assinatura de nenhum deles, e
+// duas montagens simultaneas nao se misturam. Campo ausente = valor do servidor;
+// o link e o rastreio continuam sendo os do momento do envio.
+export const ajustesOfertaCtx = new AsyncLocalStorage();
+export function ajustesOfertaAtivos() { return ajustesOfertaCtx.getStore() || null; }
+export function normalizarAjustesOferta(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return null;
+  const txt = (v, max) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const num = v => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(String(v).replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : null;
+  };
+  const r = {};
+  const nome = txt(a.nome, 300);            if (nome) r.nome = nome;
+  const gat = txt(a.gatilho, 200);          if (gat) r.gatilho = gat;
+  const imp = txt(a.importante, 300);       if (imp) r.importante = imp;
+  const de = num(a.precoDe);                if (de) r.precoDe = de;
+  const por = num(a.preco);                 if (por) r.preco = por;
+  if (a.cupom && typeof a.cupom === 'object') {
+    const codigo = txt(a.cupom.codigo, 60).toUpperCase();
+    if (codigo) {
+      const tipo = a.cupom.tipo === 'reais' ? 'reais' : 'pct';
+      let valor = num(a.cupom.valor);
+      if (tipo === 'pct' && valor && valor >= 100) valor = null;
+      r.cupom = { codigo, tipo, valor };
+    }
+  }
+  return Object.keys(r).length ? r : null;
+}
+function aplicarAjustesVars(vars, p, cupom, aj) {
+  if (aj.nome) { vars.titulo = aj.nome; vars.titulo_curto = aj.nome; }
+  if (aj.gatilho) vars.gatilho = aj.gatilho;
+  if (aj.importante) { vars.alerta = aj.importante; vars.importante = aj.importante; }
+  if (aj.cupom) {
+    vars.cupom = aj.cupom.codigo;
+    vars.cupom_desconto = '';
+  }
+  // Preco: so recalcula quando o operador mexeu em algo que muda o numero.
+  if (aj.preco || aj.precoDe || aj.cupom) {
+    const base = aj.preco || Number(p.preco) || 0;
+    let desc = 0;
+    if (aj.cupom) {
+      if (aj.cupom.valor) desc = aj.cupom.tipo === 'pct' ? base * aj.cupom.valor / 100 : aj.cupom.valor;
+    } else if (cupom && Number(cupom.desconto) > 0) {
+      desc = Number(cupom.desconto);
+    }
+    const final = Math.max(0, Math.round((base - desc) * 100) / 100);
+    if (aj.preco || desc || aj.cupom) {
+      vars.preco = brl(final);
+      vars.preco_cheio = brl(base);
+      if (desc > 0) vars.cupom_desconto = brl(desc);
+      // A vista/parcelas foram calculados sobre o preco do servidor: com o
+      // preco recalculado aqui eles mentiriam, entao as linhas somem.
+      vars.preco_prazo = ''; vars.avista_str = ''; vars.parcelas_str = '';
+    }
+    const fin = aj.preco || desc || aj.cupom ? final : null;
+    const deRef = aj.precoDe || (fin !== null ? (Number(p.precoDe) || 0) : 0);
+    const finRef = fin !== null ? fin : Number(String(vars.preco).replace(/\./g, '').replace(',', '.'));
+    if (aj.precoDe || fin !== null) {
+      const ok = deRef > finRef;
+      vars.preco_de = ok ? brl(deRef) : '';
+      vars.economia = ok ? brl(deRef - finRef) : '';
+      vars.desconto = ok ? Math.round((1 - finRef / deRef) * 100) : '';
+    }
+    if (aj.preco) {
+      const n = diasMenorPreco(p, base), q = quedaHabitual(p, base);
+      const queda = q ? q + '% abaixo do preço das últimas semanas' : '';
+      vars.menor_preco = n ? 'Menor preço dos últimos ' + n + ' dias' : queda;
+      vars.menor_preco_dias = n ? String(n) : '';
+      vars.queda_habitual = queda;
+    }
+  }
+  return vars;
+}
+
 export function varsDoProduto(p, cupom) {
+  const vars = _varsDoProdutoBase(p, cupom);
+  const aj = ajustesOfertaAtivos();
+  return aj ? aplicarAjustesVars(vars, p, cupom, aj) : vars;
+}
+
+function _varsDoProdutoBase(p, cupom) {
   const precoPrazo = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
   // O preco principal e o mesmo que a PDP mostra em destaque: o a vista. Sem
   // cupom usa o valor exato lido da pagina. Com cupom a pagina desconhece o
@@ -3779,6 +3868,18 @@ export function salvarLista(dados = {}) {
     }
   }
 
+  // Campos da oferta digitados na extensao (gatilho, nome, De, Por, cupom a mao,
+  // IMPORTANTE): { asin: ajustes } — aplicados na montagem da hora do envio.
+  const _ajBruto = (dados.ajustesItem !== undefined ? dados.ajustesItem : ant.ajustesItem) || {};
+  const ajustesItem = {};
+  if (_ajBruto && typeof _ajBruto === 'object' && !Array.isArray(_ajBruto)) {
+    for (const [a, aj] of Object.entries(_ajBruto)) {
+      if (!_noLista.has(String(a))) continue;
+      const n = normalizarAjustesOferta(aj);
+      if (n) ajustesItem[String(a)] = n;
+    }
+  }
+
   // ── ROTEAMENTO DA LISTA ──
   // O nicho curado da base de produtos so era lido pelo monitor de precos. A
   // lista montava a oferta SEM categoria, e oferta sem categoria cai nas
@@ -3825,6 +3926,7 @@ export function salvarLista(dados = {}) {
       ? String(dados.cupomCodigo || ant.cupomCodigo || '').trim().toUpperCase() : null,
     cuponsItem: Object.keys(cuponsItem).length ? cuponsItem : null,
     edicoesItem: Object.keys(edicoesItem).length ? edicoesItem : null,
+    ajustesItem: Object.keys(ajustesItem).length ? ajustesItem : null,
     roteamento,
     agenda,
     janelas: janelas.length ? janelas : null,

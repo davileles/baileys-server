@@ -61,6 +61,7 @@ import {
   contasAmazonSeparadas, formatarOfertaAmazon,
   lerPrecoAVista, diagnosticarAVista, estadoAVista,
   precosDeclaradosNoTexto, RE_PRECO_EXPLICADO, precoPorDoPost,
+  ajustesOfertaCtx, normalizarAjustesOferta,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -18717,7 +18718,15 @@ function aplicarEdicaoDisparo(o, ed) {
   return { mensagem: final, usada: 'texto' };
 }
 
-async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', edicao = null) {
+// Ajustes da oferta (campos da extensao) valem para a montagem inteira deste
+// item: o AsyncLocalStorage leva-os ate varsDoProduto de qualquer loja.
+async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', edicao = null, ajustes = null) {
+  const aj = normalizarAjustesOferta(ajustes);
+  if (aj) return ajustesOfertaCtx.run(aj, () => _dispararProdutoDaLista(asin, codigoCupom, roteamento, edicao, aj));
+  return _dispararProdutoDaLista(asin, codigoCupom, roteamento, edicao, null);
+}
+
+async function _dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', edicao = null, ajustes = null) {
   const item = itemVitrine(asin);
   if (!item) return { ok:false, motivo:'produto nao esta mais na vitrine' };
 
@@ -18751,7 +18760,7 @@ async function dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', e
   if (!o) return { ok:false, motivo: montado.descartados[0]?.motivo || 'produto descartado' };
   // Rede de seguranca para qualquer loja: nome provisorio de cadastro
   // ("Produto MLB123", "Produto B0XXXX") nunca sai para grupo.
-  if (ehNomeProvisorio(o.produto?.titulo)) {
+  if (ehNomeProvisorio(o.produto?.titulo) && !ajustes?.nome) {
     return { ok:false, motivo:'sem nome real do produto (' + o.produto.titulo + ') — corrija o nome na lista' };
   }
   // Filtro de disparo: item de lista com serie madura e sem queda real pula a
@@ -19056,7 +19065,8 @@ async function processarItemLista(id) {
 
     try {
       const r = await dispararProdutoDaLista(asin, cupomDaLista(lista, asin), lista.roteamento,
-                                             lista.edicoesItem?.[String(asin)] || null);
+                                             lista.edicoesItem?.[String(asin)] || null,
+                                             lista.ajustesItem?.[String(asin)] || null);
       if (!execucaoVigente()) {
         console.log('[LISTA] "' + lista.nome + '" mudou durante o envio de ' + asin + ' — andamento descartado.');
         return;
@@ -19252,7 +19262,10 @@ app.post('/listas/disparo-unico/previa', async (req, res) => {
     const modo = ['auto', 'fixo', 'nenhum'].includes(req.body?.cupomModo) ? req.body.cupomModo : 'auto';
     const codigo = modo === 'fixo' ? String(req.body?.cupomCodigo || '').trim().toUpperCase() || null
                  : modo === 'nenhum' ? 'nenhum' : 'auto';
-    const m = await montarProdutoDaLista(asin, codigo, { previa:true });
+    // Campos da oferta digitados na extensao (mesmos da aba "Criar oferta").
+    const aj = normalizarAjustesOferta(req.body?.ajustes);
+    const m = aj ? await ajustesOfertaCtx.run(aj, () => montarProdutoDaLista(asin, codigo, { previa:true }))
+                 : await montarProdutoDaLista(asin, codigo, { previa:true });
     if (m.erro) return res.json({ ok:false, erro:m.erro });
     const { o } = m;
     res.json({ ok:true, asin, loja: o.produto?.loja || m.item.loja || null,
@@ -19290,6 +19303,7 @@ app.post('/listas/disparo-unico', async (req, res) => {
     cupomCodigo: req.body?.cupomCodigo,
     cuponsItem: req.body?.cuponsItem,
     edicoesItem: req.body?.edicoesItem,
+    ajustesItem: req.body?.ajustesItem,
     roteamento: req.body?.roteamento,
     efemera: true,
     agenda: { ativo:false },
