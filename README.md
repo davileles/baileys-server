@@ -1,123 +1,45 @@
-# TSP Baileys Server 🤖
+# baileys-server
 
-Servidor Node.js com Baileys para envio de mensagens no WhatsApp via HTTP.  
-Feito para rodar no **Railway** e ser acessado de qualquer dispositivo.
+Servidor de mensageria das operações **Tica Promos (TSP)** e **Clube do Viajante (CDV)**: lê grupos e canais, monta ofertas e alertas e publica nos grupos de WhatsApp.
 
----
+Uso interno. Este repositório não é um projeto para instalar do zero: não há passo a passo de instalação, e ele depende de serviços, variáveis de ambiente e dados que ficam fora daqui.
 
-## Rotas disponíveis
+## O que tem aqui
 
-| Método | Rota | Descrição |
-|--------|------|-----------|
-| GET | `/` | Página de status |
-| GET | `/qr` | Exibe o QR Code para conectar |
-| GET | `/status` | Retorna JSON com status da conexão |
-| POST | `/enviar` | Envia mensagem de texto |
-| POST | `/enviar-imagem` | Envia imagem com legenda |
-| GET | `/grupos` | Lista grupos do WhatsApp conectado |
+| Parte | O que faz |
+|---|---|
+| `server.js` | Servidor principal (Node 20+, ESM, Express). Conexão WhatsApp (Baileys), filas de envio, rotas HTTP consumidas pelos painéis |
+| `wa-envio/` | Motor de envio em grupo (Go + whatsmeow). Serviço separado; detalhes em [`wa-envio/README.md`](wa-envio/README.md) |
+| `radar-*.js`, `awin-*.js`, `monitor-precos.js` | Radares de afiliados e série de preços |
+| `bot-*.js`, `telegram-*.js` | Bots de revisão e leitura de canais no Telegram |
+| `config-*.js`, `estados-cdv.js`, `tenants.js` | Configuração das operações, grupos por estado e operadores |
+| `sync-github.js`, `feed-publico.js` | Sincronização de dados e publicação do feed dos sites |
+| `apps-script/` | Script do Gmail que encaminha alertas por e-mail |
+| `.github/` | Guardas de CI (sintaxe, superfície de rotas, regressão) |
 
----
+## Documentação
 
-## Deploy no Railway — passo a passo
+- [`CLAUDE.md`](CLAUDE.md): arquitetura, módulos, rotas, variáveis de ambiente e regras de negócio. É a fonte da verdade e muda junto com o código.
+- [`RUNBOOK.md`](RUNBOOK.md): operação e incidentes (como saber se está tudo bem, o que fazer quando o WhatsApp cai, como parear de novo).
+- [`wa-envio/README.md`](wa-envio/README.md): o motor de envio em Go.
 
-### 1. Criar repositório no GitHub
+## Hospedagem
 
-1. Acesse [github.com](https://github.com) e crie um repositório novo  
-   (pode ser privado) — ex: `baileys-server`
-2. Faça upload dos arquivos desta pasta:  
-   - `server.js`
-   - `package.json`
-   - `.gitignore`
+Railway, dois serviços a partir deste repositório: o servidor principal (raiz, com volume para a sessão) e o `wa-envio` (pasta `wa-envio/`, com volume próprio). Cada push na `main` publica em produção.
 
-> **Não suba** a pasta `sessao/` nem `node_modules/`
+## Regras que não podem ser esquecidas
 
----
+- Uma réplica só, sem sobreposição entre deploys e sem healthcheck (`railway.json`). Duas instâncias na mesma sessão derrubam uma à outra.
+- Nunca apagar `creds.json`, `pre-key-*` nem `app-state-sync-*` da sessão.
+- Mudança que reinicia o servidor fica para fora da janela de envio (8h–21h, horário de São Paulo).
+- Nenhum token, senha, telefone ou identificador de grupo neste arquivo. Credenciais vivem só nas variáveis de ambiente do Railway.
+- Renomeou ou removeu rota ou função listada em `.github/superficie.json`? Atualize o arquivo no mesmo commit.
 
-### 2. Criar projeto no Railway
+## Validação antes de commitar
 
-1. Acesse [railway.app](https://railway.app) e faça login com sua conta GitHub
-2. Clique em **"New Project"** → **"Deploy from GitHub repo"**
-3. Selecione o repositório `baileys-server`
-4. O Railway vai detectar o `package.json` e fazer o deploy automaticamente
-
----
-
-### 3. Adicionar volume persistente (IMPORTANTE)
-
-Sem isso, a sessão do WhatsApp se perde toda vez que o servidor reiniciar.
-
-1. No painel do projeto no Railway, clique no serviço
-2. Vá em **"Volumes"** → **"Add Volume"**
-3. Configure:
-   - **Mount path:** `/app/sessao`
-4. Salve — o Railway vai reiniciar o serviço automaticamente
-
----
-
-### 4. Conectar o WhatsApp
-
-1. Após o deploy, vá em **"Settings"** → **"Domains"** e copie a URL pública  
-   (ex: `https://baileys-server-production.up.railway.app`)
-2. Acesse essa URL no navegador
-3. Clique em **"Escanear QR Code"**
-4. No WhatsApp do celular: **Dispositivos conectados → Conectar dispositivo**
-5. Escaneie o QR — pronto! ✅
-
----
-
-### 5. Atualizar a URL nos HTMLs
-
-No seu arquivo HTML do gerador, atualize a variável do servidor:
-
-```javascript
-// Troque localhost pela URL do Railway:
-const SERVIDOR = 'https://baileys-server-production.up.railway.app';
+```bash
+node --check server.js
+node --check radar-ml.js   # e os demais .js alterados
 ```
 
----
-
-## Adicionar novos grupos
-
-Edite o objeto `GRUPOS` no topo do `server.js`:
-
-```javascript
-const GRUPOS = {
-  tsp:         '120363424721106736@g.us',
-  cdv_ofertas: '120363423014138662@g.us',
-  cdv_emissao: '120363172490263905@g.us',
-  novo_grupo:  'ID_DO_GRUPO@g.us',   // ← adicione aqui
-};
-```
-
-Para descobrir o ID de um grupo, acesse `/grupos` após conectar o WhatsApp.
-
----
-
-## Uso das rotas
-
-### POST /enviar
-```json
-{
-  "grupo": "tsp",
-  "mensagem": "🔥 Cupom SAVE10 — 10% off na Amazon!"
-}
-```
-
-### POST /enviar-imagem
-```
-Content-Type: multipart/form-data
-grupo: tsp
-legenda: Confira essa oferta!
-imagem: [arquivo]
-```
-
----
-
-## Solução de problemas
-
-| Problema | Solução |
-|----------|---------|
-| QR não aparece | Aguarde ~10s e recarregue `/qr` |
-| Sessão expirou | Acesse `/qr` e escaneie novamente |
-| Grupo não encontrado | Acesse `/grupos` para ver os IDs corretos |
-| Servidor não responde | Verifique os logs no painel do Railway |
+O `node --check` não pega referência inexistente nem uso antes da declaração: conferir os nomes e a ordem das declarações.
