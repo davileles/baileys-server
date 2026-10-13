@@ -94,7 +94,7 @@ import {
 
 // ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
 import {
-  iniciarFeedPublico, registrarPublicacao, publicarAgora, estadoFeedPublico,
+  iniciarFeedPublico, registrarPublicacao, registrarEnvioManual, publicarAgora, estadoFeedPublico,
 } from './feed-publico.js';
 
 // ── CONFIG DA OPERACAO TSP (editavel pelo painel) ─────────────────────────────
@@ -3340,7 +3340,13 @@ async function despacharAgendamento(ag, grupoId) {
     }
     catch (e) { console.warn('[AGEND] Nao montou o preview de #' + ag.id + ':', e.message); }
   }
-  return enviarMensagem(grupoId, lp ? { text: msg, linkPreview: lp } : { text: msg }, 0, op);
+  const _resAg = await enviarMensagem(grupoId, lp ? { text: msg, linkPreview: lp } : { text: msg }, 0, op);
+  // Site publico: oferta agendada com card para um grupo TSP entra na vitrine
+  // como as do radar (o agendamento multi-grupo registra em enviarManualParaGrupos).
+  if (ag.preview?.link && String(ag.tipo || '').toLowerCase() !== 'cupom' && ehGrupoTsp(grupoId)) {
+    registrarEnvioManual(ag.preview, 1);
+  }
+  return _resAg;
 }
 
 // Versao multi-grupo do despacho agendado. Anexo so vale se for imagem: enviar
@@ -5693,6 +5699,9 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
   }
 
   if (!enviados.length) throw new Error('Nenhum grupo recebeu a mensagem.');
+  // Site publico: oferta enviada a mao com card de produto (na hora, na janela
+  // ou agendada para varios grupos) entra na vitrine como as do radar.
+  if (!ehCupom && preview?.link) registrarEnvioManual(preview, enviados.length);
   if (falhas.length) {
     try {
       await enviarMensagem(GRUPOS.operador, { text: '*Envio manual nao entregue em ' + falhas.length + ' grupo(s)* \u26a0\ufe0f\n\n'

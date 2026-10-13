@@ -33,8 +33,11 @@ const ARQ_LOCAL  = SESSAO_DIR + '/publicadas.json';
 // Retencao do feed. Oferta de marketplace envelhece rapido: preco muda, estoque
 // acaba. Sete dias e o limite em que ainda vale mostrar, e o teto por quantidade
 // impede que um dia de pico deixe a pagina pesada no celular.
+// O teto era 120 e, com o volume de out/2026, enchia em ~25 h: o site dizia
+// "achados na semana" mas mostrava um dia. 500 cobre os 7 dias; o feed fica
+// em ~220 KB e as imagens do site carregam sob demanda (lazy).
 const RETENCAO_MS = 7 * 24 * 3600e3;
-const MAX_ITENS   = 120;
+const MAX_ITENS   = 500;
 
 // Debounce longo de proposito: cada push vira commit e rebuild do Pages. Dez
 // minutos de atraso na vitrine nao muda nada para quem navega, e evita dezenas
@@ -145,6 +148,51 @@ export function registrarPublicacao(oferta, grupos = 0) {
     return item;
   } catch (e) {
     console.warn('[FEED] Falha ao registrar publicacao:', e.message);
+    return null;
+  }
+}
+
+// Loja a partir do dominio do link, para envio manual (o card do painel nao
+// traz a loja num campo proprio quando a descricao vem vazia).
+function lojaDoLink(url) {
+  let h = '';
+  try { h = new URL(url).hostname.toLowerCase(); } catch { return ''; }
+  if (/(^|\.)amazon\.|(^|\.)amzn\./.test(h)) return 'Amazon';
+  if (/mercadoli[vb]re|(^|\.)meli\.la$/.test(h)) return 'Mercado Livre';
+  if (/shopee|(^|\.)shp\.ee$/.test(h)) return 'Shopee';
+  if (/magazineluiza|magalu/.test(h)) return 'Magalu';
+  return '';
+}
+
+/**
+ * Registra no site uma oferta enviada a mao pelo painel (envio imediato, na
+ * janela ou agendado) que saiu com card de produto. Sem card nao ha link nem
+ * imagem para a vitrine: mensagem livre e aviso ficam de fora de proposito.
+ * Nao lanca: falha aqui nunca pode derrubar um envio que ja aconteceu.
+ *
+ * @param {object} preview  { link, titulo, descricao: 'R$ 99,90 · Loja', imagemUrl }
+ * @param {number} grupos   em quantos grupos entrou (so para log)
+ */
+export function registrarEnvioManual(preview, grupos = 0) {
+  try {
+    if (!preview?.link || !preview?.titulo) return null;
+    const desc = String(preview.descricao || '');
+    const mPreco = desc.match(/R\$\s*([\d.]+(?:,\d{1,2})?)/);
+    const preco = mPreco ? Number(mPreco[1].replace(/\./g, '').replace(',', '.')) : null;
+    const lojaDesc = desc.includes('·') ? desc.split('·').pop().trim() : '';
+    return registrarPublicacao({
+      id: 'm' + Date.now(),
+      enviadoEm: new Date().toISOString(),
+      dadosExtraidos: {
+        link:      preview.link,
+        titulo:    preview.titulo,
+        imagemUrl: preview.imagemUrl || null,
+        loja:      lojaDesc || lojaDoLink(preview.link),
+        preco,
+      },
+    }, grupos);
+  } catch (e) {
+    console.warn('[FEED] Falha ao registrar envio manual:', e.message);
     return null;
   }
 }
