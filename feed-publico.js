@@ -16,12 +16,11 @@
 //
 // Variaveis no Railway (todas opcionais — os padroes ja valem):
 //   GITHUB_TOKEN          mesmo PAT do sync-github.js
-//   GITHUB_REPO_PUBLICO   padrao davileles/tsp-site,davileles/tica-site
-//                         Aceita LISTA separada por virgula: durante a migracao
-//                         de dominio os dois sites publicos ficam no ar em
-//                         paralelo e precisam do MESMO feed. Espelhar o
-//                         repositorio nao resolveria — a copia nasceria com as
-//                         ofertas congeladas no momento em que foi feita.
+//   GITHUB_REPO_PUBLICO   padrao davileles/tica-site
+//                         Aceita LISTA separada por virgula. Repos em
+//                         REPOS_APOSENTADOS sao ignorados mesmo que a variavel
+//                         ainda os cite: o tsp-site (tudosobrepromos.com, nao
+//                         renovado) virou so redirect em out/2026.
 //   TSP_LINK_GRUPO        padrao https://ir.ticapromos.com.br/geral
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -45,9 +44,11 @@ const DEBOUNCE_MS  = 10 * 60 * 1000;
 // Sem isso a aba Cupons mostraria codigo vencido ate o proximo envio.
 const INTERVALO_MS = 30 * 60 * 1000;
 
+const REPOS_APOSENTADOS = new Set(['davileles/tsp-site']);
 function reposPublicos() {
-  return String(process.env.GITHUB_REPO_PUBLICO || 'davileles/tsp-site,davileles/tica-site')
-    .split(',').map(s => s.trim()).filter(Boolean);
+  const lista = String(process.env.GITHUB_REPO_PUBLICO || 'davileles/tica-site')
+    .split(',').map(s => s.trim()).filter(s => s && !REPOS_APOSENTADOS.has(s));
+  return lista.length ? lista : ['davileles/tica-site'];
 }
 function linkGrupo()   { return process.env.TSP_LINK_GRUPO || 'https://ir.ticapromos.com.br/geral'; }
 function ativo()       { return !!process.env.GITHUB_TOKEN; }

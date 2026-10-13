@@ -64,7 +64,7 @@ Presentes em painel-cdv, baileys-server, gestor-cdv, concierge, tudo-sobre-promo
 | `tudo-sobre-promos` | Painel de gestão Tica Promos/TSP + coletor de comissões | GitHub Pages | `gestao.ticapromos.com.br` | HTML único |
 | `tica-grupos` (ex-`davileles-grupos`) | Landings de entrada nos grupos TSP (geral + nichos) | GitHub Pages | `grupos.ticapromos.com.br` | estático |
 | `tica-site` | Site público de ofertas | GitHub Pages | `ticapromos.com.br` | estático |
-| `tsp-site` | Site público antigo (mesmo conteúdo) | GitHub Pages | `www.tudosobrepromos.com` (domínio não será renovado; vence out/2026) | estático |
+| `tsp-site` | **Só redirect** para `ticapromos.com.br` (aposentado) | GitHub Pages | `www.tudosobrepromos.com` (domínio não renovado; vence out/2026) | estático |
 | `davileles-site` | Espelho "Promos do Davi" | GitHub Pages | `davileles.com` (guarda-chuva em aposentadoria) | estático |
 | `teamrausch` | Sistema do estúdio (Wellhub, agenda, totem, TV, mensagens) — `app/` + `whatsapp/` | Railway (2 serviços) | `app.teamrausch.com.br` (via Cloudflare) · `appteamrausch-production.up.railway.app` | CommonJS |
 | `financas` | App de finanças da família + proxy de IA próprio | GitHub Pages + Railway (`proxy/`) | `davileles.github.io/financas` | ESM (proxy) |
@@ -94,7 +94,7 @@ gestor-cdv · concierge · tudo-sobre-promos · roteiros · baileys-server
                     ├─ wa-envio (Go/whatsmeow, serviço separado) → envio em grupo de tico-02/03/04
                     ├─ Telegram: GramJS (fonte de cupons) + 3 bots (TSP, Passagens CDV, Ofertas CDV)
                     ├─ radares Amazon/ML/Shopee/Magalu/Awin
-                    ├─ sync-github → davileles/dados/tsp/ · feed-publico → tica-site, tsp-site
+                    ├─ sync-github → davileles/dados/tsp/ · feed-publico → tica-site
                     └─ agenda-actions → dispara workflows (cron do Actions é só fallback)
 
 TeamRausch, financas e castanheiras são ISOLADOS (serviços, tokens e dados próprios).
@@ -259,7 +259,7 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 - Encerramento (`encerrarComFlush`): dreno da sessão Signal no SIGTERM **e de novo logo antes do exit** (o flush do GitHub leva até 20 s e o processo segue enviando nesse intervalo); `[AUTH] Dreno … ESTOUROU o teto` no log = ficou chave sem gravar.
 
 **Variáveis de ambiente principais**
-- Núcleo: `PORT`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPO_DADOS` (padrão no código ainda `davileles/cdv-tsp-dados` → funciona por redirect; ideal `davileles/dados`), `GITHUB_PASTA_DADOS` (`tsp`), `GITHUB_REPO_PUBLICO` (`davileles/tsp-site,davileles/tica-site`), `HUBLA_TOKEN`, `RESEND_API_KEY`, `ALERTA_EMAIL`, `SEATS_ALERTA_SEGREDO`, `SEATS_ALERTA_GRUPO`, `CAMPANHAS_KEY`, `TSP_TENANT_SECRET`.
+- Núcleo: `PORT`, `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`, `GITHUB_REPO_DADOS` (padrão no código ainda `davileles/cdv-tsp-dados` → funciona por redirect; ideal `davileles/dados`), `GITHUB_PASTA_DADOS` (`tsp`), `GITHUB_REPO_PUBLICO` (`davileles/tica-site`; `tsp-site` é ignorado pelo código mesmo se listado), `HUBLA_TOKEN`, `RESEND_API_KEY`, `ALERTA_EMAIL`, `SEATS_ALERTA_SEGREDO`, `SEATS_ALERTA_GRUPO`, `CAMPANHAS_KEY`, `TSP_TENANT_SECRET`.
 - Telegram: `TG_API_ID`, `TG_API_HASH`, `TG_GRUPO` (canais-fonte de cupom, ex. `@juaocupons`, `@fadadoscupons`), `TG_CANAIS_IGNORADOS`, `TG_FAXINA_DIARIA`, `TELEGRAM_BOT_{TOKEN,SECRET,ADMINS}`, `TELEGRAM_BOT_PASSAGENS_*`, `TELEGRAM_BOT_OFERTAS_*`, `OFERTAS_POLL_MIN`, `BOT_TSP_URL`.
 - Flags (padrão): `AUTO_ENVIO_CUPOM` (sombra: off|sombra|on), `AUTO_ENVIO_OFERTA` (off), `AUTO_ENVIO_ALERTA` (on), `GATE_ASSIMETRICO`, `PISO_AUTO_ALERTA`; config do painel `autoEnvio.*` tem precedência.
 - ML: `ML_SO_API=1` (nenhuma leitura de página pública do ML; só API oficial; sonda diária `ML_SONDA_PAGINA_H=24`), `ML_SOCIAL`, `CUPONS_ML_PAUSADO` (sync antigo pelo Railway, segue pausado), `CUPONS_ML_LEITURA` (1; leitura de validade pela extensão), `CUPONS_ML_LEITURA_{MIN,JANELA}` (120 · 8-23), `CUPONS_ML_INSERCAO_AUTO`, `CUPONS_ML_EXTENSAO_TOKEN`, `CUPONS_ML_AUTO_{AGRUPAR_MIN,TETO,JANELA,ESPERA_MAX_MIN,SELETORES}` (as antigas `TETO_DIA/ATRASO_MIN/LOTE/PAUSA_MIN/FOLGA_PCT` são ignoradas).
@@ -289,7 +289,7 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 - **Espelhos:** `PROGRAMAS_SLUG` e `IR_BASE` (`https://ir.clubedoviajante.com.br/`) devem ser iguais aos de `gestor-cdv/index.html`.
 - `sync-github.js`: baixa no boot e faz push com debounce de 10 s para `dados/tsp/` (`cupons_base.json`, `vitrine.json`, `templates.json`, `listas.json`, `radar_config.json`, `config_tsp.json`, `config_cdv.json`, `awin_config.json`, `tenants.json`, `grupos_*`, `rastreio.json`, `categorias.json`…).
 - **Alertas do seats.aero por e-mail → WhatsApp** (`seats-alertas.js`, desde 01/10/2026): Apps Script na conta Gmail do Davi (`apps-script/seats-alertas.gs`, gatilho de 5 min, controle de lido por id de e-mail nas propriedades do script) manda os e-mails de `alerts@seats.aero` para `/seats-alertas/email`. Leitura por regex do texto fixo do seats.aero (IA Haiku só de reserva; sem leitura → bloco com assunto + link). Repetição descartada por id do Gmail e por alerta+rota+data+cabine+programa+voos+pontos em 24 h. Envio direto (fora da fila e da janela) por uma conta de disparo (`contaDisparoSeatsAlertas`: número do grupo/turno, senão a primeira tico conectada; principal só de reserva) ao grupo "Alertas Seats.aero" (`SEATS_ALERTA_GRUPO`, padrão no código), até 5 alertas por mensagem. Estado em `sessao/seats_alertas.json`, gravado só depois do envio; falha de envio → 502 e o script reenvia.
-- `feed-publico.js`: publica `dados/feed.json` e `dados/cupons.json` em tica-site e tsp-site (debounce 10 min, varredura 30 min). Operação: `GET /publico/estado`, `POST /publico/publicar`.
+- `feed-publico.js`: publica `dados/feed.json` e `dados/cupons.json` em tica-site (tsp-site aposentado, ignorado via `REPOS_APOSENTADOS`) (debounce 10 min, varredura 30 min). Operação: `GET /publico/estado`, `POST /publico/publicar`.
 - Disco `./sessao` (volume), sempre `escreverAtomico` (tmp + rename).
 
 **Nunca faça (sessão WhatsApp)**
@@ -366,9 +366,9 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 - README ainda fala do roteamento por `?g=` (removido). Fontes Nunito + Bebas Neue; `--orange` é nome legado para coral.
 
 ### 4.8 `tica-site`, `tsp-site`, `davileles-site`
-- `tica-site` (`ticapromos.com.br`, ativo) e `tsp-site` (`www.tudosobrepromos.com`) têm o mesmo `index.html`; `dados/feed.json` e `dados/cupons.json` são publicados pelo `feed-publico.js` — **ninguém edita `dados/` à mão**.
-- `tsp-site` fica no ar enquanto houver anúncio apontando para ele; depois vira redirect.
-- `davileles-site` (`davileles.com`) lê dados por HTTP do tsp-site (o fallback `gestao.tudosobrepromos.com/dados/` dá 404). **Quando o tsp-site sair, apontar `BASES_DADOS` para `ticapromos.com.br/dados/`.**
+- `tica-site` (`ticapromos.com.br`) é o único site ativo; `dados/feed.json` e `dados/cupons.json` são publicados pelo `feed-publico.js` — **ninguém edita `dados/` à mão**. SEO: `canonical`/`og:url` para `https://ticapromos.com.br/`, `robots.txt` e `sitemap.xml` na raiz.
+- `tsp-site` (out/2026): domínio `tudosobrepromos.com` **não renovado**. `index.html` e `404.html` só redirecionam para `ticapromos.com.br` (canonical + refresh 0 + JS repassando `?utm` e `#`); `dados/` congelado. Quando o domínio expirar: apagar `CNAME` e arquivar o repo.
+- `davileles-site` (`davileles.com`) lê dados por HTTP de `ticapromos.com.br/dados/` (`BASES_DADOS`).
 
 ### 4.9 Regras de negócio TSP / Tica Promos
 - Fontes: grupos WhatsApp + canais Telegram (GramJS). **O TSP não dispara no Telegram** (Telegram é só fonte).
@@ -454,4 +454,4 @@ Cron do GitHub está degradado (atrasa 2–4 h): disparo real vem do Railway; cr
 - Mensagens recorrentes/agendadas do TSP ainda não suportam anexo.
 - Consolidação de domínios: aposentar `davileles.com`; tudo para `ticapromos.com.br` / `clubedoviajante.com.br`.
 - `baileys-server`: padrão de `GITHUB_REPO_DADOS` no código ainda é o nome antigo `cdv-tsp-dados`.
-- READMEs desatualizados: `tica-grupos` (`?g=`), `tsp-site`, `tudo-sobre-promos` ("Gerador de mensagens"); `gestor-cdv` ainda cita "gerador-cdv" num comentário.
+- READMEs desatualizados: `tica-grupos` (`?g=`), `tudo-sobre-promos` ("Gerador de mensagens"); `gestor-cdv` ainda cita "gerador-cdv" num comentário.
