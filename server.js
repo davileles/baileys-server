@@ -15879,7 +15879,8 @@ app.get('/radar/fila', (req, res) => {
 //   ofertas.json — e so uma mensagem.
 // Kill switch: LEMBRETE_ACABA_HOJE=off. Categorias: LEMBRETE_ACABA_HOJE_CATS.
 const LEMBRETES_RADAR_PATH = SESSAO_DIR + '/lembretes_radar.json';
-const LEMBRETE_OFERTAS_URL = process.env.LEMBRETE_OFERTAS_URL || 'https://painel.clubedoviajante.com.br/ofertas.json';
+// Desde out/2026 o conteúdo do painel sai só pelo proxy, com chave de operador.
+const LEMBRETE_OFERTAS_URL = process.env.LEMBRETE_OFERTAS_URL || 'https://cdv-proxy-production.up.railway.app/conteudo/ofertas.json';
 const LEMBRETE_HORA_PADRAO = '09:00';   // horario do lembrete no dia do prazo (SP)
 const LEMBRETE_HORA_LIMITE = '21:00';   // depois disso nao manda (servidor ficou fora o dia todo)
 const LEMBRETE_RETENCAO_DIAS = 60;
@@ -15973,7 +15974,10 @@ function mensagemAcabaHoje(msg) {
 }
 
 async function ofertasAprovadasCdv() {
-  const r = await fetch(LEMBRETE_OFERTAS_URL + '?t=' + Date.now(), { signal: AbortSignal.timeout(20000) });
+  const r = await fetch(LEMBRETE_OFERTAS_URL, {
+    headers: process.env.CAMPANHAS_KEY ? { 'X-CDV-Op': process.env.CAMPANHAS_KEY } : {},
+    signal: AbortSignal.timeout(20000),
+  });
   if (!r.ok) throw new Error('ofertas.json status ' + r.status);
   const j = await r.json();
   return Array.isArray(j.items) ? j.items : [];
