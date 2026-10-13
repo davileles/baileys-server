@@ -95,9 +95,13 @@ async function proxyLocal(metodo, caminho, body) {
 
 async function proxy(metodo, caminho, body) {
   try {
+    // Desde 13/10/2026 o proxy exige X-CDV-Op (= CAMPANHAS_KEY) para aprovar,
+    // rejeitar, editar e enviar ofertas.
+    const headers = { 'Content-Type': 'application/json' };
+    if (process.env.CAMPANHAS_KEY) headers['X-CDV-Op'] = process.env.CAMPANHAS_KEY;
     const r = await fetch(PROXY + caminho, {
       method: metodo,
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const d = await r.json().catch(() => ({}));
