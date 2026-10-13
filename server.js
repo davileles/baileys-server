@@ -169,7 +169,7 @@ import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram, 
 // decide passagem nao e a mesma cabeca (nem o mesmo momento) do que decide
 // oferta de pontos, e misturar os dois num chat so faz um esconder o outro.
 import { bootBotPassagens, tratarUpdateBotPassagens, BOT_PASSAGENS_PATH,
-         enviarCardPassagem, diagBotPassagens } from './bot-cdv-passagens.js';
+         enviarCardPassagem, diagBotPassagens, avisarMudancaFilaPassagens } from './bot-cdv-passagens.js';
 import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH,
          diagBotOfertas } from './bot-cdv-ofertas.js';
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
@@ -1080,6 +1080,16 @@ app.use((req, res, next) => {
   // Contexto assincrono: tudo que a requisicao tocar (mesmo apos awaits)
   // enxerga o estado DESTE operador nos modulos de dados.
   comContextoTenant(req.tenantId, next);
+});
+
+// Acao na fila de aprovacao (gestor, painel ou o proprio bot) fecha os cards
+// do bot de passagens que ficaram desatualizados: decidido de um lado, some
+// do outro. Ver avisarMudancaFilaPassagens em bot-cdv-passagens.js.
+app.use((req, res, next) => {
+  if (req.method === 'POST' && /^\/painel\/(aprovar|rejeitar|mesclar|limpar)\b/.test(req.path)) {
+    res.on('finish', () => { try { avisarMudancaFilaPassagens(); } catch {} });
+  }
+  next();
 });
 
 let sock         = null;
@@ -16585,6 +16595,12 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   // ser aprovado de novo — duplicaria a mensagem nos grupos.
   if (oferta.status === 'enviando') return res.status(409).json({ ok:false, erro:'Este item ja esta sendo enviado agora.' });
   if (oferta.status === 'enviado')  return res.status(409).json({ ok:false, erro:'Este item ja foi enviado.' });
+  // Ja decidido em outra tela (gestor x bot do Telegram): aprovar de novo
+  // poria a mesma emissao duas vezes na fila de envio.
+  if (['aprovado', 'agendado', 'rejeitado', 'mesclado'].includes(oferta.status)) {
+    return res.status(409).json({ ok:false, jaResolvida:true, status: oferta.status,
+      erro:'Já resolvida em outro lugar (' + oferta.status + ').' });
+  }
   if (!haContaDeDisparo()) {
     const ok = await aguardarContaDeDisparo();
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
@@ -16862,6 +16878,12 @@ app.post('/painel/rejeitar/:id', (req, res) => {
   if (!oferta) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
   // Dono: agir em item de outro operador e proibido (defesa alem do filtro de listagem).
   if ((oferta.tenant || TENANT_PADRAO) !== req.tenantId) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  // Ja aprovada/agendada/enviada em outra tela: marcar 'rejeitado' nao segura
+  // o envio e so deixaria o registro mentindo.
+  if (['aprovado', 'agendado', 'enviando', 'enviado'].includes(oferta.status)) {
+    return res.status(409).json({ ok:false, jaResolvida:true, status: oferta.status,
+      erro:'Já aprovada em outro lugar (' + oferta.status + ').' });
+  }
   oferta.status = 'rejeitado';
   salvarFila();
   // Card do monitor descartado vira recusa da curadoria (pode aprender:
@@ -24588,6 +24610,7 @@ iniciarInsercaoMlAuto({
 // HTTP que o painel usa, entao nao ha regra de negocio duplicada neles.
 bootBotPassagens({
   PORT,
+  sessaoDir: SESSAO_DIR,
   // Listas salvas para os botoes de Programa e Cia no bot de emissoes.
   programas: Object.keys(PROGRAMAS_SLUG),
   cias: Object.values(ALIAS_CIA),

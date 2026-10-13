@@ -19,6 +19,7 @@
 //   BOT_TSP_URL                     URL publica do servico (default: RAILWAY_PUBLIC_DOMAIN)
 
 import { criarBot, citacao, valorCopiavel } from './telegram-core.js';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 
 const bot = criarBot({
   nome:    'BOT-PASSAGENS',
@@ -34,8 +35,107 @@ export const diagBotPassagens    = () => bot.diagnostico();
 
 let dep = null;
 
-const cardsAbertos = new Map();
+const cardsAbertos = new Map();      // 'chatId:msgId' -> ofertaId
+const cardsDesde   = new Map();      // 'chatId:msgId' -> ms em que o card abriu
 const msgDaFila    = new Map();
+const emAcao       = new Set();      // cards com toque em andamento neste instante
+
+// ── CARDS RESOLVIDOS EM OUTRO LUGAR ──────────────────────────────────────────
+// A mesma passagem aparece no gestor (aba Alertas) e aqui. Aprovada ou
+// descartada no gestor, o card do Telegram ficava com os botoes vivos: o
+// operador perdia tempo olhando de novo algo ja decidido. Agora todo card
+// aberto e conferido contra a fila (na hora, depois de qualquer
+// /painel/aprovar|rejeitar|mesclar|limpar, e a cada 30 s como rede) e o que
+// nao esta mais pendente vira recibo de uma linha, sem botoes.
+//
+// O mapa de cards vai para disco: sem isso um deploy esquecia os cards ja
+// enviados e eles nunca mais seriam fechados. Card com mais de 7 dias sai do
+// mapa (tocado depois disso, a releitura do tratarAcao ainda responde "ja
+// resolvida").
+const CARD_TTL_MS   = 7 * 24 * 3600 * 1000;
+const SYNC_INTERVALO_MS = 30 * 1000;
+let arquivoCards = './sessao/cards-passagens.json';
+
+function salvarCards() {
+  try {
+    const dir = arquivoCards.replace(/\/[^/]*$/, '');
+    if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const lista = [...cardsAbertos].map(([k, id]) => [k, id, cardsDesde.get(k) || Date.now()]);
+    writeFileSync(arquivoCards, JSON.stringify(lista));
+  } catch (err) { console.warn(bot.TAG + ' cards nao salvos: ' + err.message); }
+}
+
+function carregarCards() {
+  try {
+    if (!existsSync(arquivoCards)) return;
+    const corte = Date.now() - CARD_TTL_MS;
+    for (const [k, id, ts] of JSON.parse(readFileSync(arquivoCards, 'utf-8'))) {
+      if (!k || !id || (ts || 0) < corte) continue;
+      cardsAbertos.set(String(k), String(id));
+      cardsDesde.set(String(k), ts);
+    }
+    console.log(bot.TAG + ' ' + cardsAbertos.size + ' card(s) aberto(s) recuperado(s) do disco.');
+  } catch (err) { console.warn(bot.TAG + ' cards nao recuperados: ' + err.message); }
+}
+
+function esquecerCard(chave) {
+  const tinha = cardsAbertos.delete(chave);
+  cardsDesde.delete(chave);
+  if (tinha) salvarCards();
+}
+
+const DESFECHO_EXTERNO = {
+  aprovado: '✅ Aprovada em outro lugar',
+  enviando: '✅ Aprovada em outro lugar',
+  enviado:  '✅ Enviada (aprovada em outro lugar)',
+  agendado: '🕐 Agendada em outro lugar',
+  rejeitado:'🗑️ Descartada em outro lugar',
+  mesclado: '🔗 Mesclada com outra no gestor',
+  expirado: '⌛ Expirou',
+};
+
+let sincronizando = false;
+async function sincronizarCards() {
+  if (sincronizando || !dep || !cardsAbertos.size) return;
+  sincronizando = true;
+  try {
+    const corte = Date.now() - CARD_TTL_MS;
+    const porId = new Map();
+    for (const [k, id] of cardsAbertos) {
+      if ((cardsDesde.get(k) || 0) < corte) { esquecerCard(k); continue; }
+      if (!porId.has(id)) porId.set(id, []);
+      porId.get(id).push(k);
+    }
+    for (const [id, chaves] of porId) {
+      const r = await apiLocal('GET', '/cdv/oferta/' + id).catch(() => null);
+      if (!r) continue;                                   // servidor ocupado: tenta na proxima
+      if (r.ok && r.oferta?.status === 'pendente') continue;
+      if (!r.ok && r.http !== 404) continue;               // erro transitorio nao fecha card
+      const texto = r.ok
+        ? recibo(r.oferta, (DESFECHO_EXTERNO[r.oferta.status] || '✔️ Já resolvida (' + r.oferta.status + ')') + ':')
+        : '⚠️ #' + e(id) + ' saiu da fila (resolvida em outro lugar ou expirada).';
+      for (const k of chaves) {
+        if (emAcao.has(k) || cardsAbertos.get(k) !== id) continue;
+        const [chatId, msgId] = k.split(':');
+        try { await encerrarCard(chatId, Number(msgId), texto, { soEditar: true }); }
+        catch (err) { console.warn(bot.TAG + ' card #' + id + ' nao fechado: ' + err.message); }
+        esquecerCard(k);
+      }
+      console.log(bot.TAG + ' card(s) da passagem #' + id + ' fechado(s): '
+        + (r.ok ? r.oferta.status : 'fora da fila') + '.');
+    }
+  } finally { sincronizando = false; }
+}
+
+// Chamado pelo server.js depois de qualquer acao na fila. Debounce curto: um
+// "limpar" ou varias aprovacoes seguidas viram uma unica conferencia.
+let timerSync = null;
+export function avisarMudancaFilaPassagens() {
+  if (!bot.ativo || !cardsAbertos.size) return;
+  clearTimeout(timerSync);
+  timerSync = setTimeout(() => { sincronizarCards().catch(() => {}); }, 2000);
+  timerSync.unref?.();
+}
 
 const LIMITE_PREVIA   = 2200;
 const LIMITE_ORIGINAL = 700;
@@ -250,7 +350,12 @@ function recibo(o, prefixo) {
 }
 
 function registrarCard(chatId, msgId, ofertaId) {
-  if (msgId) cardsAbertos.set(String(chatId) + ':' + msgId, String(ofertaId));
+  if (!msgId) return;
+  const k = String(chatId) + ':' + msgId;
+  if (cardsAbertos.get(k) === String(ofertaId)) return;
+  cardsAbertos.set(k, String(ofertaId));
+  cardsDesde.set(k, Date.now());
+  salvarCards();
 }
 
 // Card aberto A PARTIR da lista reusa a mensagem da lista (o toque no item
@@ -258,10 +363,19 @@ function registrarCard(chatId, msgId, ofertaId) {
 // levava a fila embora e o proximo item exigia /start de novo. Ali a mensagem
 // volta a ser a lista, ja sem o item resolvido e com o desfecho no topo.
 // Card que chegou por push (mensagem propria) segue virando recibo de uma linha.
-async function encerrarCard(chatId, msgId, texto) {
-  cardsAbertos.delete(String(chatId) + ':' + msgId);
-  sessoes.delete(String(chatId));
+// soEditar: fechamento vindo da sincronizacao. So edita — se a mensagem nao
+// existe mais (apagada no chat), nao manda outra no lugar, senao cada
+// conferencia viraria uma mensagem solta.
+async function encerrarCard(chatId, msgId, texto, { soEditar = false } = {}) {
+  esquecerCard(String(chatId) + ':' + msgId);
+  const s = sessoes.get(String(chatId));
+  if (!soEditar || (s && String(s.msgId) === String(msgId))) sessoes.delete(String(chatId));
   if (msgId && msgDaFila.get(String(chatId)) === msgId) return mostrarFila(chatId, msgId, texto);
+  if (soEditar) {
+    const d = await bot.tg('editMessageText', { chat_id: chatId, message_id: msgId, text: texto,
+      parse_mode: 'HTML', disable_web_page_preview: true });
+    return d?.ok ? d.result : null;
+  }
   return bot.falarHtml(chatId, texto, null, msgId);
 }
 
@@ -334,6 +448,7 @@ function rotuloItemFila(i) {
 // (HTML ja escapado, vem de recibo()). Vai no topo, acima do cabecalho — a
 // confirmacao do envio nao pode sumir junto com o card.
 async function mostrarFila(chatId, msgId, desfecho) {
+  if (msgId) esquecerCard(String(chatId) + ':' + msgId);
   const r = await apiLocal('GET', '/cdv/fila');
   if (!r.ok) {
     // Sem a fila, o desfecho ainda precisa aparecer: e a unica confirmacao.
@@ -365,6 +480,13 @@ async function mostrarFila(chatId, msgId, desfecho) {
 
 // ── ACOES ────────────────────────────────────────────────────────────────────
 async function tratarAcao(chatId, msgId, partes, callbackId) {
+  const k = String(chatId) + ':' + msgId;
+  emAcao.add(k);
+  try { return await tratarAcaoCard(chatId, msgId, partes, callbackId); }
+  finally { emAcao.delete(k); }
+}
+
+async function tratarAcaoCard(chatId, msgId, partes, callbackId) {
   const acao = partes[1];
   // 'campo' e 'cab' carregam um argumento a mais antes do id.
   // 'opt' carrega dois: campo e indice da opcao na lista.
@@ -627,6 +749,14 @@ export async function tratarUpdateBotPassagens(update) {
 
 export async function bootBotPassagens(deps) {
   dep = deps;
+  if (deps.sessaoDir) arquivoCards = deps.sessaoDir.replace(/\/$/, '') + '/cards-passagens.json';
+  if (bot.ativo) {
+    carregarCards();
+    setInterval(() => { sincronizarCards().catch(() => {}); }, SYNC_INTERVALO_MS).unref?.();
+    // Primeira conferencia logo apos o boot: o que foi decidido no gestor
+    // durante o deploy fecha sem esperar o intervalo.
+    setTimeout(() => { sincronizarCards().catch(() => {}); }, 20000).unref?.();
+  }
   await bot.bootWebhook([
     { command: 'fila',     description: 'Passagens esperando decisão' },
     { command: 'nova',     description: 'Criar emissão a partir de texto ou print' },
