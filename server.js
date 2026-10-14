@@ -18928,11 +18928,123 @@ function relogioSP(ts) {
     .format(new Date(ts));
 }
 
+// ── SELECAO DO DIA (lista salva) ─────────────────────────────────────────────
+// Lista salva com selecaoDia.ativo nao manda todos os produtos a cada execucao:
+// reavalia cada um com o mesmo comparativo do painel (preco de agora com o cupom
+// do disparo x ultimo envio, ou x mediana de 30 dias quando nunca saiu) e monta
+// a fila do dia so com os mais atrativos. A ordem e a do painel (lstChavePrior):
+// maior desconto primeiro, em faixas de 2 pontos; no empate, o enviado ha mais
+// tempo. Fica de fora: indisponivel na loja, mais caro que no ultimo envio
+// (excluirPiores) e abaixo do desconto minimo. A lista guarda os produtos; a
+// fila do dia vai em execucao.fila e o laudo em execucao.selecao.
+const SELECAO_FAIXA = 2;
+// Ultimo laudo por lista (em memoria): o painel mostra o que saiu e o que ficou
+// de fora mesmo depois de a fila terminar ou de o dia nao ter nada atrativo.
+const _ultimaSelecaoLista = new Map();
+
+/** Fila efetiva da execucao: a do dia (selecao) ou a lista inteira. */
+function filaDaExecucao(lista) {
+  return Array.isArray(lista?.execucao?.fila) ? lista.execucao.fila : (lista?.produtos || []);
+}
+
+async function selecionarProdutosDoDia(lista) {
+  const cfg = lista?.selecaoDia;
+  const produtos = (lista?.produtos || []).map(String);
+  if (!cfg?.ativo || !produtos.length) return null;
+  const envios = await _enviosPorAsin(TENANT_PADRAO);
+  const vitrine = listarVitrine();
+  const porAsin = new Map(vitrine.map(i => [String(i.asin), i]));
+  const porGrupo = new Map();
+  for (const i of vitrine) {
+    const g = String(i.grupo || '').trim();
+    if (!g) continue;
+    if (!porGrupo.has(g)) porGrupo.set(g, []);
+    porGrupo.get(g).push(String(i.asin));
+  }
+  const corte90 = Date.now() - 90 * 86400000;
+  const avaliados = [], fora = [];
+  for (const asin of produtos) {
+    if (!porAsin.has(asin)) { fora.push({ asin, motivo: 'saiu da base de produtos' }); continue; }
+    const cod = cupomDaLista(lista, asin);
+    const modoCupom = cod === 'nenhum' ? 'nenhum' : (cod && cod !== 'auto' ? 'fixo' : 'auto');
+    let comp = null;
+    try {
+      comp = _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom,
+        codigoFixo: modoCupom === 'fixo' ? cod : null, cupItem: {}, corte90 });
+    } catch (e) { comp = null; }
+    const nome = porAsin.get(asin)?.nome || asin;
+    if (comp?.atual && comp.atual.disponivel === false) { fora.push({ asin, nome, motivo: 'indisponível na loja' }); continue; }
+    if (cfg.excluirPiores && comp?.veredito === 'pior') {
+      fora.push({ asin, nome, motivo: 'mais caro que no último envio (' + (comp.variacaoPct > 0 ? '+' : '') + comp.variacaoPct + '%)' });
+      continue;
+    }
+    let desc = null, g = 2, em = 0;
+    if (comp?.atual) {
+      g = 1;
+      if (comp.variacaoPct != null) desc = -Number(comp.variacaoPct);
+      else if (comp.mediana30 > 0 && comp.atual.fonte === 'monitor') {
+        const pd = comp.atual.precoDivulgado > 0 ? comp.atual.precoDivulgado : comp.atual.preco;
+        desc = Math.round((1 - pd / comp.mediana30) * 1000) / 10;
+      }
+      em = comp.ultimoEnvio?.em ? (Date.parse(comp.ultimoEnvio.em) || 0) : 0;
+    }
+    if (cfg.descontoMin > 0 && !(desc != null && desc >= cfg.descontoMin)) {
+      fora.push({ asin, nome, motivo: desc == null ? 'sem referência de preço para medir o desconto'
+                                                   : 'desconto de ' + desc + '% abaixo do mínimo de ' + cfg.descontoMin + '%' });
+      continue;
+    }
+    avaliados.push({ asin, nome, g, desc: desc ?? 0, temDesc: desc != null, em,
+                     preco: comp?.atual?.precoDivulgado ?? comp?.atual?.preco ?? null, veredito: comp?.veredito || null });
+  }
+  avaliados.sort((x, y) => {
+    if (x.g !== y.g) return x.g - y.g;
+    const fx = Math.floor(x.desc / SELECAO_FAIXA), fy = Math.floor(y.desc / SELECAO_FAIXA);
+    if (fx !== fy) return fy - fx;
+    if (x.em !== y.em) return x.em - y.em;
+    return y.desc - x.desc;
+  });
+  const escolhidos = avaliados.slice(0, cfg.maxItens);
+  for (const r of avaliados.slice(cfg.maxItens)) fora.push({ asin: r.asin, nome: r.nome, motivo: 'fora do limite de ' + cfg.maxItens + ' por dia' });
+  return {
+    fila: escolhidos.map(r => r.asin),
+    selecao: {
+      em: new Date().toISOString(), avaliados: produtos.length, maxItens: cfg.maxItens, descontoMin: cfg.descontoMin,
+      escolhidos: escolhidos.map(r => ({ asin: r.asin, nome: r.nome, desconto: r.temDesc ? r.desc : null,
+                                         preco: r.preco, veredito: r.veredito })),
+      fora,
+    },
+  };
+}
+
+/**
+ * Inicia a execucao; com selecao do dia ligada, monta antes a fila do dia.
+ * Devolve { lista, selecao } ou { vazia:true, selecao } quando nada passou.
+ */
+async function iniciarExecucaoComSelecao(lista, iniciarEm) {
+  let sel = null;
+  if (lista?.selecaoDia?.ativo) {
+    try { sel = await selecionarProdutosDoDia(lista); }
+    catch (e) { console.warn('[LISTA] "' + lista.nome + '" — selecao do dia falhou (' + e.message + '); segue com a lista inteira.'); }
+  }
+  if (sel && !sel.fila.length) {
+    console.log('[LISTA] "' + lista.nome + '" — selecao do dia sem nenhum produto atrativo ('
+      + sel.selecao.fora.length + ' fora). Nada enviado hoje.');
+    _ultimaSelecaoLista.set(lista.id, sel.selecao);
+    return { vazia: true, selecao: sel.selecao };
+  }
+  if (sel) _ultimaSelecaoLista.set(lista.id, sel.selecao);
+  const atualizada = iniciarExecucaoLista(lista, iniciarEm, sel);
+  if (sel) console.log('[LISTA] "' + lista.nome + '" — selecao do dia: ' + sel.fila.length + ' de '
+    + sel.selecao.avaliados + ' produto(s) [' + sel.selecao.escolhidos.map(e => e.asin + (e.desconto != null ? ' ' + e.desconto + '%' : '')).join(', ') + '].');
+  return { lista: atualizada, selecao: sel?.selecao || null };
+}
+
 // iniciarEm no futuro apenas empurra o primeiro item: o worker so acorda listas
 // cujo proximoEm ja venceu, entao "agendado" e "em disparo" usam a mesma maquina.
-function iniciarExecucaoLista(lista, iniciarEm) {
+function iniciarExecucaoLista(lista, iniciarEm, sel = null) {
   const alvo = Number(iniciarEm) > Date.now() ? Number(iniciarEm) : Date.now();
   return atualizarExecucaoLista(lista.id, {
+    ...(sel ? { fila: sel.fila, selecao: sel.selecao } : {}),
     iniciadaEm: new Date().toISOString(),
     indice: 0,
     proximoEm: alvo,                // agora, ou a hora marcada para hoje
@@ -19061,7 +19173,8 @@ async function processarItemLista(id) {
     const lista = listaPorId(id);
     const ex = lista?.execucao;
     if (!ex || ex.pausada || ex.proximoEm > Date.now()) return;
-    const asin = lista.produtos[ex.indice];
+    const _fila = filaDaExecucao(lista);
+    const asin = _fila[ex.indice];
     // Cancelada, removida ou reiniciada enquanto o item saia: o andamento que
     // esta execucao carrega nao vale mais e nao pode ser gravado por cima.
     const execucaoVigente = () => listaPorId(id)?.execucao === ex;
@@ -19090,7 +19203,7 @@ async function processarItemLista(id) {
       ex.proximoEm = _jan.proximoEm;
       atualizarExecucaoLista(lista.id, ex);
       console.log('[LISTA] "' + lista.nome + '" fora da janela (' + _jan.janelas + ' SP) — item '
-        + (ex.indice + 1) + '/' + lista.produtos.length + ' adiado para ' + relogioSP(_jan.proximoEm) + '.');
+        + (ex.indice + 1) + '/' + _fila.length + ' adiado para ' + relogioSP(_jan.proximoEm) + '.');
       return;
     }
 
@@ -19111,7 +19224,7 @@ async function processarItemLista(id) {
         ex.bloqueios = (ex.bloqueios || 0) + 1;
         ex.proximoEm = Date.now() + 10 * 60000;
         atualizarExecucaoLista(lista.id, ex);
-        console.warn('[LISTA] "' + lista.nome + '" — item ' + (ex.indice + 1) + '/' + lista.produtos.length
+        console.warn('[LISTA] "' + lista.nome + '" — item ' + (ex.indice + 1) + '/' + _fila.length
           + ' adiado 10 min (' + ex.bloqueios + '/3): ' + r.motivo);
         avisarAntibotMl(r.motivo).catch(() => {});
         return;
@@ -19130,7 +19243,7 @@ async function processarItemLista(id) {
     ex.indice += 1;
     ex.proximoEm = Date.now() + lista.intervaloMin * 60000;
     atualizarExecucaoLista(lista.id, ex);
-    console.log('[LISTA] "' + lista.nome + '" — item ' + ex.indice + '/' + lista.produtos.length
+    console.log('[LISTA] "' + lista.nome + '" — item ' + ex.indice + '/' + _fila.length
       + ', proximo em ' + lista.intervaloMin + ' min.');
   } catch (e) {
     console.error('[LISTA] Erro no worker (' + id + '):', e.message);
@@ -19150,7 +19263,7 @@ setInterval(() => {
 // Agendador: dispara a lista no dia da semana e hora marcados. Guarda o dia ja
 // disparado para restart do container nao repetir a lista no mesmo dia.
 const _listaDiaDisparado = new Map();
-setInterval(() => {
+setInterval(async () => {
   const agora = new Date();
   const hhmm = new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour:'2-digit', minute:'2-digit', hour12:false }).format(agora);
   const dia  = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(agora);
@@ -19165,9 +19278,12 @@ setInterval(() => {
     if (lista.agenda.hora !== hhmm) continue;
     if (_listaDiaDisparado.get(lista.id) === dia) continue;
     _listaDiaDisparado.set(lista.id, dia);
-    iniciarExecucaoLista(lista);
-    console.log('[LISTA] "' + lista.nome + '" iniciada pela agenda (' + hhmm + ' SP, '
-      + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo).');
+    try {
+      const r = await iniciarExecucaoComSelecao(lista);
+      if (r.vazia) continue;
+      console.log('[LISTA] "' + lista.nome + '" iniciada pela agenda (' + hhmm + ' SP, '
+        + filaDaExecucao(listaPorId(lista.id)).length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo).');
+    } catch (e) { console.error('[LISTA] Agenda "' + lista.nome + '":', e.message); }
   }
 }, 30000);
 
@@ -19182,7 +19298,10 @@ app.get('/listas', (req, res) => {
                                                       const n = nichoDoItemLista(it); return { nichoPrevisto:n.nicho, origemNicho:n.origem }; })(),
                                           loja: itemVitrine(a)?.loja || null,
                                           sumiu: !itemVitrine(a) })),
-    restantes: l.execucao ? Math.max(0, l.produtos.length - l.execucao.indice) : null,
+    restantes: l.execucao ? Math.max(0, filaDaExecucao(l).length - l.execucao.indice) : null,
+    // Selecao do dia: fila de hoje e laudo (o que saiu e por que o resto ficou fora).
+    filaDia: Array.isArray(l.execucao?.fila) ? l.execucao.fila : null,
+    selecao: l.execucao?.selecao || _ultimaSelecaoLista.get(l.id) || null,
     // Janelas efetivas (proprias ou padrao do servidor) para o painel exibir
     // por que uma fila em andamento pode estar parada.
     janelasEfetivas: janelasDaLista(l),
@@ -19190,7 +19309,7 @@ app.get('/listas', (req, res) => {
     // Fila em andamento: quando o ultimo item sai, ja contando as pausas.
     terminaAs: l.execucao
       ? dataHoraSP(previsaoTerminoLista(l, Math.max(l.execucao.proximoEm, Date.now()),
-          Math.max(0, l.produtos.length - l.execucao.indice)).terminaEm)
+          Math.max(0, filaDaExecucao(l).length - l.execucao.indice)).terminaEm)
       : null,
   }));
   res.json({ ok:true, total: listas.length, listas,
@@ -19254,20 +19373,27 @@ app.post('/listas/:id/disparar', async (req, res) => {
     const ok = await aguardarContaDeDisparo(10000);
     if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
-  const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
+  const _ini = await iniciarExecucaoComSelecao(lista, aguardando ? inicio : null);
+  if (_ini.vazia) {
+    return res.json({ ok:true, vazia:true, selecao:_ini.selecao,
+      aviso:'Seleção do dia: nenhum produto atrativo agora (' + _ini.selecao.fora.length + ' fora). Nada foi enviado.' });
+  }
+  const atualizada = _ini.lista;
+  const _filaDia = filaDaExecucao(atualizada);
+  const _qtd = _filaDia.length;
   // Aviso, nao bloqueio: quem dispara decide se troca o produto ou toca assim.
   let semCobertura = [];
-  try { semCobertura = await itensSemCoberturaMl(lista.produtos); } catch (e) {}
+  try { semCobertura = await itensSemCoberturaMl(_filaDia); } catch (e) {}
   if (semCobertura.length) console.warn('[LISTA] "' + lista.nome + '" — ' + semCobertura.length
     + ' item(ns) do ML sem cobertura de preco; serao pulados: '
     + semCobertura.map(x => x.asin).join(', '));
-  const minutos  = (lista.produtos.length - 1) * lista.intervaloMin;
+  const minutos  = (_qtd - 1) * lista.intervaloMin;
   const inicioTs = aguardando ? inicio : Date.now();
-  const prev     = previsaoTerminoLista(lista, inicioTs, lista.produtos.length);
+  const prev     = previsaoTerminoLista(lista, inicioTs, _qtd);
   console.log('[LISTA] "' + lista.nome + '" ' + (aguardando ? 'agendada para ' + relogioSP(inicio) + ' SP' : 'iniciada manualmente')
-    + ' — ' + lista.produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo, termina '
+    + ' — ' + _qtd + ' produto(s), ' + lista.intervaloMin + ' min de intervalo, termina '
     + dataHoraSP(prev.terminaEm) + ' SP' + (prev.cabeNoDia ? '' : ' (fila vira o dia)') + '.');
-  res.json({ ok:true, lista: atualizada, produtos: lista.produtos.length, duracaoMin: minutos,
+  res.json({ ok:true, lista: atualizada, produtos: _qtd, duracaoMin: minutos, selecao: _ini.selecao,
              semCobertura,
              aguardando, iniciarEm: inicioTs,
              iniciaAs: relogioSP(inicioTs),
@@ -19275,7 +19401,7 @@ app.post('/listas/:id/disparar', async (req, res) => {
              terminaEm: prev.terminaEm, terminaAs: dataHoraSP(prev.terminaEm),
              cabeNoDia: prev.cabeNoDia,
              aviso: prev.cabeNoDia ? null
-               : lista.produtos.length + ' itens a ' + lista.intervaloMin + ' min nao cabem na janela '
+               : _qtd + ' itens a ' + lista.intervaloMin + ' min nao cabem na janela '
                  + janelasDaLista(lista).map(j => j.inicio + '-' + j.fim).join(', ')
                  + ' — a fila pausa e continua ate ' + dataHoraSP(prev.terminaEm) + ' SP.' });
 });
@@ -19403,15 +19529,18 @@ app.post('/listas/:id/ajustar', (req, res) => {
     if (ex && _listasEmEnvio.has(lista.id)) {
       return res.status(409).json({ ok:false, erro:'um produto esta saindo agora — tente de novo em alguns segundos' });
     }
-    const feitos     = ex ? lista.produtos.slice(0, ex.indice) : [];
-    const atuais     = ex ? lista.produtos.slice(ex.indice) : lista.produtos.slice();
+    const _base      = filaDaExecucao(lista);
+    const feitos     = ex ? _base.slice(0, ex.indice) : [];
+    const atuais     = ex ? _base.slice(ex.indice) : lista.produtos.slice();
     const novos      = req.body.pendentes.map(String);
     const mesmoConj  = novos.length === atuais.length && new Set(novos).size === novos.length
       && novos.every(a => atuais.includes(a));
     if (!mesmoConj) {
       return res.status(409).json({ ok:false, erro:'a fila mudou enquanto voce editava (um item ja saiu) — recarregue e ajuste de novo' });
     }
-    alteracao.produtos = feitos.concat(novos);
+    // Fila do dia (selecao): reordena so a execucao; a lista guardada nao muda.
+    if (ex && Array.isArray(ex.fila)) atualizarExecucaoLista(lista.id, { ...ex, fila: feitos.concat(novos) });
+    else alteracao.produtos = feitos.concat(novos);
   }
 
   if (req.body?.cupomModo !== undefined) {
@@ -19440,7 +19569,8 @@ app.post('/listas/:id/cancelar', (req, res) => {
   const parcial = lista.execucao;
   if (lista.efemera) removerLista(lista.id);
   else atualizarExecucaoLista(lista.id, null);
-  res.json({ ok:true, enviados: parcial.enviados.length, restantes: lista.produtos.length - parcial.indice });
+  res.json({ ok:true, enviados: parcial.enviados.length,
+             restantes: (Array.isArray(parcial.fila) ? parcial.fila : lista.produtos).length - parcial.indice });
 });
 
 // ── NICHO CURADO ─────────────────────────────────────────────────────────────
@@ -19486,6 +19616,20 @@ app.post('/vitrine/nicho', (req, res) => {
   }
   console.log('[VITRINE] Nicho "' + (nicho || '(limpo)') + '" aplicado a ' + atualizados.length + ' item(ns).');
   res.json({ ok:true, nicho: nicho || null, atualizados: atualizados.length, faltando });
+});
+
+// Etiqueta em lote (campanha/marca). '' limpa.
+app.post('/vitrine/etiqueta', (req, res) => {
+  const asins = Array.isArray(req.body?.asins) ? req.body.asins.map(a => String(a || '').trim()).filter(Boolean) : [];
+  if (!asins.length) return res.status(400).json({ ok:false, erro:'informe { asins:[...] }' });
+  const etiqueta = String(req.body?.etiqueta || '').trim().slice(0, 60);
+  const atualizados = [], faltando = [];
+  for (const asin of asins) {
+    if (!itemVitrine(asin)) { faltando.push(asin); continue; }
+    atualizados.push(salvarItemVitrine({ asin, etiqueta }));
+  }
+  console.log('[VITRINE] Etiqueta "' + (etiqueta || '(limpa)') + '" aplicada a ' + atualizados.length + ' item(ns).');
+  res.json({ ok:true, etiqueta: etiqueta || null, atualizados: atualizados.length, faltando });
 });
 
 // ── VITRINE ──────────────────────────────────────────────────────────────────
@@ -19856,6 +20000,79 @@ function _precoDivulgadoEnvio(r) {
   return Number.isFinite(pf) && pf > 0 && pf < p ? pf : p;
 }
 
+// Comparativo de UM produto: preco de agora (monitor ou cadastro) com o cupom
+// do disparo, contra o ultimo envio dele (ou do grupo) e a serie de precos.
+// Usado pela rota /vitrine/comparativo e pela selecao do dia das listas.
+function _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom, codigoFixo, cupItem, corte90 }) {
+  const item = porAsin.get(asin) || null;
+  const g = String(item?.grupo || '').trim();
+  const irmaos = g ? (porGrupo.get(g) || []).filter(a => a !== asin) : [];
+
+  const proprios = envios.get(asin) || [];
+  const doGrupo = irmaos.flatMap(a => envios.get(a) || [])
+    .sort((x, y) => String(y.enviadoEm).localeCompare(String(x.enviadoEm)));
+  const todos = [...proprios, ...doGrupo];
+
+  // Preco atual: leitura do monitor; sem ela (Magalu/Awin), o de cadastro.
+  const h = historicoDe(asin);
+  const stats = h?.stats || null;
+  let atual = null;
+  if (h?.ult && Number.isFinite(h.ult.preco) && h.ult.preco > 0) {
+    atual = { preco: h.ult.preco, precoEfetivo: h.ult.precoEfetivo ?? null, em: h.ult.em || null,
+              disponivel: h.ult.disponivel !== false, fonte: 'monitor',
+              velho: Date.now() - Date.parse(h.ult.em || 0) > COMP_LEITURA_VELHA_MS };
+    // Sem oferta na loja: 'preco' e o ULTIMO preco lido (em 'em'), nao o de agora.
+    if (!atual.disponivel) {
+      atual.semOfertaDesde = h.ult.semOfertaDesde || null;
+      atual.semOfertaEm = h.ult.semOfertaEm || null;
+    }
+  } else if (Number.isFinite(Number(item?.preco)) && Number(item.preco) > 0) {
+    atual = { preco: Number(item.preco), precoEfetivo: null, em: item.precoEm || item.atualizadoEm || null,
+              disponivel: h?.ult?.disponivel !== false, fonte: 'cadastro', velho: true };
+    if (!atual.disponivel) {
+      atual.semOfertaDesde = h.ult.semOfertaDesde || null;
+      atual.semOfertaEm = h.ult.semOfertaEm || null;
+    }
+  }
+  if (atual) {
+    const _cItem = String(cupItem[asin] || '').trim().toUpperCase();
+    const cp = _cItem === '__SEM__' ? null
+      : _cItem
+      ? _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, 'fixo', _cItem)
+      : _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, modoCupom, codigoFixo);
+    atual.cupom = cp ? cp.codigo : null;
+    atual.descontoCupom = cp && cp.desconto > 0 ? cp.desconto : 0;
+    atual.avisoCupom = cp?.aviso || null;
+    atual.precoDivulgado = Math.round(Math.max(0, atual.preco - atual.descontoCupom) * 100) / 100;
+  }
+
+  // Referencia do veredito: ultimo envio do proprio ASIN; sem ele, o do grupo.
+  const ref = proprios[0] || doGrupo[0] || null;
+  let veredito = todos.length ? 'sem_preco' : 'inedito';
+  let variacaoPct = null;
+  if (ref && atual) {
+    variacaoPct = Math.round((atual.precoDivulgado / _precoDivulgadoEnvio(ref) - 1) * 1000) / 10;
+    veredito = variacaoPct <= -COMP_TOLERANCIA * 100 ? 'melhor'
+             : variacaoPct >=  COMP_TOLERANCIA * 100 ? 'pior' : 'igual';
+  }
+  // Produto sem oferta na loja nao tem "preco de agora" para comparar:
+  // dizer que esta mais barato que no ultimo envio seria vender o que a
+  // loja nao entrega. Veredito proprio, sem variacao.
+  if (atual && atual.disponivel === false) { veredito = 'indisponivel'; variacaoPct = null; }
+  const menor = todos.reduce((m, r) => (!m || _precoDivulgadoEnvio(r) < _precoDivulgadoEnvio(m)) ? r : m, null);
+
+  return {
+    veredito, variacaoPct,
+    viaGrupo: !proprios.length && !!doGrupo.length,
+    ultimoEnvio: _resumoEnvio(ref),
+    menorEnviado: _resumoEnvio(menor),
+    envios90d: todos.filter(r => Date.parse(r.enviadoEm || 0) >= corte90).length,
+    atual,
+    min90: stats?.min90 ?? null,
+    mediana30: stats?.mediana30 ?? null,
+  };
+}
+
 app.post('/vitrine/comparativo', async (req, res) => {
   try {
     const modoCupom = ['auto', 'fixo', 'nenhum'].includes(req.body?.cupomModo) ? req.body.cupomModo : 'auto';
@@ -19879,74 +20096,9 @@ app.post('/vitrine/comparativo', async (req, res) => {
     const corte90 = Date.now() - 90 * 86400000;
     const itens = {};
 
+    const _ctxComp = { envios, porAsin, porGrupo, modoCupom, codigoFixo, cupItem, corte90 };
     for (const asin of pedidos) {
-      const item = porAsin.get(asin) || null;
-      const g = String(item?.grupo || '').trim();
-      const irmaos = g ? (porGrupo.get(g) || []).filter(a => a !== asin) : [];
-
-      const proprios = envios.get(asin) || [];
-      const doGrupo = irmaos.flatMap(a => envios.get(a) || [])
-        .sort((x, y) => String(y.enviadoEm).localeCompare(String(x.enviadoEm)));
-      const todos = [...proprios, ...doGrupo];
-
-      // Preco atual: leitura do monitor; sem ela (Magalu/Awin), o de cadastro.
-      const h = historicoDe(asin);
-      const stats = h?.stats || null;
-      let atual = null;
-      if (h?.ult && Number.isFinite(h.ult.preco) && h.ult.preco > 0) {
-        atual = { preco: h.ult.preco, precoEfetivo: h.ult.precoEfetivo ?? null, em: h.ult.em || null,
-                  disponivel: h.ult.disponivel !== false, fonte: 'monitor',
-                  velho: Date.now() - Date.parse(h.ult.em || 0) > COMP_LEITURA_VELHA_MS };
-        // Sem oferta na loja: 'preco' e o ULTIMO preco lido (em 'em'), nao o de agora.
-        if (!atual.disponivel) {
-          atual.semOfertaDesde = h.ult.semOfertaDesde || null;
-          atual.semOfertaEm = h.ult.semOfertaEm || null;
-        }
-      } else if (Number.isFinite(Number(item?.preco)) && Number(item.preco) > 0) {
-        atual = { preco: Number(item.preco), precoEfetivo: null, em: item.precoEm || item.atualizadoEm || null,
-                  disponivel: h?.ult?.disponivel !== false, fonte: 'cadastro', velho: true };
-        if (!atual.disponivel) {
-          atual.semOfertaDesde = h.ult.semOfertaDesde || null;
-          atual.semOfertaEm = h.ult.semOfertaEm || null;
-        }
-      }
-      if (atual) {
-        const _cItem = String(cupItem[asin] || '').trim().toUpperCase();
-        const cp = _cItem === '__SEM__' ? null
-          : _cItem
-          ? _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, 'fixo', _cItem)
-          : _cupomComparativo(item, item?.loja || h?.loja || '', atual.preco, modoCupom, codigoFixo);
-        atual.cupom = cp ? cp.codigo : null;
-        atual.descontoCupom = cp && cp.desconto > 0 ? cp.desconto : 0;
-        atual.avisoCupom = cp?.aviso || null;
-        atual.precoDivulgado = Math.round(Math.max(0, atual.preco - atual.descontoCupom) * 100) / 100;
-      }
-
-      // Referencia do veredito: ultimo envio do proprio ASIN; sem ele, o do grupo.
-      const ref = proprios[0] || doGrupo[0] || null;
-      let veredito = todos.length ? 'sem_preco' : 'inedito';
-      let variacaoPct = null;
-      if (ref && atual) {
-        variacaoPct = Math.round((atual.precoDivulgado / _precoDivulgadoEnvio(ref) - 1) * 1000) / 10;
-        veredito = variacaoPct <= -COMP_TOLERANCIA * 100 ? 'melhor'
-                 : variacaoPct >=  COMP_TOLERANCIA * 100 ? 'pior' : 'igual';
-      }
-      // Produto sem oferta na loja nao tem "preco de agora" para comparar:
-      // dizer que esta mais barato que no ultimo envio seria vender o que a
-      // loja nao entrega. Veredito proprio, sem variacao.
-      if (atual && atual.disponivel === false) { veredito = 'indisponivel'; variacaoPct = null; }
-      const menor = todos.reduce((m, r) => (!m || _precoDivulgadoEnvio(r) < _precoDivulgadoEnvio(m)) ? r : m, null);
-
-      itens[asin] = {
-        veredito, variacaoPct,
-        viaGrupo: !proprios.length && !!doGrupo.length,
-        ultimoEnvio: _resumoEnvio(ref),
-        menorEnviado: _resumoEnvio(menor),
-        envios90d: todos.filter(r => Date.parse(r.enviadoEm || 0) >= corte90).length,
-        atual,
-        min90: stats?.min90 ?? null,
-        mediana30: stats?.mediana30 ?? null,
-      };
+      itens[asin] = _comparativoItem(asin, _ctxComp);
     }
     res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, cupomModo: modoCupom, itens });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
@@ -19975,6 +20127,8 @@ app.post('/vitrine', async (req, res) => {
     return res.status(400).json({ ok:false,
       erro:'nicho "' + nicho + '" nao existe na taxonomia — use um dos: ' + nichosDisponiveis().join(', ') });
   }
+  // Etiqueta da leva (campanha/marca). Vazio = nao mexe na etiqueta existente.
+  const etiquetaCad = String(req.body?.etiqueta || '').trim().slice(0, 60) || null;
   const salvos = [], erros = [];
 
   // CURADORIA SO SOBRESCREVE QUANDO FOI DECLARADA. salvarItemVitrine trata null
@@ -19989,6 +20143,7 @@ app.post('/vitrine', async (req, res) => {
     else if (cupomModo === 'nenhum') c.cupom = null;
     if (nicho) c.nicho = nicho;
     if (grupo) c.grupo = grupo;
+    if (etiquetaCad) c.etiqueta = etiquetaCad;
     return c;
   };
 

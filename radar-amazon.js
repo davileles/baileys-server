@@ -3345,6 +3345,12 @@ export function salvarItemVitrine(item) {
     divulgadoEm: item.divulgadoEm !== undefined
       ? (item.divulgadoEm || null)
       : (anterior?.divulgadoEm || null),
+    // ETIQUETA livre do operador (ex.: "Promo Marca X"): agrupa produtos de uma
+    // campanha para filtrar na base e montar a lista. Nao muda envio nenhum.
+    // '' limpa; undefined preserva.
+    etiqueta: item.etiqueta !== undefined
+      ? (String(item.etiqueta || '').trim().slice(0, 60) || null)
+      : (anterior?.etiqueta || null),
     criadoEm: anterior?.criadoEm || new Date().toISOString(),
     atualizadoEm: new Date().toISOString(),
     ultimoDisparo: anterior?.ultimoDisparo || null,
@@ -3896,6 +3902,18 @@ export function salvarLista(dados = {}) {
   // reagendar numa lista que nao vai existir amanha.
   const efemera = dados.efemera !== undefined ? !!dados.efemera : !!ant.efemera;
 
+  // SELECAO DO DIA: a cada execucao o servidor reavalia os produtos e manda so
+  // os mais atrativos do momento (ver selecionarProdutosDoDia no server.js). A
+  // lista guarda todos; a fila do dia e que muda.
+  const _sdBruto = dados.selecaoDia !== undefined ? (dados.selecaoDia || {}) : (ant.selecaoDia || {});
+  const selecaoDia = (!efemera && _sdBruto.ativo) ? {
+    ativo: true,
+    maxItens: Math.min(Math.max(Math.round(Number(_sdBruto.maxItens) || 10), 1), 200),
+    descontoMin: Number.isFinite(Number(_sdBruto.descontoMin)) && Number(_sdBruto.descontoMin) > 0
+      ? Math.min(Number(_sdBruto.descontoMin), 90) : 0,
+    excluirPiores: _sdBruto.excluirPiores !== false,
+  } : null;
+
   // Janelas de envio no fuso de SP: [{inicio:'08:00', fim:'20:00'}]. Nulo/vazio
   // = usa o padrao do servidor (LISTA_JANELAS). Fora delas o worker adia o item
   // em vez de consumir a fila fora de hora.
@@ -3929,6 +3947,7 @@ export function salvarLista(dados = {}) {
     ajustesItem: Object.keys(ajustesItem).length ? ajustesItem : null,
     roteamento,
     agenda,
+    selecaoDia,
     janelas: janelas.length ? janelas : null,
     ativo: dados.ativo !== undefined ? !!dados.ativo : (ant.ativo !== false),
     execucao: ant.execucao || null,
