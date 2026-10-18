@@ -3237,6 +3237,79 @@ function emissaoRepetida(dados) {
   }
 }
 
+// ── CARD DE APROVACAO REPETIDO (18/10/2026) ─────────────────────────────────
+// A trava acima so olha o que esta na fila de ENVIO ou ja saiu. O que cai em
+// aprovacao manual (sem historico, acima do teto, campo incompleto, pontos
+// invalidos) ficava de fora: em 18/10, das 15:54 em diante, seis grupos-fonte
+// repostaram o mesmo pacote e cada captura reanalisava o lote inteiro — o
+// mesmo card chegou 15+ vezes no bot de passagens. Agora um alerta igual
+// (mesma chave da trava + pontos ±2%) a outro que esta pendente, ou que foi
+// descartado na janela, nao vira card novo.
+function pontosDaEmissao(d) {
+  const m = String((d && d.pontos) || '').replace(/[.\s]/g, '').match(/\d+/);
+  return m ? Number(m[0]) : 0;
+}
+
+function cardAprovacaoRepetido(dados) {
+  try {
+    if (!EMISSAO_REPETIDA_JANELA_MS) return null;
+    const chave = chaveEmissaoRepetida(dados);
+    const pontos = pontosDaEmissao(dados);
+    if (!chave || pontos <= 0) return null;
+    const agora = Date.now();
+    for (const o of filaPendentes) {
+      if (!o || ehConteudoTsp(o.tipoConteudo)) continue;
+      if (o.status !== 'pendente' && o.status !== 'rejeitado') continue;
+      const em = Date.parse(o.timestamp || '') || 0;
+      if (o.status === 'rejeitado' && agora - em > EMISSAO_REPETIDA_JANELA_MS) continue;
+      if (chaveEmissaoRepetida(o.dadosExtraidos) !== chave) continue;
+      const p = pontosDaEmissao(o.dadosExtraidos);
+      if (!p || Math.abs(pontos - p) > p * EMISSAO_REPETIDA_TOL) continue;
+      return { id: o.id, pontos: p,
+               situacao: o.status === 'pendente' ? 'aguardando aprovação' : 'descartada há pouco' };
+    }
+    return null;
+  } catch (e) {
+    console.warn('[REPETIDA] Falha na checagem de card:', e.message);
+    return null;
+  }
+}
+
+// Limpeza da fila de aprovacao: das pendentes iguais (mesma regra acima),
+// fica so a mais recente; as outras viram 'rejeitado' e o bot de passagens
+// troca o card delas por recibo na proxima conferencia. Roda no boot e por
+// POST /painel/colapsar-repetidas.
+function colapsarCardsRepetidos() {
+  const pend = filaPendentes
+    .filter(o => o && o.status === 'pendente' && !ehConteudoTsp(o.tipoConteudo))
+    .sort((a, b) => (Date.parse(b.timestamp || '') || 0) - (Date.parse(a.timestamp || '') || 0));
+  const mantidas = [];
+  const descartadas = [];
+  for (const o of pend) {
+    const chave = chaveEmissaoRepetida(o.dadosExtraidos);
+    const p = pontosDaEmissao(o.dadosExtraidos);
+    if (!chave || !p) continue;
+    const igual = mantidas.find(m => m.chave === chave && Math.abs(p - m.p) <= m.p * EMISSAO_REPETIDA_TOL);
+    if (igual) {
+      o.status = 'rejeitado';
+      o.motivoFila = 'cópia repetida da #' + igual.id + ' (limpeza automática)';
+      descartadas.push(o.id);
+    } else {
+      mantidas.push({ id: o.id, chave, p });
+    }
+  }
+  if (descartadas.length) {
+    salvarFila();
+    try { avisarMudancaFilaPassagens(); } catch {}
+    console.log('[REPETIDA] Limpeza da fila de aprovação: ' + descartadas.length
+      + ' cópia(s) descartada(s), ' + mantidas.length + ' emissão(ões) mantida(s).');
+  }
+  return { descartadas, mantidas: mantidas.length };
+}
+setTimeout(() => {
+  try { colapsarCardsRepetidos(); } catch (e) { console.warn('[REPETIDA] Limpeza no boot falhou:', e.message); }
+}, 60000);
+
 function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados, opts) {
   const destino = grupoAlvo || GRUPOS[GRUPO_DESTINO_PASSAGENS];
   const posicao = filaEnvio.length;
@@ -4098,6 +4171,18 @@ function entregarOfertaAlerta(oferta, hist180) {
       console.log('[REPETIDA] Emissão descartada: ' + (deRep.origem || '?') + '->' + (deRep.destino || '?')
         + ' ' + (deRep.programa || '') + '/' + (deRep.cabine || '') + ' — ' + detalhe);
       registrarDescarteCdv({ jid: oferta.grupoOrigem, motivo: 'emissão repetida', detalhe,
+        dados: deRep, texto: oferta.conteudoOriginal });
+      return;
+    }
+    const repCard = cardAprovacaoRepetido(oferta.dadosExtraidos);
+    if (repCard) {
+      const deRep = oferta.dadosExtraidos || {};
+      const detalhe = 'igual à #' + repCard.id + ' (' + repCard.situacao + ', '
+        + Number(repCard.pontos).toLocaleString('pt-BR') + ' pts); esta veio com '
+        + pontosDaEmissao(deRep).toLocaleString('pt-BR') + ' pts';
+      console.log('[REPETIDA] Card descartado: ' + (deRep.origem || '?') + '->' + (deRep.destino || '?')
+        + ' ' + (deRep.programa || '') + '/' + (deRep.cabine || '') + ' — ' + detalhe);
+      registrarDescarteCdv({ jid: oferta.grupoOrigem, motivo: 'card repetido', detalhe,
         dados: deRep, texto: oferta.conteudoOriginal });
       return;
     }
@@ -17060,6 +17145,12 @@ app.post('/painel/mesclar', (req, res) => {
   o2.status = 'mesclado';
   salvarFila();
   res.json({ ok:true, id:o1.id, mensagemMesclada:o1.mensagemFormatada });
+});
+
+app.post('/painel/colapsar-repetidas', (req, res) => {
+  if (req.tenantId !== TENANT_PADRAO) return res.status(403).json({ ok:false, erro:'Só a operação raiz.' });
+  try { res.json({ ok:true, ...colapsarCardsRepetidos() }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
 app.post('/painel/limpar', (req, res) => {
