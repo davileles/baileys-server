@@ -15969,9 +15969,11 @@ app.get('/radar/fila', (req, res) => {
 });
 
 // ── LEMBRETE "ACABA HOJE" DAS OFERTAS DO RADAR CDV ──────────────────────────
-// Toda oferta do radar que sai num grupo (transferencia bonificada, assinatura
-// de clube, compra de pontos) e reenviada automaticamente no ULTIMO DIA do
-// prazo, com o mesmo texto e "⏰ ACABA HOJE!" no titulo.
+// Toda oferta do radar COM PRAZO que sai num grupo (qualquer categoria:
+// transferencia, compra bonificada, compra de pontos, clube, cartao, geral) e
+// reenviada automaticamente no ULTIMO DIA do prazo, com o mesmo texto e
+// "⏰ ACABA HOJE!" no titulo. A oferta com `lembrete:false` em ofertas.json
+// (desmarcada no gestor) fica de fora.
 //
 // - O texto vem do que foi REALMENTE enviado (inclusive edicoes do gestor):
 //   gravado em sessao/lembretes_radar.json no sucesso do radarWorker.
@@ -15981,7 +15983,8 @@ app.get('/radar/fila', (req, res) => {
 // - O lembrete vai direto para a filaRadar marcado como `lembrete`: nao passa
 //   pelo proxy, entao NAO mexe em historico-transferencias.json nem em
 //   ofertas.json — e so uma mensagem.
-// Kill switch: LEMBRETE_ACABA_HOJE=off. Categorias: LEMBRETE_ACABA_HOJE_CATS.
+// Kill switch: LEMBRETE_ACABA_HOJE=off. LEMBRETE_ACABA_HOJE_CATS (CSV) restringe
+// a categorias especificas; vazio/"todas" = todas (padrao desde 18/10/2026).
 const LEMBRETES_RADAR_PATH = SESSAO_DIR + '/lembretes_radar.json';
 const LEMBRETE_OFERTAS_URL = process.env.LEMBRETE_OFERTAS_URL || 'https://painel.clubedoviajante.com.br/ofertas.json';
 const LEMBRETE_HORA_PADRAO = '09:00';   // horario do lembrete no dia do prazo (SP)
@@ -15991,9 +15994,11 @@ let lembretesRadar = [];
 function lembreteAtivo() {
   return !/^(off|0|false|nao|não)$/i.test(String(process.env.LEMBRETE_ACABA_HOJE || 'on').trim());
 }
+// null = todas as categorias.
 function lembreteCategorias() {
-  return String(process.env.LEMBRETE_ACABA_HOJE_CATS || 'transferencia,clube,compra')
-    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const v = String(process.env.LEMBRETE_ACABA_HOJE_CATS || '').trim().toLowerCase();
+  if (!v || v === 'todas' || v === '*') return null;
+  return v.split(',').map(s => s.trim()).filter(Boolean);
 }
 function salvarLembretesRadar() {
   try { escreverAtomico(LEMBRETES_RADAR_PATH, JSON.stringify(lembretesRadar)); }
@@ -16101,10 +16106,13 @@ async function checarLembretesAcabaHoje({ forcar = false } = {}) {
       // varias por dia): categoria/prazo ficam copiados na entrada na primeira
       // checagem, para a oferta que saiu do arquivo ainda lembrar.
       const o = porId.get(l.id);
-      if (o && (l.categoria !== o.categoria || l.prazo !== o.prazo)) {
-        l.categoria = o.categoria || ''; l.prazo = o.prazo || ''; mudou = true;
+      const semLembrete = o ? o.lembrete === false : !!l.semLembrete;
+      if (o && (l.categoria !== o.categoria || l.prazo !== o.prazo || !!l.semLembrete !== semLembrete)) {
+        l.categoria = o.categoria || ''; l.prazo = o.prazo || ''; l.semLembrete = semLembrete; mudou = true;
       }
-      if (l.categoria == null || !cats.includes(String(l.categoria).toLowerCase())) continue;
+      if (l.categoria == null) continue;          // nunca casou com ofertas.json
+      if (l.semLembrete) continue;                // desmarcada no gestor
+      if (cats && !cats.includes(String(l.categoria).toLowerCase())) continue;
       const pz = prazoDoTexto(l.prazo, hojeSPIso(new Date(l.enviadoEm)).slice(0, 4));
       if (!pz || pz.data !== hoje) continue;
       // Divulgada no proprio ultimo dia: o post original ja e o lembrete.
@@ -16172,7 +16180,7 @@ app.get('/radar/lembretes', async (req, res) => {
   res.json({
     ok: true,
     ativo: lembreteAtivo(),
-    categorias: lembreteCategorias(),
+    categorias: lembreteCategorias() || 'todas',
     checagem,
     itens: lembretesRadar.map(x => ({
       id: x.id, grupo: NOMES_GRUPOS.get(x.grupo) || x.grupo, enviadoEm: x.enviadoEm, lembradoEm: x.lembradoEm,
