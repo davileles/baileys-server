@@ -11739,12 +11739,36 @@ function avaliarTravas() {
 
   // Portas do rodizio (proxy /gg/vagas, sondado a cada 5 min): porta fechada
   // = nenhum grupo com vaga, a landing esta mandando para a emergencia.
+  // Desde 18/10/2026 o proxy conta tambem grupo de convite travado (antes a
+  // porta com o unico grupo travado nao "fechava" e nada avisava) e informa
+  // motivo, travados[], reserva e desvios do dia.
   for (const p of (_rodizioVagas.portas || [])) {
     if (!p.ativo) continue;
-    if (p.fechada) atuais['rodizio:' + p.slug + ':fechada'] = { nivel: 'critico',
-      titulo: 'Porta /g/' + p.slug + ' fechada — todos os ' + p.grupos + ' grupos no teto; landing caindo na emergencia. Crie ou libere um grupo' };
-    else if (p.grupos > 0 && p.vagas < RODIZIO_VAGAS_MIN) atuais['rodizio:' + p.slug + ':baixa'] = { nivel: 'atencao',
+    const destinoFallback = p.fallback ? ' Hoje a pessoa vai para ' + p.fallback + '.' : '';
+    const desvios = p.desviosHoje ? ' ' + p.desviosHoje + ' clique(s) desviado(s) hoje.' : '';
+    if (p.fechada) {
+      const porque = p.motivo === 'convite' ? 'convite travado em todos os ' + p.grupos + ' grupo(s)'
+        : p.motivo === 'teto' ? 'todos os ' + p.grupos + ' grupo(s) no teto'
+        : 'grupos cheios ou com convite travado (' + p.grupos + ')';
+      atuais['rodizio:' + p.slug + ':fechada'] = { nivel: 'critico',
+        titulo: 'Porta /g/' + p.slug + ' fechada — ' + porque + ', nenhum grupo recebendo gente.' + desvios + destinoFallback + ' Crie um grupo novo' };
+    } else if (p.grupos > 0 && p.vagas < RODIZIO_VAGAS_MIN) atuais['rodizio:' + p.slug + ':baixa'] = { nivel: 'atencao',
       titulo: 'Porta /g/' + p.slug + ' com so ' + p.vagas + ' vaga(s) em ' + p.elegiveis + ' grupo(s) — prepare o proximo grupo' };
+    // Um aviso por grupo travado (chave pelo nome: o mesmo grupo em dois links
+    // vira um aviso so). Some sozinho quando o convite volta a valer.
+    for (const t of (p.travados || [])) {
+      const chave = 'rodizio:travado:' + String(t.nome || '').toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      if (atuais[chave]) continue;
+      atuais[chave] = { nivel: 'atencao',
+        titulo: 'Convite do grupo ' + t.nome + ' travado no WhatsApp (link /g/' + p.slug + ') — saiu do rodizio; crie um grupo novo' };
+    }
+    if (p.usandoReserva) atuais['rodizio:' + p.slug + ':reserva'] = { nivel: 'atencao',
+      titulo: 'Link /g/' + p.slug + ' rodando no grupo reserva — crie o proximo grupo e cadastre uma reserva nova' };
+    // Nicho de um grupo so sem reserva: ponto unico de falha. So na lista de
+    // travas (sem mensagem): o grupo do operador e para alerta grave.
+    else if (!p.fechada && p.elegiveis === 1 && p.reservasLivres === 0) atuais['rodizio:' + p.slug + ':sem-reserva'] = {
+      nivel: 'atencao', soRegistrar: true,
+      titulo: 'Link /g/' + p.slug + ' tem um grupo so e nenhuma reserva — se o convite travar, o lead cai no fallback' };
   }
 
   if (!tgConectado && agora - _bootEm > TRAVA_DESCONEXAO_MS) atuais['telegram:desconectado'] = { nivel: 'atencao',
