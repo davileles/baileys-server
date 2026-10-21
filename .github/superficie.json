@@ -223,7 +223,8 @@
         "codigo: 'sem-mensagem'",
         "function _gmNumeroDaCasa(",
         "function emissaoRepetida(",
-        "function registrarEmissaoRecente("
+        "function registrarEmissaoRecente(",
+        "async function decidirTransferenciaAutomatica("
       ]
     },
     "radar-awin.js": {

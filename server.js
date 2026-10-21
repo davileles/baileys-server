@@ -171,7 +171,8 @@ import { bootBotTsp, tratarUpdateBotTsp, BOT_TSP_PATH, notificarAdminsTelegram, 
 import { bootBotPassagens, tratarUpdateBotPassagens, BOT_PASSAGENS_PATH,
          enviarCardPassagem, diagBotPassagens, avisarMudancaFilaPassagens } from './bot-cdv-passagens.js';
 import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH,
-         diagBotOfertas } from './bot-cdv-ofertas.js';
+         diagBotOfertas, reservarOfertaAutomatica, liberarOfertaParaCard,
+         avisarOfertaAutomatica } from './bot-cdv-ofertas.js';
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
@@ -9477,8 +9478,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 //   2. existe um portao "valido": grupo de WhatsApp tem bom-dia, duvida de
 //      membro e print de emissao, e nada disso pode virar card na fila.
 //
-// O grupo SEMPRE passa por aprovacao humana — nunca ha auto-publicacao deste
-// caminho. O que a IA erra, a tela conserta antes de sair.
+// Passa por aprovacao humana, com UMA excecao: transferencia bonificada de
+// grupo monitorado decide sozinha (bloco DISPARO AUTOMATICO DE TRANSFERENCIA).
 const OFERTA_MILHAS_JANELA_MS = 45000;   // debounce: plantao posta texto e print separados
 const OFERTA_MILHAS_MAX_IMGS  = 3;       // teto de imagens por extracao (custo/tempo)
 const bufferOfertaMilhas = new Map();    // jid -> { itens, timer }
@@ -9710,6 +9711,12 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
     }
     if (d.duplicada) console.log('[CDV-OFERTA] Ja estava na fila/histórico (#' + d.id + ') — ignorada.');
     else console.log('[CDV-OFERTA] Na fila de aprovacao #' + d.id + ' — ' + item.titulo);
+    // Transferencia capturada em grupo monitorado: decide sozinha (nova sai,
+    // repetida some). Criacao manual (opts.fonte) segue sempre para aprovacao.
+    if (!d.duplicada && !opts.fonte && categoria === 'transferencia' && autoTransferenciaLigada()) {
+      reservarOfertaAutomatica(d.id);
+      agendarDecisaoTransferencia({ id: d.id, item, jid, nomeGrupo, textoBruto });
+    }
     return { ok:true, id: d.id, duplicada: !!d.duplicada, titulo: item.titulo };
   } catch (e) {
     console.error('[CDV-OFERTA] Falha ao enfileirar: ' + e.message);
@@ -9717,6 +9724,112 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
       detalhe: e.message, texto: textoBruto });
     return { ok:false, erro: 'fila de ofertas inacessivel: ' + e.message };
   }
+}
+
+// ══ DISPARO AUTOMATICO DE TRANSFERENCIA ══════════════════════════════════════
+// Transferencia bonificada capturada em grupo monitorado nao espera aprovacao:
+//   - campanha nova (origem→destino + periodo sem registro no historico nem
+//     outra igual na fila)  → aprova e envia ao grupo de ofertas;
+//   - mesma campanha ja enviada ou ja na fila (reenvio / duplicada_fila), venha
+//     do mesmo grupo ou de outro → rejeitada em silencio: nao vira card no bot
+//     nem fica na aba Aprovar Ofertas, so entra nos descartes;
+//   - origem/destino indefinidos, ou repetida com bonus MAIOR que o registrado
+//     (pode ser aumento da campanha) → segue para aprovacao manual.
+// A situacao vem do proxy (situacaoHistoricoTransferencia, a mesma que o gestor
+// mostra no card). As decisoes rodam em serie: a segunda captura da mesma
+// campanha so e julgada depois que a primeira gravou o historico. A memoria
+// local de 24 h (origem→destino+prazo) e uma segunda trava para o intervalo em
+// que o historico ainda nao refletiu o envio.
+// Kill switch: AUTO_TRANSFERENCIA=off. Sem CAMPANHAS_KEY tudo fica manual.
+const AUTO_TRANSF_MEMORIA_MS = 24 * 3600e3;
+const _autoTransfRecentes = new Map();   // chave|prazo -> { id, em }
+let _autoTransfFila = Promise.resolve();
+
+function autoTransferenciaLigada() {
+  return !/^(0|off|false|nao|não)$/i.test(String(process.env.AUTO_TRANSFERENCIA || '').trim())
+    && !!process.env.CAMPANHAS_KEY;
+}
+
+async function proxyOperadorCdv(metodo, rota, corpo) {
+  try {
+    const r = await fetch(CDV_PROXY_URL + rota, {
+      method: metodo,
+      headers: { 'Content-Type': 'application/json', 'X-CDV-Op': process.env.CAMPANHAS_KEY || '' },
+      body: corpo ? JSON.stringify(corpo) : undefined,
+      signal: AbortSignal.timeout(60000),
+    });
+    const d = await r.json().catch(() => ({}));
+    return { ...d, ok: r.ok && d.ok !== false, http: r.status };
+  } catch (e) {
+    return { ok: false, erro: e.message };
+  }
+}
+
+function _maiorPercentual(...textos) {
+  let max = 0;
+  for (const t of textos) for (const m of String(t || '').matchAll(/(\d{1,3})\s*%/g)) max = Math.max(max, Number(m[1]) || 0);
+  return max;
+}
+
+function agendarDecisaoTransferencia(ctx) {
+  _autoTransfFila = _autoTransfFila
+    .then(() => decidirTransferenciaAutomatica(ctx))
+    .catch((e) => {
+      console.warn('[AUTO-TRANSF] Decisao de #' + ctx.id + ' falhou: ' + e.message + ' — fica manual.');
+      liberarOfertaParaCard(ctx.id).catch(() => {});
+    });
+  return _autoTransfFila;
+}
+
+async function decidirTransferenciaAutomatica({ id, item, jid, nomeGrupo, textoBruto }) {
+  const manual = (motivo) => {
+    console.log('[AUTO-TRANSF] #' + id + ' fica para aprovacao manual — ' + motivo);
+    return liberarOfertaParaCard(id).catch(() => {});
+  };
+
+  const agora = Date.now();
+  for (const [k, v] of _autoTransfRecentes) if (agora - v.em > AUTO_TRANSF_MEMORIA_MS) _autoTransfRecentes.delete(k);
+
+  const det = await proxyOperadorCdv('GET', '/ofertas/mensagem/' + encodeURIComponent(id));
+  if (!det.ok) return manual('nao consegui ler a situacao no proxy (' + (det.erro || det.http) + ')');
+  const s = det.oferta && det.oferta.situacaoHistorico;
+  const tipo = s && s.tipo;
+  if (!tipo || tipo === 'indefinida') return manual('origem/destino nao identificados');
+
+  const chaveLocal = s.chave ? s.chave + '|' + String(item.prazo || '').trim().toLowerCase() : '';
+  const jaSaiuAqui = chaveLocal && _autoTransfRecentes.get(chaveLocal);
+  const repetida = tipo === 'reenvio' || tipo === 'duplicada_fila' || (tipo === 'nova' && jaSaiuAqui);
+
+  if (repetida) {
+    // Bonus maior que o ja registrado pode ser aumento da campanha: vale olhar.
+    const bonusNovo = _maiorPercentual(item.bonus, item.titulo);
+    const bonusReg = Number(s.registro && s.registro.bonusMax) || 0;
+    if (tipo === 'reenvio' && bonusReg && bonusNovo > bonusReg) {
+      return manual('mesma campanha com bonus maior (' + bonusNovo + '% x ' + bonusReg + '% registrado)');
+    }
+    const r = await proxyOperadorCdv('POST', '/ofertas/rejeitar', { id });
+    if (!r.ok) return manual('rejeicao automatica falhou (' + (r.erro || r.http) + ')');
+    const motivo = tipo === 'nova'
+      ? 'mesma campanha enviada ha pouco (#' + jaSaiuAqui.id + ')'
+      : (s.texto || tipo);
+    console.log('[AUTO-TRANSF] #' + id + ' repetida rejeitada (' + tipo + ') — ' + item.titulo + ' — ' + (nomeGrupo || jid));
+    registrarDescarteCdv({ jid, motivo: 'transferência repetida', detalhe: motivo, texto: textoBruto });
+    return;
+  }
+
+  if (tipo === 'nova') {
+    const r = await proxyOperadorCdv('POST', '/ofertas/aprovar-e-enviar', { id });
+    if (!r.ok) return manual('envio automatico falhou (' + (r.erro || r.http) + ')');
+    if (chaveLocal) _autoTransfRecentes.set(chaveLocal, { id, em: agora });
+    const como = r.enviada === false
+      ? 'aprovada, mas o envio ao WhatsApp falhou (' + (r.erroEnvio || r.erro || 'sem detalhe') + ') — reenvie pela tela'
+      : 'enviada ao grupo de ofertas';
+    console.log('[AUTO-TRANSF] #' + id + ' campanha nova ' + como + ' — ' + item.titulo);
+    avisarOfertaAutomatica(id, '🤖 Transferência nova ' + como + ': ' + item.titulo
+      + ' (#' + id + ') — capturada em ' + (nomeGrupo || 'grupo') + '.').catch(() => {});
+    return;
+  }
+  return manual('situacao "' + tipo + '" sem regra automatica');
 }
 
 // ── CRIAR OFERTA DE PONTOS SOB DEMANDA (link / texto / arquivo) ──────────────

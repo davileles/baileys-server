@@ -76,6 +76,32 @@ function salvarVistos() {
   } catch (e) { console.warn(bot.TAG + ' nao consegui gravar ' + ARQUIVO_VISTOS + ': ' + e.message); }
 }
 
+// ── DECISAO AUTOMATICA DO SERVIDOR (transferencia de grupo monitorado) ─────
+// reservar: some do poller ate a decisao sair — repetida nunca vira card.
+// liberar: a decisao ficou manual; manda o card agora (se o poller ja nao
+// mandou). avisar: recibo de uma linha, sem botoes, do que saiu sozinho.
+const _reservadas = new Set();
+export function reservarOfertaAutomatica(id) {
+  _reservadas.add(String(id));
+  vistos.add(String(id));
+  salvarVistos();
+}
+export async function liberarOfertaParaCard(id) {
+  const k = String(id);
+  if (!_reservadas.delete(k)) return;
+  if (!bot.ativo || !bot.admins.size) return;
+  const det = await carregarOferta(k);
+  if (!det?.oferta) return;
+  await enviarCardOferta(det.oferta, det.mensagem || '');
+}
+export async function avisarOfertaAutomatica(id, texto) {
+  _reservadas.delete(String(id));
+  vistos.add(String(id));
+  salvarVistos();
+  if (!bot.ativo || !bot.admins.size) return;
+  await bot.paraCadaAdmin(async (chatId) => { await bot.falarPlano(chatId, texto); });
+}
+
 // Duas rotas diferentes: a fila de ofertas vive no proxy CDV, mas a analise por
 // IA roda neste servidor (e quem tem a chave da API e o pipeline de captura).
 async function proxyLocal(metodo, caminho, body) {
