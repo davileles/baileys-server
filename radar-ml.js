@@ -1045,6 +1045,50 @@ export async function precoCatalogoApiMl(id) {
  *
  * @returns {{coberto:boolean, motivo:string|null}}
  */
+// ── CATALOGO SEM OFERTA (24/10/2026) ────────────────────────────────────
+// /products/{id}/items em 404 (ou vazio) com /products/{id} em 200 = o
+// catalogo existe, mas ninguem vende: a pagina diz "Este produto esta
+// indisponivel no momento" (trena Bosch MLB26481655). Ate aqui o pipeline
+// caia no card do nosso perfil social, que devolve um preco antigo (R$ 2.012)
+// e fazia o produto parecer vendavel. Id de anuncio da 404 em /products e
+// nao entra aqui. Devolve true so quando a API confirma as duas pontas.
+const _cacheSemOferta = new Map();          // id -> { v, em }
+const SEM_OFERTA_TTL_MS = 30 * 60 * 1000;
+
+export function idCatalogoMl(asin, url) {
+  const daUrl = (String(url || '').match(/\/p\/(MLB\d{5,})/i) || [])[1];
+  if (daUrl) return daUrl.toUpperCase();
+  return /^MLB\d{5,}$/i.test(String(asin || '')) && !/\/MLB-?\d/i.test(String(url || ''))
+    ? String(asin).toUpperCase() : null;
+}
+
+export async function catalogoSemOfertaMl(id) {
+  const cat = /^MLB\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;
+  if (!cat || !apiMlAutorizada()) return false;
+  const c = _cacheSemOferta.get(cat);
+  if (c && Date.now() - c.em < SEM_OFERTA_TTL_MS) return c.v;
+  let semOferta = false;
+  try {
+    let vazio = false;
+    try {
+      const of = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=5');
+      vazio = !(of?.results || []).some(r => Number(r?.price) > 0);
+    } catch (e) {
+      if (!/\b404\b/.test(e.message)) throw e;
+      vazio = true;
+    }
+    if (vazio) {
+      try { const prod = await apiMl('/products/' + encodeURIComponent(cat)); semOferta = !!prod?.id; }
+      catch (e) { if (!/\b404\b/.test(e.message)) throw e; }
+    }
+  } catch (e) {
+    console.warn('[ML] conferencia de oferta do catalogo ' + cat + ' falhou:', e.message);
+    return false;                           // soluco de infra nao derruba o item
+  }
+  _cacheSemOferta.set(cat, { v: semOferta, em: Date.now() });
+  return semOferta;
+}
+
 export async function coberturaApiMl(asin, url) {
   if (!ML_SO_API) return { coberto: true, motivo: null };
   if (!apiMlAutorizada())
@@ -1056,6 +1100,11 @@ export async function coberturaApiMl(asin, url) {
   for (const cat of candidatos) {
     try { if (await precoCatalogoApiMl(cat)) return { coberto: true, motivo: null }; }
     catch (e) { return { coberto: true, motivo: null }; }
+  }
+  for (const cat of candidatos) {
+    if (await catalogoSemOfertaMl(cat))
+      return { coberto: false, semOferta: true,
+               motivo: 'catalogo sem oferta ativa: indisponivel na loja — vai ser pulado no disparo' };
   }
   return { coberto: false,
            motivo: 'anuncio classico: a API oficial nao cobre (so catalogo /p/ ou /up/). '
@@ -2748,6 +2797,15 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     // nao queimar etiqueta de nicho em item que vai ser descartado — e porque
     // a leitura resolve o link curto. O asin salvo vai junto: na vitrine ele
     // costuma ser o id de catalogo, que e o que o fallback pela API aceita.
+    // Catalogo que ninguem vende nao sai, nem pelo card do perfil social (que
+    // mostra preco antigo de produto indisponivel). Ver CATALOGO SEM OFERTA.
+    const _catSo = idCatalogoMl(salvo.asin, urlSalva || bruta);
+    if (_catSo && await catalogoSemOfertaMl(_catSo)) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome,
+        motivo: 'indisponivel na loja: catalogo ' + _catSo + ' sem oferta ativa' });
+      continue;
+    }
+
     let dados;
     try { dados = await buscarDadosProdutoMl(bruta, { id: salvo.asin }); }
     catch (e) {

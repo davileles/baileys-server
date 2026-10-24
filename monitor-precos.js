@@ -34,7 +34,7 @@ import { registrarSeloPreco, registrarSeloQueda, listarVitrine, itemVitrine, sal
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
 import { buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk } from './radar-shopee.js';
-import { buscarDadosProdutoMl, precoCatalogoApiMl, tokenAffOk } from './radar-ml.js';
+import { buscarDadosProdutoMl, precoCatalogoApiMl, tokenAffOk, catalogoSemOfertaMl, idCatalogoMl } from './radar-ml.js';
 
 const SESSAO_DIR = './sessao';
 const ARQ_CFG    = 'monitor_precos_config.json';
@@ -1119,6 +1119,10 @@ async function lerPreco(item) {
     }
     if (viaApi) return { preco: viaApi.preco, precoDe: viaApi.precoDe, disponivel: true, titulo: null, fonte: 'api',
                          ofertaSuspeita: viaApi.ofertaSuspeita || null };
+    // Catalogo existe e ninguem vende = sem oferta (24/10/2026). Antes caia no
+    // card do perfil social, que devolvia preco antigo de produto indisponivel.
+    const _cat = idCatalogoMl(item.asin, item.url);
+    if (_cat && await catalogoSemOfertaMl(_cat)) return { preco: null, precoDe: null, disponivel: false, titulo: null, fonte: 'api' };
     if (!tokenAffOk()) throw new Error('Mercado Livre nao configurado (ML_AFF_TOKEN) e sem cobertura da API oficial para este item');
     const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin), { id: item.asin });
     return { preco: d.preco, precoDe: d.precoDe, disponivel: d.disponivel !== false, titulo: d.titulo };
