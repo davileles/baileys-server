@@ -2719,6 +2719,20 @@ export async function dadosPeloNossoLinkMl(url, titulo = '') {
  * informado no disparo vence o vinculado ao produto) e renderiza o template.
  * Nada e enviado aqui — devolve { prontos, descartados }.
  */
+/**
+ * URL do catalogo /p/ ja aberta na oferta cujo preco foi lido (pdp_filters).
+ * So para catalogo MLB com item conhecido; /up/MLBU nao aceita o filtro.
+ * Null quando nao se aplica — quem chama segue com a URL original.
+ */
+export function urlOfertaCatalogoMl(url, dados) {
+  const cat = String(dados?.catalogoId || '').toUpperCase();
+  const item = String(dados?.itemId || '').toUpperCase();
+  if (!/^MLB\d{5,}$/.test(cat) || !/^MLB\d{5,}$/.test(item)) return null;
+  const m = String(url || '').match(/\/p\/(MLB\d{5,})/i);
+  if (m && m[1].toUpperCase() !== cat) return null;
+  return 'https://www.mercadolivre.com.br/p/' + cat + '?pdp_filters=item_id%3A' + item;
+}
+
 export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes = {}) {
   const prontos = [], descartados = [];
 
@@ -2788,13 +2802,30 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     // O nome salvo na vitrine e o que da a categoria — e por isso que o item
     // cadastrado sai com a etiqueta do nicho e o link cru capturado num grupo
     // (que chega sem titulo) cai no balde geral.
-    try { links = await gerarLinksAfiliadoMl([url], { titulos: { [url]: nomeReal } }); }
-    catch (e) {
-      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'painel de afiliados: ' + e.message });
+    //
+    // LINK FIXADO NA OFERTA (24/10/2026): catalogo /p/ sem vendedor ganhador
+    // abre so "Ver opcoes de compra", sem preco (kit Quicko MLB67445153: uma
+    // oferta de R$ 31,99 na API, pagina sem valor). A API nao informa o buy box
+    // (buy_box_winner vem nulo ate em produto que mostra preco), entao o link
+    // passa a apontar para a OFERTA de onde saiu o preco: /p/{id}?pdp_filters=
+    // item_id:{item}, que abre com preco e botao Comprar (conferido no Chrome).
+    // Se o painel de afiliados recusar a URL com parametro, volta a do catalogo.
+    const urlOferta = urlOfertaCatalogoMl(url, dados);
+    const tentativas = urlOferta ? [urlOferta, url] : [url];
+    let r = null, erroPainel = null;
+    for (const alvo of tentativas) {
+      try { links = await gerarLinksAfiliadoMl([alvo], { titulos: { [alvo]: nomeReal } }); }
+      catch (e) { erroPainel = e; continue; }
+      r = links.get(alvo) || links.get(salvo.asin) || links.get(idDeUrl(alvo)) || { erro: 'sem resposta do painel' };
+      if (!r.erro) break;
+      if (alvo === urlOferta) console.warn('[ML] ' + salvo.asin + ' — painel recusou o link fixado na oferta ('
+        + r.erro + '); usando o link do catalogo');
+    }
+    if (!r && erroPainel) {
+      descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'painel de afiliados: ' + erroPainel.message });
       continue;
     }
-    const r = links.get(url) || links.get(salvo.asin) || links.get(idDeUrl(url)) || { erro: 'sem resposta do painel' };
-    if (r.erro) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: r.erro }); continue; }
+    if (!r || r.erro) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: (r && r.erro) || 'sem resposta do painel' }); continue; }
 
     const p = {
       asin: salvo.asin, id: salvo.asin,
