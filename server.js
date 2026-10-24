@@ -19566,7 +19566,7 @@ async function itensSemCoberturaMl(produtos) {
     if (!it || String(it.loja || '') !== 'Mercado Livre') continue;
     try {
       const r = await coberturaApiMl(asin, it.url);
-      if (!r.coberto) fora.push({ asin, nome: it.nome || asin, motivo: r.motivo });
+      if (!r.coberto) fora.push({ asin, nome: it.nome || asin, motivo: r.motivo, semOferta: !!r.semOferta });
     } catch (e) { /* soluco de infra nao acusa o item */ }
   }
   return fora;
