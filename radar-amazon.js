@@ -2713,6 +2713,34 @@ function diasMenorPreco(p, preco) {
   catch { return null; }
 }
 
+// ── COMPARACAO COM O ULTIMO ENVIO (out/2026) ─────────────────────────────────
+// "R$ 24,62 mais barato que no último envio": o preco divulgado agora (com o
+// cupom, sem o desconto a vista — a mesma base do historico de envios) contra o
+// preco que o grupo viu da ultima vez que o produto saiu. Quem conhece o
+// historico e o server.js, que registra o provedor no boot:
+// (asin) -> { preco, em } | null. So entra quando a diferenca e real (2% e
+// pelo menos R$ 1): empate ou centavos nao viram frase.
+let _provedorUltimoEnvio = null;
+export function registrarRefUltimoEnvio(fn) { _provedorUltimoEnvio = typeof fn === 'function' ? fn : null; }
+const ULT_ENVIO_TOLERANCIA = 0.02;
+const ULT_ENVIO_MIN_REAIS = 1;
+function comparacaoUltimoEnvio(p, preco) {
+  const vazio = { vs_ultimo_envio: '', ultimo_envio_preco: '', ultimo_envio_economia: '' };
+  const chave = p?.asin;
+  if (!_provedorUltimoEnvio || !chave || !Number.isFinite(preco) || preco <= 0) return vazio;
+  let ref = null;
+  try { ref = _provedorUltimoEnvio(String(chave)); } catch { return vazio; }
+  const anterior = Number(ref?.preco);
+  if (!Number.isFinite(anterior) || anterior <= 0) return vazio;
+  const diff = Math.round((anterior - preco) * 100) / 100;
+  if (preco > anterior * (1 - ULT_ENVIO_TOLERANCIA) || diff < ULT_ENVIO_MIN_REAIS) return vazio;
+  return {
+    vs_ultimo_envio: 'R$ ' + brl(diff) + ' mais barato que no último envio',
+    ultimo_envio_preco: brl(anterior),
+    ultimo_envio_economia: brl(diff),
+  };
+}
+
 /** Variaveis disponiveis no template, a partir do produto ja normalizado. */
 // ── AJUSTES DA OFERTA (extensao Captura Tica, disparo direto) ─────────────────
 // O operador preenche na extensao os mesmos campos da aba "Criar oferta" do
@@ -2787,9 +2815,17 @@ function aplicarAjustesVars(vars, p, cupom, aj) {
     if (aj.preco) {
       const n = diasMenorPreco(p, base), q = quedaHabitual(p, base);
       const queda = q ? q + '% abaixo do preço das últimas semanas' : '';
-      vars.menor_preco = n ? 'Menor preço dos últimos ' + n + ' dias' : queda;
       vars.menor_preco_dias = n ? String(n) : '';
       vars.queda_habitual = queda;
+    }
+    // Comparacao com o ultimo envio: sobre o preco final recalculado (com o
+    // cupom), a mesma base que o historico de envios guarda.
+    Object.assign(vars, comparacaoUltimoEnvio(p, final));
+    if (aj.preco) {
+      const n = Number(vars.menor_preco_dias) || null;
+      vars.menor_preco = n ? 'Menor preço dos últimos ' + n + ' dias' : (vars.queda_habitual || vars.vs_ultimo_envio);
+    } else if (vars.menor_preco_veio_do_envio) {
+      vars.menor_preco = vars.vs_ultimo_envio;
     }
   }
   return vars;
@@ -2857,9 +2893,15 @@ function _varsDoProdutoBase(p, cupom) {
       // mostra a queda contra o preco habitual — tambem pela serie propria.
       const q = quedaHabitual(p, precoPrazo);
       const queda = q ? q + '% abaixo do preço das últimas semanas' : '';
-      return { menor_preco: n ? 'Menor preço dos últimos ' + n + ' dias' : queda,
+      // Sem recorde nem queda contra o habitual, a linha do selo ainda pode
+      // dizer que esta mais barato que da ultima vez que o grupo viu o produto.
+      const ult = comparacaoUltimoEnvio(p, precoPrazo);
+      const doEnvio = !n && !queda && !!ult.vs_ultimo_envio;
+      return { menor_preco: n ? 'Menor preço dos últimos ' + n + ' dias' : (queda || ult.vs_ultimo_envio),
                menor_preco_dias: n ? String(n) : '',
-               queda_habitual: queda };
+               queda_habitual: queda,
+               menor_preco_veio_do_envio: doEnvio ? '1' : '',
+               ...ult };
     })(),
     desconto: descTotal > 0 ? descTotal : '',
     economia: (riscado && riscado > precoFinal) ? brl(riscado - precoFinal) : '',
@@ -2905,6 +2947,9 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'menor_preco',   desc:'Ex: "Menor preço dos últimos 63 dias" — pela série do monitor; sem recorde, vira "42% abaixo do preço das últimas semanas" (queda ≥ 15% contra a mediana 30d); vazio sem nenhum dos dois' },
   { chave:'queda_habitual', desc:'Só a frase "42% abaixo do preço das últimas semanas" (vazia sem queda relevante)' },
   { chave:'menor_preco_dias', desc:'Só o número de dias do selo de menor preço' },
+  { chave:'vs_ultimo_envio', desc:'Ex: "R$ 24,62 mais barato que no último envio" — contra o preço (com cupom) da última vez que o produto saiu nos grupos (até 60 dias); vazio sem queda de 2% e R$ 1. Também entra em {{menor_preco}} quando não há selo de dias nem queda contra o habitual' },
+  { chave:'ultimo_envio_preco', desc:'Preço (com cupom) do último envio do produto, quando está mais barato agora' },
+  { chave:'ultimo_envio_economia', desc:'Quanto está mais barato que no último envio, em R$' },
   { chave:'desconto',      desc:'Percentual total de desconto' },
   { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
   { chave:'cupom',         desc:'Código do cupom (vazio quando não há)' },

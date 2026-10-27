@@ -61,7 +61,7 @@ import {
   contasAmazonSeparadas, formatarOfertaAmazon,
   lerPrecoAVista, diagnosticarAVista, estadoAVista,
   precosDeclaradosNoTexto, RE_PRECO_EXPLICADO, precoPorDoPost,
-  ajustesOfertaCtx, normalizarAjustesOferta,
+  ajustesOfertaCtx, normalizarAjustesOferta, registrarRefUltimoEnvio,
 } from './radar-amazon.js';
 
 // ── CATEGORIZACAO DE PRODUTO (grupos de nicho) ────────────────────────────────
@@ -5923,6 +5923,36 @@ function enviosRecentesDoProduto(asin, dias = 15) {
   }
   return out;
 }
+
+// Ultimo envio de OFERTA do produto, para a frase "R$ X mais barato que no
+// ultimo envio" do template ({{vs_ultimo_envio}} / fallback do {{menor_preco}}).
+// Sincrono (varsDoProduto e sincrono): le os shards do mes atual e do anterior
+// ja aquecidos. Ignora as ultimas 6 h — e o proprio disparo em andamento (o
+// mesmo produto saindo grupo a grupo) e nao pode virar a referencia de si mesmo.
+const ULT_ENVIO_SELO_MIN_MS = 6 * 3600000;
+const ULT_ENVIO_SELO_MAX_DIAS = 60;
+function ultimoEnvioParaSelo(asin) {
+  if (!asin) return null;
+  const agora = Date.now();
+  const teto = agora - ULT_ENVIO_SELO_MIN_MS;
+  const piso = agora - ULT_ENVIO_SELO_MAX_DIAS * 86400000;
+  let melhor = null, melhorEm = 0;
+  for (const nome of _shardsHistoricoRecentes()) {
+    const regs = _histEnvioCache.get(nome);
+    if (!Array.isArray(regs)) continue;
+    for (const r of regs) {
+      if (!r || String(r.asin || '') !== String(asin)) continue;
+      if (!String(r.tipoConteudo || '').startsWith('oferta')) continue;
+      const em = Date.parse(r.enviadoEm || '');
+      if (!Number.isFinite(em) || em > teto || em < piso || em <= melhorEm) continue;
+      const preco = _precoDivulgadoEnvio(r);
+      if (!Number.isFinite(preco) || preco <= 0) continue;
+      melhor = { preco, em: r.enviadoEm }; melhorEm = em;
+    }
+  }
+  return melhor;
+}
+registrarRefUltimoEnvio(ultimoEnvioParaSelo);
 
 async function registrarEnvioHistorico(oferta) {
   try {

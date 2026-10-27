@@ -224,7 +224,8 @@
         "function _gmNumeroDaCasa(",
         "function emissaoRepetida(",
         "function registrarEmissaoRecente(",
-        "async function decidirTransferenciaAutomatica("
+        "async function decidirTransferenciaAutomatica(",
+        "function ultimoEnvioParaSelo("
       ]
     },
     "radar-awin.js": {
@@ -321,7 +322,8 @@
         "export function templateProprioDaLoja",
         "export function turnosTsp",
         "export function ultimoCupomDaLoja",
-        "export function varsDoProduto"
+        "export function varsDoProduto",
+        "export function registrarRefUltimoEnvio("
       ]
     },
     "radar-ml.js": {
