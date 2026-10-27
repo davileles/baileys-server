@@ -57,6 +57,7 @@ import { tagMlDoProduto, salvarItemVitrine } from './radar-amazon.js';
 // link precisa saber classificar. categorizador.js so depende de fs e do sync,
 // entao nao ha ciclo de import aqui.
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
+import { pedirPaginaMl, extensaoPaginasOnline } from './paginas-ml.js';
 
 function carregarToken() {
   try { if (existsSync(tokenPath())) tokDef(JSON.parse(readFileSync(tokenPath(), 'utf-8'))); }
@@ -652,6 +653,10 @@ export function htmlLogadoBloqueado(html) {
 function paginaMlBloqueada(res, html, ld) {
   return RE_ANTIBOT_URL_ML.test(res?.url || '') || (!ld && RE_ANTIBOT_ML.test(html || ''));
 }
+/** Mesma regra, para HTML que chegou pela extensao (server.js, /ml/pagina/resultado). */
+export function paginaMlBloqueadaHtml(urlFinal, html) {
+  return paginaMlBloqueada({ url: urlFinal }, html, extrairLdProduto(html || ''));
+}
 
 function apiMlAutorizada() {
   if (!tokAtual()) carregarToken();
@@ -1200,30 +1205,44 @@ export async function verificarPaginaProdutoMl(urlTeste, aoBloquear) {
   // A cadencia real e garantida por quem chama (rotinaSondaPaginaMl), que trava
   // o intervalo em disco: so o setInterval nao bastava, porque a sonda tambem
   // dispara no boot e o Railway reinicia a cada commit.
+  //
+  // Desde 27/10/2026 a sonda vai pelo Chrome do operador quando a extensao esta
+  // online (e o canal que o pipeline usa de verdade); o Railway so sonda quando
+  // ela esta fora — e so nesse caso o diagnostico de antibot do Railway muda.
   const cookie = cookieAff();
   if (!cookie || !urlTeste) return _saudePagina;
   try {
-    const res = await fetch(urlTeste, {
-      headers: {
-        'Cookie': cookie,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'pt-BR,pt;q=0.9',
-      },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(25000),
-    });
-    const html = await res.text();
+    let res, html, fonte;
+    const pag = await paginaPelaExtensaoMlBruta(urlTeste);
+    if (pag) {
+      fonte = 'extensao';
+      res = { ok: pag.ok, url: pag.urlFinal, status: pag.status };
+      html = pag.html;
+    } else {
+      fonte = 'railway';
+      res = await fetch(urlTeste, {
+        headers: {
+          'Cookie': cookie,
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'pt-BR,pt;q=0.9',
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(25000),
+      });
+      html = await res.text();
+    }
     const bloqueado = paginaMlBloqueada(res, html, extrairLdProduto(html));
     const antes = _saudePagina.ok;
     _saudePagina = {
       ok: res.ok && !bloqueado,
       verificadoEm: new Date().toISOString(),
       url: urlTeste,
+      fonte,
       erro: bloqueado ? ERRO_ANTIBOT_ML : (res.ok ? null : 'HTTP ' + res.status),
       avisado: bloqueado ? _saudePagina.avisado : false,
     };
-    if (bloqueado) registrarAntibotMl(urlTeste); else registrarPaginaMlOk();
+    if (fonte === 'railway') { if (bloqueado) registrarAntibotMl(urlTeste); else registrarPaginaMlOk(); }
     if (bloqueado && !_saudePagina.avisado && typeof aoBloquear === 'function') {
       _saudePagina.avisado = true;
       await aoBloquear('sonda periodica em ' + urlTeste);
@@ -1297,8 +1316,40 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   // ativo — ou seja, so parava de bater DEPOIS de ja ter apanhado. Era essa
   // janela que renovava o bloqueio a cada leva de produtos.
   if (ML_SO_API || (estadoAntibotMl().confirmadoAgora && !opcoes.forcarPagina)) {
+    // Pagina pelo Chrome do operador, em paralelo com a API: a API continua
+    // sendo a fonte do preco de catalogo (passa pela regra de oferta suspeita);
+    // a pagina acrescenta o que so ela tem — cupom declarado no anuncio e o
+    // "De" — e vira a fonte inteira para anuncio classico, que a API nao cobre.
+    const pagPromessa = opcoes.semPagina ? Promise.resolve(null) : paginaPelaExtensaoMl(alvoUrl);
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
-    if (viaApi) return { ...viaApi, bloqueado: estadoAntibotMl().confirmadoAgora, urlFinal: alvoUrl };
+    const pag = await pagPromessa;
+    if (viaApi) {
+      if (pag) {
+        const cuponsPagina = extrairCupomMl(pag.html);
+        if (cuponsPagina.length) console.log('[ML] ' + (idDeUrl(alvoUrl) || alvoUrl) + ' — ' + cuponsPagina.length + ' cupom(ns) declarado(s) na pagina (via extensao)');
+        viaApi.cuponsPagina = cuponsPagina;
+        viaApi.fontePagina = 'extensao';
+        if (!viaApi.precoDe && viaApi.preco) {
+          const ld = extrairLdProduto(pag.html);
+          const resolvido = resolverPrecoDe({
+            preco: viaApi.preco, descontoDeclarado: descontoDeclaradoNoHtml(pag.html),
+            rotulo: idDeUrl(alvoUrl) || 'ML',
+            candidatos: [
+              { fonte: FONTE_LDJSON, valor: precoDeDoLd(ld) },
+              { fonte: FONTE_ESTADO, valor: precoDeDoEstado(pag.html) },
+              { fonte: FONTE_DOM,    valor: precoDeDoDom(pag.html) },
+            ],
+          });
+          if (resolvido.precoDe) { viaApi.precoDe = resolvido.precoDe; viaApi.precoDeFonte = resolvido.fonte; }
+        }
+      }
+      return { ...viaApi, bloqueado: estadoAntibotMl().confirmadoAgora, urlFinal: alvoUrl };
+    }
+    if (pag) {
+      console.log('[ML] ' + (idDeUrl(alvoUrl) || alvoUrl) + ' — anuncio fora da API: pagina lida pela extensao');
+      return { ...(await interpretarPaginaProdutoMl(pag, alvoUrl, url, opcoes)), fontePagina: 'extensao',
+               bloqueado: estadoAntibotMl().confirmadoAgora };
+    }
     // Anuncio classico: a API nao cobre e a pagina nao sera aberta. Sobra o card
     // que o perfil social ja entregou na leitura anterior — preco renderizado
     // pelo proprio ML, sem requisicao nova e sem depender do texto do post.
@@ -1330,20 +1381,61 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
   });
   if (!res.ok) throw new Error('pagina do produto respondeu HTTP ' + res.status);
   const html = await res.text();
+  return interpretarPaginaProdutoMl({ html, urlFinal: res.url || alvoUrl, ok: res.ok, origem: 'railway' }, alvoUrl, url, opcoes);
+}
 
+// ── PAGINA PELO CHROME DO OPERADOR (paginas-ml.js, desde 27/10/2026) ──────
+// Com ML_SO_API o Railway nunca abre a pagina; o que abre e o fetch() da
+// extensao Captura Tica, sem cookie, de IP residencial. Devolve o HTML bom
+// ou null (extensao offline, freio ativo, sem resposta, tela antibot) — e
+// null nunca e erro: o pipeline segue pela API e pelo card do perfil social.
+/** Como paginaPelaExtensaoMl, mas devolve tambem a tela antibot (a sonda precisa ve-la). */
+async function paginaPelaExtensaoMlBruta(alvoUrl) {
+  if (!extensaoPaginasOnline()) return null;
+  try {
+    const r = await pedirPaginaMl(alvoUrl, { motivo: 'sonda' });
+    if (!r) return null;
+    return { html: r.html, urlFinal: r.url || alvoUrl, ok: !r.status || r.status < 400, status: r.status, bloqueada: r.bloqueada, origem: 'extensao' };
+  } catch (e) { return null; }
+}
+
+async function paginaPelaExtensaoMl(alvoUrl) {
+  if (!extensaoPaginasOnline()) return null;
+  try {
+    const r = await pedirPaginaMl(alvoUrl);
+    if (!r) return null;
+    if (r.bloqueada) {
+      console.warn('[ML] Pagina pela extensao veio bloqueada (antibot no Chrome do operador): ' + alvoUrl);
+      return null;
+    }
+    return { html: r.html, urlFinal: r.url || alvoUrl, ok: !r.status || r.status < 400, origem: 'extensao' };
+  } catch (e) {
+    console.warn('[ML] Pagina pela extensao falhou (' + e.message + '): ' + alvoUrl);
+    return null;
+  }
+}
+
+/**
+ * Le a pagina de produto ja baixada (pelo Railway ou pela extensao).
+ * O bloco de antibot so conta para o diagnostico do Railway: a extensao tem
+ * contadores proprios em paginas-ml.js.
+ */
+async function interpretarPaginaProdutoMl(pag, alvoUrl, url, opcoes = {}) {
+  const html = pag.html;
+  const doRailway = pag.origem !== 'extensao';
   const ld = extrairLdProduto(html);
 
   // Tela antibot no lugar da pagina: nomeia o bloqueio e tenta a API oficial.
   // Sem API autorizada, o erro diz o que fazer — melhor que "sem preco".
-  if (paginaMlBloqueada(res, html, ld)) {
-    registrarAntibotMl(alvoUrl);
+  if (paginaMlBloqueada({ url: pag.urlFinal, ok: pag.ok }, html, ld)) {
+    if (doRailway) registrarAntibotMl(alvoUrl);
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
     if (viaApi) return { ...viaApi, bloqueado: true, urlFinal: alvoUrl };
     throw new Error(ERRO_ANTIBOT_ML + (apiMlAutorizada()
       ? ' — API oficial nao cobre este anuncio (so catalogo /p/ ou /up/)'
       : ' — autorize a API oficial em /ml/conectar para o fallback'));
   }
-  registrarPaginaMlOk();
+  if (doRailway) registrarPaginaMlOk();
 
   const oferta = ld?.offers
     ? (Array.isArray(ld.offers) ? ld.offers[0] : ld.offers)

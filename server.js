@@ -207,8 +207,9 @@ import {
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
   estadoOrigemSocialMl,
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
-  formatarOfertaMl, amostrasCardSocialMl,
+  formatarOfertaMl, amostrasCardSocialMl, paginaMlBloqueadaHtml,
 } from './radar-ml.js';
+import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl } from './paginas-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
 // variavel porque o endpoint interno pode mudar sem aviso.
@@ -497,8 +498,9 @@ async function rotinaSondaPaginaMl({ forcar = false } = {}) {
           nivel: 'atencao', origem: 'ml', chave: 'ml:antibot-sonda',
           titulo: 'Sonda diaria: pagina do ML segue bloqueada',
           corpo: '\u23f3 *Sonda diaria do ML: bloqueio segue ativo*\n\n'
-            + 'Bloqueado desde ' + quando(d0) + '. Nenhuma acao necessaria: '
-            + 'o pipeline nao le pagina (ML_SO_API) e a proxima verificacao e em '
+            + 'Bloqueado desde ' + quando(d0) + ' (sonda pelo '
+            + (saudePaginaMl().fonte === 'extensao' ? 'Chrome do operador' : 'Railway') + '). '
+            + 'Nenhuma acao necessaria: o Railway nao le pagina (ML_SO_API) e a proxima verificacao e em '
             + (ML_SONDA_PAGINA_MS / 3600e3) + 'h.\n\n'
             + 'A API oficial segue atendendo os itens de catalogo normalmente.',
         }).catch(() => {});
@@ -515,7 +517,8 @@ async function rotinaSondaPaginaMl({ forcar = false } = {}) {
       nivel: 'atencao', origem: 'ml', chave: 'ml:antibot-liberado',
       titulo: 'ML liberou a leitura de paginas',
       corpo: '\u2705 *A pagina de produto do ML voltou a abrir*\n\n'
-        + 'Bloqueio durou desde ' + quando(marca.bloqueadoDesde || marca.em) + '.\n'
+        + 'Bloqueio durou desde ' + quando(marca.bloqueadoDesde || marca.em) + ' (sonda pelo '
+        + (saudePaginaMl().fonte === 'extensao' ? 'Chrome do operador' : 'Railway') + ').\n'
         + 'O pipeline continua em modo so-API (ML_SO_API) — nada volta a ler '
         + 'pagina sozinho. Se quiser reavaliar, a decisao e sua.',
     }).catch(() => {});
@@ -723,6 +726,8 @@ const PORT          = process.env.PORT || 3001;
 // precisa valer na proxima chamada, sem restart.
 function anthropicKey() { return process.env.ANTHROPIC_API_KEY; }
 const SESSAO_DIR    = './sessao';
+// Contador diario da leitura de pagina do ML pela extensao (paginas-ml.js).
+iniciarPaginasMl(SESSAO_DIR);
 const UPLOAD_DIR    = './tmp-uploads';
 
 [SESSAO_DIR, UPLOAD_DIR].forEach(d => { if (!existsSync(d)) mkdirSync(d, { recursive: true }); });
@@ -21240,6 +21245,24 @@ function estadoLeituraCuponsMl() {
     ultimo: _leituraMl.resumo || null,
   };
 }
+// ── LEITURA DE PAGINA DO ML PELA EXTENSAO (paginas-ml.js, desde 27/10/2026) ──
+// A extensao fica em long-poll em /proximo; quando o pipeline pede uma pagina
+// (anuncio classico, cupom declarado no anuncio, sonda diaria), ela faz o
+// fetch() sem cookie no Chrome do operador e devolve o HTML em /resultado.
+// Quem decide se veio tela antibot e o radar-ml (paginaMlBloqueadaHtml).
+app.get('/ml/pagina/proximo', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  atenderLongPollPaginasMl(req, res);
+});
+app.post('/ml/pagina/resultado', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  res.json(registrarResultadoPaginaMl(req.body || {}, (urlFinal, html) => paginaMlBloqueadaHtml(urlFinal, html)));
+});
+app.get('/ml/pagina/estado', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, ...estadoPaginasMl() });
+});
+
 app.get('/cupons/auto/leitura', (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
   const est = estadoLeituraCuponsMl();
@@ -21463,7 +21486,9 @@ app.get('/ml/status', (req, res) => res.json({ ok:true, ...estadoMl(),
   antibot: estadoAntibotMl(), antibotLogado: estadoAntibotLogadoMl(),
   // Leitor de perfil de afiliado: e por ele que todo link de grupo-fonte vira
   // produto hoje, entao seu estado precisa aparecer no mesmo lugar do resto.
-  social: estadoSocialMl() }));
+  social: estadoSocialMl(),
+  // Leitura de pagina pelo Chrome do operador (paginas-ml.js, desde 27/10/2026).
+  paginas: estadoPaginasMl() }));
 
 app.get('/ml/conectar', (req, res) => {
   if (!credenciaisMlOk()) {

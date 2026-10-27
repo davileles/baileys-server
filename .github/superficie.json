@@ -225,7 +225,9 @@
         "function emissaoRepetida(",
         "function registrarEmissaoRecente(",
         "async function decidirTransferenciaAutomatica(",
-        "function ultimoEnvioParaSelo("
+        "function ultimoEnvioParaSelo(",
+        "app.get('/ml/pagina/proximo'",
+        "app.post('/ml/pagina/resultado'"
       ]
     },
     "radar-awin.js": {
@@ -364,7 +366,8 @@
         "export function validadeDeTexto",
         "export function extrairCuponsPaginaMl",
         "export function juntarLeiturasCuponsMl",
-        "export function urlsLeituraCuponsMl"
+        "export function urlsLeituraCuponsMl",
+        "export function paginaMlBloqueadaHtml("
       ]
     },
     "radar-shopee.js": {
@@ -525,6 +528,14 @@
         "export async function processarEmailsSeats(",
         "export function lerAlertaPorRegex(",
         "export function segredoSeatsOk("
+      ]
+    },
+    "paginas-ml.js": {
+      "minLinhas": 120,
+      "obrigatorio": [
+        "export function pedirPaginaMl(",
+        "export function atenderLongPollPaginasMl(",
+        "export function registrarResultadoPaginaMl("
       ]
     }
   }
