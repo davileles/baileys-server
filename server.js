@@ -3737,9 +3737,12 @@ const PROGRAMAS_SLUG = {
   'Finnair Plus':'finnair',
   'Aeroplan':'aeroplan'
 };
-// Programas cujo link mascarado aceita a busca ja preenchida (o proxy monta a
-// URL final em BUSCA_BUILDERS). Adicionar aqui conforme forem mapeados.
-const PROGRAMAS_COM_BUSCA = new Set(['smiles']);
+// Programas cujo link mascarado aceita a busca ja preenchida: o proxy
+// (painel-cdv/busca-links.js, desde 28/10/2026) monta a pagina de pesquisa do
+// programa com rota/datas/cabine e aplica os params de afiliado de links.json
+// por cima. Mesmos formatos da aba Buscar voos (bloco bv*). Slug fora desta
+// lista recebe so o link padrao do programa.
+const PROGRAMAS_COM_BUSCA = new Set(['smiles', 'azul', 'azul-mundo', 'latam']);
 
 function linkPrograma(programa, origem, busca) {
   const slug = PROGRAMAS_SLUG[programaCanonico(programa)];
