@@ -9517,7 +9517,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
 //      membro e print de emissao, e nada disso pode virar card na fila.
 //
 // Passa por aprovacao humana, com UMA excecao: transferencia bonificada de
-// grupo monitorado decide sozinha (bloco DISPARO AUTOMATICO DE TRANSFERENCIA).
+// grupo monitorado (ou do radar de blogs) decide sozinha (bloco DISPARO
+// AUTOMATICO DE TRANSFERENCIA).
 const OFERTA_MILHAS_JANELA_MS = 45000;   // debounce: plantao posta texto e print separados
 const OFERTA_MILHAS_MAX_IMGS  = 3;       // teto de imagens por extracao (custo/tempo)
 const bufferOfertaMilhas = new Map();    // jid -> { itens, timer }
@@ -9765,7 +9766,8 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
 }
 
 // ══ DISPARO AUTOMATICO DE TRANSFERENCIA ══════════════════════════════════════
-// Transferencia bonificada capturada em grupo monitorado nao espera aprovacao:
+// Transferencia bonificada capturada em grupo monitorado OU pelo radar de
+// blogs (decidirTransferenciaRadar, desde 29/10/2026) nao espera aprovacao:
 //   - campanha nova (origem→destino + periodo sem registro no historico nem
 //     outra igual na fila)  → aprova e envia ao grupo de ofertas;
 //   - mesma campanha ja enviada ou ja na fila (reenvio / duplicada_fila), venha
@@ -9817,6 +9819,23 @@ function agendarDecisaoTransferencia(ctx) {
       liberarOfertaParaCard(ctx.id).catch(() => {});
     });
   return _autoTransfFila;
+}
+
+// Transferencia que entrou na fila pelo radar de blogs (painel-cdv,
+// coletar-radar.js — item sem 'fonte'). O poller do bot de ofertas chama isto
+// antes de mandar o card: devolve true quando a decisao automatica assumiu
+// (a oferta fica reservada; se cair em manual, liberarOfertaParaCard manda o
+// card). Captura de grupo tem fonte 'whatsapp' e ja decidiu no envio a fila;
+// criacao manual (fonte 'manual') segue sempre para aprovacao.
+function decidirTransferenciaRadar(o) {
+  if (!o || !o.id || o.categoria !== 'transferencia' || o.fonte) return false;
+  if (!autoTransferenciaLigada()) return false;
+  reservarOfertaAutomatica(o.id);
+  agendarDecisaoTransferencia({
+    id: o.id, item: o, jid: null, nomeGrupo: 'radar de blogs',
+    textoBruto: [o.titulo, o.bonus, o.prazo].filter(Boolean).join(' — '),
+  });
+  return true;
 }
 
 async function decidirTransferenciaAutomatica({ id, item, jid, nomeGrupo, textoBruto }) {
@@ -25079,7 +25098,7 @@ bootBotPassagens({
   programas: Object.keys(PROGRAMAS_SLUG),
   cias: Object.values(ALIAS_CIA),
 }).catch(e => console.warn('[BOT-PASSAGENS] Falha no boot:', e.message));
-bootBotOfertas({ sessaoDir: SESSAO_DIR, PORT }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
+bootBotOfertas({ sessaoDir: SESSAO_DIR, PORT, decidirTransferenciaRadar }).catch(e => console.warn('[BOT-OFERTAS] Falha no boot:', e.message));
 
 // ── CARDS DO MONITOR DE PRECOS ───────────────────────────────────────────────
 // Candidato do monitor entra na MESMA fila de aprovacao das ofertas capturadas

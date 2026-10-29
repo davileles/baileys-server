@@ -341,6 +341,10 @@ async function varrerPendentes() {
 
   for (const o of novos) {
     try {
+      // Transferencia que chegou pelo radar de blogs (coletar-radar.js, sem
+      // 'fonte'): mesma decisao automatica da captura de grupo. O servidor
+      // reserva a oferta e, se a decisao ficar manual, ele mesmo manda o card.
+      if (typeof dep?.decidirTransferenciaRadar === 'function' && dep.decidirTransferenciaRadar(o)) continue;
       const det = await carregarOferta(o.id);
       await enviarCardOferta(det?.oferta || o, det?.mensagem || '');
     } catch (err) {
