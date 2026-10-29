@@ -3314,6 +3314,10 @@ function colapsarCardsRepetidos() {
 }
 setTimeout(() => {
   try { colapsarCardsRepetidos(); } catch (e) { console.warn('[REPETIDA] Limpeza no boot falhou:', e.message); }
+  try {
+    const genericos = listarVitrine().filter(i => (i.loja || '') === 'Shopee' && ehNomeGenericoLoja(i.nome)).map(i => i.asin);
+    if (genericos.length && credenciaisShopeeOk()) resolverNomesProvisorios(genericos).catch(() => {});
+  } catch (e) { console.warn('[VITRINE] Reparo de nomes genericos no boot falhou:', e.message); }
 }, 60000);
 
 function enfileirarEnvio(ofertaId, mensagem, grupoAlvo, dados, opts) {
@@ -19937,7 +19941,31 @@ const NOME_PROVISORIO_VIT = /^Produto [A-Z0-9]{10}$/;
 // Qualquer marcador de cadastro: Amazon (ASIN), ML (MLB/MLBU), Shopee (itemId), Magalu.
 function ehNomeProvisorio(t) { return /^Produto [A-Za-z0-9-]+$/.test(String(t || '').trim()); }
 
+// TITULO GENERICO DA LOJA. A Shopee e uma SPA: lida cedo demais (extensao,
+// "Guardar O LINK"), a pagina ainda tem o <title> da home — "Shopee Brasil |
+// Ofertas incriveis. Melhores precos do mercado" — e esse texto entrava como
+// nome manual, vencendo o productName da API. Nome assim nao e nome: e tratado
+// como ausente no cadastro e reparado nos itens que ja entraram com ele.
+function ehNomeGenericoLoja(t) {
+  const s = String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[|;:\-–]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!s) return false;
+  if (/ofertas incriveis/.test(s) && /melhores precos/.test(s)) return true;
+  return /^(shopee( brasil)?|mercado ?livre( brasil)?|amazon(\.com\.br)?|magazine luiza|magalu)( (frete gratis.*|compre.*|ofertas.*))?$/.test(s);
+}
+
 async function resolverNomesProvisorios(asins) {
+  let reparadosShopee = 0;
+  for (const a of new Set(asins)) {
+    const i = itemVitrine(a);
+    if (!i || (i.loja || '') !== 'Shopee' || !i.shopId || !i.itemId) continue;
+    if (!ehNomeGenericoLoja(i.nome) && !ehNomeProvisorio(i.nome)) continue;
+    try {
+      const node = await buscarProdutoShopee({ shopId: i.shopId, itemId: i.itemId });
+      if (node?.productName) { salvarItemVitrine({ asin: a, nome: node.productName }); reparadosShopee++; }
+    } catch (e) { console.warn('[VITRINE] Nome Shopee de ' + a + ' nao resolvido:', e.message); }
+  }
+  if (reparadosShopee) console.log('[VITRINE] ' + reparadosShopee + ' nome(s) da Shopee reparado(s) pela API.');
   const alvo = [...new Set(asins)].filter(a => {
     const i = itemVitrine(a);
     return i && (i.loja || '') === 'Amazon' && NOME_PROVISORIO_VIT.test(i.nome || '');
@@ -20451,8 +20479,10 @@ app.post('/vitrine', async (req, res) => {
   // coisa. A deteccao e pela CONTAGEM de URLs, nao pela presenca do separador.
   const RE_URL_LINHA = /https?:\/\/[^\s|]+/g;
   const expandidas = [];
-  for (const linha of linhas) {
+  for (let linha of linhas) {
     const urls = linha.match(RE_URL_LINHA) || [];
+    const nomeFrente = urls.length ? linha.slice(0, linha.indexOf(urls[0])).replace(/[|;]\s*$/, '').trim() : '';
+    if (nomeFrente && ehNomeGenericoLoja(nomeFrente)) linha = linha.slice(linha.indexOf(urls[0]));
     if (urls.length < 2) { expandidas.push({ linha, grupo: null }); continue; }
     const nomeGrupo = linha.slice(0, linha.indexOf(urls[0])).replace(/[|;]\s*$/, '').trim();
     const grupo = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
