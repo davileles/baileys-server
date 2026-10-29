@@ -1932,8 +1932,15 @@ function avisarCandidatos(aprovados) {
   for (const [a, ts] of Object.entries(_estado.avisados)) {
     if (agora - ts > coolMs) delete _estado.avisados[a];
   }
-  const novos = aprovados.filter(({ av }) => !_estado.avisados[av.asin])
+  let novos = aprovados.filter(({ av }) => !_estado.avisados[av.asin])
     .sort((x, y) => (y.av.score || 0) - (x.av.score || 0));
+  // Modo on (29/10/2026, pedido do Davi): o publicador ja envia sozinho, entao
+  // o bot so recebe o que ele NAO vai enviar — a queda anormal (travaQueda),
+  // que fica na fila esperando o toque do operador no card.
+  if (_cfg.modo === 'on') {
+    const tq = _cfg.travaQueda || CFG_PADRAO.travaQueda;
+    novos = novos.filter(({ av }) => tq.ativo !== false && Number(av.quedaPctBruto ?? av.quedaPct) >= tq.pct);
+  }
   if (!novos.length) return 0;
 
   const MAX = 15;
@@ -1951,7 +1958,7 @@ function avisarCandidatos(aprovados) {
     return l;
   });
   const extra = novos.length > MAX ? '\n\n+ ' + (novos.length - MAX) + ' outro(s) na fila do painel.' : '';
-  const modo = _cfg.modo === 'on' ? 'modo on — entram na fila de envio'
+  const modo = _cfg.modo === 'on' ? 'modo on — queda anormal, so sai se voce aprovar no card'
     : _cfg.modo === 'sombra'
       ? (usarCards() ? 'modo sombra — so sai o que voce aprovar no card' : 'modo sombra — NAO serao enviados')
       : 'modo ' + _cfg.modo;
