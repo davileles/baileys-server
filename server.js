@@ -23792,13 +23792,19 @@ function formatarNumero(telefone) {
 
 function extrairTelefone(payload) {
   const ev = payload.event; if (!ev) return null;
-  return ev.member?.phone || ev.member?.user?.phone || ev.subscriber?.phone || ev.customer?.phone || ev.user?.phone || null;
+  return ev.user?.phone || ev.subscription?.payer?.phone || ev.member?.phone || ev.member?.user?.phone || ev.subscriber?.phone || ev.customer?.phone || null;
 }
 
 function extrairNome(payload) {
   const ev = payload.event; if (!ev) return 'novo membro';
-  const n = ev.member?.fullName || ev.member?.name || ev.member?.user?.name || ev.subscriber?.name || ev.customer?.name || ev.user?.name || null;
-  return n ? n.split(' ')[0] : 'novo membro';
+  // Webhook v2 da Hubla manda o nome em user.firstName/lastName (sem "name"):
+  // sem isso a mensagem saía "Olá, novo membro!".
+  const n = ev.user?.firstName || ev.subscription?.payer?.firstName
+    || ev.member?.fullName || ev.member?.name || ev.member?.user?.name || ev.subscriber?.name || ev.customer?.name || ev.user?.name || null;
+  if (!n) return 'novo membro';
+  const primeiro = String(n).trim().split(/\s+/)[0];
+  // "MARIA" / "maria" → "Maria"
+  return primeiro.charAt(0).toLocaleUpperCase('pt-BR') + primeiro.slice(1).toLocaleLowerCase('pt-BR');
 }
 
 app.post('/webhook/hubla', async (req, res) => {
