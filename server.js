@@ -19,6 +19,7 @@ import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, mkdirS
 import { readdir, unlink, writeFile as writeFileAsync, readFile as readFileAsync, rename as renameAsync, mkdir as mkdirAsync, rm as rmAsync, stat as statAsync, statfs as statfsAsync } from 'fs/promises';
 import { join } from 'path';
 import { createHash } from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import QRCode from 'qrcode';
 
 // ── RADAR DE MARKETPLACE (Amazon hoje; ML e Shopee entram pelo mesmo pipeline) ─
@@ -5472,9 +5473,59 @@ async function espelharCategoriaNoOperador(oferta, cls) {
 // A espera e sempre do FIM da publicacao anterior, e nao do inicio: um despacho
 // para 30 grupos ja leva minutos e nao precisa de mais pausa depois.
 
-let _portaoCadeia   = Promise.resolve();  // cadeia serial: um despacho por vez
+// ── PRIORIDADE MAXIMA (30/10/2026) ──────────────────────────────────────────
+// Envio marcado "prioridade maxima" (lista, envio unico, Criar oferta/cupom/
+// mensagem na janela) entra na FRENTE da fila do portao: so espera terminar a
+// publicacao que ja esta saindo naquele segundo. E, enquanto houver lista
+// prioritaria em andamento, o resto (capturas dos grupos-fonte, Telegram,
+// monitor, outras listas) fica SEGURADO no portao — nada se perde, volta a
+// andar quando a prioritaria acaba. Motivo: em 29/10 a lista OUTLETPRIME de
+// 3 min saiu de 10 em 10 min porque cada item entrava no fim da fila atras de
+// tudo que chegava dos grupos-fonte.
+// A marca viaja por AsyncLocalStorage: quem roda dentro de
+// prioridadeEnvioCtx.run(true, ...) publica com prioridade sem ter de passar
+// opcao por todas as camadas (lista → montagem → despacho → portao).
+const prioridadeEnvioCtx = new AsyncLocalStorage();
+// Folga minima entre uma publicacao e a prioritaria seguinte (a cadencia da
+// lista ja espaca; isto so evita colar duas publicacoes no mesmo segundo).
+const PRIORIDADE_FOLGA_MS = 15000;
+// Teto de seguranca: lista prioritaria iniciada ha mais de 12 h nao segura mais nada.
+const PRIORIDADE_TETO_MS  = 12 * 60 * 60 * 1000;
+
+/** Listas prioritarias que estao andando AGORA (nao pausadas, dentro da janela,
+ *  com o proximo item para logo). Fora da janela ou pausada nao segura o resto. */
+function listasPrioritariasAtivas() {
+  let ls = [];
+  try { ls = listarListas(); } catch (_) { return []; }
+  const agora = Date.now();
+  return ls.filter(l => {
+    const ex = l?.execucao;
+    if (!l?.prioridade || !ex || ex.pausada) return false;
+    const ini = Date.parse(ex.iniciadaEm || '') || agora;
+    if (agora - ini > PRIORIDADE_TETO_MS) return false;
+    if ((Number(ex.proximoEm) || 0) > agora + (Number(l.intervaloMin) || 20) * 60000 + 120000) return false;
+    try { if (!janelaEnvioLista(l).ok) return false; } catch (_) {}
+    return true;
+  });
+}
+
+let _portaoFila     = [];                 // { fn, rotulo, prioridade, resolve, reject }
+let _portaoRodando  = false;
+let _portaoEmVoo    = false;              // uma publicacao saindo agora
 let _portaoUltimoEm = 0;                  // fim da ultima publicacao (ms)
-let _portaoNaFila   = 0;                  // quantos aguardando vez agora
+let _portaoGapMs    = 0;                  // intervalo sorteado para a proxima normal
+let _portaoNaFila   = 0;                  // quantos aguardando vez agora (inclui a em voo)
+let _portaoAcordar  = null;
+let _portaoSegurandoLog = 0;
+
+function _portaoAtualizarContagem() { _portaoNaFila = _portaoFila.length + (_portaoEmVoo ? 1 : 0); }
+
+function _portaoDormir(ms) {
+  return new Promise(r => {
+    const t = setTimeout(() => { _portaoAcordar = null; r(); }, ms);
+    _portaoAcordar = () => { clearTimeout(t); _portaoAcordar = null; r(); };
+  });
+}
 
 /** Quanto uma publicacao que entrasse agora esperaria, em ms. Estimativa para
  *  o operador — nao reserva vaga, so responde "vai demorar mais ou menos X". */
@@ -5490,25 +5541,75 @@ function portaoOcupado() {
   return _portaoNaFila > 0 || esperaPrevistaMs() > 0;
 }
 
-/** Roda `fn` respeitando a vez e o intervalo. Erro de `fn` sobe para o caller
- *  normalmente — o portao nunca engole falha de envio. */
-function comPortaoDePublicacao(fn, rotulo = '') {
-  _portaoNaFila++;
-  const proxima = _portaoCadeia.then(async () => {
-    const alvo = _portaoUltimoEm + msEntrePublicacoes();
-    const esperar = Math.max(0, alvo - Date.now());
-    if (esperar > 0) {
-      console.log('[PORTAO] ' + (rotulo || 'publicacao') + ' aguardando '
-        + Math.round(esperar / 1000) + 's — ' + _portaoNaFila + ' na fila.');
-      await new Promise(r => setTimeout(r, esperar));
+/** Estado do portao para o painel (fila de envio). */
+function estadoPortao() {
+  const ativas = listasPrioritariasAtivas();
+  return {
+    naFila: _portaoNaFila,
+    prioritariosNaFila: _portaoFila.filter(x => x.prioridade).length,
+    segurando: ativas.length > 0 && _portaoFila.some(x => !x.prioridade),
+    listasPrioritarias: ativas.map(l => ({ id: l.id, nome: l.nome, intervaloMin: l.intervaloMin })),
+  };
+}
+
+async function _portaoBombear() {
+  if (_portaoRodando) return;
+  _portaoRodando = true;
+  try {
+    while (_portaoFila.length) {
+      let idx = _portaoFila.findIndex(x => x.prioridade);
+      if (idx < 0 && listasPrioritariasAtivas().length) {
+        // So ha conteudo normal e uma lista prioritaria segue em andamento:
+        // segura ate ela acabar (ou pausar / sair da janela).
+        if (Date.now() - _portaoSegurandoLog > 5 * 60000) {
+          _portaoSegurandoLog = Date.now();
+          console.log('[PORTAO] Prioridade maxima em andamento — ' + _portaoFila.length
+            + ' publicacao(oes) normal(is) segurada(s) ate a lista prioritaria terminar.');
+        }
+        await _portaoDormir(5000);
+        continue;
+      }
+      if (idx < 0) idx = 0;
+      const item = _portaoFila[idx];
+      const gap = item.prioridade ? PRIORIDADE_FOLGA_MS : _portaoGapMs;
+      const esperar = Math.max(0, _portaoUltimoEm + gap - Date.now());
+      if (esperar > 0) {
+        if (!item._logouEspera) {
+          item._logouEspera = true;
+          console.log('[PORTAO] ' + (item.rotulo || 'publicacao') + (item.prioridade ? ' (PRIORIDADE)' : '')
+            + ' aguardando ' + Math.round(esperar / 1000) + 's — ' + _portaoNaFila + ' na fila.');
+        }
+        // Interrompivel: chegou prioritaria no meio da espera → reavalia na hora.
+        await _portaoDormir(esperar);
+        continue;
+      }
+      _portaoFila.splice(idx, 1);
+      _portaoEmVoo = true; _portaoAtualizarContagem();
+      try { item.resolve(await prioridadeEnvioCtx.run(!!item.prioridade, item.fn)); }
+      catch (e) { item.reject(e); }
+      finally {
+        _portaoUltimoEm = Date.now();
+        _portaoGapMs = msEntrePublicacoes();
+        _portaoEmVoo = false; _portaoAtualizarContagem();
+      }
     }
-    try { return await fn(); }
-    finally { _portaoUltimoEm = Date.now(); }
+  } finally {
+    _portaoRodando = false;
+    if (_portaoFila.length) _portaoBombear().catch(() => {});
+  }
+}
+
+/** Roda `fn` respeitando a vez e o intervalo. Erro de `fn` sobe para o caller
+ *  normalmente — o portao nunca engole falha de envio. Prioridade: opcoes.
+ *  prioridade, ou herdada do contexto (prioridadeEnvioCtx). */
+function comPortaoDePublicacao(fn, rotulo = '', opcoes = {}) {
+  const prioridade = opcoes.prioridade !== undefined ? !!opcoes.prioridade : !!prioridadeEnvioCtx.getStore();
+  return new Promise((resolve, reject) => {
+    _portaoFila.push({ fn, rotulo, prioridade, resolve, reject });
+    _portaoAtualizarContagem();
+    if (prioridade && _portaoAcordar) _portaoAcordar();
+    _portaoBombear().catch(() => {});
   });
-  // A cadeia nao pode quebrar quando um despacho falha: sem o catch, a rejeicao
-  // se propaga para todos os proximos e o portao trava a operacao inteira.
-  _portaoCadeia = proxima.catch(() => {}).finally(() => { _portaoNaFila--; });
-  return proxima;
 }
 
 // Wrapper: TODO despacho de oferta passa pelo portao. `opcoes.semPortao` existe
@@ -17443,7 +17544,7 @@ app.post('/enviar', async (req, res) => {
   // de publicacao (respeita o espacamento com radar/monitor/listas); fora dela
   // vira agendamento para a proxima abertura, visivel e cancelavel em Agendados.
   // Sem o campo (ou 'agora'), comportamento historico: sai na hora.
-  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio, conta, quando } = req.body;
+  const { grupo, mensagem, agendarEm, direto, preview, anexo, tipo, categoria, dados, trilhas: trilhasEnvio, conta, quando, prioridade } = req.body;
   const contaEnvio = contaPedida(conta);
 
   // Destino e sempre grupo (resolverGrupo nao aceita DM): qualquer conta de
@@ -17474,10 +17575,10 @@ app.post('/enviar', async (req, res) => {
       if (anexo?.base64 && (!mtA || mtA.indexOf('image/') === 0)) {
         imagem = { imagemBase64: String(anexo.base64).replace(/^data:[^;]+;base64,/, ''), mime: mtA || 'image/jpeg' };
       }
-      const esperaMs = esperaPrevistaMs();
+      const esperaMs = prioridade ? 0 : esperaPrevistaMs();
       comPortaoDePublicacao(
         () => enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categoria, trilhasIds: trilhasEnvio }),
-        'manual na janela')
+        'manual na janela', { prioridade: !!prioridade })
         .then(r => console.log('[MANUAL] Na janela: enviado em ' + r.enviados.length + ' grupo(s)'
           + (r.falhas.length ? ', ' + r.falhas.length + ' falha(s)' : '') + '.'))
         .catch(e => console.error('[MANUAL] Na janela: falhou —', e.message));
@@ -19504,10 +19605,14 @@ async function processarItemLista(id) {
       return;
     }
 
+    // Prioridade maxima: o item entra na frente do portao e a cadencia conta do
+    // INICIO deste item (3 min = sai as 16:45, 16:48, 16:51...), nao do fim.
+    const _inicioItem = Date.now();
     try {
-      const r = await dispararProdutoDaLista(asin, cupomDaLista(lista, asin), lista.roteamento,
-                                             lista.edicoesItem?.[String(asin)] || null,
-                                             lista.ajustesItem?.[String(asin)] || null);
+      const r = await prioridadeEnvioCtx.run(!!lista.prioridade, () =>
+        dispararProdutoDaLista(asin, cupomDaLista(lista, asin), lista.roteamento,
+                               lista.edicoesItem?.[String(asin)] || null,
+                               lista.ajustesItem?.[String(asin)] || null));
       if (!execucaoVigente()) {
         console.log('[LISTA] "' + lista.nome + '" mudou durante o envio de ' + asin + ' — andamento descartado.');
         return;
@@ -19538,8 +19643,11 @@ async function processarItemLista(id) {
     }
 
     ex.indice += 1;
-    ex.proximoEm = Date.now() + lista.intervaloMin * 60000;
+    ex.proximoEm = lista.prioridade
+      ? Math.max(_inicioItem + lista.intervaloMin * 60000, Date.now() + 1000)
+      : Date.now() + lista.intervaloMin * 60000;
     atualizarExecucaoLista(lista.id, ex);
+    if (lista.prioridade) agendarTickLista(lista.id, ex.proximoEm);
     console.log('[LISTA] "' + lista.nome + '" — item ' + ex.indice + '/' + _fila.length
       + ', proximo em ' + lista.intervaloMin + ' min.');
   } catch (e) {
@@ -19547,7 +19655,7 @@ async function processarItemLista(id) {
   } finally { _listasEmEnvio.delete(id); }
 }
 
-setInterval(() => {
+function tickListas() {
   const vencidas = listarListas().filter(l =>
     l.execucao && !l.execucao.pausada && l.execucao.proximoEm <= Date.now()
     && !_listasEmEnvio.has(l.id));
@@ -19555,7 +19663,18 @@ setInterval(() => {
     _listasEmEnvio.add(l.id);
     processarItemLista(l.id);   // sem await: uma lista nao espera a outra
   }
-}, 15000);
+}
+setInterval(tickListas, 15000);
+
+// Lista prioritaria nao espera o tick de 15 s: acorda no segundo exato do
+// proximo item, para a cadencia escolhida valer de verdade.
+const _ticksLista = new Map();
+function agendarTickLista(id, quando) {
+  clearTimeout(_ticksLista.get(id));
+  const ms = Math.max(0, (Number(quando) || Date.now()) - Date.now());
+  if (ms > 30 * 60000) return;   // longe demais: o tick normal cobre
+  _ticksLista.set(id, setTimeout(() => { _ticksLista.delete(id); try { tickListas(); } catch (_) {} }, ms + 50));
+}
 
 // Agendador: dispara a lista no dia da semana e hora marcados. Guarda o dia ja
 // disparado para restart do container nao repetir a lista no mesmo dia.
@@ -19609,7 +19728,7 @@ app.get('/listas', (req, res) => {
           Math.max(0, filaDaExecucao(l).length - l.execucao.indice)).terminaEm)
       : null,
   }));
-  res.json({ ok:true, total: listas.length, listas,
+  res.json({ ok:true, total: listas.length, listas, portao: estadoPortao(),
              agoraSP: new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle:'short', timeStyle:'short' }).format(new Date()) });
 });
 
@@ -19676,6 +19795,7 @@ app.post('/listas/:id/disparar', async (req, res) => {
       aviso:'Seleção do dia: nenhum produto atrativo agora (' + _ini.selecao.fora.length + ' fora). Nada foi enviado.' });
   }
   const atualizada = _ini.lista;
+  if (atualizada?.prioridade) agendarTickLista(atualizada.id, aguardando ? inicio : Date.now());
   const _filaDia = filaDaExecucao(atualizada);
   const _qtd = _filaDia.length;
   // Aviso, nao bloqueio: quem dispara decide se troca o produto ou toca assim.
@@ -19759,6 +19879,7 @@ app.post('/listas/disparo-unico', async (req, res) => {
     edicoesItem: req.body?.edicoesItem,
     ajustesItem: req.body?.ajustesItem,
     roteamento: req.body?.roteamento,
+    prioridade: !!req.body?.prioridade,
     efemera: true,
     agenda: { ativo:false },
     janelas: req.body?.janelas,
@@ -19766,7 +19887,9 @@ app.post('/listas/disparo-unico', async (req, res) => {
 
   try {
     const atualizada = iniciarExecucaoLista(lista, aguardando ? inicio : null);
+    if (lista.prioridade) agendarTickLista(lista.id, aguardando ? inicio : Date.now());
     console.log('[LISTA] Envio unico ' + (aguardando ? 'agendado para ' + relogioSP(inicio) + ' SP' : 'iniciado')
+      + (lista.prioridade ? ' com PRIORIDADE MAXIMA' : '')
       + ' — ' + produtos.length + ' produto(s), ' + lista.intervaloMin + ' min de intervalo.');
     const inicioTs = aguardando ? inicio : Date.now();
     const prev     = previsaoTerminoLista(lista, inicioTs, produtos.length);

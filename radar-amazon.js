@@ -3947,6 +3947,11 @@ export function salvarLista(dados = {}) {
   // reagendar numa lista que nao vai existir amanha.
   const efemera = dados.efemera !== undefined ? !!dados.efemera : !!ant.efemera;
 
+  // PRIORIDADE MAXIMA: os itens furam a fila do portao de publicacao, seguram o
+  // resto enquanto a lista anda e a cadencia conta do inicio de cada item
+  // (ver comPortaoDePublicacao no server.js).
+  const prioridade = dados.prioridade !== undefined ? !!dados.prioridade : !!ant.prioridade;
+
   // SELECAO DO DIA: a cada execucao o servidor reavalia os produtos e manda so
   // os mais atrativos do momento (ver selecionarProdutosDoDia no server.js). A
   // lista guarda todos; a fila do dia e que muda.
@@ -3991,6 +3996,7 @@ export function salvarLista(dados = {}) {
     edicoesItem: Object.keys(edicoesItem).length ? edicoesItem : null,
     ajustesItem: Object.keys(ajustesItem).length ? ajustesItem : null,
     roteamento,
+    prioridade,
     agenda,
     selecaoDia,
     janelas: janelas.length ? janelas : null,

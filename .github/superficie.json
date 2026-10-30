@@ -227,7 +227,10 @@
         "async function decidirTransferenciaAutomatica(",
         "function ultimoEnvioParaSelo(",
         "app.get('/ml/pagina/proximo'",
-        "app.post('/ml/pagina/resultado'"
+        "app.post('/ml/pagina/resultado'",
+        "function comPortaoDePublicacao(",
+        "function listasPrioritariasAtivas(",
+        "const prioridadeEnvioCtx = new AsyncLocalStorage()"
       ]
     },
     "radar-awin.js": {
