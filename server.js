@@ -16412,7 +16412,11 @@ async function checarLembretesAcabaHoje({ forcar = false } = {}) {
       if (l.categoria == null) continue;          // nunca casou com ofertas.json
       if (l.semLembrete) continue;                // desmarcada no gestor
       if (cats && !cats.includes(String(l.categoria).toLowerCase())) continue;
-      const pz = prazoDoTexto(l.prazo, hojeSPIso(new Date(l.enviadoEm)).slice(0, 4));
+      let pz = prazoDoTexto(l.prazo, hojeSPIso(new Date(l.enviadoEm)).slice(0, 4));
+      // Oferta prorrogada (POST /radar/prorrogar): a data nova vale mesmo que o
+      // ofertas.json do Pages ainda traga o prazo antigo (cache de ate 10 min) —
+      // sem isso, prorrogar no proprio ultimo dia mandaria um ACABA HOJE errado.
+      if (l.prorrogadoAte && (!pz || pz.data < l.prorrogadoAte)) pz = { data: l.prorrogadoAte, hora: null };
       if (!pz || pz.data !== hoje) continue;
       // Divulgada no proprio ultimo dia: o post original ja e o lembrete.
       if (hojeSPIso(new Date(l.enviadoEm)) >= pz.data) { l.lembradoEm = 'pulado:enviado_no_dia'; mudou = true; continue; }
@@ -16469,6 +16473,121 @@ app.post('/radar/lembretes/registrar', (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, erro: e.message });
   }
+});
+
+// ── PRORROGACAO DE OFERTA DO RADAR CDV ──────────────────────────────────────
+// Promocao que ganha mais prazo (ex.: transferencia bonificada prorrogada pelo
+// programa). O gestor (via proxy POST /ofertas/prorrogar) informa a nova data:
+// - reenvia nos MESMOS grupos o texto que saiu, com "🔁 PRORROGADO ATÉ DD/MM!"
+//   no titulo e a linha do PRAZO trocada;
+// - rearma o "ACABA HOJE" para a nova data, ja com o texto atualizado.
+// O reenvio vai pela filaRadar marcado como `lembrete`: NAO passa pela aprovacao
+// do proxy e NAO grava historico-transferencias.json (a extensao do registro
+// existente e feita pelo proxy, sem criar campanha nova).
+function _isoParaBR(iso) {
+  const m = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : '';
+}
+function _brParaIso(br) {
+  const m = String(br || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  const d = Number(m[1]), mm = Number(m[2]);
+  if (mm < 1 || mm > 12 || d < 1 || d > 31) return null;
+  return `${m[3]}-${String(mm).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+// Troca o prazo no texto: a linha "📆 *PRAZO* ..." (formato do radar) ou, sem
+// ela, as ocorrencias da data antiga (DD/MM/AAAA e DD/MM).
+function trocarPrazoNaMensagem(msg, novoBR, prazoAntigoIso) {
+  let s = String(msg || '');
+  const reLinha = /^(\s*📆\s*\*PRAZO\*:?\s*).*$/m;
+  if (reLinha.test(s)) return s.replace(reLinha, (_, pre) => pre + novoBR);
+  if (prazoAntigoIso) {
+    const [a, mm, d] = prazoAntigoIso.split('-');
+    const novoCurto = novoBR.slice(0, 5);
+    s = s.split(`${d}/${mm}/${a}`).join(novoBR);
+    s = s.replace(new RegExp('(^|[^\\d/])' + d + '/' + mm + '(?![\\d/])', 'g'), (_, p1) => p1 + novoCurto);
+    s = s.replace(new RegExp('(^|[^\\d/])' + Number(d) + '/' + Number(mm) + '(?![\\d/])', 'g'), (_, p1) => p1 + novoCurto);
+  }
+  return s;
+}
+// Mesmo texto, com "🔁 PRORROGADO ATÉ DD/MM!" no titulo (1a linha em *negrito*).
+function mensagemProrrogada(msg, novoBR) {
+  const linhas = String(msg || '').split('\n');
+  const i = linhas.findIndex(l => l.trim());
+  const selo = '🔁 PRORROGADO ATÉ ' + novoBR.slice(0, 5) + '!';
+  if (i < 0) return msg;
+  const m = linhas[i].match(/^(\s*)\*(.+)\*\s*$/);
+  if (m) {
+    const titulo = m[2]
+      .replace(/^\s*⏰?\s*acaba\s+hoje!?\s*/i, '')
+      .replace(/^\s*🔁?\s*prorrogad[ao]\s+at[ée]\s+\d{1,2}\/\d{1,2}!?\s*/i, '')
+      .replace(/^\s*(?:acaba\s+(?:amanh[ãa]|hoje)|[úu]ltimos?\s+dias?|[úu]ltimo\s+dia)\s*[!.:–-]*\s*/i, '');
+    linhas[i] = m[1] + '*' + selo + ' ' + titulo + '*';
+  } else {
+    linhas.splice(i, 0, '*' + selo + '*', '');
+  }
+  return linhas.join('\n');
+}
+
+// GET /radar/enviadas — ofertas do radar que sairam em grupo nos ultimos 60 dias
+// (as mesmas entradas do ACABA HOJE), agrupadas por oferta.
+app.get('/radar/enviadas', (req, res) => {
+  const porId = new Map();
+  for (const x of lembretesRadar) {
+    let o = porId.get(x.id);
+    if (!o) {
+      o = { id: x.id, titulo: '', grupos: [], enviadoEm: x.enviadoEm, prazo: x.prazo || '', categoria: x.categoria || '',
+        semLembrete: !!x.semLembrete, prorrogadoAte: x.prorrogadoAte || '', prorrogacoes: x.prorrogacoes || [], lembradoEm: x.lembradoEm || null };
+      const l1 = (String(x.mensagem).split('\n').find(l => l.trim()) || '').replace(/\*/g, '').trim();
+      o.titulo = l1.slice(0, 140);
+      porId.set(x.id, o);
+    }
+    o.grupos.push(NOMES_GRUPOS.get(x.grupo) || x.grupo);
+    if (new Date(x.enviadoEm) > new Date(o.enviadoEm)) o.enviadoEm = x.enviadoEm;
+    if (x.prorrogadoAte && x.prorrogadoAte > (o.prorrogadoAte || '')) { o.prorrogadoAte = x.prorrogadoAte; o.prorrogacoes = x.prorrogacoes || []; }
+  }
+  const itens = [...porId.values()].sort((a, b) => new Date(b.enviadoEm) - new Date(a.enviadoEm));
+  res.json({ ok: true, itens });
+});
+
+// POST /radar/prorrogar { id, novoPrazo:'DD/MM/AAAA', prazoAntigo?:'DD/MM/AAAA', reenviar?:true }
+// X-CDV-Op = CAMPANHAS_KEY (chamado pelo proxy).
+app.post('/radar/prorrogar', (req, res) => {
+  if (!campRotaAutorizada(req, res)) return;
+  const { id, novoPrazo, prazoAntigo } = req.body || {};
+  const reenviar = req.body?.reenviar !== false;
+  const idStr = String(id || '').trim();
+  if (!idStr) return res.status(400).json({ ok: false, erro: 'id obrigatório' });
+  const novoIso = _brParaIso(novoPrazo);
+  if (!novoIso) return res.status(400).json({ ok: false, erro: 'novoPrazo inválido (use DD/MM/AAAA)' });
+  const hoje = hojeSPIso();
+  if (novoIso < hoje) return res.status(400).json({ ok: false, erro: 'a nova data já passou' });
+  const novoBR = _isoParaBR(novoIso);
+  const entradas = lembretesRadar.filter(x => x.id === idStr);
+  if (!entradas.length) return res.status(404).json({ ok: false, erro: 'oferta sem envio registrado nos últimos 60 dias' });
+  const agoraIso = new Date().toISOString();
+  const grupos = [];
+  for (const l of entradas) {
+    const antigoPz = prazoDoTexto(prazoAntigo || l.prazo, hojeSPIso(new Date(l.enviadoEm)).slice(0, 4));
+    const antigoIso = l.prorrogadoAte || (antigoPz && antigoPz.data) || null;
+    l.mensagem = trocarPrazoNaMensagem(l.mensagem, novoBR, antigoIso);
+    l.prazo = novoBR;
+    l.prorrogadoAte = novoIso;
+    l.lembradoEm = null;   // rearma o ACABA HOJE para a data nova
+    l.prorrogacoes = [...(l.prorrogacoes || []), { de: antigoIso || '', para: novoIso, em: agoraIso, reenviado: reenviar }].slice(-10);
+    if (reenviar) {
+      filaRadar.push({ id: 'prorrogado_' + idStr, mensagem: mensagemProrrogada(l.mensagem, novoBR), grupo: l.grupo, tentativas: 0, lembrete: true });
+    }
+    grupos.push(NOMES_GRUPOS.get(l.grupo) || l.grupo);
+  }
+  salvarLembretesRadar();
+  if (reenviar) {
+    salvarFilaRadar();
+    radarWorker().catch(e => { console.error('[RADAR] Worker erro:', e.message); radarWorkerRodando = false; });
+  }
+  console.log('[PRORROGA] ' + idStr + ' até ' + novoBR + (reenviar ? ' — reenvio em ' : ' — sem reenvio; grupos: ') + grupos.join(', '));
+  res.json({ ok: true, id: idStr, novoPrazo: novoBR, reenviado: reenviar, grupos,
+    previa: reenviar ? mensagemProrrogada(entradas[0].mensagem, novoBR) : null });
 });
 
 // GET /radar/lembretes — o que esta registrado e quando cada um lembra.

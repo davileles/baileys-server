@@ -81,6 +81,8 @@
         "app.get('/qr'",
         "app.get('/radar/fila'",
         "app.get('/radar/lembretes'",
+        "app.get('/radar/enviadas'",
+        "app.post('/radar/prorrogar'",
         "app.get('/reenvio/candidatos'",
         "app.get('/shield'",
         "app.get('/shopee/status'",
