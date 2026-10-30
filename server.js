@@ -17176,7 +17176,10 @@ app.post('/backfill-passagens', async (req, res) => {
 app.get('/agendamentos', (req, res) => {
   // Os bytes do anexo ficam de fora: o painel so precisa saber que existe um,
   // e devolver base64 aqui deixaria a listagem pesada sem nenhum ganho.
-  const lista = agendamentos.filter(a => a.status === 'aguardando').map(a => {
+  // ?status=todos devolve também os já disparados/cancelados (retidos 7 dias) —
+  // serve para recuperar o texto de um agendamento depois que ele saiu.
+  const todos = req.query.status === 'todos';
+  const lista = agendamentos.filter(a => todos || a.status === 'aguardando').map(a => {
     const { anexo, ...resto } = a;
     return anexo
       ? { ...resto, anexo: { nomeArquivo: anexo.nomeArquivo || '', mimetype: anexo.mimetype || '', bytes: anexo.bytes || 0 } }
