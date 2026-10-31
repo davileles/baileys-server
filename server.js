@@ -22647,6 +22647,21 @@ app.get('/shopee/status', async (req, res) => {
   } catch(e) { res.json({ ok:false, configurado:true, erro:e.message }); }
 });
 
+// Contas da operacao padrao que podem ler grupos e gerar convite: a principal
+// (se conectada) e as contas extras da casa conectadas, em ordem alfabetica.
+// camp-* fica de fora (exclusiva de campanha de DM).
+function socksLeituraGruposPadrao() {
+  const lista = [];
+  if (sock && conectado) lista.push({ id:'principal', sock });
+  const extras = [...contasExtras.values()]
+    .filter(c => tenantDaConta(c.id) === TENANT_PADRAO && !ehContaCampanha(c.id) && c.conectado && c.sock)
+    .sort((a, b) => a.id.localeCompare(b.id));
+  for (const c of extras) lista.push({ id:c.id, sock:c.sock });
+  return lista;
+}
+let _gruposListaTs = 0;
+const GRUPOS_LISTA_TTL_MS = 10 * 60 * 1000;
+
 app.get('/grupos', async (req, res) => {
   // ── Operador nao-padrao: lista os grupos da CONTA DELE, nunca os do socket
   // principal (que sao os grupos do telefone da operacao padrao).
@@ -22665,22 +22680,57 @@ app.get('/grupos', async (req, res) => {
   }
 
   // groupFetchAllParticipating leva ~6s com 400 grupos e trava a aba a cada
-  // abertura. O cache e preenchido na conexao e a lista muda raramente, entao
-  // responde na hora e so busca de verdade com ?refresh=1 ou cache vazio.
-  if (NOMES_GRUPOS.size && req.query.refresh !== '1') {
+  // abertura. O cache responde na hora, mas so vale por GRUPOS_LISTA_TTL_MS:
+  // sem prazo, grupo criado ou renomeado depois do boot nunca aparecia.
+  const _respCache = (aviso) => {
     const grupos = [...NOMES_GRUPOS.entries()]
       .map(([id, nome]) => ({ id, nome }))
       .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
-    return res.json({ ok:true, total:grupos.length, grupos, doCache:true });
-  }
+    return res.json({ ok:true, total:grupos.length, grupos, doCache:true, ...(aviso ? { aviso } : {}) });
+  };
+  const _cacheFresco = NOMES_GRUPOS.size && (Date.now() - _gruposListaTs) < GRUPOS_LISTA_TTL_MS;
+  if (_cacheFresco && req.query.refresh !== '1') return _respCache();
+  // Principal fora do ar (bloqueio/logout): a lista sai das contas da casa que
+  // estao conectadas (ticos). Antes ficava presa ao cache da principal — grupo
+  // criado pelos ticos ou renomeado depois nao aparecia nas trilhas.
   if (!sock || !conectado) {
+    const leitores = socksLeituraGruposPadrao().filter(l => l.id !== 'principal');
+    if (leitores.length) {
+      const mapa = new Map();
+      const res2 = await Promise.allSettled(leitores.map(l => l.sock.groupFetchAllParticipating()));
+      res2.forEach((r, i) => {
+        if (r.status !== 'fulfilled') { console.warn('[GRUPOS] ' + leitores[i].id + ': ' + (r.reason?.message || r.reason)); return; }
+        for (const g of Object.values(r.value || {})) if (!mapa.has(g.id)) mapa.set(g.id, g.subject || '(sem nome)');
+      });
+      if (mapa.size) {
+        for (const [id, nome] of mapa) NOMES_GRUPOS.set(id, nome);
+        _gruposListaTs = Date.now();
+        const grupos = [...mapa.entries()].map(([id, nome]) => ({ id, nome }))
+          .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+        return res.json({ ok:true, total:grupos.length, grupos,
+          viaContas: leitores.map(l => l.id), aviso:'Principal desconectada — lista lida de ' + leitores.map(l => l.id).join(', ') + '.' });
+      }
+    }
     const ok = await aguardarSock(15000);
-    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+    if (!ok) {
+      if (NOMES_GRUPOS.size) return _respCache('WhatsApp nao conectado — lista do cache, pode estar desatualizada.');
+      return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+    }
   }
   try {
     const chats  = await sock.groupFetchAllParticipating();
     NOMES_GRUPOS.clear();
     for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
+    // Grupos em que so os ticos estao (ex.: reserva criada por eles) entram
+    // tambem: a principal sozinha nao enxerga esses e a trilha nao os oferecia.
+    const extrasLeit = socksLeituraGruposPadrao().filter(l => l.id !== 'principal');
+    const res2 = await Promise.allSettled(extrasLeit.map(l => l.sock.groupFetchAllParticipating()));
+    for (const r of res2) {
+      if (r.status !== 'fulfilled') continue;
+      for (const g of Object.values(r.value || {})) if (!chats[g.id]) chats[g.id] = g;
+    }
+    for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
+    _gruposListaTs = Date.now();
     const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
     res.json({ ok:true, total:grupos.length, grupos });
   } catch(err) {
@@ -22716,9 +22766,9 @@ function _ggMeuNumero() {
 // participantes chegam como <id>@lid em vez de <numero>@s.whatsapp.net, entao
 // comparar so pelo telefone nunca casava e souAdmin ficava false ate em grupo
 // criado pela propria conta. Junta telefone + lid num Set.
-function _ggMinhasIds() {
+function _ggMinhasIds(s = sock) {
   const ids = new Set();
-  for (const v of [sock?.user?.id, sock?.user?.lid]) {
+  for (const v of [s?.user?.id, s?.user?.lid]) {
     const n = String(v || '').split(':')[0].split('@')[0].trim();
     if (n) ids.add(n);
   }
@@ -22733,11 +22783,11 @@ function _ggIdsDoParticipante(p) {
     .filter(Boolean);
 }
 
-async function _ggInfoGrupo(jid, forcar) {
+async function _ggInfoGrupo(jid, forcar, s = sock) {
   const c = _ggMetaCache.get(jid);
   if (!forcar && c && (Date.now() - c.ts) < GG_META_TTL_MS) return c;
-  const md = await sock.groupMetadata(jid);
-  const meus = _ggMinhasIds();
+  const md = await s.groupMetadata(jid);
+  const meus = _ggMinhasIds(s);
   const meu = (md.participants || []).find(p =>
     _ggIdsDoParticipante(p).some(n => meus.has(n)));
   const info = {
@@ -22756,19 +22806,26 @@ async function _ggInfoGrupo(jid, forcar) {
 app.get('/grupos/info', async (req, res) => {
   const jids = String(req.query.jids || '').split(',').map(s => s.trim()).filter(Boolean);
   if (!jids.length) return res.status(400).json({ ok:false, erro:'informe ?jids=jid1,jid2' });
-  if (!sock || !conectado) {
+  // Principal fora do ar: le pelas contas da casa conectadas (ticos).
+  let leitores = socksLeituraGruposPadrao();
+  if (!leitores.length) {
     const ok = await aguardarSock(15000);
-    if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+    leitores = socksLeituraGruposPadrao();
+    if (!ok && !leitores.length) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
   }
   const forcar = req.query.refresh === '1';
   const grupos = [];
   for (const jid of jids.slice(0, 60)) {
-    try {
-      const i = await _ggInfoGrupo(jid, forcar);
-      grupos.push({ jid, nome:i.nome, membros:i.membros, souAdmin:i.souAdmin });
-    } catch (e) {
-      grupos.push({ jid, nome: NOMES_GRUPOS.get(jid) || null, membros: null, erro: e.message });
+    let ultimoErro = null, feito = false;
+    for (const l of leitores) {
+      try {
+        const i = await _ggInfoGrupo(jid, forcar, l.sock);
+        grupos.push({ jid, nome:i.nome, membros:i.membros, souAdmin:i.souAdmin, conta:l.id });
+        feito = true;
+        break;
+      } catch (e) { ultimoErro = e; }
     }
+    if (!feito) grupos.push({ jid, nome: NOMES_GRUPOS.get(jid) || null, membros: null, erro: ultimoErro?.message || 'sem conta conectada no grupo' });
   }
   res.json({ ok:true, grupos });
 });
@@ -22796,11 +22853,37 @@ app.get('/grupos/convite', async (req, res) => {
       return res.status(503).json({ ok:false, erro:'conta ' + apelConvite + ' nao conectada.' });
     }
     sockConvite = ct.sock;
-  } else {
-    if (!sock || !conectado) {
+  } else if (!sock || !conectado) {
+    // Principal fora do ar (bloqueio/logout): o convite sai do primeiro tico
+    // conectado que for admin do grupo — antes o distribuidor ficava preso em
+    // "WhatsApp nao conectado" ate a principal voltar.
+    const extras = socksLeituraGruposPadrao().filter(l => l.id !== 'principal');
+    if (!extras.length) {
       const ok = await aguardarSock(15000);
       if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp nao conectado.' });
+      sockConvite = sock;
+    } else {
+      const forcarX = req.query.refresh === '1';
+      const ck = req.tenantId + '|*|' + jid;
+      const cx = _ggConviteCache.get(ck);
+      if (!forcarX && cx && (Date.now() - cx.ts) < GG_CONVITE_TTL_MS) {
+        return res.json({ ok:true, jid, url:cx.url, doCache:true, conta:cx.conta });
+      }
+      let ultimo = null;
+      for (const l of extras) {
+        try {
+          const code = await l.sock.groupInviteCode(jid);
+          const url  = 'https://chat.whatsapp.com/' + code;
+          _ggConviteCache.set(ck, { ts: Date.now(), url, conta: l.id });
+          return res.json({ ok:true, jid, url, conta: l.id });
+        } catch (e) { ultimo = e?.message || String(e); }
+      }
+      const erro = /forbidden|not-authorized|401|403/i.test(ultimo || '')
+        ? 'sem permissao — nenhuma conta conectada (' + extras.map(l => l.id).join(', ') + ') e ADMIN deste grupo'
+        : (ultimo || 'falha ao gerar convite');
+      return res.status(500).json({ ok:false, jid, erro });
     }
+  } else {
     sockConvite = sock;
   }
   const forcar = req.query.refresh === '1';
