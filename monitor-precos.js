@@ -396,7 +396,7 @@ function serializarShard(mes) {
     for (const [d, v] of Object.entries(h.diasDe || {})) if (mesDoDia(d) === mes) diasDe[d.slice(8)] = v;
     // Produto marcado sem oferta entra no shard corrente mesmo sem ponto no mes:
     // sem isto a marca morreria a cada deploy e o preco velho voltaria a valer.
-    const semOferta = mes === mesSP() && h.ult?.disponivel === false && !!h.ult?.semOfertaEm;
+    const semOferta = mes === mesSP() && ((h.ult?.disponivel === false && !!h.ult?.semOfertaEm) || !!h.ult?.falhaEm);
     if (!Object.keys(dias).length && !Object.keys(diasEf).length && !semOferta) continue;
     const reg = { n: h.n, loja: h.loja, dias, diasEf, diasDe };
     // A ultima leitura e estado corrente, nao historico: mora so no shard do
@@ -678,7 +678,7 @@ export function salvarConfigMonitorPrecos(parcial = {}) {
 // 8 leituras/dia e 200 produtos, guardar tudo daria ~2 MB de serie em 90 dias
 // e a Contents API para de devolver arquivo acima de ~1 MB — a restauracao
 // pos-deploy morreria em silencio. O minimo diario e o que o gatilho usa.
-function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfetivo }) {
+function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfetivo, itemId }) {
   if (!asin) return null;
   if (!Number.isFinite(preco) || preco <= 0) return null;
   const dia = diaSP();
@@ -707,6 +707,9 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
 
   h.ult = { preco, precoDe: precoDe ?? null, disponivel: disponivel !== false,
             precoEfetivo: ef, em: new Date().toISOString() };
+  // ML catalogo: a oferta de onde saiu o preco (o painel abre /p/ com
+  // pdp_filters nela, como a mensagem enviada — sem isso cai em "ver opcoes").
+  if (itemId) h.ult.itemId = String(itemId);
 
   // Poda: dias fora do horizonte saem do arquivo.
   const corte = diaSP(Date.now() - DIAS_RETENCAO * 86400000);
@@ -728,8 +731,51 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
 // A proxima leitura com preco passa por registrarPreco e limpa a marca.
 function carimboUlt(u) {
   if (!u) return '';
-  const a = String(u.em || ''), b = String(u.semOfertaEm || '');
-  return b > a ? b : a;
+  const a = String(u.em || ''), b = String(u.semOfertaEm || ''), f = String(u.falhaEm || '');
+  return [a, b, f].sort().pop();
+}
+
+// ── LEITURA QUE FALHOU ───────────────────────────────────────────────────────
+// A loja nao respondeu sobre o produto (Shopee: fora do catalogo de afiliados;
+// ML: API sem oferta e sem pagina; erro da chamada daquele item). Antes so
+// contava falha na rodada e a ultima leitura BOA seguia como "agora" para
+// sempre — a montagem de disparo mostrava "inedito · agora R$ 389,91 (lido
+// 17/10)" para produto que a loja nao vende mais (01/11/2026). Aqui o preco e o
+// carimbo (em) ficam intactos; so se anota a falha, com contagem seguida. A
+// proxima leitura com preco (registrarPreco) ou sem oferta limpa a marca.
+// Quem decide se e "sem leitura confirmada" e o comparativo (falhas seguidas +
+// idade da ultima leitura boa), para uma falha passageira nao derrubar nada.
+export const LEITURA_FALHAS_MIN = 2;
+export const LEITURA_VELHA_DIAS = 2;
+function registrarFalhaLeitura(asin, { nome, loja, motivo } = {}) {
+  if (!asin) return null;
+  const agora = new Date().toISOString();
+  const h = _hist[asin] || { n: '', loja: '', dias: {}, diasEf: {}, diasDe: {}, ult: null };
+  h.n = h.n || nome || '';
+  h.loja = h.loja || loja || '';
+  const ant = h.ult || { preco: null, precoDe: null, precoEfetivo: null, em: null, disponivel: true };
+  h.ult = {
+    ...ant,
+    falhaEm: agora,
+    falhaDesde: ant.falhaDesde || agora,
+    falhasSeguidas: (ant.falhasSeguidas || 0) + 1,
+    falhaMotivo: String(motivo || 'leitura falhou').slice(0, 160),
+  };
+  _hist[asin] = h;
+  return h;
+}
+
+/** A ultima leitura boa ainda vale como "preco de agora"? */
+export function leituraNaoConfirmada(ult, agora = Date.now()) {
+  if (!ult || !ult.falhaEm || ult.disponivel === false) return false;
+  if ((ult.falhasSeguidas || 0) < LEITURA_FALHAS_MIN) return false;
+  const boa = Date.parse(ult.em || 0) || 0;
+  return !boa || (agora - boa) > LEITURA_VELHA_DIAS * 86400000;
+}
+
+// Falha que nao diz nada sobre o produto (credencial, configuracao da loja).
+function falhaDeConfiguracao(msg) {
+  return /nao configurad|credencia|SHOPEE_APP_ID|AMZ_CLIENT|loja sem leitura/i.test(String(msg || ''));
 }
 
 function registrarSemOferta(asin, { nome, loja, motivo } = {}) {
@@ -1095,7 +1141,11 @@ async function lerPreco(item) {
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) throw new Error('Shopee nao configurada');
     const node = await buscarProdutoShopee({ shopId: item.shopId, itemId: item.itemId });
-    if (!node) throw new Error('fora do catalogo de afiliados');
+    if (!node) {
+      const e = new Error('fora do catalogo de afiliados da Shopee (produto retirado ou sem oferta)');
+      e.semOfertaLoja = true;
+      throw e;
+    }
     const p = normalizarShopee(node);
     return { preco: p.preco, precoDe: p.precoDe, disponivel: p.disponivel, titulo: p.titulo };
   }
@@ -1118,6 +1168,7 @@ async function lerPreco(item) {
       console.warn('[MONITOR] API oficial ML falhou para ' + item.asin + ': ' + e.message + ' — tentando a pagina');
     }
     if (viaApi) return { preco: viaApi.preco, precoDe: viaApi.precoDe, disponivel: true, titulo: null, fonte: 'api',
+                         itemId: viaApi.itemId || null,
                          ofertaSuspeita: viaApi.ofertaSuspeita || null };
     // Catalogo existe e ninguem vende = sem oferta (24/10/2026). Antes caia no
     // card do perfil social, que devolvia preco antigo de produto indisponivel.
@@ -1778,6 +1829,7 @@ export async function varrer({ manual = false } = {}) {
     registrarPreco(item.asin, {
       nome: leitura.titulo || item.nome, loja: item.loja,
       preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
+      itemId: leitura.itemId || null,
       precoEfetivo: Number.isFinite(leitura.preco) ? leitura.preco - descontoAgora : null,
     });
     // Loja respondeu sem preco = sem oferta ativa. Marca para a ultima leitura
@@ -1839,6 +1891,10 @@ export async function varrer({ manual = false } = {}) {
                 motivo: 'ASIN nao retornado pela API da Amazon' });
               resumo.semOferta = (resumo.semOferta || 0) + 1;
             }
+            else if (mapa.size > 0) {
+              registrarFalhaLeitura(item.asin, { nome: item.nome, loja: item.loja,
+                motivo: 'ASIN nao retornado pela API da Amazon' });
+            }
             falhar(item, 'ASIN nao retornado pela API da Amazon'); continue;
           }
           try { processar(item, leitura); }
@@ -1860,6 +1916,14 @@ export async function varrer({ manual = false } = {}) {
         if (e?.ofertaSuspeita?.preco) {
           resumo.suspeitas = (resumo.suspeitas || 0) + 1;
           try { expurgarLeiturasDaSerie(item.asin, { preco: e.ofertaSuspeita.preco }); } catch (e2) {}
+        }
+        if (e?.semOfertaLoja && _hist[item.asin]?.ult?.em) {
+          // A loja respondeu e o produto nao esta la (Shopee: fora do catalogo
+          // de afiliados) — mesmo tratamento do ASIN que some do lote da Amazon.
+          registrarSemOferta(item.asin, { nome: item.nome, loja: item.loja, motivo: e.message });
+          resumo.semOferta = (resumo.semOferta || 0) + 1;
+        } else if (!falhaDeConfiguracao(e?.message)) {
+          registrarFalhaLeitura(item.asin, { nome: item.nome, loja: item.loja, motivo: e?.message });
         }
         falhar(item, e.message);
       }

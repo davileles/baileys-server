@@ -77,7 +77,7 @@ import {
 // preco cai contra o proprio historico — nao contra o "de" que a loja anuncia.
 import {
   iniciarMonitorPrecos, configMonitorPrecos, salvarConfigMonitorPrecos,
-  estadoMonitorPrecos, listarMonitorados, historicoDe, varrer as varrerPrecos,
+  estadoMonitorPrecos, listarMonitorados, historicoDe, leituraNaoConfirmada, varrer as varrerPrecos,
   simular as simularPrecos, descartarCandidato, publicarAgora as publicarPrecoAgora,
   carregarMonitorPrecos, LOJAS_MONITORAVEIS_PRECO,
   semearVitrinePorDesempenho, rankingEpc, estadoEpc,
@@ -19494,6 +19494,10 @@ async function selecionarProdutosDoDia(lista) {
     } catch (e) { comp = null; }
     const nome = porAsin.get(asin)?.nome || asin;
     if (comp?.atual && comp.atual.disponivel === false) { fora.push({ asin, nome, motivo: 'indisponível na loja' }); continue; }
+    if (comp?.atual?.semLeitura) {
+      const _d = comp.atual.em ? new Date(comp.atual.em).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit' }) : '';
+      fora.push({ asin, nome, motivo: 'sem leitura confirmada na loja' + (_d ? ' desde ' + _d : '') }); continue;
+    }
     if (cfg.excluirPiores && comp?.veredito === 'pior') {
       fora.push({ asin, nome, motivo: 'mais caro que no último envio (' + (comp.variacaoPct > 0 ? '+' : '') + comp.variacaoPct + '%)' });
       continue;
@@ -20585,7 +20589,7 @@ function _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom, codigoFi
   let atual = null;
   if (h?.ult && Number.isFinite(h.ult.preco) && h.ult.preco > 0) {
     atual = { preco: h.ult.preco, precoEfetivo: h.ult.precoEfetivo ?? null, em: h.ult.em || null,
-              disponivel: h.ult.disponivel !== false, fonte: 'monitor',
+              disponivel: h.ult.disponivel !== false, fonte: 'monitor', itemId: h.ult.itemId || null,
               velho: Date.now() - Date.parse(h.ult.em || 0) > COMP_LEITURA_VELHA_MS };
     // Sem oferta na loja: 'preco' e o ULTIMO preco lido (em 'em'), nao o de agora.
     if (!atual.disponivel) {
@@ -20599,6 +20603,16 @@ function _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom, codigoFi
       atual.semOfertaDesde = h.ult.semOfertaDesde || null;
       atual.semOfertaEm = h.ult.semOfertaEm || null;
     }
+  }
+  // Leitura que falha seguidas vezes (produto retirado da Shopee, /up/ do ML
+  // sem oferta...): o preco guardado e de dias atras e nao vale como "agora"
+  // (01/11/2026 — lista de ferramentas com 4 produtos mortos "lido 17/10").
+  if (atual && atual.disponivel !== false && leituraNaoConfirmada(h?.ult)) {
+    atual.semLeitura = true;
+    atual.falhaMotivo = h.ult.falhaMotivo || null;
+    atual.falhaDesde = h.ult.falhaDesde || null;
+    atual.falhaEm = h.ult.falhaEm || null;
+    atual.falhasSeguidas = h.ult.falhasSeguidas || 0;
   }
   if (atual) {
     const _cItem = String(cupItem[asin] || '').trim().toUpperCase();
@@ -20625,6 +20639,7 @@ function _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom, codigoFi
   // dizer que esta mais barato que no ultimo envio seria vender o que a
   // loja nao entrega. Veredito proprio, sem variacao.
   if (atual && atual.disponivel === false) { veredito = 'indisponivel'; variacaoPct = null; }
+  else if (atual?.semLeitura) { veredito = 'sem_leitura'; variacaoPct = null; }
   const menor = todos.reduce((m, r) => (!m || _precoDivulgadoEnvio(r) < _precoDivulgadoEnvio(m)) ? r : m, null);
 
   return {
