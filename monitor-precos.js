@@ -731,7 +731,10 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
 // A proxima leitura com preco passa por registrarPreco e limpa a marca.
 function carimboUlt(u) {
   if (!u) return '';
-  const a = String(u.em || ''), b = String(u.semOfertaEm || ''), f = String(u.falhaEm || '');
+  // A falha so conta como carimbo depois de confirmada (2+ seguidas): com uma
+  // so, o item da camada fria precisa ser retentado logo, nao em friaCadaDias.
+  const a = String(u.em || ''), b = String(u.semOfertaEm || '');
+  const f = (u.falhasSeguidas || 0) >= LEITURA_FALHAS_MIN ? String(u.falhaEm || '') : '';
   return [a, b, f].sort().pop();
 }
 
