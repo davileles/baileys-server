@@ -3379,6 +3379,45 @@ export function resolverCupomPaginaMl(cupons, preco) {
 
 }
 
+// ── CUPOM DA PAGINA PARA A MONTAGEM DE LISTA DO CATALOGO (02/11/2026) ──────
+// O painel (Catalogo -> montar lista) quer ver, em cada linha de produto do ML,
+// o cupom que o proprio anuncio oferece. A pagina vem pelo Chrome do operador
+// (paginas-ml.js, fetch sem cookie e sem aba); a resolucao e a mesma das
+// ofertas monitoradas. Regra de 27/10: so entra cupom que esta NA PAGINA e
+// TAMBEM na base, vigente — nada de o sistema escolher um cupom por conta.
+// Devolve sempre um objeto com 'estado':
+//   ok             -> { codigo, desconto, preco }
+//   sem_cupom      -> a pagina nao oferece cupom (ou so com minimo nao atingido)
+//   fora_da_base   -> ha cupom na pagina, mas nao ha codigo vigente na base que case
+//   indisponivel   -> extensao offline, fora da janela, teto, bloqueio ou sem resposta
+export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null) {
+  if (!url) return { estado: 'indisponivel', motivo: 'produto sem link' };
+  let alvo = url;
+  try { alvo = await resolverLinkMl(url); } catch (e) { /* segue com a original */ }
+  let r = null;
+  try { r = await pedirPaginaMl(alvo, { esperaMs: 30000, motivo: 'catalogo' }); } catch (e) { r = null; }
+  if (!r || !r.html) return { estado: 'indisponivel', motivo: 'pagina nao lida' };
+  if (r.bloqueada) return { estado: 'indisponivel', motivo: 'pagina bloqueada' };
+  let preco = Number(precoRef) || null;
+  if (!preco) {
+    try {
+      const ld = extrairLdProduto(r.html);
+      const of = ld?.offers ? (Array.isArray(ld.offers) ? ld.offers[0] : ld.offers) : null;
+      preco = Number(of?.price ?? of?.lowPrice) || null;
+    } catch (e) { /* sem preco */ }
+  }
+  // Cupom com minimo de compra nao atingido aparece na pagina, mas nao vale no checkout.
+  const cupons = extrairCupomMl(r.html).filter(c => !/MIN_PURCHASE|NOT_MIN/i.test(String(c.tipoMl || '')));
+  if (!cupons.length) return { estado: 'sem_cupom', preco };
+  if (!preco) return { estado: 'indisponivel', motivo: 'preco nao lido na pagina' };
+  const { cupom } = resolverCupomPaginaMl(cupons, preco);
+  if (!cupom || !cupom.codigo || cupom.ambiguo || cupom.semCodigo) return { estado: 'fora_da_base', preco };
+  const reg = cupom.reg || cupomPorCodigo('Mercado Livre', cupom.codigo);
+  if (!reg || !cupomVigente(reg)) return { estado: 'fora_da_base', preco };
+  if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) return { estado: 'sem_cupom', preco };
+  return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto: cupom.desconto, preco };
+}
+
 // ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────
 // Se a pagina /cupons/active publicar o campaign_id ao lado do codigo, o
 // vinculo campanha -> codigo deixa de ser aprendido por (tipo, valor) e passa a

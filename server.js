@@ -204,7 +204,7 @@ import {
   extrairCuponsPaginaMl, juntarLeiturasCuponsMl, urlsLeituraCuponsMl, htmlLogadoBloqueado, validadeDeTexto, validadeDeVencimento,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
   sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
-  buscarDadosProdutoMl, resolverLinkMl, idProdutoMl,
+  buscarDadosProdutoMl, resolverLinkMl, idProdutoMl, cupomDaPaginaParaCatalogoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
   estadoOrigemSocialMl,
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
@@ -20964,6 +20964,65 @@ app.post('/vitrine/comparativo', async (req, res) => {
     }
     res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, cupomModo: modoCupom, itens });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+
+// ── CUPOM DA PAGINA DO ML NA MONTAGEM DE LISTA (02/11/2026) ─────────────────
+// POST { asins: [...] } -> { itens: { asin: { estado, codigo?, desconto? } } }.
+// Responde na hora com o que ja esta em cache; o que falta entra numa fila de
+// leitura em segundo plano (uma pagina por vez, pela extensao Captura Tica) e
+// volta como estado 'lendo'. O painel pergunta de novo ate nao haver 'lendo'.
+// Cache de 4 h por produto; 'indisponivel' fica so 10 min (a extensao pode voltar).
+const _cupomPagCat = new Map();      // asin -> { estado, codigo, desconto, em }
+const _cupomPagFila = [];            // asins aguardando leitura
+let _cupomPagRodando = false;
+const CUPOM_PAG_TTL = 4 * 3600000, CUPOM_PAG_TTL_FALHA = 10 * 60000;
+
+function _ehItemMl(i) {
+  const l = String(i?.loja || '').toLowerCase();
+  return l.includes('mercado livre') || l === 'ml';
+}
+async function _rodarFilaCupomPag() {
+  if (_cupomPagRodando) return;
+  _cupomPagRodando = true;
+  try {
+    while (_cupomPagFila.length) {
+      const asin = _cupomPagFila.shift();
+      const item = listarVitrine().find(i => String(i.asin) === asin);
+      if (!item || !_ehItemMl(item)) { _cupomPagCat.delete(asin); continue; }
+      let r;
+      try { r = await cupomDaPaginaParaCatalogoMl(item.url, item.preco); }
+      catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
+      _cupomPagCat.set(asin, { ...r, em: Date.now() });
+      if (r.estado === 'ok') console.log('[Catalogo] Cupom da pagina ML ' + asin + ': ' + r.codigo);
+    }
+  } finally { _cupomPagRodando = false; }
+}
+
+app.post('/vitrine/cupons-pagina-ml', (req, res) => {
+  try {
+    const pedidos = (Array.isArray(req.body?.asins) ? req.body.asins : [])
+      .map(x => String(x).trim()).filter(Boolean).slice(0, 60);
+    const porAsin = new Map(listarVitrine().map(i => [String(i.asin), i]));
+    const itens = {};
+    const agora = Date.now();
+    for (const asin of pedidos) {
+      const item = porAsin.get(asin);
+      if (!item || !_ehItemMl(item)) continue;
+      const c = _cupomPagCat.get(asin);
+      const ttl = c && c.estado === 'indisponivel' ? CUPOM_PAG_TTL_FALHA : CUPOM_PAG_TTL;
+      if (c && c.estado !== 'lendo' && agora - c.em < ttl) {
+        itens[asin] = { estado: c.estado, codigo: c.codigo || null, desconto: c.desconto ?? null, motivo: c.motivo || null };
+        continue;
+      }
+      if (!c || c.estado !== 'lendo') {
+        _cupomPagCat.set(asin, { estado: 'lendo', em: agora });
+        if (!_cupomPagFila.includes(asin)) _cupomPagFila.push(asin);
+      }
+      itens[asin] = { estado: 'lendo' };
+    }
+    _rodarFilaCupomPag();
+    res.json({ ok: true, itens });
+  } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
 app.get('/vitrine', (req, res) => {
