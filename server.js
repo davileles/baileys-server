@@ -15357,6 +15357,287 @@ app.get('/grupos-gestao/tarefa-ativa', (req, res) => {
   res.json({ ok: true, tarefa: j ? _gmResumoJob(j) : null });
 });
 
+// ── FILA LENTA DE ADESAO DOS TICOS (01/11/2026) ──────────────────────────────
+// Coloca os numeros da casa (tico-02/03/04) dentro dos grupos e como admin, UMA
+// acao por vez e devagar: 10 a 20 min entre acoes, so das 9h as 21h, com teto
+// diario por conta que executa. Diferente da gestao de grupos (45-90 s entre
+// grupos, tarefa em memoria), esta fila fica em disco e continua depois de um
+// deploy — o trabalho todo leva dias.
+//
+// Regras que protegem a principal (bloqueada em 30/10/2026 por acao em massa):
+//   - quem executa e sempre um tico admin do grupo; a principal so entra quando
+//     NENHUM tico e admin ali e o passo permite (permitePrincipal), e no maximo
+//     FA_MAX_PRINCIPAL_DIA acoes por dia;
+//   - conta envolvida caiu = a fila PAUSA e espera alguem retomar;
+//   - rate-overlimit = a fila dorme 2 h.
+//
+// Passo: { tipo: 'add'|'promote'|'convite', alvo: 'tico-04', jid?, link?,
+//          permitePrincipal?, fase? }. 'convite' = o proprio alvo entra pelo
+// link (grupo de terceiros, onde nenhuma conta nossa e admin).
+const FA_PATH              = SESSAO_DIR + '/fila_adesao.json';
+const FA_PAUSA_MS          = [10 * 60e3, 20 * 60e3];
+const FA_JANELA_H          = [9, 21];
+const FA_MAX_PRINCIPAL_DIA = 6;
+const FA_MAX_TICO_DIA      = 25;
+const FA_SONO_LIMITE_MS    = 2 * 3600e3;
+
+function _fa() {
+  if (!_fa.s) {
+    let est = null;
+    try { if (existsSync(FA_PATH)) est = JSON.parse(readFileSync(FA_PATH, 'utf-8')); } catch (e) { est = null; }
+    _fa.s = Object.assign({ passos: [], pausado: false, motivo: null, proximaEm: null, dormirAte: null,
+      contagem: { data: null, porConta: {} }, criadoEm: new Date().toISOString() }, est || {});
+    _fa.s.rodando = false;
+  }
+  return _fa.s;
+}
+function _faSalvar() {
+  const s = _fa();
+  try {
+    const { rodando, ...gravar } = s;
+    escreverAtomico(FA_PATH, JSON.stringify(gravar), 'utf-8');
+  } catch (e) { console.warn('[FILA-ADESAO] Nao gravei o estado: ' + e.message); }
+}
+function _faHoraSP() {
+  return Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Sao_Paulo', hour: 'numeric', hourCycle: 'h23' }).format(new Date()));
+}
+function _faContar(id) {
+  const s = _fa();
+  const hoje = _gmHoje();
+  if (s.contagem.data !== hoje) s.contagem = { data: hoje, porConta: {} };
+  if (id) s.contagem.porConta[id] = (s.contagem.porConta[id] || 0) + 1;
+  return s.contagem.porConta;
+}
+function _faCabeHoje(id) {
+  const usados = _faContar(null)[id] || 0;
+  return usados < (id === 'principal' ? FA_MAX_PRINCIPAL_DIA : FA_MAX_TICO_DIA);
+}
+function _faPausar(motivo) {
+  const s = _fa();
+  s.pausado = true; s.motivo = motivo; s.proximaEm = null;
+  _faSalvar();
+  console.warn('[FILA-ADESAO] PAUSADA: ' + motivo);
+}
+function _faCodigoDoLink(link) {
+  const m = String(link || '').match(/chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9]{10,})/);
+  return m ? m[1] : null;
+}
+function _faAgendar(ms) {
+  const s = _fa();
+  clearTimeout(_fa.timer);
+  s.proximaEm = new Date(Date.now() + ms).toISOString();
+  _fa.timer = setTimeout(() => { _faTick().catch(e => { console.warn('[FILA-ADESAO] tick falhou: ' + e.message); _faAgendar(5 * 60e3); }); }, ms);
+}
+
+// Executa UM passo. Devolve { agiu, estado, detalhe, por } ou { esperar: motivo }.
+async function _faExecutar(p, retratos) {
+  const alvo = retratos.find(r => r.id === p.alvo);
+  if (!alvo) return { esperar: 'a conta ' + p.alvo + ' nao esta conectada' };
+
+  if (p.tipo === 'convite') {
+    const code = _faCodigoDoLink(p.link);
+    if (!code) return { agiu: false, estado: 'falha', detalhe: 'link de convite invalido' };
+    let info;
+    try { info = await alvo.sock.groupGetInviteInfo(code); }
+    catch (e) { return { agiu: true, estado: 'falha', detalhe: 'link nao abriu (revogado ou expirado?): ' + e.message }; }
+    const jid = info?.id ? (String(info.id).includes('@') ? String(info.id) : info.id + '@g.us') : null;
+    p.jid = p.jid || jid; p.nome = info?.subject || p.nome || null;
+    if (jid && alvo.mapa[jid] && _gmEuNoGrupo(alvo.sock, alvo.mapa[jid])) return { agiu: true, estado: 'pulado', detalhe: 'ja estava no grupo' };
+    await alvo.sock.groupAcceptInvite(code);
+    return { agiu: true, estado: 'ok', por: p.alvo, detalhe: 'entrou pelo link' };
+  }
+
+  const md = _gmMeta(retratos, p.jid);
+  if (!md) return { agiu: false, estado: 'falha', detalhe: 'nenhuma conta conectada participa deste grupo' };
+  p.nome = md.subject || p.nome || null;
+  const euAlvo = _gmEuNoGrupo(alvo.sock, md);
+  if (p.tipo === 'add' && euAlvo) return { agiu: false, estado: 'pulado', detalhe: 'ja estava no grupo' };
+  if (p.tipo === 'promote' && euAlvo?.admin) return { agiu: false, estado: 'pulado', detalhe: 'ja era admin' };
+  if (p.tipo === 'promote' && !euAlvo) return { agiu: false, estado: 'falha', detalhe: 'a conta nao esta no grupo — o passo de inclusao falhou antes' };
+
+  // Executor: tico admin do grupo primeiro; principal so como ultimo recurso.
+  const admins = retratos.filter(r => r.id !== p.alvo && _gmEuNoGrupo(r.sock, r.mapa[p.jid])?.admin);
+  const ticos = admins.filter(r => r.id !== 'principal');
+  let exec = ticos.find(r => _faCabeHoje(r.id)) || null;
+  if (!exec && !ticos.length && p.permitePrincipal) exec = admins.find(r => r.id === 'principal' && _faCabeHoje('principal')) || null;
+  if (!exec) {
+    if (ticos.length || (p.permitePrincipal && admins.some(r => r.id === 'principal'))) return { esperar: 'teto diario atingido nas contas admin deste grupo' };
+    return { agiu: false, estado: 'falha', detalhe: admins.length ? 'so a principal e admin aqui e este passo nao permite usa-la' : 'nenhuma conta conectada e admin deste grupo' };
+  }
+
+  const alvoJid = p.tipo === 'add' ? _gaJidDoAlvo(alvo.sock) : euAlvo.id;
+  if (!alvoJid) return { esperar: 'nao consegui ler o telefone da conta ' + p.alvo };
+  const r = await exec.sock.groupParticipantsUpdate(p.jid, [alvoJid], p.tipo);
+  _faContar(exec.id);
+  const st = String(r?.[0]?.status || '');
+  if (st === '200') return { agiu: true, estado: 'ok', por: exec.id, detalhe: p.tipo === 'add' ? 'incluida' : 'agora e admin' };
+  if (st === '409') return { agiu: true, estado: 'pulado', por: exec.id, detalhe: 'o WhatsApp respondeu que ja estava assim' };
+  if (p.tipo === 'add' && st === '403') {
+    // Privacidade barrou a inclusao direta: a propria conta entra pelo convite.
+    const code = await exec.sock.groupInviteCode(p.jid);
+    await alvo.sock.groupAcceptInvite(code);
+    return { agiu: true, estado: 'ok', por: exec.id, detalhe: 'entrou por convite (privacidade bloqueou a inclusao direta)' };
+  }
+  return { agiu: true, estado: 'falha', por: exec.id, detalhe: 'WhatsApp retornou status ' + (st || '?') };
+}
+
+async function _faTick() {
+  const s = _fa();
+  if (s.rodando) return;
+  s.proximaEm = null;
+  const pendente = s.passos.find(p => p.estado === 'pendente');
+  if (!pendente) { _faSalvar(); return; }
+  if (s.pausado) { _faSalvar(); return; }
+  if (s.dormirAte && Date.now() < Date.parse(s.dormirAte)) return _faAgendar(Date.parse(s.dormirAte) - Date.now() + 1000);
+  const h = _faHoraSP();
+  if (h < FA_JANELA_H[0] || h >= FA_JANELA_H[1]) return _faAgendar(15 * 60e3);
+  if (_gm().ativo) return _faAgendar(5 * 60e3);   // nao concorre com a gestao de grupos
+
+  s.rodando = true;
+  try {
+    // Pula passos ja resolvidos sem pausa, ate achar um que exija acao.
+    for (let guarda = 0; guarda < 200; guarda++) {
+      const p = s.passos.find(x => x.estado === 'pendente');
+      if (!p) break;
+      const retratos = await _gmRetratos(guarda === 0);   // forca leitura so no 1o passo: pular varios nao vira rajada
+      const vivas = new Set(retratos.map(r => r.id));
+      let res;
+      try { res = await _faExecutar(p, retratos); }
+      catch (e) {
+        const msg = String(e?.message || e);
+        if (/rate-overlimit|429/i.test(msg)) {
+          s.dormirAte = new Date(Date.now() + FA_SONO_LIMITE_MS).toISOString();
+          console.warn('[FILA-ADESAO] rate-overlimit — dormindo 2 h.');
+          _faSalvar();
+          return _faAgendar(FA_SONO_LIMITE_MS + 1000);
+        }
+        res = { agiu: true, estado: 'falha', detalhe: msg };
+      }
+      if (res.esperar) {
+        p.ultimaEspera = res.esperar;
+        _faSalvar();
+        console.log('[FILA-ADESAO] esperando: ' + res.esperar);
+        return _faAgendar(30 * 60e3);
+      }
+      Object.assign(p, { estado: res.estado, detalhe: res.detalhe, por: res.por || null, em: new Date().toISOString() });
+      delete p.ultimaEspera;
+      _faSalvar();
+      console.log('[FILA-ADESAO] ' + p.tipo + ' ' + p.alvo + ' em "' + (p.nome || p.jid || p.link) + '": ' + res.estado + ' — ' + res.detalhe + (res.por ? ' (por ' + res.por + ')' : ''));
+
+      if (res.agiu) {
+        // Conta caiu logo depois da acao (foi assim em 07/10/2026): pausa tudo.
+        await new Promise(r => setTimeout(r, 15000));
+        const agora = new Set(_gmContas().map(c => c.id));
+        const caidas = [...vivas].filter(id => !agora.has(id));
+        if (caidas.length) { _faPausar('conta(s) ' + caidas.join(', ') + ' cairam depois da ultima acao — confira antes de retomar'); return; }
+        const ms = Math.round(FA_PAUSA_MS[0] + Math.random() * (FA_PAUSA_MS[1] - FA_PAUSA_MS[0]));
+        return _faAgendar(ms);
+      }
+    }
+    _faSalvar();
+  } finally { s.rodando = false; }
+}
+setTimeout(() => { if (_fa().passos.some(p => p.estado === 'pendente')) _faAgendar(1000); }, 4 * 60e3);
+
+function _faResumo() {
+  const s = _fa();
+  const cont = (e) => s.passos.filter(p => p.estado === e).length;
+  return { ok: true, total: s.passos.length, pendentes: cont('pendente'), feitos: cont('ok'), pulados: cont('pulado'), falhas: cont('falha'),
+    pausado: s.pausado, motivo: s.motivo, proximaEm: s.proximaEm, dormirAte: s.dormirAte, rodando: !!s.rodando,
+    hoje: _faContar(null), tetos: { principal: FA_MAX_PRINCIPAL_DIA, tico: FA_MAX_TICO_DIA }, janela: FA_JANELA_H,
+    passos: s.passos };
+}
+
+app.get('/grupos-gestao/fila-lenta', (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  if (String(req.query.relatorio || '') === '1') return res.json({ ok: true, texto: _faTextoRelatorio() });
+  res.json(_faResumo());
+});
+
+// Body: { passos: [...] } acrescenta ao fim | { acao: 'pausar'|'retomar'|'limpar' }.
+// 'limpar' remove so os passos pendentes.
+app.post('/grupos-gestao/fila-lenta', (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const s = _fa();
+  const b = req.body || {};
+  if (b.acao === 'pausar') { _faPausar(String(b.motivo || 'pausada pelo painel')); clearTimeout(_fa.timer); return res.json(_faResumo()); }
+  if (b.acao === 'retomar') { s.pausado = false; s.motivo = null; s.dormirAte = null; _faSalvar(); _faAgendar(1000); return res.json(_faResumo()); }
+  if (b.acao === 'limpar') { s.passos = s.passos.filter(p => p.estado !== 'pendente'); _faSalvar(); return res.json(_faResumo()); }
+  const novos = [];
+  for (const p of (Array.isArray(b.passos) ? b.passos : [])) {
+    const tipo = String(p?.tipo || '');
+    const alvo = String(p?.alvo || '').trim();
+    if (!['add', 'promote', 'convite'].includes(tipo) || !/^tico-\d+$/.test(alvo)) return res.status(400).json({ ok: false, erro: 'passo invalido: ' + JSON.stringify(p) });
+    if (tipo === 'convite' ? !_faCodigoDoLink(p.link) : !String(p.jid || '').endsWith('@g.us')) return res.status(400).json({ ok: false, erro: 'passo sem jid/link valido: ' + JSON.stringify(p) });
+    novos.push({ id: 'fa-' + Date.now().toString(36) + '-' + (s.passos.length + novos.length), tipo, alvo,
+      jid: p.jid || null, link: p.link || null, nome: p.nome || null, fase: p.fase || null,
+      permitePrincipal: p.permitePrincipal === true, estado: 'pendente' });
+  }
+  if (!novos.length) return res.status(400).json({ ok: false, erro: 'nenhum passo enviado' });
+  s.passos.push(...novos);
+  _faSalvar();
+  if (!s.pausado && !s.rodando) _faAgendar(1000);
+  res.json(_faResumo());
+});
+
+// Relatorio diario no grupo do operador, as 21h30, enquanto houver passo
+// pendente — e um ultimo no dia em que a fila termina. Pedido do Davi em
+// 01/11/2026 (excecao a regra "grupo do operador so recebe alerta grave").
+const FA_RELATORIO_HM = '21:30';
+const FA_FASES = { '1-tica': 'Fase 1 · Tica Promos', '2-concierge': 'Fase 2 · Concierge', '3-terceiros': 'Fase 3 · Terceiros' };
+function _faTextoRelatorio() {
+  const s = _fa();
+  const hoje = _gmHoje();
+  const doDia = (p) => p.em && _fmtDataSP(new Date(p.em)) === hoje;
+  const pend = s.passos.filter(p => p.estado === 'pendente').length;
+  const linhasFase = Object.keys(FA_FASES).map(f => {
+    const ps = s.passos.filter(p => p.fase === f);
+    if (!ps.length) return null;
+    const n = (e) => ps.filter(p => p.estado === e).length;
+    const prontos = ps.length - n('pendente');
+    return (n('pendente') ? '⏳ ' : '✅ ') + FA_FASES[f] + ': ' + prontos + '/' + ps.length
+      + ' (' + n('ok') + ' feitos, ' + n('pulado') + ' já estavam certos' + (n('falha') ? ', ' + n('falha') + ' falha(s)' : '') + ')';
+  }).filter(Boolean);
+  const hojeOk = s.passos.filter(p => doDia(p) && p.estado === 'ok');
+  const hojeFalha = s.passos.filter(p => doDia(p) && p.estado === 'falha');
+  const rotulo = (p) => (p.tipo === 'add' ? 'entrou' : p.tipo === 'promote' ? 'virou admin' : 'entrou pelo link') + ' — ' + p.alvo + ' em ' + (p.nome || p.jid || 'grupo do link') + (p.por && p.por !== p.alvo ? ' (por ' + p.por + ')' : '');
+  const cont = _faContar(null);
+  const [d, m] = hoje.split('-').slice(1).reverse();
+  let estado;
+  if (!pend) estado = '🏁 Fila concluída — não há mais nada pendente.';
+  else if (s.pausado) estado = '⏸️ PAUSADA: ' + (s.motivo || 'sem motivo') + '\nPara retomar: POST /grupos-gestao/fila-lenta {acao:"retomar"}';
+  else if (s.dormirAte && Date.now() < Date.parse(s.dormirAte)) estado = '😴 Dormindo por limite do WhatsApp até ' + new Date(s.dormirAte).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+  else {
+    const prox = s.passos.find(p => p.estado === 'pendente');
+    estado = '▶️ Rodando. Próximo: ' + (prox.tipo === 'promote' ? 'promover ' : prox.tipo === 'add' ? 'incluir ' : 'entrar pelo link: ') + prox.alvo + (prox.nome ? ' em ' + prox.nome : '')
+      + (prox.ultimaEspera ? '\n   aguardando: ' + prox.ultimaEspera : '');
+  }
+  return 'Fila de adesão dos ticos — ' + d + '/' + m + '\n\n'
+    + estado + '\n\n'
+    + linhasFase.join('\n') + '\n'
+    + 'Pendentes: ' + pend + '\n\n'
+    + '📋 Hoje: ' + hojeOk.length + ' ação(ões) feita(s)' + (hojeFalha.length ? ', ' + hojeFalha.length + ' falha(s)' : '')
+    + (Object.keys(cont).length ? ' · executores: ' + Object.entries(cont).map(([k, v]) => k + ' ' + v).join(', ') : '') + '\n'
+    + hojeOk.slice(-15).map(p => '• ' + rotulo(p)).join('\n')
+    + (hojeOk.length > 15 ? '\n• … e mais ' + (hojeOk.length - 15) : '')
+    + (hojeFalha.length ? '\n\n⚠️ Falhas de hoje:\n' + hojeFalha.map(p => '• ' + p.alvo + ' em ' + (p.nome || p.jid || p.link) + ': ' + p.detalhe).join('\n') : '');
+}
+setInterval(async () => {
+  try {
+    const s = _fa();
+    if (!s.passos.length || hhmmSP() < FA_RELATORIO_HM) return;
+    const hoje = _gmHoje();
+    if (s.relatorioData === hoje) return;
+    const pend = s.passos.some(p => p.estado === 'pendente');
+    if (!pend && s.relatorioFinal) return;
+    if (!GRUPOS.operador) return;
+    s.relatorioData = hoje;
+    if (!pend) s.relatorioFinal = true;
+    _faSalvar();
+    await enviarMensagem(GRUPOS.operador, { text: _faTextoRelatorio() });
+    console.log('[FILA-ADESAO] Relatorio diario enviado ao grupo do operador.');
+  } catch (e) { console.warn('[FILA-ADESAO] Relatorio diario falhou: ' + e.message); }
+}, 60e3);
 // ── REENTRADA DE EX-ALUNO NOS GRUPOS DO CDV ──────────────────────────────────
 // Quem foi REMOVIDO de um grupo nao volta pelo link de convite: o WhatsApp
 // recusa a entrada por link de quem um admin tirou. So volta se um admin
