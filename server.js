@@ -13500,6 +13500,10 @@ app.get('/contas', (req, res) => {
       qrDisponivel: !!c.qr, ultimoEnvio: c.ultimoEnvio, ultimoErro: c.ultimoErro,
       ultimoErroEm: c.ultimoErroEm || null, ultimoErroGrupo: c.ultimoErroGrupo || null,
       numero: telefoneDaConta(c.sock),
+      // Motor de envio em grupo (wa-envio/whatsmeow): e um aparelho vinculado
+      // SEPARADO do Baileys. Conta ligada no motor e deslogada nele cai no
+      // Baileys sem aviso na lista — o painel usa isto para pedir o QR certo.
+      motorEnvio: motorEnvioDaConta(apelidoDaConta(c.id)),
     }));
   res.json({
     ok: true,
@@ -13639,6 +13643,90 @@ app.get('/contas/:id/qr', async (req, res) => {
   if (c.conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Conta ' + id + ' ja conectada!</h2></body></html>');
   if (!c.qr) return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR de ' + id + '...</h2></body></html>');
   res.send('<html><head><title>QR ' + id + '</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Parear conta: ' + id + '</h2><img src="' + c.qr + '" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
+});
+
+// ── PAREAMENTO NO MOTOR DE ENVIO (wa-envio / whatsmeow) — 03/11/2026 ─────────
+// O botao QR do painel pareia so o Baileys. O disparo em grupo das contas em
+// WA_ENVIO_CONTAS sai pelo wa-envio, que e OUTRO aparelho vinculado: deslogado
+// la, a conta envia pelo Baileys (mais "Aguardando mensagem") e o painel nao
+// oferecia como parear de novo. Estas rotas fazem o meio de campo com o token
+// do servidor (o operador nunca ve o WA_ENVIO_TOKEN). So para a raiz logada.
+function motorEnvioDaConta(apelido) {
+  const a = String(apelido || '').toLowerCase();
+  const ligado = !!(WA_ENVIO_URL && WA_ENVIO_TOKEN && WA_ENVIO_CONTAS.has(a));
+  if (!ligado) return { ligado: false };
+  const e = waEnvioEstadoConta(a);
+  return { ligado: true, sondado: !!e, conectado: !!(e && e.conectado), logado: !!(e && e.logado),
+           quarentena: !!(e && e.quarentena), ultimoErro: (e && e.ultimoErro) || null };
+}
+function _apelidoMotorReq(req, res) {
+  if (!ehAdminRaiz(req)) { res.status(401).json({ ok:false, erro:'faca login no painel' }); return null; }
+  if (!WA_ENVIO_URL || !WA_ENVIO_TOKEN) { res.status(503).json({ ok:false, erro:'motor de envio nao configurado' }); return null; }
+  const a = String(req.params.id || '').trim().toLowerCase();
+  if (!/^[a-z0-9_-]{2,24}$/.test(a) || a === 'principal') { res.status(400).json({ ok:false, erro:'conta invalida' }); return null; }
+  if (!WA_ENVIO_CONTAS.has(a)) { res.status(400).json({ ok:false, erro:'conta fora de WA_ENVIO_CONTAS — ela envia pelo Baileys' }); return null; }
+  return a;
+}
+function _waEnvioFetch(caminho, opcoes = {}) {
+  return fetch(WA_ENVIO_URL + caminho, {
+    ...opcoes,
+    headers: { 'Authorization': 'Bearer ' + WA_ENVIO_TOKEN, ...(opcoes.headers || {}) },
+    signal: AbortSignal.timeout(20000),
+  });
+}
+app.post('/contas/:id/motor/conectar', async (req, res) => {
+  const a = _apelidoMotorReq(req, res); if (!a) return;
+  try {
+    const r = await _waEnvioFetch('/contas/' + encodeURIComponent(a) + '/conectar', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) console.log('[WA-ENVIO] Pareamento de ' + a + ' aberto pelo painel.');
+    res.status(r.status).json(d);
+  } catch (e) { res.status(502).json({ ok:false, erro:'wa-envio: ' + e.message }); }
+});
+app.get('/contas/:id/motor/qr', async (req, res) => {
+  const a = _apelidoMotorReq(req, res); if (!a) return;
+  try {
+    const r = await _waEnvioFetch('/contas/' + encodeURIComponent(a) + '/qr');
+    const d = await r.json().catch(() => ({}));
+    if (d?.conta?.logado) atualizarEstadoWaEnvio().catch(() => {});
+    res.status(r.status).json(d);
+  } catch (e) { res.status(502).json({ ok:false, erro:'wa-envio: ' + e.message }); }
+});
+app.get('/contas/:id/motor/qr.png', async (req, res) => {
+  const a = _apelidoMotorReq(req, res); if (!a) return;
+  try {
+    const r = await _waEnvioFetch('/contas/' + encodeURIComponent(a) + '/qr.png');
+    if (!r.ok) return res.status(r.status).json(await r.json().catch(() => ({ ok:false })));
+    res.set('Content-Type', 'image/png'); res.set('Cache-Control', 'no-store');
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (e) { res.status(502).json({ ok:false, erro:'wa-envio: ' + e.message }); }
+});
+// Tela de pareamento (mesma logica da /pair do wa-envio: QR que renova sozinho,
+// ate 5 janelas de ~160 s). O token do painel vai na query (?tsp_token=).
+app.get('/contas/:id/motor/parear', (req, res) => {
+  const a = _apelidoMotorReq(req, res); if (!a) return;
+  const tk = String(req.query.tsp_token || '').replace(/[^A-Za-z0-9._~-]/g, '');
+  res.set('Cache-Control', 'no-store');
+  res.send('<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Parear envio ' + a + '</title>'
+    + '<style>body{background:#12141C;color:#D4D7E2;font-family:Montserrat,system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:14px;margin:0;padding:16px;text-align:center}'
+    + 'h2{color:#FA5150;margin:0}img{width:280px;max-width:90vw;border:4px solid #FA5150;border-radius:12px;background:#fff}p{color:#767D93;font-size:.92rem;max-width:420px;margin:0}#msg{color:#D4D7E2}button{background:#FA5150;color:#fff;border:0;border-radius:8px;padding:10px 18px;font-weight:600;font-size:15px}</style></head><body>'
+    + '<h2>Parear envio em grupos: ' + a + '</h2>'
+    + '<p>Este é o <b>motor de envio</b> (aparelho "Tica Envio"), separado do QR normal. No celular do ' + a + ': WhatsApp → Dispositivos conectados → Conectar dispositivo.</p>'
+    + '<img id="qr" hidden alt="QR"><div id="msg">abrindo…</div><button id="b" hidden onclick="iniciar()">Mostrar QR de novo</button>'
+    + '<script>var A=' + JSON.stringify(a) + ',T=' + JSON.stringify(tk) + ',laco=null,ciclos=0,ult="",urlQr=null;'
+    + 'function u(p){return "/contas/"+A+"/motor/"+p+"?tsp_token="+encodeURIComponent(T)}'
+    + 'function el(i){return document.getElementById(i)}function msg(t){el("msg").textContent=t}'
+    + 'function parar(){clearInterval(laco);laco=null;el("b").hidden=false}'
+    + 'function pronto(){parar();el("qr").hidden=true;el("b").hidden=true;msg("✅ Pareado! O "+A+" volta a enviar pelo motor em até 1 minuto. Pode fechar esta aba.")}'
+    + 'async function abrir(){ciclos++;var r=await fetch(u("conectar"),{method:"POST"});return r.json().catch(function(){return{}})}'
+    + 'async function iniciar(){el("b").hidden=true;ciclos=0;ult="";msg("abrindo…");var d=await abrir().catch(function(e){return{erro:String(e)}});'
+    + 'if(!d.ok){parar();msg("erro: "+(d.erro||"falhou"));return}if(d.conta&&d.conta.logado){pronto();return}laco=setInterval(passo,2500);passo()}'
+    + 'async function passo(){var d=await fetch(u("qr")).then(function(r){return r.json()}).catch(function(){return{}});if(!d.ok)return;'
+    + 'if(d.conta&&d.conta.logado){pronto();return}'
+    + 'if(d.qr){if(d.qr!==ult){ult=d.qr;var r=await fetch(u("qr.png"));if(r.ok){var b=await r.blob();if(urlQr)URL.revokeObjectURL(urlQr);urlQr=URL.createObjectURL(b);el("qr").src=urlQr;el("qr").hidden=false}}'
+    + 'msg("Aponte a câmera do WhatsApp do "+A+" para o QR."+(d.conta&&d.conta.pareandoRestaS?" ("+d.conta.pareandoRestaS+" s)":""))}'
+    + 'else if(!(d.conta&&d.conta.pareando)){el("qr").hidden=true;ult="";if(ciclos<5){msg("renovando o QR…");await abrir()}else{parar();msg("Tempo esgotado. Clique para mostrar de novo.")}}}'
+    + 'iniciar();</script></body></html>');
 });
 
 // Repareamento de conta existente SEM perder o que ela carrega. Excluir e
