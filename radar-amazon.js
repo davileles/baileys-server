@@ -2213,7 +2213,12 @@ export function precosDeclaradosNoTexto(texto) {
 // Ambiguo (dois 'por', tres valores soltos) devolve null e nada muda.
 const RE_REAIS_POST = /(~?)[ \t]*R\$[ \t]*([\d.]{1,12},\d{1,2}|\d{1,3}(?:\.\d{3})+|\d{1,7})(?![\d,])([ \t]*~)?/gi;
 const RE_RUIDO_ANTES = /(?:acima de|a partir de|m[ií]nim[oa](?: de)?|compras? (?:de|acima)|frete|cashback|economi[sz]e|economia de|ganhe|desconto de|limite de|at[eé]|vale|cupom de|off de)\s*:?$/;
-const RE_RUIDO_DEPOIS = /^\s*(?:off\b|de desconto|em desconto|de cashback|em cashback|de volta|de economia|em compras|na primeira|a menos|(?:de\s+)?frete|(?:a|cada|por)\s+unidade|\/\s*un|(?:o|por|\/)\s*(?:kg|litro|l\b|metro|m\b))/;
+// Preco por unidade ('R$ 0,62 a tira', 'R$ 1,99 cada', 'R$ 3,50/lata') e
+// conta de quem posta, nao o preco do produto: em 03/11 o post 'R$ 44 em 2x
+// (R$ 0,62 a tira)' leu 0,62 e a oferta de fralda ficou retida por divergencia.
+const UNIDADE_POST = '(?:unidade|unid|und|un|tira|fralda|lata|latinha|garrafa|rolo|c[a\u00e1]psula|sach[e\u00ea]|dose|lavagem|folha|pe[c\u00e7]a|barra|comprimido|refil|quilo|kg|litro|ml|l|metro|m)(?![a-z\u00e0-\u00fa0-9])';
+const RE_RUIDO_DEPOIS = new RegExp('^\\s*(?:off\\b|de desconto|em desconto|de cashback|em cashback|de volta|de economia|em compras|na primeira|a menos|(?:de\\s+)?frete'
+  + '|cada(?![a-z\u00e0-\u00fa])|(?:a|o|cada|por|p\\/)\\s+' + UNIDADE_POST + '|\\/\\s*' + UNIDADE_POST + ')');
 const RE_DE_ANTES  = /(?:^|\s)(?:de|era|antes)\s*:?$/;
 const RE_POR_ANTES = /(?:^|\s)(?:por|apenas|so|só|valor|pre[cç]o|sai|saindo)\s*:?$/;
 const RE_POR_DEPOIS = /^\s*(?:[àa]\s*vista|avista|no\s+pix|pix|com\s+(?:o\s+)?cupom|usando)/;
@@ -2255,7 +2260,13 @@ export function precoPorDoPost(texto) {
   if (p.length > 1)   return null;
   if (n.length === 1) return { preco: n[0].valor, semCentavos: n[0].semCentavos, rotulado: false };
   // Dois valores soltos numa oferta de um produto so: o maior e o 'de' sem rotulo.
-  if (n.length === 2) { const x = n[0].valor < n[1].valor ? n[0] : n[1]; return { preco: x.valor, semCentavos: x.semCentavos, rotulado: false }; }
+  // Menor abaixo de 10% do maior nao e 'de/por' (desconto de 90%+): e outro
+  // numero (unidade sem rotulo, brinde). Ambiguo — nada muda.
+  if (n.length === 2) {
+    const x = n[0].valor < n[1].valor ? n[0] : n[1], y = x === n[0] ? n[1] : n[0];
+    if (x.valor < y.valor * 0.10) return null;
+    return { preco: x.valor, semCentavos: x.semCentavos, rotulado: false };
+  }
   return null;
 }
 
