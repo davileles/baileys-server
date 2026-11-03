@@ -852,7 +852,10 @@ function blocoAtencao(o) {
                                      + ' e calculamos R$ ' + esc(o.precoDivergente.calculado));
   // Preco do post no lugar do da loja: os dois numeros lado a lado, para o
   // operador decidir sem abrir o link. Quer o da loja? Digita no Por.
-  if (o.precoDoPost?.aplicado) {
+  if (o.precoDoPost?.aplicado && o.precoDoPost.programeEPoupe) {
+    avisos.push('📦 Programe e Poupe: ' + esc(brlCurto(o.precoDoPost.declarado)) + ' (loja '
+      + esc(brlCurto(o.precoDoPost.calculado)) + ', ' + esc(o.precoDoPost.diferencaPct) + '%)');
+  } else if (o.precoDoPost?.aplicado) {
     avisos.push('preço do post ' + esc(brlCurto(o.precoDoPost.declarado)) + ' · loja '
       + esc(brlCurto(o.precoDoPost.calculado)) + ' (' + (o.precoDoPost.diferencaPct > 0 ? '+' : '')
       + esc(o.precoDoPost.diferencaPct) + '%)');

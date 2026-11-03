@@ -5670,7 +5670,10 @@ async function revalidarOfertaVelha(oferta) {
     console.warn('[FRESCOR] #' + oferta.id + ' ' + asin + ' releitura falhou (' + e.message + ') — segue.');
     return;
   }
-  const base = Number(de.preco);
+  // Preco do post aplicado (Programe e Poupe): a loja segue mostrando o preco
+  // de balcao, entao a releitura compara com o da loja na captura.
+  const base = Number(oferta.precoDoPost?.aplicado && oferta.precoDoPost.calculado > 0
+    ? oferta.precoDoPost.calculado : de.preco);
   if (!p || !p.disponivel) {
     throw vencida('indisponivel na Amazon depois de ' + idadeMin + ' min na fila');
   }
@@ -8795,6 +8798,13 @@ function divergenciaPrecoPost(texto, precoFinal, temCupom) {
 const LOJAS_PRECO_DO_POST = new Set(['Amazon', 'Mercado Livre', 'Shopee']);
 const PRECO_POST_FAIXA_MIN = 0.35;
 const PRECO_POST_FAIXA_MAX = 1.50;
+// Programe e Poupe (03/11): o post da Amazon anuncia o preco com o desconto
+// de recorrencia aplicado (5% a 15%). Diferenca explicada: a oferta sai SOZINHA
+// com o preco do post e a linha IMPORTANTE avisando a condicao — sem ela, quem
+// clica ve o preco cheio e acha que a oferta acabou. Fora da faixa, retem.
+const RE_PROGRAME_POUPE = /programe\s*e\s*poupe|recorr[e\u00ea]ncia|assinatura/i;
+const PROGRAME_POUPE_MIN = 0.80;
+const IMPORTANTE_PROGRAME_POUPE = 'Utilize o Programe e Poupe para chegar neste valor.';
 const RE_LINK_LOJA_POST = /https?:\/\/(?:[\w-]+\.)*(?:amazon\.com\.br|amzn\.to|a\.co|mercadolivre\.com(?:\.br)?|meli\.la|shopee\.com\.br|magazineluiza\.com\.br|magazinevoce\.com\.br)(?=[\/?#\s]|$)\S*/gi;
 
 function precoDoPostParaOferta(texto, p, r, umProdutoSo) {
@@ -8818,6 +8828,10 @@ function precoDoPostParaOferta(texto, p, r, umProdutoSo) {
     diferencaPct: Math.round((razao - 1) * 1000) / 10,
   };
   if (igual) return { ...base, igual: true, aplicar: false, retem: false };
+  if (p.loja === 'Amazon' && RE_PROGRAME_POUPE.test(String(texto || ''))
+      && razao >= PROGRAME_POUPE_MIN && razao < 1) {
+    return { ...base, aplicar: true, retem: false, programeEPoupe: true };
+  }
   if (razao < PRECO_POST_FAIXA_MIN || razao > PRECO_POST_FAIXA_MAX) {
     return { ...base, aplicar: false, retem: true, foraDaFaixa: true };
   }
@@ -9552,17 +9566,24 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       oferta.precoDoPost = {
         declarado: _precoPost.declarado, calculado: _precoPost.calculado,
         diferencaPct: _precoPost.diferencaPct, rotulado: _precoPost.rotulado,
-        aplicado: false, foraDaFaixa: !!_precoPost.foraDaFaixa, retem: true,
+        aplicado: false, foraDaFaixa: !!_precoPost.foraDaFaixa, retem: _precoPost.retem !== false,
+        programeEPoupe: !!_precoPost.programeEPoupe,
       };
       if (_precoPost.aplicar) {
         try {
-          const _rm = remontarOfertaFila(oferta, { preco: _precoPost.declarado });
+          const _ovPost = { preco: _precoPost.declarado };
+          // Linha IMPORTANTE so entra se o operador/fonte nao trouxe outra.
+          if (_precoPost.programeEPoupe && !String(produtoDaOfertaFila(oferta).importante || '').trim()) {
+            _ovPost.importante = IMPORTANTE_PROGRAME_POUPE;
+          }
+          const _rm = remontarOfertaFila(oferta, _ovPost);
           // Nao foi ajuste do operador: sem a marca, o card nao diz 'ajustado'.
           delete oferta.ajustes; delete oferta.ajustadoEm;
           oferta.precoDoPost.aplicado = true;
           console.log('[PRECO-POST] #' + oferta.id + ' ' + (p.asin || '?') + ' — post R$ '
             + _precoPost.declarado + ' no lugar de R$ ' + _precoPost.calculado
             + ' (' + (_precoPost.diferencaPct > 0 ? '+' : '') + _precoPost.diferencaPct + '%)'
+            + (_precoPost.programeEPoupe ? ' · Programe e Poupe, libera auto-envio' : '')
             + (_rm?.aviso ? ' · ' + _rm.aviso : ''));
         } catch (e) {
           // Remontagem falhou: segue com a mensagem original e o card avisa.
