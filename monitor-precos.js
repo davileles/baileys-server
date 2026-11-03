@@ -1192,6 +1192,14 @@ async function lerPreco(item) {
 }
 
 /**
+ * Leitura avulsa para quem esta fora da vitrine (avisos de preco dos clientes,
+ * avisos-preco.js). Mesmo caminho da varredura, sem tocar a serie do monitor:
+ * quem chama decide o que fazer com o preco.
+ */
+export async function lerPrecoProduto(item) { return lerPreco(item); }
+export async function lerPrecosAmazonEmLote(itens) { return lerPrecosAmazon(itens); }
+
+/**
  * Leitura em LOTE da Amazon: getItems aceita 10 ASINs por chamada, entao ler um
  * a um seria gastar 10x a cota para o mesmo resultado. Devolve um Map
  * asin -> leitura; ASIN ausente do Map e ASIN que a API nao devolveu (fora do

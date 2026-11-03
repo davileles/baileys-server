@@ -232,7 +232,11 @@
         "app.post('/ml/pagina/resultado'",
         "function comPortaoDePublicacao(",
         "function listasPrioritariasAtivas(",
-        "const prioridadeEnvioCtx = new AsyncLocalStorage()"
+        "const prioridadeEnvioCtx = new AsyncLocalStorage()",
+        "app.post('/avisos-preco/pedido'",
+        "app.post('/avisos-preco/previa'",
+        "app.get('/avisos-preco/info'",
+        "observarMensagemAvisos('principal', mm)"
       ]
     },
     "radar-awin.js": {
@@ -541,6 +545,16 @@
         "export function pedirPaginaMl(",
         "export function atenderLongPollPaginasMl(",
         "export function registrarResultadoPaginaMl("
+      ]
+    },
+    "avisos-preco.js": {
+      "minLinhas": 700,
+      "obrigatorio": [
+        "export function observarMensagemAvisos(",
+        "export async function criarPedido(",
+        "export async function varrerAvisos(",
+        "const RE_SAIR",
+        "if (body?.aceite !== true)"
       ]
     }
   }

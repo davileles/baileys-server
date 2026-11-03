@@ -78,6 +78,9 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // Links fixos rastreados (resgate de cupons, Prime...): codigo permanente por
   // link. Perdido, cada link ganharia codigo novo e os cliques se partiriam.
   'links_fixos.json',
+  // Avisos de preco no privado (avisos-preco.js): pedidos dos clientes, com
+  // nome e telefone. Vai para o repo PRIVADO de dados, como todo o resto daqui.
+  'avisos_preco.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.

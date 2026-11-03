@@ -177,6 +177,11 @@ import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH,
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
+// Avisos de preco no privado para clientes do Tica Promos (pagina /avisos/ do
+// tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
+import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
+         criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
+         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -564,7 +569,7 @@ const baileysLogger = pino({ level: 'silent' });
     if (r.baixados) {
       carregarTenants(); carregarConfigTsp();
       carregarRadarConfig(); carregarCuponsBase(); carregarTemplates(); carregarVitrine();
-      carregarCategorias(); carregarMonitorPrecos();
+      carregarCategorias(); carregarMonitorPrecos(); carregarAvisosPreco();
       carregarCensoHist(); carregarMembrosLog();
       recarregarRadarTenants();
       semearMonitorDasFontes();
@@ -1690,7 +1695,9 @@ function contaIdReq(req) { return contaIdDe(req.tenantId, String(req.params.id |
 // automatica: substituta de disparo em grupo, reserva de leitura, "ha conta de
 // disparo" e executor de acao de admin. Sem isso, por ser admin dos grupos, ele
 // viraria remetente de oferta quando um tico caisse.
-const RE_CONTA_CAMPANHA = /^camp-/i;
+// aviso-* (numero dos avisos de preco no privado, avisos-preco.js) entra na
+// mesma regra: DM em volume nao pode arrastar um numero que dispara grupo.
+const RE_CONTA_CAMPANHA = /^(camp|aviso)-/i;
 function ehContaCampanha(id) {
   return tenantDaConta(id) === TENANT_PADRAO && RE_CONTA_CAMPANHA.test(apelidoDaConta(id));
 }
@@ -1864,6 +1871,7 @@ async function conectarConta(id) {
         if (ehContaCampanha(id)) campanhaMarcarResposta(msg).catch(() => {});
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
+        if (tenantDaConta(id) === TENANT_PADRAO) observarMensagemAvisos(apelidoDaConta(id), msg);
         if (!msg.message) continue;
         if (tenantDaConta(id) === TENANT_PADRAO && String(msg.key?.remoteJid || '').endsWith('@g.us')) {
           shieldObservar(msg, apelidoDaConta(id), c.sock).catch(e => console.warn('[SHIELD] ' + e.message));
@@ -12753,6 +12761,7 @@ async function conectar() {
           if (_debugUpserts.length > 60) _debugUpserts.shift();
           registrarSombra('baileys:principal', mm);
           registrarContatoPrivado('principal', sock, mm);
+          observarMensagemAvisos('principal', mm);
           observarRevoke(mm, 'revoke visto pela principal');
           if (mm.messageStubType === 2) {
             _stub2Total++;
@@ -26120,6 +26129,78 @@ iniciarMonitorPrecos({
 });
 
 aquecerHistoricoEnvios().catch(e => console.warn('[PRECOS] Aquecer historico de envios:', e.message));
+
+// ── AVISOS DE PRECO NO PRIVADO (clientes do Tica Promos) ────────────────────
+// Pagina publica ticapromos.com.br/avisos/ -> /avisos-preco/{info,previa,pedido}.
+// Cliente ativa mandando a mensagem pronta (com o numero do pedido) para a
+// conta configurada; o modulo le os precos e manda o aviso por essa conta.
+function _contaAvisosConectada(apelido) {
+  if (!apelido) return false;
+  if (apelido === 'principal') return !!(conectado && sock);
+  const c = contasExtras.get(contaIdDe(TENANT_PADRAO, apelido));
+  return !!(c?.conectado && c.sock);
+}
+function _numeroDaContaAvisos(apelido) {
+  const s = apelido === 'principal' ? sock : contasExtras.get(contaIdDe(TENANT_PADRAO, apelido))?.sock;
+  const id = String(s?.user?.id || '');
+  return id ? id.split('@')[0].split(':')[0] : null;
+}
+async function _enviarDmAvisos(apelido, jid, texto) {
+  if (apelido === 'principal') {
+    if (!conectado || !sock) throw new Error('principal desconectada');
+    return saidaSerializada(() => sock.sendMessage(jid, { text: texto }));
+  }
+  return enviarPelaConta(contaIdDe(TENANT_PADRAO, apelido), jid, { text: texto });
+}
+function _listarContasAvisos() {
+  const out = [{ apelido: 'principal', conectado: !!(conectado && sock), exclusiva: false }];
+  for (const c of contasExtras.values()) {
+    if (tenantDaConta(c.id) !== TENANT_PADRAO) continue;
+    const ap = apelidoDaConta(c.id);
+    out.push({ apelido: ap, conectado: !!(c.conectado && c.sock), exclusiva: /^aviso-/i.test(ap) });
+  }
+  return out;
+}
+iniciarAvisosPreco({
+  enviarDm: _enviarDmAvisos,
+  contaConectada: _contaAvisosConectada,
+  numeroDaConta: _numeroDaContaAvisos,
+  listarContas: _listarContasAvisos,
+  montarAmazon: montarOfertasVitrine,
+  montarShopee: montarOfertasShopeeVitrine,
+  montarMl: montarOfertasMlVitrine,
+});
+
+function _ipDaReq(req) {
+  return String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || '';
+}
+// Publicas (pagina do tica-site). Nada de dado pessoal na resposta.
+app.get('/avisos-preco/info', (req, res) => { res.json(avisosInfoPublica()); });
+app.post('/avisos-preco/previa', async (req, res) => {
+  try { res.json(await avisosPrevia(req.body?.url, _ipDaReq(req))); }
+  catch (e) { res.status(500).json({ ok:false, erro:'Falha ao ler o link.' }); }
+});
+app.post('/avisos-preco/pedido', async (req, res) => {
+  try { res.json(await avisosCriarPedido(req.body || {}, _ipDaReq(req))); }
+  catch (e) { console.error('[AVISOS] Pedido:', e.message); res.status(500).json({ ok:false, erro:'Falha ao registrar o pedido. Tente de novo.' }); }
+});
+// Painel (so raiz logada: a lista tem nome e telefone mascarado dos clientes).
+app.get('/avisos-preco', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(estadoAvisos());
+});
+app.post('/avisos-preco/config', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json({ ok:true, config: salvarConfigAvisos(req.body || {}) });
+});
+app.post('/avisos-preco/pedido/:id/:acao', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(avisosAcaoPedido(String(req.params.id), String(req.params.acao)));
+});
+app.post('/avisos-preco/varrer', async (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(await varrerAvisos({ manual: true }));
+});
 
 // Relogio dos workflows do painel-cdv. Sobe cedo e independente do WhatsApp: a
 // coleta de pontuacao nao depende do socket, e nao pode ficar refem de um
