@@ -5509,7 +5509,7 @@ function listasPrioritariasAtivas() {
   });
 }
 
-let _portaoFila     = [];                 // { fn, rotulo, prioridade, resolve, reject }
+let _portaoFila     = [];                 // { fn, rotulo, prioridade, perecivel, resolve, reject }
 let _portaoRodando  = false;
 let _portaoEmVoo    = false;              // uma publicacao saindo agora
 let _portaoUltimoEm = 0;                  // fim da ultima publicacao (ms)
@@ -5547,6 +5547,7 @@ function estadoPortao() {
   return {
     naFila: _portaoNaFila,
     prioritariosNaFila: _portaoFila.filter(x => x.prioridade).length,
+    pereciveisNaFila: _portaoFila.filter(x => x.perecivel && !x.prioridade).length,
     segurando: ativas.length > 0 && _portaoFila.some(x => !x.prioridade),
     listasPrioritarias: ativas.map(l => ({ id: l.id, nome: l.nome, intervaloMin: l.intervaloMin })),
   };
@@ -5569,7 +5570,11 @@ async function _portaoBombear() {
         await _portaoDormir(5000);
         continue;
       }
-      if (idx < 0) idx = 0;
+      // Faixa do meio: captura de grupo-fonte/Telegram (perecivel) passa na
+      // frente de lista, monitor e reenvio — uma oferta relampago que espera
+      // atras de 10 itens de lista morre antes de sair (03/11/2026: leva do
+      // Fada capturada 09:10, ultima saiu 10:23).
+      if (idx < 0) { const ip = _portaoFila.findIndex(x => x.perecivel); idx = ip >= 0 ? ip : 0; }
       const item = _portaoFila[idx];
       const gap = item.prioridade ? PRIORIDADE_FOLGA_MS : _portaoGapMs;
       const esperar = Math.max(0, _portaoUltimoEm + gap - Date.now());
@@ -5604,8 +5609,9 @@ async function _portaoBombear() {
  *  prioridade, ou herdada do contexto (prioridadeEnvioCtx). */
 function comPortaoDePublicacao(fn, rotulo = '', opcoes = {}) {
   const prioridade = opcoes.prioridade !== undefined ? !!opcoes.prioridade : !!prioridadeEnvioCtx.getStore();
+  const perecivel = !!opcoes.perecivel;
   return new Promise((resolve, reject) => {
-    _portaoFila.push({ fn, rotulo, prioridade, resolve, reject });
+    _portaoFila.push({ fn, rotulo, prioridade, perecivel, resolve, reject });
     _portaoAtualizarContagem();
     if (prioridade && _portaoAcordar) _portaoAcordar();
     _portaoBombear().catch(() => {});
@@ -5618,8 +5624,72 @@ function comPortaoDePublicacao(fn, rotulo = '', opcoes = {}) {
 function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
   if (opcoes.semPortao) return _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes);
   return comPortaoDePublicacao(
-    () => _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes),
-    'oferta #' + (oferta?.id || '?'));
+    async () => {
+      // A releitura roda na VEZ da oferta (depois da espera no portao), que e
+      // quando o preco pode ter mudado.
+      if (opcoes.revalidarPreco) await revalidarOfertaVelha(oferta);
+      return _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes);
+    },
+    'oferta #' + (oferta?.id || '?'),
+    { perecivel: ofertaPerecivel(oferta) });
+}
+
+// ── FRESCOR DA OFERTA CAPTURADA (03/11/2026) ────────────────────────────────
+// Oferta capturada em grupo-fonte/Telegram e perecivel: erro de preco e
+// relampago da Amazon somem em minutos. Lista, monitor e reenvio nao sao.
+function ofertaPerecivel(o) {
+  if (!o || !o.grupoOrigem) return false;
+  const orig = String(o.origem || '');
+  return orig !== 'lista' && orig !== 'monitor-precos';
+}
+
+// Auto-envio que esperou mais que REVALIDAR_OFERTA_MIN (padrao 10) desde a
+// captura rele o preco na Amazon antes de sair. Indisponivel ou mais de 3%
+// acima do capturado = descartada (e.ofertaVencida). Falha de leitura nunca
+// segura a oferta: segue como antes. REVALIDAR_OFERTA_MIN=0 desliga.
+const REVALIDAR_OFERTA_MIN = process.env.REVALIDAR_OFERTA_MIN !== undefined
+  ? Number(process.env.REVALIDAR_OFERTA_MIN) : 10;
+async function revalidarOfertaVelha(oferta) {
+  if (!(REVALIDAR_OFERTA_MIN > 0)) return;
+  const ts = Date.parse(oferta?.timestamp || '');
+  if (!ts) return;
+  const idadeMin = Math.round((Date.now() - ts) / 60000);
+  if (idadeMin < REVALIDAR_OFERTA_MIN) return;
+  const de = oferta.dadosExtraidos || {};
+  const asin = de.asin;
+  if (!asin || String(de.loja || 'Amazon') !== 'Amazon') return;
+  const vencida = (motivo) => { const e = new Error(motivo); e.ofertaVencida = true; return e; };
+  let p = null;
+  try {
+    if (apiAmazonIndisponivel()) return;
+    const itens = await buscarProdutos([asin]);
+    if (!itens.length) { console.warn('[FRESCOR] #' + oferta.id + ' ' + asin + ' sem resposta da API — segue sem releitura.'); return; }
+    const it = itens.find(x => x.asin === asin);
+    p = it ? normalizar(it) : null;
+  } catch (e) {
+    console.warn('[FRESCOR] #' + oferta.id + ' ' + asin + ' releitura falhou (' + e.message + ') — segue.');
+    return;
+  }
+  const base = Number(de.preco);
+  if (!p || !p.disponivel) {
+    throw vencida('indisponivel na Amazon depois de ' + idadeMin + ' min na fila');
+  }
+  const agora = Number(p.preco);
+  if (Number.isFinite(base) && base > 0 && Number.isFinite(agora) && agora > base * 1.03) {
+    throw vencida('preco subiu de R$ ' + base.toFixed(2) + ' para R$ ' + agora.toFixed(2)
+      + ' depois de ' + idadeMin + ' min na fila');
+  }
+  console.log('[FRESCOR] #' + oferta.id + ' ' + asin + ' conferida apos ' + idadeMin + ' min — R$ '
+    + (Number.isFinite(agora) ? agora.toFixed(2) : '?') + ' (capturado R$ ' + (Number.isFinite(base) ? base.toFixed(2) : '?') + ').');
+}
+
+// Envio em paralelo POR NUMERO: cada conta manda os seus grupos em sequencia
+// (com o espacamento de sempre), e as contas andam ao mesmo tempo. Um numero
+// continua mandando um grupo por vez. ENVIO_PARALELO_CONTAS=0 volta ao
+// sequencial antigo.
+function envioParaleloAtivo() {
+  const v = String(process.env.ENVIO_PARALELO_CONTAS ?? '1').trim().toLowerCase();
+  return !(v === '0' || v === 'off' || v === 'false');
 }
 
 // Entrada unica do roteamento por trilha. O despacho e o card de revisao do bot
@@ -5777,8 +5847,7 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   const _execId = oferta?.id ? String(oferta.id) : ('o_' + Date.now());
   const _rastExec = _execId + '@' + Date.now();
 
-  for (const jid of alvos) {
-    if (soCupons.has(jid)) continue;
+  const _enviarNoGrupo = async (jid) => {
     // Numero fixo do grupo quando houver; senao, o turno vigente.
     const op = { conta: contaDoGrupo(jid) };
     // Rodape extra decidido AQUI, ja sabendo o destino: e o que permite a mesma
@@ -5797,12 +5866,33 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
     try {
       await enviarMensagem(jid, lpDoGrupo ? { text: _rast.texto, linkPreview: lpDoGrupo } : { text: _rast.texto }, 0, op);
       enviados.push(jid);
-      if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
+      return true;
     } catch (e) {
       console.error('[MKT] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
       outboxEnfileirar({ id: _execId, jid, texto: _rast.texto, conta: op.conta, origem: 'oferta', erro: e.message });
+      return false;
     }
+  };
+  const _alvosOk = alvos.filter(j => !soCupons.has(j));
+  const _porConta = new Map();
+  for (const jid of _alvosOk) {
+    const c = contaDoGrupo(jid) || 'principal';
+    if (!_porConta.has(c)) _porConta.set(c, []);
+    _porConta.get(c).push(jid);
+  }
+  const _filas = (envioParaleloAtivo() && _porConta.size > 1) ? [..._porConta.values()] : [_alvosOk];
+  const _t0Despacho = Date.now();
+  await Promise.all(_filas.map(async (lista) => {
+    for (let i = 0; i < lista.length; i++) {
+      const ok = await _enviarNoGrupo(lista[i]);
+      if (ok && i < lista.length - 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
+    }
+  }));
+  if (_filas.length > 1) {
+    console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' em paralelo por ' + _filas.length + ' numero(s) ('
+      + [..._porConta.entries()].map(([c, l]) => c + ':' + l.length).join(', ') + ') em '
+      + Math.round((Date.now() - _t0Despacho) / 1000) + 's.');
   }
   if (!enviados.length) throw new Error('Nenhum grupo recebeu a oferta.');
   // Vitrine publica: so entra o que realmente saiu em algum grupo. Chamada aqui
@@ -9556,7 +9646,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         && !oferta.cupomAmbiguo
         && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
       try {
-        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
+        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta, { revalidarPreco: true });
         oferta.status = 'enviado';
         oferta.enviadoEm = new Date().toISOString();
         oferta.gruposEnviados = r.enviados;
@@ -9569,6 +9659,17 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
           + ' R$ ' + p.preco + ' -> ' + r.enviados.length + ' grupo(s)');
         continue;
       } catch (e) {
+        // Esperou demais no portao e o preco nao vale mais: descarta em vez de
+        // virar card de uma oferta que ja acabou (fica no historico da fila).
+        if (e.ofertaVencida) {
+          oferta.status = 'rejeitado';
+          oferta.motivoFila = 'descartada antes do envio: ' + e.message;
+          oferta.descartadaPorFrescor = true;
+          filaPendentes.unshift(oferta);
+          salvarFila();
+          console.log('[FRESCOR] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA — ' + e.message);
+          continue;
+        }
         // Falhou o envio: cai para a fila em vez de perder a oferta. A causa fica
         // GRAVADA na oferta — sem isso o operador ve o item parado no painel e no
         // card sem nenhuma pista de que houve uma tentativa e do que a barrou
@@ -9596,6 +9697,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
             + oferta.precoDoPost.calculado + ') — mantido o da loja')
       : oferta.revisaoDeEdicao ? 'versao editada de um post que ja saiu'
       : _seguraPorPreco        ? 'preco veio do texto do grupo, nao da loja'
+      : _filtro?.bloqueia      ? 'trava de preco: ' + (_filtro.motivo || _filtro.nivel || 'serie de precos')
       : 'motivo nao identificado';
 
     filaPendentes.unshift(oferta);
