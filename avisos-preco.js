@@ -323,7 +323,9 @@ async function resolverLink(url) {
     return { item, leitura };
   }
 
-  if (/amazon\.com|amzn\.to|a\.co\//i.test(u)) {
+  // Mesmos domínios do REGEX_URL_AMAZON do radar: inclui os encurtadores
+  // amzn.to, amzn.eu, a.co e link.amazon (este último ficava de fora).
+  if (/(?:^|\/\/|\.)(?:amazon\.com(?:\.br)?|amzn\.to|amzn\.eu|a\.co|link\.amazon(?:\.com)?)\//i.test(u)) {
     const r = await resolverLinhaVitrine(u);
     if (!r || r.erro) return { erro: 'Não conseguimos identificar esse produto da Amazon. Abra o produto e copie o link de novo.' };
     const brutos = await buscarProdutosAmazon([r.asin]);
