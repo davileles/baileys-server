@@ -13697,6 +13697,9 @@ app.get('/contas/:id/qr', async (req, res) => {
     return res.status(404).send('<html><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;gap:12px;margin:0"><h2 style="color:#ffa500">Conexao "' + id + '" nao existe</h2><p style="color:#aaa">Ela foi removida ou ainda nao foi criada. Pode fechar esta aba.</p><p style="color:#aaa">Para criar: painel Gestao TSP - aba Conexao - Gerar QR.</p></body></html>');
   }
   if (c.conectado) return res.send('<html><body style="background:#0d0d0d;color:#ffa500;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Conta ' + id + ' ja conectada!</h2></body></html>');
+  // 04/11/2026: conta registrada sem socket (motor wa-envio sem sessao Baileys)
+  // ficava eterna em "Gerando QR": ninguem abria o socket de pareamento.
+  if (!c.qr && !c.sock && !c.conectando) conectarConta(id).catch(() => {});
   if (!c.qr) return res.send('<html><head><meta http-equiv="refresh" content="3"></head><body style="background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h2>Gerando QR de ' + id + '...</h2></body></html>');
   res.send('<html><head><title>QR ' + id + '</title><meta http-equiv="refresh" content="30"><style>body{background:#0d0d0d;color:#f0f0f0;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;gap:16px;margin:0}h2{color:#ffa500}img{border:4px solid #ffa500;border-radius:12px;width:260px}p{color:#aaa;font-size:.9rem;text-align:center}</style></head><body><h2>Parear conta: ' + id + '</h2><img src="' + c.qr + '" alt="QR"/><p>WhatsApp - Dispositivos conectados - Conectar dispositivo</p></body></html>');
 });
