@@ -13712,18 +13712,29 @@ app.get('/contas/:id/qr', async (req, res) => {
 // do servidor (o operador nunca ve o WA_ENVIO_TOKEN). So para a raiz logada.
 function motorEnvioDaConta(apelido) {
   const a = String(apelido || '').toLowerCase();
-  const ligado = !!(WA_ENVIO_URL && WA_ENVIO_TOKEN && WA_ENVIO_CONTAS.has(a));
-  if (!ligado) return { ligado: false };
+  const configurado = !!(WA_ENVIO_URL && WA_ENVIO_TOKEN);
+  const ligado = configurado && WA_ENVIO_CONTAS.has(a);
+  // 04/11/2026: conta nova (tico-05) ficava sem o botao "QR do envio" porque so
+  // conta ja listada em WA_ENVIO_CONTAS podia parear — mas a ordem certa e parear
+  // PRIMEIRO e so depois incluir na variavel (conta na variavel sem pareamento
+  // abre a trava). Conta de disparo fora da variavel agora e "pareavel".
+  const pareavel = configurado && !ligado && _contaPareavelNoMotor(a);
+  if (!ligado && !pareavel) return { ligado: false };
   const e = waEnvioEstadoConta(a);
-  return { ligado: true, sondado: !!e, conectado: !!(e && e.conectado), logado: !!(e && e.logado),
+  return { ligado, pareavel, sondado: !!e, conectado: !!(e && e.conectado), logado: !!(e && e.logado),
            quarentena: !!(e && e.quarentena), ultimoErro: (e && e.ultimoErro) || null };
+}
+function _contaPareavelNoMotor(apelido) {
+  const a = String(apelido || '').toLowerCase();
+  return /^[a-z0-9_-]{2,24}$/.test(a) && a !== 'principal' && a !== 'paulo' && !RE_CONTA_CAMPANHA.test(a)
+    && contasExtras.has(contaIdDe(TENANT_PADRAO, a));
 }
 function _apelidoMotorReq(req, res) {
   if (!ehAdminRaiz(req)) { res.status(401).json({ ok:false, erro:'faca login no painel' }); return null; }
   if (!WA_ENVIO_URL || !WA_ENVIO_TOKEN) { res.status(503).json({ ok:false, erro:'motor de envio nao configurado' }); return null; }
   const a = String(req.params.id || '').trim().toLowerCase();
   if (!/^[a-z0-9_-]{2,24}$/.test(a) || a === 'principal') { res.status(400).json({ ok:false, erro:'conta invalida' }); return null; }
-  if (!WA_ENVIO_CONTAS.has(a)) { res.status(400).json({ ok:false, erro:'conta fora de WA_ENVIO_CONTAS — ela envia pelo Baileys' }); return null; }
+  if (!WA_ENVIO_CONTAS.has(a) && !_contaPareavelNoMotor(a)) { res.status(400).json({ ok:false, erro:'conta nao pode parear no motor de envio' }); return null; }
   return a;
 }
 function _waEnvioFetch(caminho, opcoes = {}) {
