@@ -181,7 +181,7 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 // tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
-         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos } from './avisos-preco.js';
+         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -26204,8 +26204,10 @@ app.post('/avisos-preco/config', (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
   res.json({ ok:true, config: salvarConfigAvisos(req.body || {}) });
 });
-app.post('/avisos-preco/pedido/:id/:acao', (req, res) => {
+app.post('/avisos-preco/pedido/:id/:acao', async (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  // 'vincular' {url}: liga um pedido feito pelo nome ao link certo do produto.
+  if (req.params.acao === 'vincular') return res.json(await vincularLinkPedido(String(req.params.id), String(req.body?.url || '')));
   res.json(avisosAcaoPedido(String(req.params.id), String(req.params.acao)));
 });
 app.post('/avisos-preco/varrer', async (req, res) => {

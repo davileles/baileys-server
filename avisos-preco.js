@@ -438,15 +438,23 @@ export async function criarPedido(body, ip) {
     return { ok: false, erro: 'Muitos pedidos no momento. Tente de novo mais tarde.' };
   }
 
-  // Item resolvido na prévia; se não houver, lê agora.
-  let cache = _previaCache.get(url);
-  if (!cache || Date.now() - cache.em > 30 * 60000) {
-    const prev = await previaDoLink(url, ip);
-    if (!prev.ok) return prev;
+  // Pedido pelo NOME: sem link, ou com link que não deu para ler. Fica para
+  // avaliação no painel (vincular o link certo depois); não é monitorado até lá.
+  const produtoTexto = String(body?.produtoTexto || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+  let cache = null;
+  if (url) {
     cache = _previaCache.get(url);
+    if (!cache || Date.now() - cache.em > 30 * 60000) {
+      const prev = await previaDoLink(url, ip);
+      if (!prev.ok && !produtoTexto) return prev;
+      cache = prev.ok ? _previaCache.get(url) : null;
+    }
   }
   const { item, leitura } = cache || {};
-  if (!item) return { ok: false, erro: 'Não conseguimos ler esse link. Tente de novo.' };
+  if (!item) {
+    if (produtoTexto.length < 3) return { ok: false, erro: url ? 'Não conseguimos ler esse link. Escreva o nome do produto que a gente procura.' : 'Escreva o nome do produto.' };
+    return criarPedidoPorNome({ nome, telefone, produtoTexto, url, body, ip, abertos });
+  }
 
   if (abertos.some(p => p.produto === item.asin)) {
     return { ok: false, erro: 'Você já pediu aviso desse produto.' };
@@ -484,17 +492,79 @@ export async function criarPedido(body, ip) {
       + (pedido.precoAlvo ? ' (seu preço: ' + brl(pedido.precoAlvo) + ')' : '') + '. 🔔\n\nPara parar os avisos, responda SAIR.', { resposta: true });
   }
 
+  return respostaAtivacao(pedido, contato);
+}
+
+function lerAlvo(body) {
+  const v = body?.precoAlvo === '' || body?.precoAlvo == null ? null : Number(String(body.precoAlvo).replace(/\./g, '').replace(',', '.'));
+  return v != null && v > 0 ? arred(v) : null;
+}
+
+function respostaAtivacao(pedido, contato) {
+  const c = E().config;
   return {
-    ok: true, id: pedido.id, codigo, status: pedido.status,
+    ok: true, id: pedido.id, codigo: pedido.codigo, status: pedido.status,
+    porNome: !!pedido.porNome,
     jaAtivo: !!contato,
     ativacao: contato ? null : {
       disponivel: !!numeroDosAvisos(),
       numero: numeroDosAvisos(),
       numeroFormatado: numeroDosAvisos() ? formatarTelefone(numeroDosAvisos()) : null,
-      link: linkAtivacao(codigo),
+      link: linkAtivacao(pedido.codigo),
       expiraDias: c.ativacaoDias,
     },
   };
+}
+
+function criarPedidoPorNome({ nome, telefone, produtoTexto, url, body, ip, abertos }) {
+  const c = E().config;
+  const chave = produtoTexto.toLowerCase();
+  if (abertos.some(p => p.porNome && String(p.titulo || '').toLowerCase() === chave)) {
+    return { ok: false, erro: 'Você já pediu aviso desse produto.' };
+  }
+  const contato = contatoPorTelefone(telefone);
+  const agora = new Date().toISOString();
+  const pedido = {
+    id: 'AV' + (++E().seq),
+    codigo: novoCodigo(), nome, telefone,
+    produto: null, loja: null, porNome: true,
+    titulo: produtoTexto, linkInformado: url || null,
+    precoInicial: null, precoAlvo: lerAlvo(body),
+    status: contato ? 'ativo' : 'aguardando',
+    jid: contato ? contato.jid : null,
+    criadoEm: agora, ativadoEm: contato ? agora : null,
+    expiraEm: new Date(Date.now() + (contato ? c.validadeDias : c.ativacaoDias) * MS_DIA).toISOString(),
+    avisos: [], ultimoAvisoPreco: null, ultimoAvisoEm: null,
+    origem: { ipHash: hashIp(ip), utm: String(body?.origem || '').slice(0, 40) || null },
+  };
+  E().pedidos.push(pedido);
+  gravar();
+  console.log('[AVISOS] Pedido por nome ' + pedido.id + ' ("' + encurtar(produtoTexto, 60) + '"' + (url ? ', link não lido' : '') + ') — ' + pedido.status + '.');
+  if (contato) {
+    enfileirarEnvio(contato.jid, 'Anotei: *' + encurtar(produtoTexto, 80) + '*' + (pedido.precoAlvo ? ' (seu preço: ' + brl(pedido.precoAlvo) + ')' : '')
+      + '. Vou procurar o produto e te aviso por aqui quando aparecer uma boa oferta. 🔔\n\nPara parar os avisos, responda SAIR.', { resposta: true });
+  }
+  return respostaAtivacao(pedido, contato);
+}
+
+// Painel: liga um pedido feito pelo nome (ou com link não lido) a um link de
+// produto. A partir daí ele é monitorado como qualquer outro.
+export async function vincularLinkPedido(id, url) {
+  const p = E().pedidos.find(x => x.id === id);
+  if (!p) return { ok: false, erro: 'pedido não encontrado' };
+  let r;
+  try { r = await resolverLink(url); } catch (e) { return { ok: false, erro: 'falha ao ler o link: ' + e.message }; }
+  if (r.erro) return { ok: false, erro: r.erro };
+  const prod = guardarProduto(r.item, r.leitura);
+  p.produto = r.item.asin; p.loja = r.item.loja;
+  if (!p.textoOriginal) p.textoOriginal = p.titulo;
+  p.titulo = String(r.leitura?.titulo || r.item.nome || p.titulo).slice(0, 200);
+  p.precoInicial = Number(r.leitura?.preco) > 0 ? arred(r.leitura.preco) : null;
+  if (p.precoAlvo && p.precoInicial && p.precoAlvo >= p.precoInicial) p.precoAlvo = null;
+  p.porNome = false; p.vinculadoEm = new Date().toISOString();
+  gravar();
+  console.log('[AVISOS] Pedido ' + id + ' vinculado a ' + p.loja + ' ' + p.produto + '.');
+  return { ok: true, titulo: p.titulo, loja: p.loja, preco: prod.ult?.preco ?? null };
 }
 
 function encurtar(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1).trimEnd() + '…' : s; }
@@ -621,7 +691,7 @@ async function processarFila() {
 
 // ── Varredura de preços ─────────────────────────────────────────────────────
 function produtosVigiados() {
-  const chaves = new Set(E().pedidos.filter(p => p.status === 'ativo').map(p => p.produto));
+  const chaves = new Set(E().pedidos.filter(p => p.status === 'ativo' && p.produto).map(p => p.produto));
   return [...chaves].map(k => E().produtos[k]).filter(Boolean);
 }
 
@@ -811,6 +881,7 @@ export function estadoAvisos() {
         criadoEm: p.criadoEm, ativadoEm: p.ativadoEm, expiraEm: p.expiraEm,
         avisos: p.avisos.length, ultimoAvisoEm: p.ultimoAvisoEm, ultimoAvisoPreco: p.ultimoAvisoPreco,
         alvoAtingidoEm: p.alvoAtingidoEm || null, motivoFim: p.motivoFim || null,
+        porNome: !!p.porNome, linkInformado: p.linkInformado || null, textoOriginal: p.textoOriginal || null,
       };
     }),
   };
