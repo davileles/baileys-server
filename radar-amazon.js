@@ -1525,6 +1525,41 @@ export function ultimoCupomDaLoja(loja) {
  * que nunca falou em cupom anunciaria um preco que nao existe no checkout.
  */
 /**
+ * O texto cita este codigo como PALAVRA INTEIRA?
+ *
+ * Antes a comparacao era por substring no texto sem espacos (normalizarTexto),
+ * e um codigo casava dentro de frases e de outros codigos: em 04/11/2026 o post
+ * "Use o cupom: *AQUITEMPROMO*" virou "useocupomaquitempromo", que contem
+ * "cupomaqui" — e a TV TCL (#40936) saiu com CUPOMAQUI (R$ 500) em vez do
+ * AQUITEMPROMO (R$ 300) que a fonte citou.
+ *
+ * Agora texto e codigo sao quebrados em palavras (espaco e pontuacao separam;
+ * hifen, ponto, barra e sublinhado dentro da palavra sao ignorados, para
+ * "MELI-10" casar com "MELI10" e links continuarem inteiros) e o codigo tem de
+ * aparecer como sequencia exata de palavras. Vale para codigo de uma palavra e
+ * para os "codigos" que sao frases ("10% DE DESCONTO NO CARRINHO").
+ */
+function palavrasDoTexto(s) {
+  return String(s || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .split(/[^a-z0-9\-_.\/]+/)
+    .map(t => t.replace(/[^a-z0-9]/g, ''))
+    .filter(Boolean);
+}
+export function textoCitaCodigo(textoOriginal, codigo) {
+  const cod = palavrasDoTexto(String(codigo || '').replace(/^outro:\s*/i, ''));
+  if (!cod.length) return false;
+  const txt = palavrasDoTexto(textoOriginal);
+  for (let i = 0; i + cod.length <= txt.length; i++) {
+    let ok = true;
+    for (let j = 0; j < cod.length; j++) if (txt[i + j] !== cod[j]) { ok = false; break; }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/**
  * Codigos QUE ESTAO NA BASE desta loja e aparecem citados no texto.
  * Diferente de cupomCitadoDesconhecido(), que devolve os que NAO estao.
  */
@@ -1537,7 +1572,7 @@ export function codigosDaBaseCitados(loja, textoOriginal) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== lojaKey) continue;
     if (!reg.codigo) continue;
-    if (texto.includes(normalizarTexto(reg.codigo))) achados.add(reg.codigo.toUpperCase());
+    if (textoCitaCodigo(textoOriginal, reg.codigo)) achados.add(reg.codigo.toUpperCase());
   }
   return [...achados];
 }
@@ -1599,6 +1634,7 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
   // aprovacao, quem decide isso e o chamador).
   const _citados = codigosDaBaseCitados(loja, textoOriginal);
   let escopo = texto;
+  let escopoBruto = textoOriginal;
   if (_citados.length >= 2) {
     const bloco = blocoDoLink(textoOriginal, opcoes.urlOrigem);
     if (!bloco) {
@@ -1608,6 +1644,7 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
       return null;
     }
     escopo = normalizarTexto(bloco);
+    escopoBruto = bloco;
   }
 
   // Bloco do link deste produto, calculado uma unica vez e so quando um cupom
@@ -1618,7 +1655,7 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
   const blocoDesteLink = () => {
     if (_blocoCache === undefined) {
       const b = blocoDoLink(textoOriginal, opcoes.urlOrigem);
-      _blocoCache = b ? normalizarTexto(b) : null;
+      _blocoCache = b || null;
     }
     return _blocoCache;
   };
@@ -1627,8 +1664,7 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== lojaKey) continue;
     if (!reg.codigo) continue;
-    const cod = normalizarTexto(reg.codigo);
-    if (!escopo.includes(cod)) continue;
+    if (!textoCitaCodigo(escopoBruto, reg.codigo)) continue;
 
     // Restrito entra SO por citacao — nunca por escolha do sistema — e, quando
     // conhecemos o link de origem, so se o codigo estiver no bloco dele. Foi a
@@ -1636,7 +1672,7 @@ export function melhorCupom(loja, preco, textoOriginal = '', opcoes = {}) {
     // autorizacao, e ela nao se estende ao post inteiro.
     if (cupomRestrito(reg) && opcoes.urlOrigem) {
       const bloco = blocoDesteLink();
-      if (!bloco || !bloco.includes(cod)) {
+      if (!bloco || !textoCitaCodigo(bloco, reg.codigo)) {
         console.warn('[CUPOM] ' + loja + ': ' + reg.codigo + ' e restrito e nao aparece no bloco '
           + 'deste link — ignorado.');
         continue;
