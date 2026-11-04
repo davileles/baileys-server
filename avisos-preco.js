@@ -307,16 +307,18 @@ async function resolverLink(url) {
     if (!tokenAffOk()) return { erro: 'Ainda não conseguimos ler produtos do Mercado Livre. Tente mais tarde.' };
     const r = await resolverLinhaVitrineMl(u);
     if (!r || r.erro) return { erro: 'Não conseguimos identificar esse produto do Mercado Livre. Abra o produto e copie o link de novo.' };
-    const item = { asin: r.asin, loja: 'Mercado Livre', url: r.url, nome: r.nome };
+    // O título do card do perfil social vem com o preço colado no fim ("… - R$ 56,09").
+    const nomeMl = String(r.nome || '').replace(/\s*[-–|]\s*R\$\s*[\d.,]+\s*$/, '').trim();
+    const item = { asin: r.asin, loja: 'Mercado Livre', url: r.url, nome: nomeMl };
     let leitura = null;
     try {
       const l = await lerPrecoProduto(item);
-      leitura = { preco: l.preco, precoDe: l.precoDe, disponivel: l.disponivel, titulo: l.titulo || r.nome };
+      leitura = { preco: l.preco, precoDe: l.precoDe, disponivel: l.disponivel, titulo: l.titulo || nomeMl };
     } catch (e) { console.warn('[AVISOS] Prévia ML sem preço (' + r.asin + '): ' + e.message); }
     try {
       const d = await buscarDadosProdutoMl(r.url, { id: r.asin });
       if (d?.imagem) leitura = { ...(leitura || {}), imagem: d.imagem };
-      if (!leitura?.preco && d?.preco) leitura = { ...(leitura || {}), preco: d.preco, precoDe: d.precoDe, titulo: d.titulo || r.nome, disponivel: d.disponivel !== false };
+      if (!leitura?.preco && d?.preco) leitura = { ...(leitura || {}), preco: d.preco, precoDe: d.precoDe, titulo: d.titulo || nomeMl, disponivel: d.disponivel !== false };
     } catch (e) {}
     return { item, leitura };
   }
