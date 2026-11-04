@@ -1942,6 +1942,21 @@ if (WA_ENVIO_URL && WA_ENVIO_TOKEN && WA_ENVIO_CONTAS.size) {
   const _tWm = setInterval(atualizarEstadoWaEnvio, 30000);
   if (typeof _tWm.unref === 'function') _tWm.unref();
 }
+// 04/11/2026: a lista de contas (contasExtras) so era montada a partir das
+// pastas de credenciais do Baileys. Conta do motor cujo Baileys foi deslogado
+// (401 apaga a pasta) sumia no proximo restart: fora do painel, da lista de
+// remetentes e — pior — da escala, porque contaDisponivel() exige o registro.
+// Foi o que aconteceu com o tico-03: pareado e conectado no wa-envio, mas sem
+// disparar nada. Toda conta de WA_ENVIO_CONTAS ganha registro (sem socket e
+// sem conectar): dispara pelo motor e aparece no painel pedindo o QR do Baileys.
+for (const ap of WA_ENVIO_CONTAS) {
+  if (ap === 'principal' || !/^[a-z0-9_-]{2,24}$/.test(ap)) continue;
+  if (!contasExtras.has(ap)) {
+    estadoConta(ap);
+    if (!existsSync(CONTAS_DIR + '/' + ap + '/creds.json'))
+      console.warn('[CONTA:' + ap + '] no motor wa-envio sem sessao Baileys — dispara pelo motor; pareie o QR normal para acoes de admin e leitura.');
+  }
+}
 
 function waEnvioEstadoConta(apelido) {
   if (Date.now() - _waEnvio.em >= 90000) return null;   // sonda velha: nao confiar
