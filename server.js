@@ -8806,6 +8806,9 @@ function divergenciaPrecoPost(texto, precoFinal, temCupom) {
 const LOJAS_PRECO_DO_POST = new Set(['Amazon', 'Mercado Livre', 'Shopee']);
 const PRECO_POST_FAIXA_MIN = 0.35;
 const PRECO_POST_FAIXA_MAX = 1.50;
+// Tolerancia de 'mesmo preco' entre post e loja: libera auto-envio.
+const PRECO_POST_TOLERANCIA_PCT = 0.01;
+const PRECO_POST_TOLERANCIA_RS = 1.00;
 // Programe e Poupe (03/11): o post da Amazon anuncia o preco com o desconto
 // de recorrencia aplicado (5% a 15%). Diferenca explicada: a oferta sai SOZINHA
 // com o preco do post e a linha IMPORTANTE avisando a condicao — sem ela, quem
@@ -8836,6 +8839,13 @@ function precoDoPostParaOferta(texto, p, r, umProdutoSo) {
     diferencaPct: Math.round((razao - 1) * 1000) / 10,
   };
   if (igual) return { ...base, igual: true, aplicar: false, retem: false };
+  // Diferenca de centavos (03/11/2026, #40208: post R$ 39,90 x loja R$ 39,99,
+  // -0,2%, ficou retida): ate 1% OU ate R$ 1 e o mesmo preco. Sai sozinha com
+  // o numero do post, sem card. Acima disso segue a regra de sempre.
+  if (Math.abs(declarado - calculado) <= PRECO_POST_TOLERANCIA_RS
+      || Math.abs(razao - 1) <= PRECO_POST_TOLERANCIA_PCT) {
+    return { ...base, aplicar: true, retem: false, quaseIgual: true };
+  }
   if (p.loja === 'Amazon' && RE_PROGRAME_POUPE.test(String(texto || ''))
       && razao >= PROGRAME_POUPE_MIN && razao < 1) {
     return { ...base, aplicar: true, retem: false, programeEPoupe: true };
@@ -9592,6 +9602,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
             + _precoPost.declarado + ' no lugar de R$ ' + _precoPost.calculado
             + ' (' + (_precoPost.diferencaPct > 0 ? '+' : '') + _precoPost.diferencaPct + '%)'
             + (_precoPost.programeEPoupe ? ' · Programe e Poupe, libera auto-envio' : '')
+            + (_precoPost.quaseIgual ? ' · diferenca de centavos, libera auto-envio' : '')
             + (_rm?.aviso ? ' · ' + _rm.aviso : ''));
         } catch (e) {
           // Remontagem falhou: segue com a mensagem original e o card avisa.
