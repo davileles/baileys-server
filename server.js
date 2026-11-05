@@ -26340,6 +26340,8 @@ function _listarContasAvisos() {
   return out;
 }
 iniciarAvisosPreco({
+  // IA do Tico na conversa dos alertas (Haiku, JSON). null = segue sem IA.
+  ia: (system, texto, max) => chamarClaude(system, texto, max || 400, 'claude-haiku-4-5'),
   enviarDm: _enviarDmAvisos,
   contaConectada: _contaAvisosConectada,
   numeroDaConta: _numeroDaContaAvisos,

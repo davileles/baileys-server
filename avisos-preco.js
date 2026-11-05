@@ -70,6 +70,7 @@ const RE_SAIR = /^\s*(sair|parar|pare|cancelar|cancela|stop|descadastrar)\s*[.!]
 // SAIR 2: para só o alerta 2 da lista que o MEUS ALERTAS mostrou.
 const RE_SAIR_UM = /^\s*(?:sair|parar|pare|cancelar|cancela|stop)\s*#?\s*(\d{1,2})\s*[.!]?\s*$/i;
 const RE_MEUS = /^\s*(?:meus|minhas|ver)?\s*(?:alertas?|avisos?|lista)(?:\s+de\s+pre[cç]os?)?\s*[.!?]?\s*$/i;
+const RE_CANCELAR = /^\s*(cancelar|cancela|desisto|deixa\s+pra\s+l[aá]|esquece)\s*[.!]?\s*$/i;
 const RE_URL = /https?:\/\/[^\s<>"']+/i;
 const RE_OK = /^\s*(ok|okay|sim|pode|isso|beleza|blz|fechado|confirmo|confirmar|quero)\s*[.!]*\s*$/i;
 const RE_SEM_ALVO = /^\s*(qualquer|qualquer\s+queda|sem\s+pre[cç]o|tanto\s+faz)\s*[.!]*\s*$/i;
@@ -604,6 +605,10 @@ export function observarMensagemAvisos(apelido, msg) {
 
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
 
+    if (RE_CANCELAR.test(texto) && _criacaoPendente.has(jid)) {
+      tratarConversa(jid, numeros, texto, msg.pushName, null).catch(e => console.warn('[AVISOS] Conversa: ' + e.message));
+      return;
+    }
     if (RE_SAIR.test(texto)) { tratarSair(jid, numeros); return; }
     const mSairUm = RE_SAIR_UM.exec(texto);
     if (mSairUm) { tratarSairUm(jid, numeros, Number(mSairUm[1])); return; }
@@ -653,11 +658,15 @@ export function observarMensagemAvisos(apelido, msg) {
 }
 
 function tratarSair(jid, numeros) {
+  const tinhaPendente = _criacaoPendente.delete(jid);
   const c = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean) || null;
   const vs = new Set(numeros.flatMap(n => [...variantesTelefone(n)]));
   const alvo = E().pedidos.filter(p => !ehFinal(p.status)
     && (p.jid === jid || [...variantesTelefone(p.telefone)].some(v => vs.has(v))));
-  if (!c && !alvo.length) return;
+  if (!c && !alvo.length) {
+    if (tinhaPendente) responder(jid, 'Tudo bem, deixei esse alerta de lado. Quando quiser, é só colar aqui o link de um produto. 🙂', true);
+    return;
+  }
   const agora = new Date().toISOString();
   for (const p of alvo) { p.status = 'cancelado'; p.canceladoEm = agora; p.motivoFim = 'cliente mandou SAIR'; }
   if (c) c.saiuEm = agora;
@@ -683,7 +692,7 @@ function podeConversar(jid) {
   if (_respostasPorJid.size > 3000) _respostasPorJid.delete(_respostasPorJid.keys().next().value);
   return true;
 }
-function falar(jid, texto) { if (podeConversar(jid)) enfileirarEnvio(jid, texto, { resposta: true }); }
+function falar(jid, texto) { if (podeConversar(jid)) { anotarConversa(jid, 'tico', texto); enfileirarEnvio(jid, texto, { resposta: true }); } }
 
 // Alertas em aberto de uma pessoa, na ordem em que foram criados (a numeração
 // do MEUS ALERTAS e do SAIR n é esta).
@@ -740,7 +749,15 @@ function lerValor(t) {
 }
 
 async function tratarConversa(jid, numeros, texto, pushName, contato) {
+  anotarConversa(jid, 'cliente', texto);
   const abertos = pedidosAbertosDe(jid, numeros, contato);
+
+  // CANCELAR desiste do alerta em criação (sem tocar nos que já existem).
+  if (RE_CANCELAR.test(texto) && pendenteDe(jid)) {
+    _criacaoPendente.delete(jid);
+    falar(jid, 'Tudo bem, deixei esse alerta de lado. Quando quiser, é só colar o link de outro produto aqui. 🙂');
+    return;
+  }
   const ehCliente = !!contato || abertos.length > 0;
 
   if (RE_MEUS.test(texto)) {
@@ -749,43 +766,13 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     return;
   }
 
-  // Resposta à pergunta de preço de um alerta que está sendo criado.
-  // Mesma linguagem da página: valor em reais, % abaixo do preço de agora,
-  // o preço sugerido (OK) ou qualquer queda boa.
-  const pend = _criacaoPendente.get(jid);
-  if (pend && Date.now() - pend.em > 30 * 60000) _criacaoPendente.delete(jid);
-  if (pend && _criacaoPendente.has(jid) && !RE_URL.test(texto)) {
-    const atual = Number(pend.leitura?.preco) > 0 ? Number(pend.leitura.preco) : null;
-    const exemplo = atual ? String(Math.floor(atual * 0.85)) : '150';
-    let alvo;
-    if (RE_OK.test(texto) && pend.sugestao) alvo = pend.sugestao.valor;
-    else if (RE_SEM_ALVO.test(texto)) alvo = null;
-    else {
-      const mPct = RE_PCT.exec(texto);
-      if (mPct) {
-        const pct = Number(mPct[1].replace(',', '.'));
-        if (!atual) { falar(jid, 'Como ainda não consegui ler o preço desse anúncio, mande o valor em reais (ex.: ' + exemplo + '), ou *QUALQUER* para ser avisado de qualquer queda boa.'); return; }
-        if (!(pct > 0 && pct < 90)) { falar(jid, 'Mande um desconto entre 1% e 89% (ex.: 15%), um valor em reais (ex.: ' + exemplo + ') ou *QUALQUER*.'); return; }
-        alvo = arred(Math.floor(atual * (1 - pct / 100) * 100) / 100);
-      } else {
-        alvo = lerValor(texto);
-        if (alvo == null) {
-          falar(jid, 'Não entendi. Responda com o valor que você quer pagar (ex.: ' + exemplo + ')'
-            + (atual ? ', o desconto em % (ex.: 15%)' : '')
-            + (pend.sugestao ? ', *OK* para ' + brl(pend.sugestao.valor) : '')
-            + ' ou *QUALQUER* para ser avisado de qualquer queda boa.');
-          return;
-        }
-      }
-      if (atual && alvo >= atual) {
-        falar(jid, 'Esse valor já é igual ou maior que o preço de agora (' + brl(atual) + '). Mande um valor abaixo disso, ou *QUALQUER* para ser avisado de qualquer queda boa.');
-        return;
-      }
-    }
-    _criacaoPendente.delete(jid);
-    const r = criarPedidoDaConversa({ jid, numeros, contato, pushName, item: pend.item, leitura: pend.leitura, alvo });
-    falar(jid, r.texto);
-    return;
+  // Resposta à pergunta de preço de um alerta que está sendo criado. O que
+  // dá para ler sem dúvida (valor, %, OK, QUALQUER) vai direto; o resto passa
+  // pela IA, que também pode desistir da criação ou mudar de assunto.
+  const pend = pendenteDe(jid);
+  if (pend && !RE_URL.test(texto)) {
+    const resp = lerRespostaAlvo(texto);
+    if (resp) { aplicarAlvoPendente({ jid, numeros, contato, pushName, pend, resp }); return; }
   }
 
   const mUrl = RE_URL.exec(texto);
@@ -808,12 +795,28 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     const preco = Number(r.leitura?.preco) > 0 ? arred(r.leitura.preco) : null;
     const titulo = String(r.leitura?.titulo || r.item.nome || '').slice(0, 200);
     const sug = preco ? sugestaoDePreco(preco, historicoParaSugestao(r.item.asin)) : null;
-    _criacaoPendente.set(jid, { item: r.item, leitura: r.leitura, sugestao: sug, em: Date.now() });
+    _criacaoPendente.set(jid, { item: r.item, leitura: r.leitura, sugestao: sug, titulo, em: Date.now() });
     if (_criacaoPendente.size > 2000) _criacaoPendente.delete(_criacaoPendente.keys().next().value);
     falar(jid, textoPerguntaAlvo(r.item, titulo, preco, sug));
     return;
   }
 
+  // Fora dos comandos: a IA entende o pedido e o código executa.
+  if (await conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente })) return;
+
+  // Sem IA (falhou ou desligada): pergunta pendente ganha uma nova chance e
+  // depois é largada — ninguém fica preso nela.
+  const pend2 = pendenteDe(jid);
+  if (pend2) {
+    pend2.erros = (pend2.erros || 0) + 1;
+    if (pend2.erros >= 2) {
+      _criacaoPendente.delete(jid);
+      falar(jid, 'Deixei esse alerta de lado por enquanto.\n\n' + textoAjuda(ehCliente).replace(/^Oi! /, ''));
+      return;
+    }
+    falar(jid, textoNaoEntendiAlvo(pend2) + '\n\nSe mudou de ideia, mande *CANCELAR*.');
+    return;
+  }
   // Ajuda: cliente sempre (com trava de laço); quem nunca pediu, no máximo 1x/dia
   // — o número também dispara em grupos e recebe conversa que não é para o Tico.
   if (!ehCliente) {
@@ -823,6 +826,193 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     if (_ajudaPorJid.size > 5000) _ajudaPorJid.delete(_ajudaPorJid.keys().next().value);
   }
   falar(jid, textoAjuda(ehCliente));
+}
+
+// ── Pergunta de preço pendente ──────────────────────────────────────────────
+function pendenteDe(jid) {
+  const p = _criacaoPendente.get(jid);
+  if (p && Date.now() - p.em > 30 * 60000) { _criacaoPendente.delete(jid); return null; }
+  return p || null;
+}
+
+// Lê sem IA: OK, QUALQUER, valor em reais ou desconto em %.
+function lerRespostaAlvo(texto) {
+  if (RE_OK.test(texto)) return { tipo: 'ok' };
+  if (RE_SEM_ALVO.test(texto)) return { tipo: 'qualquer' };
+  const mPct = RE_PCT.exec(texto);
+  if (mPct) return { tipo: 'pct', valor: Number(mPct[1].replace(',', '.')) };
+  const v = lerValor(texto);
+  if (v != null) return { tipo: 'valor', valor: v };
+  return null;
+}
+
+function textoNaoEntendiAlvo(pend) {
+  const atual = Number(pend.leitura?.preco) > 0 ? Number(pend.leitura.preco) : null;
+  const exemplo = atual ? String(Math.floor(atual * 0.85)) : '150';
+  return 'Para criar o alerta de *' + encurtar(pend.titulo || pend.item?.nome || 'produto', 60) + '*, responda com o valor que você quer pagar (ex.: ' + exemplo + ')'
+    + (atual ? ', o desconto em % (ex.: 15%)' : '')
+    + (pend.sugestao ? ', *OK* para ' + brl(pend.sugestao.valor) : '')
+    + ' ou *QUALQUER* para ser avisado de qualquer queda boa.';
+}
+
+// Valida e cria. Devolve true se criou.
+function aplicarAlvoPendente({ jid, numeros, contato, pushName, pend, resp }) {
+  const atual = Number(pend.leitura?.preco) > 0 ? Number(pend.leitura.preco) : null;
+  const exemplo = atual ? String(Math.floor(atual * 0.85)) : '150';
+  let alvo = null;
+  if (resp.tipo === 'ok') {
+    if (!pend.sugestao) { falar(jid, textoNaoEntendiAlvo(pend)); return false; }
+    alvo = pend.sugestao.valor;
+  } else if (resp.tipo === 'pct') {
+    if (!atual) { falar(jid, 'Como ainda não consegui ler o preço desse anúncio, mande o valor em reais (ex.: ' + exemplo + '), ou *QUALQUER* para ser avisado de qualquer queda boa.'); return false; }
+    if (!(resp.valor > 0 && resp.valor < 90)) { falar(jid, 'Mande um desconto entre 1% e 89% (ex.: 15%), um valor em reais (ex.: ' + exemplo + ') ou *QUALQUER*.'); return false; }
+    alvo = arred(Math.floor(atual * (1 - resp.valor / 100) * 100) / 100);
+  } else if (resp.tipo === 'valor') {
+    alvo = arred(resp.valor);
+    if (!(alvo > 0)) { falar(jid, textoNaoEntendiAlvo(pend)); return false; }
+    if (atual && alvo >= atual) {
+      falar(jid, 'Esse valor já é igual ou maior que o preço de agora (' + brl(atual) + '). Mande um valor abaixo disso, ou *QUALQUER* para ser avisado de qualquer queda boa.');
+      return false;
+    }
+  }
+  _criacaoPendente.delete(jid);
+  const r = criarPedidoDaConversa({ jid, numeros, contato, pushName, item: pend.item, leitura: pend.leitura, alvo });
+  falar(jid, r.texto);
+  return true;
+}
+
+// ── IA: entende a mensagem livre, o código executa ──────────────────────────
+// A IA nunca inventa preço nem produto: ela devolve uma intenção (e, quando é
+// conversa, uma resposta curta); números e ações saem sempre do nosso estado.
+const _historicoConversa = new Map();   // jid → [{ de: 'cliente'|'tico', t, em }]
+const _iaPorJid = new Map();            // jid → [ts] (teto diário de chamadas)
+
+function anotarConversa(jid, de, t) {
+  const v = (_historicoConversa.get(jid) || []).filter(x => Date.now() - x.em < 6 * MS_H);
+  v.push({ de, t: String(t || '').slice(0, 700), em: Date.now() });
+  _historicoConversa.set(jid, v.slice(-10));
+  if (_historicoConversa.size > 3000) _historicoConversa.delete(_historicoConversa.keys().next().value);
+}
+
+function podeChamarIa(jid) {
+  const agora = Date.now();
+  const v = (_iaPorJid.get(jid) || []).filter(t => agora - t < MS_DIA);
+  if (v.length >= 40) { _iaPorJid.set(jid, v); return false; }
+  v.push(agora); _iaPorJid.set(jid, v);
+  if (_iaPorJid.size > 3000) _iaPorJid.delete(_iaPorJid.keys().next().value);
+  return true;
+}
+
+const IA_SISTEMA = `Você é o Tico, o assistente de WhatsApp do Tica Promos (site de ofertas e grupos de promoções no WhatsApp). Fale em português do Brasil, de um jeito simpático, direto e curto (no máximo 4 linhas), como uma pessoa no WhatsApp. Pode usar *negrito* do WhatsApp e no máximo 1 emoji.
+
+O que você faz por aqui: alertas de preço. A pessoa cola o link de um produto da Amazon, Mercado Livre ou Shopee, diz quanto quer pagar e você avisa quando o preço chegar lá (ou cair bem). Comandos que a pessoa pode usar: MEUS ALERTAS (lista numerada), SAIR + número (para um alerta), SAIR (para todos), CANCELAR (desiste do alerta que está sendo criado). Também dá para criar e ver os alertas em ticapromos.com.br/avisos.
+
+Outros caminhos que você pode indicar: ofertas do dia em ticapromos.com.br; grupos de promoções em ir.ticapromos.com.br/geral. Você NÃO tem acesso a pedidos, entregas, trocas ou atendimento das lojas (isso é com a loja), nem lista cupons por aqui (cupons saem nos grupos e no site).
+
+Regras:
+- Nunca invente preço, desconto, produto, cupom ou prazo. Os dados que você tem estão no CONTEXTO.
+- Não prometa que o preço vai cair.
+- Se a pessoa quiser criar um alerta e não mandou link, peça o link do produto.
+- Se não entender, diga com naturalidade o que você consegue fazer.
+
+Responda SÓ com um JSON, sem texto fora dele:
+{"acao": "...", "valor": null, "pct": null, "n": null, "resposta": "..."}
+
+Ações:
+- "responder": só conversa; escreva a resposta em "resposta".
+- "definir_alvo": a pessoa disse quanto quer pagar no alerta em criação; use "valor" (reais) ou "pct" (desconto em %).
+- "aceitar_sugestao": aceitou o preço sugerido do alerta em criação.
+- "qualquer_queda": quer ser avisada de qualquer queda boa (sem preço definido) no alerta em criação.
+- "cancelar_criacao": desistiu do alerta em criação.
+- "listar": quer ver os alertas dela.
+- "parar": quer parar UM alerta; "n" = número dele na lista do CONTEXTO.
+- "parar_todos": quer parar TODOS os alertas.
+- "mudar_alvo": quer trocar o preço desejado de um alerta existente; "n" = número na lista, e "valor" ou "pct".
+Em todas as ações, "resposta" pode ficar vazia (o sistema escreve a confirmação), exceto em "responder".`;
+
+function contextoParaIa(jid, abertos, pend) {
+  const l = [];
+  if (pend) {
+    const atual = Number(pend.leitura?.preco) > 0 ? brl(pend.leitura.preco) : 'ainda não lido';
+    l.push('ALERTA EM CRIAÇÃO (o Tico perguntou quanto a pessoa quer pagar): ' + encurtar(pend.titulo || pend.item?.nome || '', 80)
+      + ' · preço de agora: ' + atual + (pend.sugestao ? ' · preço sugerido: ' + brl(pend.sugestao.valor) : ''));
+  } else l.push('ALERTA EM CRIAÇÃO: nenhum.');
+  if (abertos.length) {
+    l.push('ALERTAS DA PESSOA:');
+    abertos.forEach((p, i) => {
+      const prod = E().produtos[p.produto] || {};
+      l.push((i + 1) + '. ' + encurtar(p.titulo, 70) + ' · agora ' + (prod.ult?.preco ? brl(prod.ult.preco) : 'sem leitura')
+        + ' · seu preço ' + (p.precoAlvo ? brl(p.precoAlvo) : 'qualquer queda boa'));
+    });
+  } else l.push('ALERTAS DA PESSOA: nenhum.');
+  const h = (_historicoConversa.get(jid) || []).slice(0, -1);
+  if (h.length) {
+    l.push('CONVERSA RECENTE:');
+    for (const x of h.slice(-6)) l.push((x.de === 'tico' ? 'Tico: ' : 'Pessoa: ') + x.t.replace(/\s+/g, ' ').slice(0, 300));
+  }
+  return l.join('\n');
+}
+
+async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente }) {
+  if (!_deps.ia || !podeChamarIa(jid)) return false;
+  const pend = pendenteDe(jid);
+  let r = null;
+  try {
+    r = await _deps.ia(IA_SISTEMA, 'CONTEXTO:\n' + contextoParaIa(jid, abertos, pend) + '\n\nMENSAGEM DA PESSOA: ' + String(texto).slice(0, 800), 400);
+  } catch (e) { console.warn('[AVISOS] IA falhou: ' + e.message); }
+  if (!r || typeof r !== 'object' || !r.acao) return false;
+  const resposta = String(r.resposta || '').trim().slice(0, 700);
+  const n = Number(r.n);
+  const valor = Number(r.valor), pct = Number(r.pct);
+  console.log('[AVISOS] IA: ' + r.acao + ' (' + mascarar(numeros[0] || jid) + ').');
+
+  switch (r.acao) {
+    case 'definir_alvo':
+    case 'aceitar_sugestao':
+    case 'qualquer_queda': {
+      if (!pend) break;
+      const resp = r.acao === 'aceitar_sugestao' ? { tipo: 'ok' }
+        : r.acao === 'qualquer_queda' ? { tipo: 'qualquer' }
+        : pct > 0 ? { tipo: 'pct', valor: pct }
+        : valor > 0 ? { tipo: 'valor', valor } : null;
+      if (!resp) break;
+      aplicarAlvoPendente({ jid, numeros, contato, pushName, pend, resp });
+      return true;
+    }
+    case 'cancelar_criacao':
+      if (!pend) break;
+      _criacaoPendente.delete(jid);
+      falar(jid, resposta || 'Tudo bem, deixei esse alerta de lado. Quando quiser, é só colar o link de outro produto aqui. 🙂');
+      return true;
+    case 'listar':
+      falar(jid, textoLista(abertos));
+      return true;
+    case 'parar':
+      if (!(n >= 1)) break;
+      tratarSairUm(jid, numeros, n);
+      return true;
+    case 'parar_todos':
+      tratarSair(jid, numeros);
+      return true;
+    case 'mudar_alvo': {
+      const p = abertos[n - 1];
+      if (!p) break;
+      const prod = E().produtos[p.produto] || {};
+      const atual = prod.ult?.preco || p.precoInicial || null;
+      let novo = pct > 0 && atual ? arred(Math.floor(atual * (1 - pct / 100) * 100) / 100) : (valor > 0 ? arred(valor) : null);
+      if (!novo) break;
+      if (atual && novo >= atual) { falar(jid, 'Esse valor já é igual ou maior que o preço de agora (' + brl(atual) + '). Mande um valor abaixo disso.'); return true; }
+      p.precoAlvo = novo; p.ultimoAvisoPreco = null;
+      gravar();
+      console.log('[AVISOS] ' + p.id + ' alvo trocado para ' + novo + ' pela conversa.');
+      falar(jid, 'Pronto! 🎯 Novo preço para *' + encurtar(p.titulo, 70) + '*: *' + brl(novo) + '*' + (atual ? ' (' + Math.round((1 - novo / atual) * 100) + '% abaixo de agora)' : '') + '. Te aviso quando chegar lá.');
+      return true;
+    }
+  }
+  // "responder" ou ação que não fechou: vale a resposta da IA, se houver.
+  if (!resposta) return false;
+  falar(jid, resposta + (pend ? '\n\n' + textoNaoEntendiAlvo(pend) : ''));
+  return true;
 }
 
 // Pergunta do preço desejado, com a mesma régua da página: até 20% abaixo é
@@ -898,6 +1088,7 @@ function textoConfirmacao(pedido, c) {
 }
 
 function tratarSairUm(jid, numeros, n) {
+  _criacaoPendente.delete(jid);
   const contato = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean) || null;
   const abertos = pedidosAbertosDe(jid, numeros, contato);
   if (!abertos.length) { if (contato) falar(jid, 'Você não tem alertas ativos no momento.'); return; }
@@ -1017,6 +1208,7 @@ function responder(jid, texto, forcar = false) {
   const ult = _ultimaRespostaPorJid.get(jid) || 0;
   if (!forcar && Date.now() - ult < 30000) return;
   _ultimaRespostaPorJid.set(jid, Date.now());
+  anotarConversa(jid, 'tico', texto);
   enfileirarEnvio(jid, texto, { resposta: true });
 }
 
