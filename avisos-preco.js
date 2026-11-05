@@ -714,7 +714,7 @@ function textoAjuda(temAlertas) {
   return 'Oi! Eu sou o Tico, do Tica Promos 🐦\n\n'
     + 'Por aqui eu entendo só estes pedidos:\n'
     + '• *cole o link* de um produto (Amazon, Mercado Livre ou Shopee) para criar um alerta de preço;\n'
-    + (temAlertas ? '• *MEUS ALERTAS* para ver sua lista;\n• *SAIR 2* para parar o alerta 2, ou *SAIR* para parar todos.\n' : '')
+    + (temAlertas ? '• *MEUS ALERTAS* para ver sua lista numerada;\n• *SAIR* + o número do alerta para parar só aquele (ex.: *SAIR 1* para o primeiro da lista);\n• *SAIR* sozinho para parar todos.\n' : '')
     + '\nVocê também pode criar e ver seus alertas em ' + SITE_ALERTAS + '\n'
     + 'Não consigo responder outras perguntas por aqui.';
 }
@@ -724,7 +724,7 @@ function textoLista(abertos) {
     return 'Você não tem alertas de preço ativos no momento.\n\nPara criar um, cole aqui o link do produto (Amazon, Mercado Livre ou Shopee) ou use ' + SITE_ALERTAS;
   }
   return '🔔 *Seus alertas de preço*\n\n' + abertos.map(linhaDoPedido).join('\n\n')
-    + '\n\nPara parar um, responda *SAIR* e o número (ex.: SAIR ' + Math.min(2, abertos.length) + '). *SAIR* sozinho para todos.'
+    + '\n\nPara parar um alerta, responda *SAIR* + o número dele na lista acima (ex.: *SAIR 1*). *SAIR* sozinho para todos.'
     + '\nPara criar outro, cole aqui o link do produto.'
     + '\nVeja a régua de preços de cada um em ' + SITE_ALERTAS;
 }
