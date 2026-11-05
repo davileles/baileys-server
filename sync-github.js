@@ -135,14 +135,63 @@ function _idsTenantsDoDisco() {
 }
 
 const _shas = new Map();      // caminho no repo -> sha do ultimo commit conhecido
-const _timers = new Map();    // arquivo -> timer de debounce
+const _timers = new Map();    // arquivo -> timer de debounce (ou de nova tentativa)
 let _ultimoErro = null;
+
+// ── FILA DE ENVIO + NOVA TENTATIVA ─────────────────────────────────────────
+// Antes cada arquivo subia no seu proprio timer, todos ao mesmo tempo: um item
+// de lista grava listas.json, historico de envios, rastreio, links_fixos e a
+// serie de precos no mesmo segundo, e os cinco PUTs na Contents API disputavam
+// a mesma branch. O GitHub recusa parte deles (409) e o arquivo recusado nao
+// era reenviado — ficava velho no repo ate a proxima gravacao. No boot seguinte
+// baixarDoGitHub() reescrevia o disco com a copia velha. Em 05/11/2026 isso fez
+// a lista "Quinta - Shopee" voltar 3 itens a cada deploy (11:27, 11:46, 12:09)
+// e a mesma caneleira saiu 4 vezes nos grupos.
+// Agora: um envio por vez (fila unica) e, se falhar, o arquivo volta para o
+// debounce com espera crescente (10 s, 20 s, 40 s... ate 5 min) ate subir.
+// Enquanto nao sobe, ele aparece em pushesPendentes() e o flush do SIGTERM
+// tenta de novo.
+let _filaEnvio = Promise.resolve();
+const _naFila = new Set();     // arquivos ja na fila, esperando a vez
+const _falhas = new Map();     // arquivo -> tentativas seguidas que falharam
+const RETRY_BASE_MS = 10000;
+const RETRY_TETO_MS = 5 * 60000;
+
+function enfileirarEnvio(local) {
+  _naFila.add(local);
+  const passo = async () => {
+    _naFila.delete(local);
+    return enviar(local);
+  };
+  const p = _filaEnvio.then(passo, passo);
+  _filaEnvio = p.catch(() => {});
+  return p;
+}
+
+async function enviarComNovaTentativa(local) {
+  const ok = await enfileirarEnvio(local);
+  if (ok) { _falhas.delete(local); return true; }
+  const n = (_falhas.get(local) || 0) + 1;
+  _falhas.set(local, n);
+  // Gravacao nova no meio da espera ja reagendou o arquivo: nao duplica.
+  if (_timers.has(local)) return false;
+  const espera = Math.min(RETRY_BASE_MS * 2 ** (n - 1), RETRY_TETO_MS);
+  console.warn('[SYNC] ' + local + ' nao subiu (tentativa ' + n + '); nova tentativa em '
+    + Math.round(espera / 1000) + ' s.');
+  _timers.set(local, setTimeout(() => {
+    _timers.delete(local);
+    enviarComNovaTentativa(local).catch(e => console.error('[SYNC] Erro inesperado:', e.message));
+  }, espera));
+  return false;
+}
 
 export function sincronizacaoAtiva() { return !!process.env.GITHUB_TOKEN; }
 export function estadoSync() {
   const t = process.env.GITHUB_TOKEN || '';
   return {
     ativo: sincronizacaoAtiva(), repo: repoDados(), pasta: pastaDados(), ultimoErro: _ultimoErro,
+    pendentes: pushesPendentes(),
+    falhando: Object.fromEntries(_falhas),
     arquivos: Object.keys(ARQUIVOS_SINCRONIZADOS),
     // Diagnostico sem vazar o segredo: so presenca, tamanho e prefixo. Variavel
     // adicionada no Railway so entra no processo apos o restart do container.
@@ -252,11 +301,13 @@ export async function baixarArquivoDoGitHub(local) {
   } catch { return false; }
 }
 
+// Devolve true quando o repo ficou igual ao disco (subiu ou ja era igual) e
+// false quando falhou — quem chama decide se tenta de novo.
 async function enviar(local) {
-  if (!caminhoValido(local)) return;
+  if (!caminhoValido(local)) return true;
   const remoto = remotoDe(local);
   const caminhoLocal = SESSAO_DIR + '/' + local;
-  if (!existsSync(caminhoLocal)) return;
+  if (!existsSync(caminhoLocal)) return true;
 
   try {
     const conteudo = readFileSync(caminhoLocal, 'utf-8');
@@ -268,7 +319,7 @@ async function enviar(local) {
       const d = await atual.json();
       sha = d.sha;
       // Conteudo identico: nao gera commit vazio.
-      if (Buffer.from(d.content, 'base64').toString('utf-8') === conteudo) { _shas.set(remoto, sha); return; }
+      if (Buffer.from(d.content, 'base64').toString('utf-8') === conteudo) { _shas.set(remoto, sha); return true; }
     } else if (atual.status !== 404) {
       throw new Error('leitura falhou: HTTP ' + atual.status);
     }
@@ -285,9 +336,11 @@ async function enviar(local) {
     _shas.set(remoto, d.content?.sha);
     _ultimoErro = null;
     console.log('[SYNC] ' + local + ' -> ' + repoDados() + '/' + remoto);
+    return true;
   } catch (e) {
     _ultimoErro = local + ': ' + e.message;
     console.error('[SYNC] Falha ao enviar ' + local + ':', e.message);
+    return false;
   }
 }
 
@@ -300,12 +353,12 @@ export function agendarPush(local) {
   if (_timers.has(local)) clearTimeout(_timers.get(local));
   _timers.set(local, setTimeout(() => {
     _timers.delete(local);
-    enviar(local).catch(e => console.error('[SYNC] Erro inesperado:', e.message));
+    enviarComNovaTentativa(local).catch(e => console.error('[SYNC] Erro inesperado:', e.message));
   }, DEBOUNCE_MS));
 }
 
-/** Arquivos gravados no disco que ainda nao subiram (estao no debounce). */
-export function pushesPendentes() { return [..._timers.keys()]; }
+/** Arquivos gravados no disco que ainda nao subiram (debounce, fila ou nova tentativa). */
+export function pushesPendentes() { return [...new Set([..._timers.keys(), ..._naFila])]; }
 
 /**
  * Envia AGORA so o que esta no debounce. Existe para o encerramento: o Railway
@@ -320,8 +373,12 @@ export async function flushPushesPendentes() {
   const pendentes = pushesPendentes();
   // Cancela os timers antes de enviar: se o processo sobreviver, o envio ja
   // aconteceu e o timer dispararia um segundo PUT identico.
-  for (const local of pendentes) { clearTimeout(_timers.get(local)); _timers.delete(local); }
-  for (const local of pendentes) await enviar(local);
+  // Os que ja estao na fila saem pela propria fila; os do debounce entram nela.
+  for (const local of pendentes) {
+    if (_timers.has(local)) { clearTimeout(_timers.get(local)); _timers.delete(local); }
+  }
+  for (const local of pendentes) if (!_naFila.has(local)) enfileirarEnvio(local);
+  await _filaEnvio;
   return pendentes;
 }
 
@@ -336,7 +393,7 @@ export async function pushImediato() {
   }
   for (const local of alvos) {
     if (_timers.has(local)) { clearTimeout(_timers.get(local)); _timers.delete(local); }
-    await enviar(local);
+    if (await enfileirarEnvio(local)) _falhas.delete(local);
     feitos.push(local);
   }
   return feitos;
