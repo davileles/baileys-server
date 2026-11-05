@@ -184,6 +184,20 @@ export async function buscarProdutoShopee({ shopId, itemId }) {
   return d?.productOfferV2?.nodes?.[0] || null;
 }
 
+// Busca por palavra-chave (avisos de preco: achar o mesmo produto na Shopee).
+// sortType 1 = relevancia.
+export async function buscarShopeePorTermo(termo, n = 10) {
+  const q = String(termo || '').trim().slice(0, 120);
+  if (!q) return [];
+  const query = `{
+    productOfferV2(keyword: ${JSON.stringify(q)}, sortType: 1, page: 1, limit: ${Math.min(20, Math.max(1, Number(n) || 10))}) {
+      nodes { ${CAMPOS_PRODUTO} }
+    }
+  }`;
+  const d = await chamarShopee(query);
+  return d?.productOfferV2?.nodes || [];
+}
+
 /**
  * Converte a resposta da Shopee no mesmo formato do produto normalizado da
  * Amazon, para o template e o calculo de cupom funcionarem sem saber de qual

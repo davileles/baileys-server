@@ -2003,6 +2003,34 @@ export async function buscarProdutos(asins) {
   return itens;
 }
 
+// ── BUSCA POR TERMO (05/11/2026) ─────────────────────────────────────────
+// Usada pelos avisos de preco para achar o mesmo produto na Amazon quando o
+// cliente pediu o alerta de outra loja. Devolve itens crus da Creators API
+// (mesmo formato do getItems, para passar pelo normalizar). Erro vira exception
+// com o status, para o painel mostrar o motivo.
+export async function buscarAmazonPorTermo(termo, n = 10) {
+  const q = String(termo || '').trim().slice(0, 200);
+  if (!q) return [];
+  const token = await getToken();
+  const partnerTag = credencialTsp('AMZ_PARTNER_TAG_LEITURA')
+                  || E().cfg.partnerTag || credencialTsp('AMZ_PARTNER_TAG');
+  if (!partnerTag) throw new Error('partnerTag nao configurado.');
+  const res = await fetch(API_BASE + '/catalog/v1/searchItems', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', 'x-marketplace': MARKETPLACE },
+    body: JSON.stringify({
+      keywords: q, searchIndex: 'All', itemCount: Math.min(10, Math.max(1, n)),
+      marketplace: MARKETPLACE, partnerTag, partnerType: 'Associates', resources: RECURSOS,
+    }),
+    signal: AbortSignal.timeout(20000),
+  });
+  const texto = await res.text();
+  if (!res.ok) throw new Error('searchItems ' + res.status + ': ' + texto.slice(0, 160));
+  let data = null;
+  try { data = JSON.parse(texto); } catch (e) { throw new Error('searchItems resposta nao-JSON'); }
+  return data?.searchResult?.items || data?.itemsResult?.items || data?.items || [];
+}
+
 // ── NORMALIZACAO ──────────────────────────────────────────────────────────
 
 // A Amazon pode devolver mais de um listing para o mesmo ASIN (ex.: um Prime

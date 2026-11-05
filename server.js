@@ -182,7 +182,8 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido,
-         pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas } from './avisos-preco.js';
+         pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
+         acaoEquivalente, trabalhoOutrasLojas } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -26341,7 +26342,7 @@ function _listarContasAvisos() {
 }
 iniciarAvisosPreco({
   // IA do Tico na conversa dos alertas (Haiku, JSON). null = segue sem IA.
-  ia: (system, texto, max) => chamarClaude(system, texto, max || 400, 'claude-haiku-4-5'),
+  ia: (system, texto, max, modelo) => chamarClaude(system, texto, max || 400, modelo || 'claude-haiku-4-5'),
   enviarDm: _enviarDmAvisos,
   contaConectada: _contaAvisosConectada,
   numeroDaConta: _numeroDaContaAvisos,
@@ -26399,6 +26400,20 @@ app.get('/avisos-preco/conversas', (req, res) => {
 app.post('/avisos-preco/varrer', async (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
   res.json(await varrerAvisos({ manual: true }));
+});
+// Mesmo produto em outras lojas + cupom do ML (painel, aba Avisos de preço).
+// {produto, acao: buscar|cupom|remover|trocar|adicionar, chave?, url?}
+app.post('/avisos-preco/equivalente', async (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  const b = req.body || {};
+  try {
+    res.json(await acaoEquivalente({ produto: String(b.produto || ''), acao: String(b.acao || ''),
+      chave: b.chave ? String(b.chave) : null, url: b.url ? String(b.url).trim() : null }));
+  } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
+});
+app.post('/avisos-preco/outras-lojas', async (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(await trabalhoOutrasLojas());
 });
 
 // Relogio dos workflows do painel-cdv. Sobe cedo e independente do WhatsApp: a

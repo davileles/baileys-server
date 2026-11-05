@@ -29,9 +29,9 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from '
 import { createHash } from 'crypto';
 import { agendarPush } from './sync-github.js';
 import { lerPrecoProduto, lerPrecosAmazonEmLote, estatisticas as estatisticasMonitor } from './monitor-precos.js';
-import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
-import { ehLinkShopee, extrairIdsShopee, buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk } from './radar-shopee.js';
-import { ehLinkMl, resolverLinhaVitrineMl, buscarDadosProdutoMl, tokenAffOk } from './radar-ml.js';
+import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon, buscarAmazonPorTermo, listarCuponsBase, cupomVigente } from './radar-amazon.js';
+import { ehLinkShopee, extrairIdsShopee, buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk, buscarShopeePorTermo } from './radar-shopee.js';
+import { ehLinkMl, resolverLinhaVitrineMl, buscarDadosProdutoMl, tokenAffOk, cupomDaPaginaParaCatalogoMl } from './radar-ml.js';
 
 const SESSAO_DIR = './sessao';
 const ARQ = 'avisos_preco.json';
@@ -106,6 +106,7 @@ function estruturar(bruto) {
     produtos: e.produtos && typeof e.produtos === 'object' ? e.produtos : {},
     contatos: Array.isArray(e.contatos) ? e.contatos : [],
     envios: Array.isArray(e.envios) ? e.envios : [],
+    cuponsMlVistos: Array.isArray(e.cuponsMlVistos) ? e.cuponsMlVistos : [],
   };
 }
 
@@ -742,12 +743,13 @@ function pedidosAbertosDe(jid, numeros, contato) {
 
 function linhaDoPedido(p, i) {
   const prod = E().produtos[p.produto] || {};
-  const atual = prod.ult?.preco;
+  const mo = prod.asin ? melhorOferta(prod) : null;
+  const atual = mo?.preco ?? prod.ult?.preco;
   const l = [(i + 1) + '. *' + encurtar(p.titulo, 70) + '*' + (p.loja ? ' (' + p.loja + ')' : '')];
   if (p.status === 'aguardando') l.push('⏳ Aguardando ativação');
   if (p.pausado) l.push('⏸️ Pausado');
   if (p.porNome) l.push('🔎 Ainda estamos procurando o produto');
-  if (atual) l.push('💰 Hoje: ' + brl(atual));
+  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo && mo.prod.loja !== p.loja ? ' na ' + mo.prod.loja : '') + (mo?.cupom ? ' com o cupom ' + mo.cupom : ''));
   if (p.precoAlvo) {
     if (atual && atual <= p.precoAlvo) l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + ' ✅ chegou!');
     else l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
@@ -1248,6 +1250,7 @@ export function listaConsulta(token) {
         status: p.status, pausado: !!p.pausado, porNome: !!p.porNome,
         precoInicial: p.precoInicial, precoAlvo: p.precoAlvo,
         precoAtual: prod.ult?.preco ?? null, disponivel: prod.ult ? prod.ult.disponivel !== false : null,
+        melhor: (() => { const mo = prod.asin ? melhorOferta(prod) : null; return mo ? { preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null } : null; })(),
         lidoEm: prod.lidoEm || null, criadoEm: p.criadoEm, expiraEm: p.expiraEm,
         avisos: (p.avisos || []).map(a => ({ em: a.em, preco: a.preco, tipo: a.tipo })),
         serie: serieDoProduto(prod),
@@ -1318,9 +1321,22 @@ async function processarFila() {
 }
 
 // ── Varredura de preços ─────────────────────────────────────────────────────
-function produtosVigiados() {
-  const chaves = new Set(E().pedidos.filter(p => p.status === 'ativo' && p.produto).map(p => p.produto));
+function produtosBase() {
+  const chaves = new Set(E().pedidos.filter(p => p.status === 'ativo' && p.produto && !p.porNome).map(p => p.produto));
   return [...chaves].map(k => E().produtos[k]).filter(Boolean);
+}
+// Base + o mesmo produto nas outras lojas (equivalentes ativos).
+function produtosVigiados() {
+  const out = new Map();
+  for (const p of produtosBase()) {
+    out.set(p.asin, p);
+    for (const eq of p.equivalentes || []) {
+      if (eq.ativo === false) continue;
+      const q = E().produtos[eq.chave];
+      if (q) out.set(q.asin, q);
+    }
+  }
+  return [...out.values()];
 }
 
 function vencidos(p) {
@@ -1379,26 +1395,30 @@ function avisosHoje(jid) {
   return E().envios.filter(e => e.jid === jid && e.dia === hoje).length;
 }
 
-async function montarLink(p) {
+async function montarLink(p, cupom = null) {
   const item = itemDoProduto(p);
   let montado = null;
   if (p.loja === 'Amazon') montado = await _deps.montarAmazon([p.asin], 'nenhum');
   else if (p.loja === 'Shopee') montado = await _deps.montarShopee([item], 'nenhum');
-  else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], 'nenhum');
+  else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], cupom || 'nenhum');
   const o = montado?.prontos?.[0];
   if (!o?.produto?.link) return null;
   const preco = Number(o.precoFinal ?? o.produto.preco);
   return { link: o.produto.link, preco: preco > 0 ? arred(preco) : null, titulo: o.produto.titulo || p.titulo };
 }
 
-function textoDoAviso(pedido, preco, tipo, link) {
+function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   const linhas = [];
+  const outraLoja = extra.loja && pedido.loja && extra.loja !== pedido.loja;
   if (tipo === 'alvo') linhas.push('🔔 *Chegou no seu preço!*');
+  else if (outraLoja) linhas.push('🔔 *Achei mais barato!*');
   else linhas.push('🔔 *Baixou o preço!*');
   linhas.push('');
   linhas.push(encurtar(pedido.titulo, 120));
   linhas.push('');
+  if (outraLoja) { linhas.push('🏪 Mesmo produto, agora na *' + extra.loja + '*'); }
   linhas.push('💰 Agora: *' + brl(preco) + '*' + (pedido.precoInicial ? ' (era ' + brl(pedido.precoInicial) + ' quando você pediu)' : ''));
+  if (extra.cupom) linhas.push('🎟️ Usando o cupom *' + extra.cupom + '* (aparece no anúncio)');
   if (pedido.precoAlvo) {
     if (preco <= pedido.precoAlvo) linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' ✅');
     else linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' (faltam ' + brl(preco - pedido.precoAlvo) + ')');
@@ -1436,32 +1456,35 @@ export async function varrerAvisos({ manual = false } = {}) {
       for (const pedido of E().pedidos) {
         if (pedido.status !== 'ativo' || !pedido.jid || pedido.pausado || jaNaFila.has(pedido.id)) continue;
         const prod = E().produtos[pedido.produto];
-        if (!prod?.ult?.preco || !prod.ult.disponivel) continue;
+        if (!prod) continue;
         // Criado sem preço lido (anúncio que a loja não mostrou na hora): a
         // primeira leitura vira a referência das quedas.
         if (!pedido.precoInicial) {
+          if (!prod.ult?.preco || !prod.ult.disponivel) continue;
           pedido.precoInicial = prod.ult.preco;
           if (pedido.precoAlvo && pedido.precoAlvo >= pedido.precoInicial) pedido.precoAlvo = null;
           continue;
         }
-        if (Date.now() - Date.parse(prod.ult.em) > 8 * MS_H) continue;
-        const av = avaliarPedido(pedido, prod.ult.preco, cfg);
+        // Menor preço entre a loja pedida e as equivalentes (com cupom do ML).
+        const mo = melhorOferta(prod, { maxIdadeMs: 8 * MS_H });
+        if (!mo) continue;
+        const av = avaliarPedido(pedido, mo.preco, cfg);
         if (!av) continue;
         if (avisosHoje(pedido.jid) + _filaEnvio.filter(f => f.jid === pedido.jid && f.pedidoId).length >= cfg.avisosPorDia) continue;
         // Confirma o preço na hora de montar o link (releitura da loja).
         let m = null;
-        try { m = await montarLink(prod); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + prod.asin + '): ' + e.message); }
+        try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + mo.prod.asin + '): ' + e.message); }
         if (!m?.link || !m.preco) continue;
         const conf = avaliarPedido(pedido, m.preco, cfg);
-        if (!conf) { registrarLeitura(prod, { preco: m.preco, disponivel: true }); continue; }
-        const texto = textoDoAviso(pedido, m.preco, conf.tipo, m.link);
+        if (!conf) { if (!mo.cupom) registrarLeitura(mo.prod, { preco: m.preco, disponivel: true }); continue; }
+        const texto = textoDoAviso(pedido, m.preco, conf.tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom });
         const precoEnviado = m.preco;
         enfileirarEnvio(pedido.jid, texto, {
           pedidoId: pedido.id,
           aoEnviar: () => {
             const em = new Date().toISOString();
             pedido.ultimoAvisoPreco = precoEnviado; pedido.ultimoAvisoEm = em;
-            pedido.avisos.push({ em, preco: precoEnviado, tipo: conf.tipo });
+            pedido.avisos.push({ em, preco: precoEnviado, tipo: conf.tipo, loja: mo.prod.loja, cupom: mo.cupom || null });
             if (pedido.avisos.length > 30) pedido.avisos = pedido.avisos.slice(-30);
             if (conf.tipo === 'alvo' && !pedido.alvoAtingidoEm) pedido.alvoAtingidoEm = em;
             E().envios.push({ jid: pedido.jid, dia: diaSP(), em, pedido: pedido.id, preco: precoEnviado, tipo: conf.tipo });
@@ -1483,6 +1506,264 @@ export async function varrerAvisos({ manual = false } = {}) {
     _ultimaVarredura = res;
   }
   return { ok: true, ...res };
+}
+
+
+// ── OUTRAS LOJAS E CUPOM DO ML (05/11/2026) ─────────────────────────────────
+// O mesmo produto pode estar mais barato em outra loja, ou sair mais barato no
+// ML com o cupom que o anúncio oferece. Tudo aqui roda em segundo plano (nunca
+// na conversa): um trabalho a cada 15 min procura o produto nas outras lojas
+// (Amazon e Shopee têm busca; o ML não deixa buscar, então só entra à mão pelo
+// painel), confere com IA se é o MESMO produto e passa a vigiar o achado junto.
+// O aviso sai pelo menor preço entre as lojas, com o link da loja mais barata.
+// Cupom do ML: só o que está NA PÁGINA do anúncio e vigente na base (mesma
+// regra do Catálogo — o sistema nunca escolhe cupom por conta própria).
+const EQUIV_CONFIANCA_MIN = 85;
+const EQUIV_REBUSCA_DIAS = 7;
+const CUPOM_ML_RECHECA_H = 12;
+let _ultimaBuscaEquiv = null;
+const _errosBusca = {};
+let _trabalhando = false;
+
+function precoEfetivo(p, maxIdadeMs = Infinity) {
+  if (!p?.ult?.preco || p.ult.disponivel === false) return null;
+  if (Date.now() - Date.parse(p.ult.em) > maxIdadeMs) return null;
+  let preco = p.ult.preco, cupom = null;
+  const c = p.cupomMl;
+  // O desconto foi lido para um preço; com o preço mudando mais de 5% ele
+  // pode não valer igual — espera a próxima conferência.
+  if (c?.estado === 'ok' && c.codigo && c.desconto > 0 && c.precoRef
+      && Math.abs(preco - c.precoRef) / c.precoRef <= 0.05
+      && Date.now() - Date.parse(c.em) < 24 * MS_H) {
+    preco = arred(Math.max(0.01, preco - c.desconto)); cupom = c.codigo;
+  }
+  return { preco, cupom };
+}
+
+function melhorOferta(prod, { maxIdadeMs = Infinity } = {}) {
+  const cands = [prod];
+  for (const eq of prod.equivalentes || []) {
+    if (eq.ativo === false) continue;
+    const q = E().produtos[eq.chave];
+    if (q) cands.push(q);
+  }
+  let melhor = null;
+  for (const q of cands) {
+    const ef = precoEfetivo(q, maxIdadeMs);
+    if (!ef) continue;
+    if (!melhor || ef.preco < melhor.preco - 0.009) melhor = { prod: q, preco: ef.preco, cupom: ef.cupom };
+  }
+  return melhor;
+}
+
+function painelDoProduto(prod) {
+  const mo = melhorOferta(prod);
+  const ofertaPainel = q => ({
+    chave: q.asin, loja: q.loja, titulo: q.titulo || '', url: q.url || '',
+    preco: q.ult?.preco ?? null, disponivel: q.ult ? q.ult.disponivel !== false : null, lidoEm: q.lidoEm || null,
+    falha: q.falhas ? q.falhaMotivo : null,
+    cupomMl: q.loja === 'Mercado Livre' ? (q.cupomMl || null) : undefined,
+  });
+  return {
+    ...ofertaPainel(prod),
+    melhor: mo ? { chave: mo.prod.asin, loja: mo.prod.loja, preco: mo.preco, cupom: mo.cupom || null } : null,
+    equivalentes: (prod.equivalentes || []).map(eq => {
+      const q = E().produtos[eq.chave] || { asin: eq.chave, loja: eq.loja, titulo: eq.titulo };
+      return { ...ofertaPainel(q), confianca: eq.confianca ?? null, origem: eq.origem, motivo: eq.motivo || '',
+               ativo: eq.ativo !== false, em: eq.em, removidoEm: eq.removidoEm || null };
+    }),
+    busca: prod.equivBusca || null,
+  };
+}
+
+// ── Cupom do ML ──
+function codigosMlVigentes() {
+  try {
+    return listarCuponsBase().filter(r => r.loja === 'Mercado Livre' && cupomVigente(r) && r.codigo).map(r => String(r.codigo).toUpperCase()).sort();
+  } catch (e) { return []; }
+}
+
+function marcarCuponsNovosMl() {
+  const atuais = codigosMlVigentes();
+  const vistos = new Set(E().cuponsMlVistos || []);
+  const novos = atuais.filter(c => !vistos.has(c));
+  E().cuponsMlVistos = atuais;
+  if (novos.length && vistos.size) {
+    for (const p of Object.values(E().produtos)) if (p.loja === 'Mercado Livre') p.cupomMlRechecar = true;
+    console.log('[AVISOS] Cupom novo do ML na base (' + novos.slice(0, 5).join(', ') + '): reconferindo os produtos dos alertas.');
+  }
+  return novos.length;
+}
+
+function precisaConferirCupom(p) {
+  if (p.loja !== 'Mercado Livre' || !p.url || !p.ult?.preco) return false;
+  if (p.cupomMlTentativaEm && Date.now() - Date.parse(p.cupomMlTentativaEm) < MS_H) return false;
+  const c = p.cupomMl;
+  if (!c || p.cupomMlRechecar) return true;
+  if (Date.now() - Date.parse(c.em) >= CUPOM_ML_RECHECA_H * MS_H) return true;
+  return c.precoRef && Math.abs(p.ult.preco - c.precoRef) / c.precoRef > 0.05;
+}
+
+async function conferirCupomMl(p) {
+  p.cupomMlTentativaEm = new Date().toISOString();
+  let r = null;
+  try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
+  if (!r || r.estado === 'indisponivel') return r;   // fica o que já havia; tenta de novo em 1 h
+  p.cupomMl = { estado: r.estado, codigo: r.codigo || null, desconto: r.desconto ? arred(r.desconto) : null,
+                precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null), em: new Date().toISOString() };
+  p.cupomMlRechecar = false;
+  if (r.estado === 'ok') console.log('[AVISOS] Cupom ' + r.codigo + ' vale para ' + p.asin + ' (−' + brl(r.desconto) + ').');
+  return r;
+}
+
+// ── Mesmo produto em outras lojas ──
+function termoDeBusca(titulo) {
+  return String(titulo || '')
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s.,-]/gu, ' ')
+    .split(/\s+/).filter(Boolean).slice(0, 10).join(' ');
+}
+
+async function candidatosNaLoja(loja, termo) {
+  if (loja === 'Amazon') {
+    const brutos = await buscarAmazonPorTermo(termo, 10);
+    return brutos.map(b => { try { return normalizarAmazon(b); } catch (e) { return null; } }).filter(x => x && x.asin && x.preco > 0)
+      .map(x => ({ loja, item: { asin: x.asin, loja, url: 'https://www.amazon.com.br/dp/' + x.asin, nome: x.titulo },
+                   leitura: { preco: x.preco, precoDe: x.precoDe, disponivel: x.disponivel !== false, titulo: x.titulo, imagem: x.imagemUrl || null } }));
+  }
+  if (loja === 'Shopee') {
+    if (!credenciaisShopeeOk()) return [];
+    const nodes = await buscarShopeePorTermo(termo, 10);
+    return nodes.map(n => { const x = normalizarShopee(n); return { n, x }; }).filter(({ x }) => x.preco > 0)
+      .map(({ n, x }) => ({ loja, item: { asin: 'SHOPEE-' + n.shopId + '-' + n.itemId, loja, shopId: String(n.shopId), itemId: String(n.itemId), url: n.productLink || n.offerLink || '', nome: x.titulo },
+                             leitura: { preco: x.preco, precoDe: x.precoDe, disponivel: true, titulo: x.titulo, imagem: x.imagemUrl || null } }));
+  }
+  return [];
+}
+
+const IA_EQUIV = `Você compara anúncios de lojas online brasileiras. Recebe o PRODUTO ORIGINAL e uma lista numerada de CANDIDATOS de outras lojas. Diga quais candidatos são EXATAMENTE o mesmo produto: mesma marca, mesmo modelo/linha, mesma versão (tamanho, capacidade, volume, voltagem, cor quando faz diferença) e mesma quantidade de unidades no pacote. NÃO é o mesmo: kit ou pack com quantidade diferente, acessório, refil, capa, peça, modelo parecido ou de outra geração, produto genérico "compatível". Na dúvida, deixe de fora.
+Responda só com JSON, sem texto fora dele: {"iguais":[{"i":<número do candidato>,"confianca":<0 a 100>,"motivo":"<até 12 palavras>"}]}. Liste só os que você acha iguais com confiança de 70 ou mais.`;
+
+export async function buscarEquivalentesDe(prod, { manual = false } = {}) {
+  const busca = { em: new Date().toISOString(), termo: termoDeBusca(prod.titulo), lojas: {}, achados: 0 };
+  prod.equivBusca = busca;
+  prod.equivalentes = Array.isArray(prod.equivalentes) ? prod.equivalentes : [];
+  if (!busca.termo || !_deps.ia) { busca.erro = !busca.termo ? 'produto sem título' : 'IA indisponível'; return busca; }
+  const lojas = ['Amazon', 'Shopee'].filter(l => l !== prod.loja);
+  const cands = [];
+  for (const loja of lojas) {
+    // Loja com link escolhido à mão no painel fica como está.
+    if (prod.equivalentes.some(eq => eq.loja === loja && eq.origem === 'manual' && eq.ativo !== false)) { busca.lojas[loja] = 'manual'; continue; }
+    try {
+      const lista = (await candidatosNaLoja(loja, busca.termo))
+        .filter(c => c.item.asin !== prod.asin && !prod.equivalentes.some(eq => eq.chave === c.item.asin && eq.ativo === false))
+        .slice(0, 8);
+      busca.lojas[loja] = lista.length + ' candidato(s)';
+      cands.push(...lista);
+      delete _errosBusca[loja];
+    } catch (e) {
+      busca.lojas[loja] = 'erro: ' + String(e.message || e).slice(0, 140);
+      _errosBusca[loja] = { em: busca.em, erro: busca.lojas[loja] };
+      console.warn('[AVISOS] Busca na ' + loja + ' falhou: ' + e.message);
+    }
+  }
+  if (!cands.length) { gravar(); return busca; }
+  const texto = 'PRODUTO ORIGINAL (' + prod.loja + '): ' + prod.titulo + (prod.ult?.preco ? ' — ' + brl(prod.ult.preco) : '')
+    + '\n\nCANDIDATOS:\n' + cands.map((c, i) => (i + 1) + '. [' + c.loja + '] ' + String(c.leitura.titulo || '').slice(0, 220) + ' — ' + brl(c.leitura.preco)).join('\n');
+  let r = null;
+  try { r = await _deps.ia(IA_EQUIV, texto, 600, 'claude-sonnet-4-6'); } catch (e) { busca.erro = 'IA: ' + e.message; }
+  const iguais = Array.isArray(r?.iguais) ? r.iguais : [];
+  const ref = prod.ult?.preco || null;
+  const porLoja = {};
+  for (const g of iguais) {
+    const c = cands[Number(g.i) - 1];
+    const conf = Number(g.confianca) || 0;
+    if (!c || conf < EQUIV_CONFIANCA_MIN) continue;
+    // Preço muito fora (metade ou o dobro) costuma ser outra versão ou kit.
+    if (ref && (c.leitura.preco < ref * 0.5 || c.leitura.preco > ref * 2)) continue;
+    const atual = porLoja[c.loja];
+    if (!atual || conf > atual.conf || (conf === atual.conf && c.leitura.preco < atual.c.leitura.preco)) porLoja[c.loja] = { c, conf, motivo: String(g.motivo || '').slice(0, 120) };
+  }
+  for (const [loja, { c, conf, motivo }] of Object.entries(porLoja)) {
+    const q = guardarProduto(c.item, c.leitura);
+    // Troca o automático anterior da mesma loja; o manual nunca é trocado.
+    prod.equivalentes = prod.equivalentes.filter(eq => !(eq.loja === loja && eq.origem === 'auto' && eq.ativo !== false && eq.chave !== q.asin));
+    const ja = prod.equivalentes.find(eq => eq.chave === q.asin);
+    if (ja) { ja.confianca = conf; ja.motivo = motivo; ja.em = busca.em; }
+    else prod.equivalentes.push({ chave: q.asin, loja, origem: 'auto', confianca: conf, motivo, titulo: q.titulo, em: busca.em, ativo: true });
+    busca.achados++;
+  }
+  console.log('[AVISOS] Outras lojas de ' + prod.asin + ': ' + busca.achados + ' equivalente(s) (' + cands.length + ' candidato(s)).');
+  gravar();
+  return busca;
+}
+
+function precisaBuscarEquiv(p) {
+  if (!p.titulo) return false;
+  const b = p.equivBusca;
+  if (!b) return true;
+  return Date.now() - Date.parse(b.em) >= EQUIV_REBUSCA_DIAS * MS_DIA;
+}
+
+export async function trabalhoOutrasLojas() {
+  if (_trabalhando) return { ok: false, erro: 'em andamento' };
+  const h = horaSP();
+  if (h < 8 || h >= 23) return { ok: true, pulado: 'fora do horário' };
+  _trabalhando = true;
+  const res = { em: new Date().toISOString(), buscas: 0, cupons: 0 };
+  try {
+    // 1. Mesmo produto em outras lojas: 2 por rodada, os nunca buscados primeiro.
+    const fila = produtosBase().filter(precisaBuscarEquiv)
+      .sort((a, b) => (a.equivBusca ? Date.parse(a.equivBusca.em) : 0) - (b.equivBusca ? Date.parse(b.equivBusca.em) : 0));
+    for (const p of fila.slice(0, 2)) { await buscarEquivalentesDe(p); res.buscas++; }
+    // 2. Cupom da página do ML (pela extensão, uma página por vez).
+    res.cuponsNovos = marcarCuponsNovosMl();
+    const ml = produtosVigiados().filter(precisaConferirCupom);
+    for (const p of ml.slice(0, 4)) { await conferirCupomMl(p); res.cupons++; }
+    gravar();
+  } finally {
+    _trabalhando = false;
+    _ultimaBuscaEquiv = res;
+  }
+  return { ok: true, ...res };
+}
+
+// Painel: remover / trocar / adicionar link de outra loja, ou buscar de novo.
+export async function acaoEquivalente({ produto, acao, chave, url } = {}) {
+  const prod = E().produtos[produto];
+  if (!prod) return { ok: false, erro: 'produto não encontrado' };
+  prod.equivalentes = Array.isArray(prod.equivalentes) ? prod.equivalentes : [];
+  if (acao === 'buscar') {
+    const b = await buscarEquivalentesDe(prod, { manual: true });
+    return { ok: true, busca: b, produto: painelDoProduto(prod) };
+  }
+  if (acao === 'cupom') {
+    const alvo = chave ? E().produtos[chave] : prod;
+    if (!alvo || alvo.loja !== 'Mercado Livre') return { ok: false, erro: 'só produtos do Mercado Livre têm cupom de página' };
+    const r = await conferirCupomMl(alvo); gravar();
+    return { ok: true, cupom: r, produto: painelDoProduto(prod) };
+  }
+  if (acao === 'remover' || acao === 'trocar') {
+    const eq = prod.equivalentes.find(e => e.chave === chave && e.ativo !== false);
+    if (!eq) return { ok: false, erro: 'link não encontrado' };
+    // Fica na lista como removido: a busca automática não traz de volta.
+    eq.ativo = false; eq.removidoEm = new Date().toISOString();
+    if (acao === 'remover') { gravar(); return { ok: true, produto: painelDoProduto(prod) }; }
+  }
+  if (acao === 'trocar' || acao === 'adicionar') {
+    const r = await resolverLink(url);
+    if (!r || r.erro) { gravar(); return { ok: false, erro: r?.erro || 'não consegui ler o link' }; }
+    if (r.item.asin === prod.asin) return { ok: false, erro: 'esse link é o próprio produto do pedido' };
+    const q = guardarProduto(r.item, r.leitura);
+    // Um link manual por loja: o anterior dessa loja sai.
+    for (const e of prod.equivalentes) if (e.loja === q.loja && e.ativo !== false && e.chave !== q.asin) { e.ativo = false; e.removidoEm = new Date().toISOString(); }
+    const ja = prod.equivalentes.find(e => e.chave === q.asin);
+    if (ja) Object.assign(ja, { ativo: true, removidoEm: null, origem: 'manual', confianca: 100, em: new Date().toISOString() });
+    else prod.equivalentes.push({ chave: q.asin, loja: q.loja, origem: 'manual', confianca: 100, titulo: q.titulo, em: new Date().toISOString(), ativo: true });
+    gravar();
+    return { ok: true, produto: painelDoProduto(prod) };
+  }
+  return { ok: false, erro: 'ação inválida' };
 }
 
 // ── Painel ───────────────────────────────────────────────────────────────────
@@ -1517,8 +1798,11 @@ export function estadoAvisos() {
         avisos: p.avisos.length, ultimoAvisoEm: p.ultimoAvisoEm, ultimoAvisoPreco: p.ultimoAvisoPreco,
         alvoAtingidoEm: p.alvoAtingidoEm || null, motivoFim: p.motivoFim || null,
         porNome: !!p.porNome, linkInformado: p.linkInformado || null, textoOriginal: p.textoOriginal || null,
+        produto: p.produto || null,
       };
     }),
+    produtos: Object.fromEntries(produtosBase().map(prod => [prod.asin, painelDoProduto(prod)])),
+    buscaOutrasLojas: { ultima: _ultimaBuscaEquiv, erros: _errosBusca },
   };
 }
 
@@ -1570,6 +1854,9 @@ export function iniciarAvisosPreco(deps) {
   // A cada 10 min: cada produto só é relido quando vence o intervalo da loja.
   setInterval(() => { varrerAvisos().catch(() => {}); }, 10 * 60000);
   setTimeout(() => { varrerAvisos().catch(() => {}); }, 4 * 60000);
+  // Outras lojas + cupom do ML: em segundo plano, separado da conversa.
+  setInterval(() => { trabalhoOutrasLojas().catch(e => console.warn('[AVISOS] Outras lojas: ' + e.message)); }, 15 * 60000);
+  setTimeout(() => { trabalhoOutrasLojas().catch(() => {}); }, 7 * 60000);
   // Fila parada por conta desconectada: tenta de novo a cada 2 min.
   setInterval(() => { if (_filaEnvio.length) processarFila(); }, 2 * 60000);
   console.log('[AVISOS] Avisos de preço inicializados (' + E().pedidos.filter(p => p.status === 'ativo').length + ' pedido(s) ativo(s)).');

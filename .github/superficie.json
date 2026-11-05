@@ -239,7 +239,9 @@
         "observarMensagemAvisos('principal', mm)",
         "app.post('/avisos-preco/consulta/codigo'",
         "app.post('/avisos-preco/consulta/entrar'",
-        "app.get('/avisos-preco/conversas'"
+        "app.get('/avisos-preco/conversas'",
+        "app.post('/avisos-preco/equivalente'",
+        "app.post('/avisos-preco/outras-lojas'"
       ]
     },
     "radar-awin.js": {
@@ -337,7 +339,8 @@
         "export function turnosTsp",
         "export function ultimoCupomDaLoja",
         "export function varsDoProduto",
-        "export function registrarRefUltimoEnvio("
+        "export function registrarRefUltimoEnvio(",
+        "export async function buscarAmazonPorTermo("
       ]
     },
     "radar-ml.js": {
@@ -395,7 +398,8 @@
         "export function credenciaisShopeeOk",
         "export function ehLinkShopee",
         "export function formatarOfertaShopee",
-        "export function normalizarShopee"
+        "export function normalizarShopee",
+        "export async function buscarShopeePorTermo("
       ]
     },
     "radar-magalu.js": {
@@ -560,7 +564,10 @@
         "if (body?.aceite !== true)",
         "export function pedirCodigoConsulta(",
         "export function listaConsulta(",
-        "const RE_SAIR_UM"
+        "const RE_SAIR_UM",
+        "export async function acaoEquivalente(",
+        "export async function trabalhoOutrasLojas(",
+        "function melhorOferta("
       ]
     }
   }
