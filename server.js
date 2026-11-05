@@ -15686,6 +15686,18 @@ const FA_MAX_TICO_DIA      = 4;
 const FA_MAX_ALVO_DIA      = 10;
 const FA_DESCANSO_EXEC_MS  = 90 * 60e3;
 const FA_SONO_LIMITE_MS    = 2 * 3600e3;
+// 05/11/2026: tres grupos suspensos (Baby e Kids #01, #02 e Tica Promos #22),
+// os tres logo depois de o tico-04 ADICIONAR o tico-05 (numero de 1 dia). As
+// inclusoes feitas pelo tico-02 no mesmo dia passaram; as promocoes tambem.
+// Medidas: (1) a conta-alvo entra PELO LINK do grupo em vez de ser adicionada
+// (FA_ADD_POR_LINK=0 volta a inclusao direta); (2) contas de FA_EXEC_SEM_ADD
+// nunca executam inclusao nem leem o link para isso; (3) resposta de grupo
+// suspenso ("locked") pausa a fila e avisa o operador; (4) grupos com entrada
+// de gente nas ultimas 48 h (anuncio/rodizio) ficam para o fim da fila.
+const FA_ADD_POR_LINK      = String(process.env.FA_ADD_POR_LINK ?? '1') !== '0';
+const FA_EXEC_SEM_ADD      = new Set(String(process.env.FA_EXEC_SEM_ADD ?? 'tico-04').split(',').map(x => x.trim()).filter(Boolean));
+const FA_TRAFEGO_MIN       = Math.max(1, parseInt(process.env.FA_TRAFEGO_MIN || '10', 10) || 10);
+const FA_RE_GRUPO_SUSPENSO = /\blocked\b|suspen|banid|banned/i;
 
 function _fa() {
   if (!_fa.s) {
@@ -15785,6 +15797,42 @@ function _faPausar(motivo) {
   _faSalvar();
   console.warn('[FILA-ADESAO] PAUSADA: ' + motivo);
 }
+// Grupos que receberam FA_TRAFEGO_MIN+ entradas nas ultimas 48 h (anuncio,
+// rodizio do distribuidor): ficam para o fim da fila de adesao.
+function _faGruposComTrafego() {
+  const cont = new Map();
+  try {
+    const corte = Date.now() - 48 * 3600e3;
+    for (const e of (_membrosLog?.eventos || [])) {
+      if (e.a !== 'add' || new Date(e.ts).getTime() < corte) continue;
+      cont.set(e.g, (cont.get(e.g) || 0) + 1);
+    }
+  } catch (e) { /* ledger indisponivel: ordem original */ }
+  return new Set([...cont].filter(([, n]) => n >= FA_TRAFEGO_MIN).map(([g]) => g));
+}
+// Proximo passo pendente: primeiro os grupos sem trafego; os com trafego so
+// quando nao sobrar outro (inclusao e admin do mesmo grupo andam juntos).
+function _faProximo() {
+  const pend = _fa().passos.filter(p => p.estado === 'pendente');
+  if (pend.length < 2) return pend[0] || null;
+  const quentes = _faGruposComTrafego();
+  return pend.find(p => !p.jid || !quentes.has(p.jid)) || pend[0];
+}
+// Grupo suspenso no meio da adesao: pausa a fila e avisa o operador (alerta grave).
+async function _faGrupoSuspenso(p, detalhe) {
+  const anterior = _fa().passos.filter(x => x !== p && x.jid && x.jid === p.jid && x.em && x.estado === 'ok')
+    .sort((a, b) => Date.parse(b.em) - Date.parse(a.em))[0];
+  const hora = (iso) => new Date(iso).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
+  _faPausar('grupo ' + (p.nome || p.jid) + ' respondeu "' + String(detalhe).slice(0, 60) + '" (provavel suspensao) — confira antes de retomar');
+  clearTimeout(_fa.timer);
+  const texto = '🚨 *Fila de adesão PAUSADA*\n\n'
+    + 'O grupo *' + (p.nome || p.jid) + '* respondeu "' + String(detalhe).slice(0, 60) + '" ao tentar '
+    + (p.tipo === 'promote' ? 'promover ' : p.tipo === 'add' ? 'incluir ' : 'entrar com ') + p.alvo + ' — provável grupo suspenso pelo WhatsApp.\n'
+    + (anterior ? '\nÚltima ação nesse grupo: ' + (anterior.tipo === 'add' ? 'inclusão' : anterior.tipo === 'promote' ? 'promoção' : 'entrada pelo link') + ' de ' + anterior.alvo + (anterior.por && anterior.por !== anterior.alvo ? ' por ' + anterior.por : '') + ' às ' + hora(anterior.em) + '.\n' : '')
+    + '\nNenhuma outra ação roda até retomar: POST /grupos-gestao/fila-lenta {acao:"retomar"}';
+  try { if (GRUPOS.operador) await enviarMensagem(GRUPOS.operador, { text: texto }); }
+  catch (e) { console.warn('[FILA-ADESAO] Aviso de grupo suspenso falhou: ' + e.message); }
+}
 function _faCodigoDoLink(link) {
   const m = String(link || '').match(/chat\.whatsapp\.com\/(?:invite\/)?([A-Za-z0-9]{10,})/);
   return m ? m[1] : null;
@@ -15826,7 +15874,18 @@ async function _faExecutar(p, retratos) {
 
   // Executor: tico admin do grupo primeiro; principal so como ultimo recurso.
   const admins = retratos.filter(r => r.id !== p.alvo && _gmEuNoGrupo(r.sock, r.mapa[p.jid])?.admin);
-  const ticos = admins.filter(r => r.id !== 'principal');
+  const ticos = admins.filter(r => r.id !== 'principal' && !(p.tipo === 'add' && FA_EXEC_SEM_ADD.has(r.id)));
+  if (p.tipo === 'add' && FA_ADD_POR_LINK) {
+    // A conta-alvo entra pelo link do grupo; um admin so le o codigo do convite.
+    const leitor = ticos.find(r => !_faDescansando(r.id)) || ticos[0]
+      || (p.permitePrincipal ? admins.find(r => r.id === 'principal') : null);
+    if (!leitor) return { agiu: false, estado: 'falha', detalhe: admins.length ? 'nenhum admin autorizado a ler o link deste grupo' : 'nenhuma conta conectada e admin deste grupo' };
+    const code = await leitor.sock.groupInviteCode(p.jid);
+    if (!code) return { agiu: false, estado: 'falha', detalhe: 'nao consegui ler o link do grupo' };
+    await alvo.sock.groupAcceptInvite(code);
+    _faContar(p.alvo); _faContarAlvo(p.alvo);
+    return { agiu: true, estado: 'ok', por: p.alvo, detalhe: 'entrou pelo link (lido por ' + leitor.id + ')' };
+  }
   let exec = _faEscolherExecutor(ticos);
   if (!exec && !ticos.length && p.permitePrincipal) exec = admins.find(r => r.id === 'principal' && _faCabeHoje('principal') && !_faDescansando('principal')) || null;
   if (!exec) {
@@ -15866,7 +15925,7 @@ async function _faTick() {
   try {
     // Pula passos ja resolvidos sem pausa, ate achar um que exija acao.
     for (let guarda = 0; guarda < 200; guarda++) {
-      const p = s.passos.find(x => x.estado === 'pendente');
+      const p = _faProximo();
       if (!p) break;
       const retratos = await _gmRetratos(guarda === 0);   // forca leitura so no 1o passo: pular varios nao vira rajada
       const vivas = new Set(retratos.map(r => r.id));
@@ -15897,6 +15956,7 @@ async function _faTick() {
       }
       _faSalvar();
       console.log('[FILA-ADESAO] ' + p.tipo + ' ' + p.alvo + ' em "' + (p.nome || p.jid || p.link) + '": ' + res.estado + ' — ' + res.detalhe + (res.por ? ' (por ' + res.por + ')' : ''));
+      if (res.estado === 'falha' && FA_RE_GRUPO_SUSPENSO.test(String(res.detalhe || ''))) { await _faGrupoSuspenso(p, res.detalhe); return; }
 
       if (res.agiu) {
         // Conta caiu logo depois da acao (foi assim em 07/10/2026): pausa tudo.
@@ -15989,7 +16049,7 @@ function _faTextoRelatorio() {
   else if (s.pausado) estado = '⏸️ PAUSADA: ' + (s.motivo || 'sem motivo') + '\nPara retomar: POST /grupos-gestao/fila-lenta {acao:"retomar"}';
   else if (s.dormirAte && Date.now() < Date.parse(s.dormirAte)) estado = '😴 Dormindo por limite do WhatsApp até ' + new Date(s.dormirAte).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' });
   else {
-    const prox = s.passos.find(p => p.estado === 'pendente');
+    const prox = _faProximo();
     estado = '▶️ Rodando. Próximo: ' + (prox.tipo === 'promote' ? 'promover ' : prox.tipo === 'add' ? 'incluir ' : 'entrar pelo link: ') + prox.alvo + (prox.nome ? ' em ' + prox.nome : '')
       + (prox.ultimaEspera ? '\n   aguardando: ' + prox.ultimaEspera : '');
   }

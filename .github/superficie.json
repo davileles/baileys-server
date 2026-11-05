@@ -242,7 +242,9 @@
         "app.get('/avisos-preco/conversas'",
         "app.post('/avisos-preco/equivalente'",
         "app.post('/avisos-preco/outras-lojas'",
-        "async function criarCardAvisoPreco("
+        "async function criarCardAvisoPreco(",
+        "async function _faGrupoSuspenso(",
+        "function _faProximo("
       ]
     },
     "radar-awin.js": {
