@@ -74,6 +74,7 @@ const RE_URL = /https?:\/\/[^\s<>"']+/i;
 const RE_OK = /^\s*(ok|okay|sim|pode|isso|beleza|blz|fechado|confirmo|confirmar|quero)\s*[.!]*\s*$/i;
 const RE_SEM_ALVO = /^\s*(qualquer|qualquer\s+queda|sem\s+pre[cç]o|tanto\s+faz)\s*[.!]*\s*$/i;
 const SITE_ALERTAS = 'ticapromos.com.br/avisos';
+const RE_PCT = /^\s*(?:-\s*)?(\d{1,2}(?:[.,]\d+)?)\s*%\s*(?:abaixo|de\s+desconto|off|a\s+menos)?\s*[.!]?\s*$/i;
 
 let _estado = null;
 let _deps = {};
@@ -749,21 +750,35 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
   }
 
   // Resposta à pergunta de preço de um alerta que está sendo criado.
+  // Mesma linguagem da página: valor em reais, % abaixo do preço de agora,
+  // o preço sugerido (OK) ou qualquer queda boa.
   const pend = _criacaoPendente.get(jid);
   if (pend && Date.now() - pend.em > 30 * 60000) _criacaoPendente.delete(jid);
   if (pend && _criacaoPendente.has(jid) && !RE_URL.test(texto)) {
+    const atual = Number(pend.leitura?.preco) > 0 ? Number(pend.leitura.preco) : null;
+    const exemplo = atual ? String(Math.floor(atual * 0.85)) : '150';
     let alvo;
-    if (RE_OK.test(texto)) alvo = pend.sugestao?.valor || null;
+    if (RE_OK.test(texto) && pend.sugestao) alvo = pend.sugestao.valor;
     else if (RE_SEM_ALVO.test(texto)) alvo = null;
     else {
-      alvo = lerValor(texto);
-      if (alvo == null) {
-        falar(jid, 'Não entendi o valor. Responda só com o preço que você quer pagar (ex.: ' + (pend.sugestao ? String(Math.floor(pend.sugestao.valor)) : '150') + '), *OK* para o preço sugerido ou *QUALQUER* para ser avisado de qualquer queda boa.');
-        return;
+      const mPct = RE_PCT.exec(texto);
+      if (mPct) {
+        const pct = Number(mPct[1].replace(',', '.'));
+        if (!atual) { falar(jid, 'Como ainda não consegui ler o preço desse anúncio, mande o valor em reais (ex.: ' + exemplo + '), ou *QUALQUER* para ser avisado de qualquer queda boa.'); return; }
+        if (!(pct > 0 && pct < 90)) { falar(jid, 'Mande um desconto entre 1% e 89% (ex.: 15%), um valor em reais (ex.: ' + exemplo + ') ou *QUALQUER*.'); return; }
+        alvo = arred(Math.floor(atual * (1 - pct / 100) * 100) / 100);
+      } else {
+        alvo = lerValor(texto);
+        if (alvo == null) {
+          falar(jid, 'Não entendi. Responda com o valor que você quer pagar (ex.: ' + exemplo + ')'
+            + (atual ? ', o desconto em % (ex.: 15%)' : '')
+            + (pend.sugestao ? ', *OK* para ' + brl(pend.sugestao.valor) : '')
+            + ' ou *QUALQUER* para ser avisado de qualquer queda boa.');
+          return;
+        }
       }
-      const atual = Number(pend.leitura?.preco);
-      if (atual > 0 && alvo >= atual) {
-        falar(jid, 'Esse valor já é igual ou maior que o preço de agora (' + brl(atual) + '). Mande um valor menor, *OK* para ' + (pend.sugestao ? brl(pend.sugestao.valor) : 'o sugerido') + ' ou *QUALQUER*.');
+      if (atual && alvo >= atual) {
+        falar(jid, 'Esse valor já é igual ou maior que o preço de agora (' + brl(atual) + '). Mande um valor abaixo disso, ou *QUALQUER* para ser avisado de qualquer queda boa.');
         return;
       }
     }
@@ -790,22 +805,12 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
       falar(jid, 'Você já tem alerta para esse produto. Mande *MEUS ALERTAS* para ver sua lista.');
       return;
     }
-    const preco = Number(r.leitura?.preco);
+    const preco = Number(r.leitura?.preco) > 0 ? arred(r.leitura.preco) : null;
     const titulo = String(r.leitura?.titulo || r.item.nome || '').slice(0, 200);
-    if (!(preco > 0)) {
-      // Sem preço agora: cria o alerta sem alvo (avisa quando aparecer com queda).
-      const res = criarPedidoDaConversa({ jid, numeros, contato, pushName, item: r.item, leitura: r.leitura, alvo: null });
-      falar(jid, 'Esse produto está sem preço na loja agora. ' + res.texto);
-      return;
-    }
-    const sug = sugestaoDePreco(preco, historicoParaSugestao(r.item.asin));
+    const sug = preco ? sugestaoDePreco(preco, historicoParaSugestao(r.item.asin)) : null;
     _criacaoPendente.set(jid, { item: r.item, leitura: r.leitura, sugestao: sug, em: Date.now() });
     if (_criacaoPendente.size > 2000) _criacaoPendente.delete(_criacaoPendente.keys().next().value);
-    falar(jid, 'Achei: *' + encurtar(titulo, 100) + '* (' + r.item.loja + ')\n'
-      + '💰 Preço agora: *' + brl(preco) + '*\n\n'
-      + 'Quanto você quer pagar? Responda só com o valor (ex.: ' + (sug ? String(Math.floor(sug.valor)) : String(Math.floor(preco * 0.9))) + ').\n'
-      + (sug ? '• *OK* para ' + brl(sug.valor) + ' (' + sug.motivo + ');\n' : '')
-      + '• *QUALQUER* para ser avisado de qualquer queda de ' + E().config.quedaSemAlvoPct + '% ou mais.');
+    falar(jid, textoPerguntaAlvo(r.item, titulo, preco, sug));
     return;
   }
 
@@ -818,6 +823,34 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     if (_ajudaPorJid.size > 5000) _ajudaPorJid.delete(_ajudaPorJid.keys().next().value);
   }
   falar(jid, textoAjuda(ehCliente));
+}
+
+// Pergunta do preço desejado, com a mesma régua da página: até 20% abaixo é
+// queda comum, 20–30% acontece às vezes, acima de 30% dificilmente chega.
+function textoPerguntaAlvo(item, titulo, preco, sug) {
+  const l = ['Achei: *' + encurtar(titulo, 100) + '* (' + item.loja + ')'];
+  if (preco) {
+    l.push('💰 Preço de agora: *' + brl(preco) + '*');
+    const h = historicoParaSugestao(item.asin);
+    if (h.min90) {
+      l.push(h.min90 < preco
+        ? '📉 Nos últimos ' + Math.min(90, h.dias) + ' dias o menor preço foi ' + brl(h.min90) + ' (' + Math.round((1 - h.min90 / preco) * 100) + '% abaixo de agora).'
+        : '📉 Nos últimos ' + Math.min(90, h.dias) + ' dias ele não ficou mais barato que agora.');
+    } else l.push('📉 Ainda não temos histórico de preço deste produto: use a régua abaixo como guia.');
+    l.push('');
+    l.push('*Quanto você quer pagar?* Responda com:');
+    l.push('• o valor (ex.: ' + Math.floor(preco * 0.85) + '), ou');
+    l.push('• o desconto sobre o preço de agora (ex.: 15%)' + (sug ? ', ou' : ''));
+    if (sug) l.push('• *OK* para ' + brl(sug.valor) + ' (' + sug.motivo + ')');
+    l.push('• ou *QUALQUER* para ser avisado de qualquer queda boa (' + E().config.quedaSemAlvoPct + '% ou mais).');
+    l.push('');
+    l.push('_Régua: até 20% abaixo é queda comum · 20 a 30% acontece às vezes · acima de 30% dificilmente chega._');
+  } else {
+    l.push('Ainda não consegui ler o preço deste anúncio por aqui, mas vou acompanhar.');
+    l.push('');
+    l.push('*Quanto você quer pagar?* Olhe o preço na loja e responda com o valor (ex.: 150), ou *QUALQUER* para ser avisado de qualquer queda boa.');
+  }
+  return l.join('\n');
 }
 
 function criarPedidoDaConversa({ jid, numeros, contato, pushName, item, leitura, alvo }) {
@@ -845,10 +878,23 @@ function criarPedidoDaConversa({ jid, numeros, contato, pushName, item, leitura,
   console.log('[AVISOS] Pedido ' + pedido.id + ' pelo WhatsApp (' + pedido.loja + ' ' + pedido.produto + ', alvo ' + (pedido.precoAlvo ?? '—') + ').');
   return {
     pedido,
-    texto: 'Pronto! 🔔 Alerta criado para *' + encurtar(pedido.titulo, 80) + '*'
-      + (pedido.precoAlvo ? ' — te aviso quando chegar em ' + brl(pedido.precoAlvo) + ' ou cair bem perto disso.' : ' — te aviso quando o preço cair ' + c.quedaSemAlvoPct + '% ou mais.')
-      + '\n\nMande *MEUS ALERTAS* para ver sua lista ou *SAIR* para parar.',
+    texto: textoConfirmacao(pedido, c),
   };
+}
+
+function textoConfirmacao(pedido, c) {
+  const l = ['Pronto! 🔔 Alerta criado para *' + encurtar(pedido.titulo, 80) + '*', ''];
+  const ini = pedido.precoInicial;
+  if (pedido.precoAlvo) {
+    l.push('🎯 Seu preço: *' + brl(pedido.precoAlvo) + '*' + (ini ? ' (' + Math.round((1 - pedido.precoAlvo / ini) * 100) + '% abaixo de agora)' : ''));
+    l.push('Te aviso quando chegar lá' + (c.avisarQuedaParcial ? ' e também se cair ' + c.quedaParcialPct + '% ou mais no caminho.' : '.'));
+    if (ini && 1 - pedido.precoAlvo / ini > 0.3) l.push('_Acima de 30% de desconto o preço dificilmente chega. Se quiser ajustar, mande SAIR + o número dele na lista e crie de novo._');
+  } else {
+    l.push('Te aviso quando o preço cair ' + c.quedaSemAlvoPct + '% ou mais.');
+  }
+  l.push('');
+  l.push('Mande *MEUS ALERTAS* para ver sua lista ou *SAIR* para parar todos.');
+  return l.join('\n');
 }
 
 function tratarSairUm(jid, numeros, n) {
@@ -1132,6 +1178,13 @@ export async function varrerAvisos({ manual = false } = {}) {
         if (pedido.status !== 'ativo' || !pedido.jid || pedido.pausado || jaNaFila.has(pedido.id)) continue;
         const prod = E().produtos[pedido.produto];
         if (!prod?.ult?.preco || !prod.ult.disponivel) continue;
+        // Criado sem preço lido (anúncio que a loja não mostrou na hora): a
+        // primeira leitura vira a referência das quedas.
+        if (!pedido.precoInicial) {
+          pedido.precoInicial = prod.ult.preco;
+          if (pedido.precoAlvo && pedido.precoAlvo >= pedido.precoInicial) pedido.precoAlvo = null;
+          continue;
+        }
         if (Date.now() - Date.parse(prod.ult.em) > 8 * MS_H) continue;
         const av = avaliarPedido(pedido, prod.ult.preco, cfg);
         if (!av) continue;
