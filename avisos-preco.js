@@ -70,6 +70,8 @@ const RE_SAIR = /^\s*(sair|parar|pare|cancelar|cancela|stop|descadastrar)\s*[.!]
 // SAIR 2: para só o alerta 2 da lista que o MEUS ALERTAS mostrou.
 const RE_SAIR_UM = /^\s*(?:sair|parar|pare|cancelar|cancela|stop)\s*#?\s*(\d{1,2})\s*[.!]?\s*$/i;
 const RE_MEUS = /^\s*(?:meus|minhas|ver)?\s*(?:alertas?|avisos?|lista)(?:\s+de\s+pre[cç]os?)?\s*[.!?]?\s*$/i;
+// Cumprimento sozinho ("oi", "bom dia", "olá tico"): resposta fixa, sem IA.
+const RE_OI = /^\s*(oi+|ol[aá]|e\s*a[ií]|opa|eae|hey|hello|bom\s+dia|boa\s+tarde|boa\s+noite|tudo\s+bem\??|tudo\s+bom\??)(\s+tico)?\s*[!.?,]*\s*(tudo\s+(bem|bom)\s*\??)?\s*[!.?]*\s*$/i;
 const RE_CANCELAR = /^\s*(cancelar|cancela|desisto|deixa\s+pra\s+l[aá]|esquece)\s*[.!]?\s*$/i;
 const RE_URL = /https?:\/\/[^\s<>"']+/i;
 const RE_OK = /^\s*(ok|okay|sim|pode|isso|beleza|blz|fechado|confirmo|confirmar|quero)\s*[.!]*\s*$/i;
@@ -753,6 +755,12 @@ function linhaDoPedido(p, i) {
   return l.join('\n');
 }
 
+function textoBoasVindas(temAlertas) {
+  return 'Oi! 👋 Sou o Tico e tô aqui para te avisar quando seu produto cai de preço.\n\n'
+    + 'É só colar aqui o link dele (Amazon, Mercado Livre ou Shopee) e me dizer quanto você quer pagar.'
+    + (temAlertas ? '\n\nPara ver os alertas que você já tem, mande *MEUS ALERTAS*.' : '');
+}
+
 function textoAjuda(temAlertas) {
   return 'Oi! Eu sou o Tico, do Tica Promos 🐦\n\n'
     + 'Por aqui eu entendo só estes pedidos:\n'
@@ -793,6 +801,11 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     return;
   }
   const ehCliente = !!contato || abertos.length > 0;
+
+  if (RE_OI.test(texto) && !pendenteDe(jid)) {
+    falar(jid, textoBoasVindas(ehCliente));
+    return;
+  }
 
   if (RE_MEUS.test(texto)) {
     if (!ehCliente) { falar(jid, textoAjuda(false)); return; }
@@ -942,7 +955,7 @@ function podeChamarIa(jid) {
   return true;
 }
 
-const IA_SISTEMA = `Você é o Tico, o assistente de WhatsApp do Tica Promos (site de ofertas e grupos de promoções no WhatsApp). Fale em português do Brasil, de um jeito simpático, direto e curto (no máximo 4 linhas), como uma pessoa no WhatsApp. Pode usar *negrito* do WhatsApp e no máximo 1 emoji.
+const IA_SISTEMA = `Você é o Tico, o assistente de WhatsApp do Tica Promos (site de ofertas e grupos de promoções no WhatsApp). Fale em português do Brasil correto, de um jeito simpático, direto e curto (no máximo 4 linhas), como uma pessoa no WhatsApp: pode usar \"tô\" e \"pra\", mas sem gíria forçada, sem imperativo de gíria (\"cola o link\", \"diz aí\") e sem comer artigo (\"quando o produto cai\", nunca \"quando produto cai\"). Para pedir o link, diga \"é só colar aqui o link do produto\". Pode usar *negrito* do WhatsApp e no máximo 1 emoji. Jeito de se apresentar, quando precisar: \"Sou o Tico e tô aqui para te avisar quando seu produto cai de preço.\"
 
 O que você faz por aqui: alertas de preço. A pessoa cola o link de um produto da Amazon, Mercado Livre ou Shopee, diz quanto quer pagar e você avisa quando o preço chegar lá (ou cair bem). Comandos que a pessoa pode usar: MEUS ALERTAS (lista numerada), SAIR + número (para um alerta), SAIR (para todos), CANCELAR (desiste do alerta que está sendo criado). Também dá para criar e ver os alertas em ticapromos.com.br/avisos.
 
