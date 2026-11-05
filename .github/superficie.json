@@ -241,7 +241,8 @@
         "app.post('/avisos-preco/consulta/entrar'",
         "app.get('/avisos-preco/conversas'",
         "app.post('/avisos-preco/equivalente'",
-        "app.post('/avisos-preco/outras-lojas'"
+        "app.post('/avisos-preco/outras-lojas'",
+        "async function criarCardAvisoPreco("
       ]
     },
     "radar-awin.js": {
@@ -567,7 +568,8 @@
         "const RE_SAIR_UM",
         "export async function acaoEquivalente(",
         "export async function trabalhoOutrasLojas(",
-        "function melhorOferta("
+        "function melhorOferta(",
+        "async function cardParaGrupos("
       ]
     }
   }

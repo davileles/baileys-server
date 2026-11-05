@@ -872,7 +872,21 @@ function blocoAtencao(o) {
 // Cabecalho compartilhado pelo card e pelas telas de ajuste (preco, cupom...):
 // o operador nunca perde de vista QUAL oferta esta editando e para onde ela vai.
 function cabecalhoCard(o) {
-  return [tituloCard(o), blocoMonitor(o), blocoPreco(o), blocoTrilha(o), blocoAtencao(o)].filter(Boolean).join('\n\n');
+  return [tituloCard(o), blocoAvisoPreco(o), blocoMonitor(o), blocoPreco(o), blocoTrilha(o), blocoAtencao(o)].filter(Boolean).join('\n\n');
+}
+
+// Card que veio de um ALERTA DE PREÇO DE CLIENTE (avisos-preco.js): o cliente
+// já recebeu no privado; o card é para decidir se a oferta vai também aos grupos.
+function blocoAvisoPreco(o) {
+  const a = o.avisoPreco;
+  if (!a) return '';
+  const motivo = a.tipo === 'alvo' ? 'chegou no preço que o cliente pediu' : 'caiu de preço';
+  const linhas = ['🔔 <b>ALERTA DE PREÇO DE CLIENTE</b> — não é oferta capturada nem do monitor',
+    '     ' + esc(motivo + (a.clientes > 1 ? ' (' + a.clientes + ' clientes vigiando)' : '')
+      + (a.alvo ? ' · alvo ' + brlCurto(a.alvo) : '')),
+    '     o cliente já recebeu no privado; aqui é para mandar também aos grupos'];
+  if (o.expiraEm) linhas.push('     ⏳ vale até ' + esc(horaCurta(o.expiraEm)));
+  return linhas.join('\n');
 }
 
 // Card que veio do monitor de precos: o porque da oferta logo abaixo do titulo
@@ -969,7 +983,7 @@ function brlCurto(v) {
 // preco) vem antes do titulo.
 function rotuloItemFila(i) {
   const nicho = Array.isArray(i.nichos) && i.nichos.length ? '🎯' + i.nichos.join('+') : null;
-  const partes = [(i.monitor ? '📉' : '') + '#' + i.id, brlCurto(i.precoFinal), nicho, String(i.titulo || '').slice(0, 30)];
+  const partes = [(i.avisoPreco ? '🔔' : i.monitor ? '📉' : '') + '#' + i.id, brlCurto(i.precoFinal), nicho, String(i.titulo || '').slice(0, 30)];
   return partes.filter(Boolean).join(' · ')
     + (i.falhou ? ' 🛑' : i.aviso ? ' ⚠️' : '') + (i.ajustado ? ' ✏️' : '');
 }

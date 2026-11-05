@@ -17849,6 +17849,11 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     return;
   }
 
+  // Card de alerta de cliente vencido nao sai (o preco que disparou pode ter voltado).
+  if (oferta.origem === 'avisos-preco' && oferta.expiraEm && Date.parse(oferta.expiraEm) < Date.now()) {
+    oferta.status = 'expirado'; salvarFila();
+    return res.status(410).json({ ok:false, erro:'Card do alerta de cliente expirou — o preço pode ter mudado.' });
+  }
   // Card do monitor de precos: vencido nao sai, e o preco e relido na loja —
   // se voltou a subir, a oferta que justificou o card nao existe mais.
   if (oferta.origem === 'monitor-precos' && oferta.monitorCard) {
@@ -23127,6 +23132,7 @@ function resumoOfertaFila(o) {
     // Card do monitor de precos: o porque da oferta (queda vs mediana, recorde).
     origem: o.origem || null,
     monitor: o.origem === 'monitor-precos' ? (d.monitor || null) : null,
+    avisoPreco: o.origem === 'avisos-preco' ? (d.avisoPreco || null) : null,
     expiraEm: o.expiraEm || null,
     revisaoDeEdicao: !!o.revisaoDeEdicao,
     cupomForaDaBase: o.cupomForaDaBase || null,
@@ -23229,6 +23235,7 @@ app.get('/mkt/fila', (req, res) => {
       falhou: !!o.falhaAutoEnvio,
       motivo: o.motivoFila || null,
       monitor: o.origem === 'monitor-precos',
+      avisoPreco: o.origem === 'avisos-preco',
       // Um unico sinal para o rotulo do botao: o motivo detalhado esta no card.
       aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.precoDivergente || d.precoDeReferencia),
       timestamp: o.timestamp || null,
@@ -26260,6 +26267,58 @@ function criarCardMonitorPrecos({ oferta, candidato = {}, nichoCurado = null, es
   return { ok:true, id: oferta.id };
 }
 
+// ── CARD DE ALERTA DE PRECO DE CLIENTE (05/11/2026) ─────────────────────────
+// Quando um alerta de preco no privado (avisos-preco.js) chega no alvo ou cai
+// de verdade, a mesma oferta vira card de revisao no @ticopromosbot e na fila
+// do painel, marcado como alerta de cliente. Motivo: link de afiliado so no
+// privado, com poucos cliques, arrisca a comissao; no grupo a oferta tambem
+// serve. Nada sai sozinho — o envio continua sendo pelo botao do card.
+async function criarCardAvisoPreco({ item, cupom = null, tipo = 'alvo', clientes = 1, precoAviso = null, alvo = null, ttlHoras = 3 } = {}) {
+  if (!item?.asin || !item.loja) return { ok:false, erro:'sem produto' };
+  const jaPendente = filaPendentes.some(x => x.status === 'pendente' && x.origem === 'avisos-preco'
+    && x.dadosExtraidos?.asin === item.asin);
+  if (jaPendente) return { ok:false, duplicado:true };
+  let montado = null;
+  if (item.loja === 'Amazon') montado = await montarOfertasVitrine([item.asin], cupom || 'nenhum');
+  else if (item.loja === 'Shopee') montado = await montarOfertasShopeeVitrine([item], cupom || 'nenhum');
+  else if (item.loja === 'Mercado Livre') montado = await montarOfertasMlVitrine([item], cupom || 'nenhum');
+  const o = montado?.prontos?.[0];
+  if (!o) return { ok:false, erro: montado?.descartados?.[0]?.motivo || 'produto descartado na montagem' };
+  const precoFinal = Number(o.precoFinal ?? o.produto?.preco);
+  // Mesma trava do monitor: ja saiu nos grupos em 15 dias a preco igual ou menor.
+  if (Number.isFinite(precoFinal) && enviosRecentesDoProduto(item.asin, 15).some(r => r.preco <= precoFinal * 1.01)) {
+    return { ok:false, jaEnviado:true };
+  }
+  const cls = classificarProduto({ titulo: o.produto?.titulo || item.nome, asin: item.asin, loja: item.loja });
+  const agora = Date.now();
+  const oferta = {
+    id: gerarId(),
+    origem: 'avisos-preco',
+    tipoConteudo: item.loja === 'Shopee' ? 'oferta_shopee' : item.loja === 'Mercado Livre' ? 'oferta_ml' : 'oferta_amazon',
+    mensagemFormatada: o.mensagem,
+    dadosExtraidos: {
+      loja: o.produto?.loja || item.loja, asin: o.asin || item.asin, titulo: o.produto?.titulo || item.nome,
+      preco: o.produto?.preco, precoDe: o.produto?.precoDe, desconto: o.produto?.desconto,
+      link: o.produto?.link, cupom: o.cupom, precoFinal: o.precoFinal,
+      precoDeReferencia: !!o.precoDeReferencia,
+      imagemUrl: o.produto?.imagemUrl || null,
+      categoria: cls.categoria || null, categoriaConfianca: cls.confianca || 0,
+      avisoPreco: { tipo, clientes, precoAviso, alvo, cupom: cupom || null },
+    },
+    imagens: [],
+    status: 'pendente', tenant: TENANT_PADRAO,
+    timestamp: new Date(agora).toISOString(),
+    expiraEm: new Date(agora + Math.max(1, Number(ttlHoras) || 3) * 3600000).toISOString(),
+  };
+  try { const img = await baixarImagemProduto(o.produto?.imagemUrl); if (img) oferta.imagens = [img]; } catch (e) {}
+  filaPendentes.unshift(oferta);
+  salvarFila();
+  enviarCardRevisaoTelegram(oferta).catch(e =>
+    console.warn('[BOT-TSP] Card do alerta de cliente #' + oferta.id + ' falhou: ' + e.message));
+  console.log('[AVISOS] Card #' + oferta.id + ' para os grupos — ' + item.asin + ' (' + tipo + ', ' + clientes + ' cliente(s)).');
+  return { ok:true, id: oferta.id };
+}
+
 // Card parado alem da validade sai da fila: o preco que justificou a oferta
 // pode ter voltado. Quem tocar nele depois ve "ja resolvida (expirado)".
 setInterval(() => {
@@ -26267,10 +26326,10 @@ setInterval(() => {
     const agora = Date.now();
     let mudou = 0;
     for (const o of filaPendentes) {
-      if (o.status !== 'pendente' || o.origem !== 'monitor-precos' || !o.expiraEm) continue;
+      if (o.status !== 'pendente' || (o.origem !== 'monitor-precos' && o.origem !== 'avisos-preco') || !o.expiraEm) continue;
       if (Date.parse(o.expiraEm) > agora) continue;
       o.status = 'expirado';
-      o.motivoFila = 'card do monitor expirou sem aprovacao';
+      o.motivoFila = o.origem === 'avisos-preco' ? 'card do alerta de cliente expirou sem aprovacao' : 'card do monitor expirou sem aprovacao';
       mudou++;
     }
     if (mudou) { salvarFila(); console.log('[PRECOS] ' + mudou + ' card(s) do monitor expirado(s).'); }
@@ -26343,6 +26402,7 @@ function _listarContasAvisos() {
 iniciarAvisosPreco({
   // IA do Tico na conversa dos alertas (Haiku, JSON). null = segue sem IA.
   ia: (system, texto, max, modelo) => chamarClaude(system, texto, max || 400, modelo || 'claude-haiku-4-5'),
+  cardGrupos: criarCardAvisoPreco,
   enviarDm: _enviarDmAvisos,
   contaConectada: _contaAvisosConectada,
   numeroDaConta: _numeroDaContaAvisos,

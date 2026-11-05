@@ -63,6 +63,8 @@ const CFG_PADRAO = {
   intervaloHoras: { 'Amazon': 3, 'Shopee': 3, 'Mercado Livre': 4 },
   // Espaço entre duas mensagens de aviso (segundos), para não sair em rajada.
   espacoEntreEnviosS: [25, 50],
+  // Alerta que chega no alvo (ou queda sem alvo) vira card no bot para ir aos grupos.
+  cardGrupos: true,
 };
 
 const RE_ATIVAR = /pedido\s*n?[ºo°.]?\s*#?\s*(\d{4,6})/i;
@@ -1453,6 +1455,7 @@ export async function varrerAvisos({ manual = false } = {}) {
     // 3. Avisos, só na janela e com a conta conectada.
     if (cfg.conta && dentroDaJanela() && _deps.contaConectada?.(cfg.conta)) {
       const jaNaFila = new Set(_filaEnvio.filter(f => f.pedidoId).map(f => f.pedidoId));
+      const paraGrupos = new Map();   // produto da loja → { item, cupom, tipo, clientes, preco, alvo }
       for (const pedido of E().pedidos) {
         if (pedido.status !== 'ativo' || !pedido.jid || pedido.pausado || jaNaFila.has(pedido.id)) continue;
         const prod = E().produtos[pedido.produto];
@@ -1495,7 +1498,14 @@ export async function varrerAvisos({ manual = false } = {}) {
           },
         });
         res.avisos++;
+        // Também para os grupos (card de revisão no bot), só alvo ou queda de verdade.
+        if (conf.tipo === 'alvo' || conf.tipo === 'queda') {
+          const g = paraGrupos.get(mo.prod.asin);
+          if (g) { g.clientes++; if (conf.tipo === 'alvo') g.tipo = 'alvo'; }
+          else paraGrupos.set(mo.prod.asin, { prod: mo.prod, cupom: mo.cupom || null, tipo: conf.tipo, clientes: 1, preco: m.preco, alvo: pedido.precoAlvo || null });
+        }
       }
+      for (const g of paraGrupos.values()) await cardParaGrupos(g, res);
     }
     gravar();
   } catch (e) {
@@ -1573,6 +1583,8 @@ function painelDoProduto(prod) {
                ativo: eq.ativo !== false, em: eq.em, removidoEm: eq.removidoEm || null };
     }),
     busca: prod.equivBusca || null,
+    cardGrupo: (() => { const qs = [prod, ...(prod.equivalentes || []).map(e => E().produtos[e.chave]).filter(Boolean)].map(q => q.cardGrupo).filter(Boolean);
+                         return qs.sort((a, b) => String(b.em).localeCompare(String(a.em)))[0] || null; })(),
   };
 }
 
@@ -1766,6 +1778,23 @@ export async function acaoEquivalente({ produto, acao, chave, url } = {}) {
   return { ok: false, erro: 'ação inválida' };
 }
 
+// ── Card para os grupos (05/11/2026) ──
+// Link só no privado, com poucos cliques, arrisca a comissão; a mesma oferta
+// vira card no @ticopromosbot (marcado como alerta de cliente) para o operador
+// mandar também aos grupos. Um card por produto a cada 24 h, salvo nova queda de 3%.
+async function cardParaGrupos(g, res) {
+  if (!_deps.cardGrupos || E().config.cardGrupos === false) return;
+  const p = g.prod;
+  const ult = p.cardGrupo;
+  if (ult && Date.now() - Date.parse(ult.em) < 24 * MS_H && !(g.preco < ult.preco * 0.97)) return;
+  try {
+    const r = await _deps.cardGrupos({ item: itemDoProduto(p), cupom: g.cupom, tipo: g.tipo, clientes: g.clientes, precoAviso: g.preco, alvo: g.alvo });
+    if (r?.ok) { p.cardGrupo = { em: new Date().toISOString(), preco: g.preco, id: r.id }; res.cards = (res.cards || 0) + 1; }
+    else if (r?.jaEnviado || r?.duplicado) p.cardGrupo = { em: new Date().toISOString(), preco: g.preco, pulado: r.jaEnviado ? 'já enviado nos grupos em 15 dias' : 'card pendente' };
+    else console.warn('[AVISOS] Card para os grupos não criado (' + p.asin + '): ' + (r?.erro || '?'));
+  } catch (e) { console.warn('[AVISOS] Card para os grupos falhou (' + p.asin + '): ' + e.message); }
+}
+
 // ── Painel ───────────────────────────────────────────────────────────────────
 export function estadoAvisos() {
   const st = E();
@@ -1829,6 +1858,7 @@ export function salvarConfigAvisos(parcial = {}) {
   if ('quedaSemAlvoPct' in parcial) c.quedaSemAlvoPct = num(parcial.quedaSemAlvoPct, 1, 80, c.quedaSemAlvoPct);
   if ('quedaParcialPct' in parcial) c.quedaParcialPct = num(parcial.quedaParcialPct, 1, 80, c.quedaParcialPct);
   if ('avisarQuedaParcial' in parcial) c.avisarQuedaParcial = !!parcial.avisarQuedaParcial;
+  if ('cardGrupos' in parcial) c.cardGrupos = !!parcial.cardGrupos;
   if ('novaQuedaPct' in parcial) c.novaQuedaPct = num(parcial.novaQuedaPct, 0, 50, c.novaQuedaPct);
   if (c.janelaFim <= c.janelaIni) c.janelaFim = Math.min(24, c.janelaIni + 1);
   gravar();
