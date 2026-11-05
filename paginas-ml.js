@@ -8,7 +8,10 @@
 //
 // Mesma receita da insercao de cupons (27/09/2026): quem toca a pagina e o
 // Chrome do operador, por um fetch() do service worker da extensao — IP
-// residencial, TLS de navegador, SEM cookie (credentials: 'omit'), sem aba.
+// residencial, TLS de navegador, sem aba. Desde 05/11/2026 (extensao 2.10.0)
+// o fetch vai COM os cookies do Chrome do operador: sem cookie, cada busca era
+// um "aparelho novo" para o ML e ele passou a responder com /captcha/wall e
+// /gz/account-verification a todas.
 // Este modulo e so a fila: o server pede uma pagina, a extensao (em long-poll
 // em /ml/pagina/proximo) busca e devolve o HTML em /ml/pagina/resultado; quem
 // interpreta o HTML e o radar-ml.js, com o que ja existia.
@@ -16,7 +19,11 @@
 // Freios, para a leitura nao virar o mesmo padrao que derrubou o Railway:
 //   - so na janela (ML_PAGINA_JANELA, 8-23) e com teto diario (ML_PAGINA_TETO);
 //   - espacamento entre paginas e da extensao (4-8 s); aqui, uma por vez;
-//   - 3 walls seguidas -> pausa (ML_PAGINA_PAUSA_MIN); leitura boa zera tudo;
+//   - 1a tela de verificacao -> PARA tudo e avisa o operador no WhatsApp com o
+//     link do anuncio; ele abre no Chrome dele e resolve o captcha (pessoa, nao
+//     robo). Continuar batendo depois do bloqueio so o endurece. A leitura so
+//     volta quando um teste (a cada ML_PAGINA_TESTE_MIN, ou "Ja resolvi" no
+//     popup da extensao) abrir a pagina normalmente. Sobrevive a restart.
 //   - pedido sem extensao online (sem long-poll nos ultimos 90 s) devolve null
 //     na hora: nada fica esperando, o pipeline segue pelo caminho da API.
 // Estado em memoria (contadores zeram no boot; o teto conta por dia civil).
@@ -32,9 +39,8 @@ function escreverAtomico(caminho, dados) {
 const LIGADO     = String(process.env.ML_PAGINA_EXTENSAO ?? '1') !== '0';
 const TETO_DIA   = Number(process.env.ML_PAGINA_TETO || 200);
 const ESPERA_MS  = Number(process.env.ML_PAGINA_ESPERA_MS || 20000);   // quanto o pipeline espera a pagina
-const PAUSA_MS   = Number(process.env.ML_PAGINA_PAUSA_MIN || 30) * 60000;
+const TESTE_MS   = Number(process.env.ML_PAGINA_TESTE_MIN || 15) * 60000; // teste enquanto espera a verificacao
 const ONLINE_MS  = 90000;                                              // long-poll visto ha menos = extensao online
-const WALLS_PAUSA = 3;
 const HTML_MAX   = 2.5 * 1024 * 1024;
 const [JAN_INI, JAN_FIM] = String(process.env.ML_PAGINA_JANELA || '8-23').split('-').map(Number);
 
@@ -42,9 +48,13 @@ let _seq = 0;
 const _fila = [];               // [{ id, url, criadoEm, resolve, timer, entregueEm }]
 const _esperando = [];          // long-polls da extensao: [{ res, timer }]
 let _estado = {
-  ultimoPollEm: 0, lidas: 0, walls: 0, wallsSeguidas: 0, pausadoAte: 0,
+  ultimoPollEm: 0, lidas: 0, walls: 0,
   dia: null, hoje: 0, ultimaUrl: null, ultimaEm: null, ultimoErro: null, semResposta: 0,
+  // { desde, url, ultimoTesteEm, testes } enquanto o ML espera a verificacao manual
+  verificacao: null,
 };
+let _aoPedirVerificacao = null;  // (url) => Promise — aviso no WhatsApp (server.js)
+let _aoLiberar = null;           // (verificacao) => Promise
 let _arquivo = null;            // caminho do json com o contador do dia (sobrevive a restart)
 
 function diaSp() { return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' }); }
@@ -56,7 +66,7 @@ function zerarDia() {
 }
 function gravar() {
   if (!_arquivo) return;
-  try { escreverAtomico(_arquivo, JSON.stringify({ dia: _estado.dia, hoje: _estado.hoje })); } catch (e) {}
+  try { escreverAtomico(_arquivo, JSON.stringify({ dia: _estado.dia, hoje: _estado.hoje, verificacao: _estado.verificacao })); } catch (e) {}
 }
 
 /** Chamado no boot pelo server com o diretorio da sessao. */
@@ -66,9 +76,32 @@ export function iniciarPaginasMl(sessaoDir) {
     if (existsSync(_arquivo)) {
       const m = JSON.parse(readFileSync(_arquivo, 'utf-8'));
       if (m?.dia === diaSp()) { _estado.dia = m.dia; _estado.hoje = Number(m.hoje) || 0; }
+      if (m?.verificacao?.url) _estado.verificacao = m.verificacao;
     }
   } catch (e) {}
   zerarDia();
+  setInterval(() => { testarVerificacaoMl(false).catch(() => {}); }, 60000).unref?.();
+}
+
+/** server.js registra quem avisa o operador (bloqueio) e quem registra a volta. */
+export function configurarAvisosPaginasMl({ aoPedirVerificacao, aoLiberar } = {}) {
+  _aoPedirVerificacao = aoPedirVerificacao || null;
+  _aoLiberar = aoLiberar || null;
+}
+
+/**
+ * Enquanto o ML espera a verificacao, testa UMA pagina (a que bloqueou) para
+ * saber se o operador ja resolveu. agora=true: pedido do popup ("Ja resolvi").
+ */
+export async function testarVerificacaoMl(agora) {
+  const v = _estado.verificacao;
+  if (!v || !LIGADO || !extensaoPaginasOnline()) return { ok: false, motivo: v ? 'extensao_offline' : 'sem_verificacao_pendente' };
+  if (!agora && (!naJanela() || Date.now() - (v.ultimoTesteEm || v.desde || 0) < TESTE_MS)) return { ok: false, motivo: 'ainda_nao' };
+  if (_fila.some(p => p.forcar)) return { ok: true, motivo: 'teste_em_andamento' };
+  v.ultimoTesteEm = Date.now(); v.testes = (v.testes || 0) + 1; gravar();
+  const r = await pedirPaginaMl(v.url, { motivo: 'teste', forcar: true, esperaMs: 40000 });
+  if (!r) return { ok: false, motivo: 'sem_resposta' };
+  return { ok: true, liberada: !r.bloqueada };
 }
 
 export function extensaoPaginasOnline() {
@@ -79,7 +112,7 @@ export function extensaoPaginasOnline() {
 export function motivoIndisponivelPaginasMl() {
   if (!LIGADO) return 'desligada';
   if (!extensaoPaginasOnline()) return 'extensao_offline';
-  if (Date.now() < _estado.pausadoAte) return 'pausa_por_bloqueio';
+  if (_estado.verificacao) return 'aguardando_verificacao';
   if (!naJanela()) return 'fora_da_janela';
   zerarDia();
   if (_estado.hoje >= TETO_DIA) return 'teto';
@@ -91,15 +124,16 @@ export function motivoIndisponivelPaginasMl() {
  * @returns {Promise<{html:string, url:string, status:number}|null>}
  *   null = extensao indisponivel, freio ativo ou sem resposta no prazo.
  */
-export function pedirPaginaMl(url, { esperaMs = ESPERA_MS, motivo = 'leitura' } = {}) {
-  const porque = motivoIndisponivelPaginasMl();
+export function pedirPaginaMl(url, { esperaMs = ESPERA_MS, motivo = 'leitura', forcar = false } = {}) {
+  // forcar: so o teste da verificacao passa por cima do freio (precisa da extensao online)
+  const porque = forcar ? (LIGADO && extensaoPaginasOnline() ? null : 'extensao_offline') : motivoIndisponivelPaginasMl();
   if (porque) return Promise.resolve(null);
   // A mesma URL pedida duas vezes seguidas (dois grupos-fonte publicando junto)
   // vai uma vez so: o segundo pedido pega carona no primeiro.
-  const igual = _fila.find(p => p.url === url && !p.entregueEm);
+  const igual = !forcar && _fila.find(p => p.url === url && !p.entregueEm && !p.forcar);
   if (igual) return new Promise(res => igual.caronas.push(res));
   return new Promise(resolve => {
-    const p = { id: ++_seq, url, motivo, criadoEm: Date.now(), entregueEm: 0, resolve, caronas: [], timer: null };
+    const p = { id: ++_seq, url, motivo, forcar, criadoEm: Date.now(), entregueEm: 0, resolve, caronas: [], timer: null };
     p.timer = setTimeout(() => concluir(p, null, 'sem resposta no prazo'), esperaMs);
     _fila.push(p);
     acordarExtensao();
@@ -121,10 +155,9 @@ function proximoParaEntregar() {
   // Uma por vez: so entrega a proxima quando a anterior foi respondida ou
   // passou do prazo (a extensao espaca 4-8 s entre as buscas).
   if (_fila.some(p => p.entregueEm && Date.now() - p.entregueEm < ESPERA_MS)) return null;
-  const p = _fila.find(p => !p.entregueEm);
+  // O teste da verificacao vai na frente e ignora o freio; o resto espera.
+  const p = _fila.find(p => !p.entregueEm && p.forcar) || (motivoIndisponivelPaginasMl() ? null : _fila.find(p => !p.entregueEm && !p.forcar));
   if (!p) return null;
-  const porque = motivoIndisponivelPaginasMl();
-  if (porque) return null;
   p.entregueEm = Date.now();
   return { id: p.id, url: p.url, motivo: p.motivo };
 }
@@ -183,13 +216,23 @@ export function registrarResultadoPaginaMl(corpo, bloqueadaFn) {
   }
   const bloqueada = !!bloqueadaFn(urlFinal, html, status);
   if (bloqueada) {
-    _estado.walls++; _estado.wallsSeguidas++;
-    if (_estado.wallsSeguidas >= WALLS_PAUSA) {
-      _estado.pausadoAte = Date.now() + PAUSA_MS;
-      console.warn('[ML] Pagina pela extensao: ' + WALLS_PAUSA + ' bloqueios seguidos — pausa de ' + (PAUSA_MS / 60000) + ' min');
+    _estado.walls++;
+    if (!_estado.verificacao) {
+      // Primeira tela de verificacao: para na hora e chama o operador.
+      _estado.verificacao = { desde: Date.now(), url: p.url, ultimoTesteEm: Date.now(), testes: 0 };
+      gravar();
+      console.warn('[ML] Pagina pela extensao: ML pediu verificacao — leitura parada ate o operador resolver (' + p.url + ')');
+      if (_aoPedirVerificacao) Promise.resolve(_aoPedirVerificacao(p.url)).catch(e => console.error('[ML] Falha ao avisar verificacao:', e.message));
     }
   } else {
-    _estado.lidas++; _estado.wallsSeguidas = 0; _estado.pausadoAte = 0;
+    _estado.lidas++;
+    if (_estado.verificacao) {
+      const v = _estado.verificacao;
+      _estado.verificacao = null;
+      gravar();
+      console.log('[ML] Pagina pela extensao voltou a abrir — verificacao resolvida, leitura retomada.');
+      if (_aoLiberar) Promise.resolve(_aoLiberar(v)).catch(() => {});
+    }
   }
   concluir(p, { html, url: urlFinal, status, bloqueada });
   acordarExtensao();
@@ -203,8 +246,12 @@ export function estadoPaginasMl() {
     ultimoPollEm: _estado.ultimoPollEm ? new Date(_estado.ultimoPollEm).toISOString() : null,
     naFila: _fila.length, pollsEsperando: _esperando.length,
     hoje: _estado.hoje, teto: TETO_DIA, janela: JAN_INI + '-' + JAN_FIM,
-    lidas: _estado.lidas, walls: _estado.walls, wallsSeguidas: _estado.wallsSeguidas,
-    pausadoAte: _estado.pausadoAte ? new Date(_estado.pausadoAte).toISOString() : null,
+    lidas: _estado.lidas, walls: _estado.walls,
+    verificacao: _estado.verificacao ? {
+      desde: new Date(_estado.verificacao.desde).toISOString(), url: _estado.verificacao.url, testes: _estado.verificacao.testes || 0,
+      ultimoTesteEm: _estado.verificacao.ultimoTesteEm ? new Date(_estado.verificacao.ultimoTesteEm).toISOString() : null,
+      proximoTesteEm: new Date((_estado.verificacao.ultimoTesteEm || _estado.verificacao.desde) + TESTE_MS).toISOString(),
+    } : null,
     semResposta: _estado.semResposta, ultimaUrl: _estado.ultimaUrl, ultimaEm: _estado.ultimaEm, ultimoErro: _estado.ultimoErro,
   };
 }

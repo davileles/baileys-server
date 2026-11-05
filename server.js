@@ -216,7 +216,7 @@ import {
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
   formatarOfertaMl, amostrasCardSocialMl, paginaMlBloqueadaHtml,
 } from './radar-ml.js';
-import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl } from './paginas-ml.js';
+import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl } from './paginas-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
 // variavel porque o endpoint interno pode mudar sem aviso.
@@ -735,6 +735,21 @@ function anthropicKey() { return process.env.ANTHROPIC_API_KEY; }
 const SESSAO_DIR    = './sessao';
 // Contador diario da leitura de pagina do ML pela extensao (paginas-ml.js).
 iniciarPaginasMl(SESSAO_DIR);
+// ML pediu verificacao (captcha / account-verification) na leitura pela extensao:
+// a leitura para e o operador recebe o link para resolver no proprio Chrome.
+configurarAvisosPaginasMl({
+  aoPedirVerificacao: (url) => registrarAlerta({ nivel: 'critico', origem: 'ml', chave: 'ml:verificacao-pagina',
+    janelaMs: 30 * 60 * 1000,
+    titulo: 'Mercado Livre pediu verificação na leitura de páginas',
+    corpo: '🤖 *Mercado Livre pediu verificação*\n\n'
+      + 'A Captura Tica parou de ler páginas de produto do ML até você resolver.\n\n'
+      + '1. No Chrome onde a extensão está instalada, abra:\n' + url + '\n'
+      + '2. Resolva o que o ML pedir (captcha ou confirmar a conta)\n'
+      + '3. Na extensão, clique em *Já resolvi* — ou espere: ela testa sozinha a cada 15 min\n\n'
+      + 'Enquanto isso, as ofertas do ML seguem pela API oficial.' }),
+  aoLiberar: () => registrarAlerta({ nivel: 'info', origem: 'ml', chave: 'ml:verificacao-pagina-ok', soRegistrar: true,
+    titulo: 'Leitura de páginas do ML voltou', corpo: 'A página de produto voltou a abrir pela extensão; leitura retomada.' }),
+});
 const UPLOAD_DIR    = './tmp-uploads';
 
 [SESSAO_DIR, UPLOAD_DIR].forEach(d => { if (!existsSync(d)) mkdirSync(d, { recursive: true }); });
@@ -22275,7 +22290,9 @@ function estadoLeituraCuponsMl() {
 // ── LEITURA DE PAGINA DO ML PELA EXTENSAO (paginas-ml.js, desde 27/10/2026) ──
 // A extensao fica em long-poll em /proximo; quando o pipeline pede uma pagina
 // (anuncio classico, cupom declarado no anuncio, sonda diaria), ela faz o
-// fetch() sem cookie no Chrome do operador e devolve o HTML em /resultado.
+// fetch() com os cookies do Chrome do operador (desde 05/11/2026) e devolve o
+// HTML em /resultado. Na 1a tela de verificacao a leitura para e o operador e
+// avisado (paginas-ml.js); /testar confere se ele ja resolveu.
 // Quem decide se veio tela antibot e o radar-ml (paginaMlBloqueadaHtml).
 app.get('/ml/pagina/proximo', (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
@@ -22284,6 +22301,12 @@ app.get('/ml/pagina/proximo', (req, res) => {
 app.post('/ml/pagina/resultado', (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
   res.json(registrarResultadoPaginaMl(req.body || {}, (urlFinal, html) => paginaMlBloqueadaHtml(urlFinal, html)));
+});
+// "Ja resolvi" no popup da extensao: testa agora a pagina que pediu verificacao.
+app.post('/ml/pagina/testar', async (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  try { res.json({ ok: true, ...(await testarVerificacaoMl(true)) }); }
+  catch (e) { res.json({ ok: false, erro: e.message }); }
 });
 app.get('/ml/pagina/estado', (req, res) => {
   res.set('Cache-Control', 'no-store');
