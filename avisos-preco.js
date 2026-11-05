@@ -741,18 +741,16 @@ function pedidosAbertosDe(jid, numeros, contato) {
 function linhaDoPedido(p, i) {
   const prod = E().produtos[p.produto] || {};
   const atual = prod.ult?.preco;
-  let l = (i + 1) + '. *' + encurtar(p.titulo, 70) + '*' + (p.loja ? ' (' + p.loja + ')' : '');
-  const det = [];
-  if (p.status === 'aguardando') det.push('aguardando ativação');
-  if (p.pausado) det.push('pausado');
-  if (p.porNome) det.push('vamos procurar o produto');
-  if (atual) det.push('agora ' + brl(atual));
+  const l = [(i + 1) + '. *' + encurtar(p.titulo, 70) + '*' + (p.loja ? ' (' + p.loja + ')' : '')];
+  if (p.status === 'aguardando') l.push('⏳ Aguardando ativação');
+  if (p.pausado) l.push('⏸️ Pausado');
+  if (p.porNome) l.push('🔎 Ainda estamos procurando o produto');
+  if (atual) l.push('💰 Hoje: ' + brl(atual));
   if (p.precoAlvo) {
-    if (atual && atual <= p.precoAlvo) det.push('seu preço ' + brl(p.precoAlvo) + ' ✅');
-    else det.push('seu preço ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
-  } else if (!p.porNome) det.push('aviso em quedas de ' + E().config.quedaSemAlvoPct + '%');
-  if (det.length) l += '\n   ' + det.join(' · ');
-  return l;
+    if (atual && atual <= p.precoAlvo) l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + ' ✅ chegou!');
+    else l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
+  } else if (!p.porNome) l.push('🎯 Te aviso em qualquer queda de ' + E().config.quedaSemAlvoPct + '% ou mais');
+  return l.join('\n');
 }
 
 function textoAjuda(temAlertas) {
@@ -766,12 +764,13 @@ function textoAjuda(temAlertas) {
 
 function textoLista(abertos) {
   if (!abertos.length) {
-    return 'Você não tem alertas de preço ativos no momento.\n\nPara criar um, cole aqui o link do produto (Amazon, Mercado Livre ou Shopee) ou use ' + SITE_ALERTAS;
+    return 'Você não tem nenhum alerta de preço ativo agora.\n\nQuer criar um? É só colar aqui o link do produto (Amazon, Mercado Livre ou Shopee) ou usar ' + SITE_ALERTAS;
   }
   return '🔔 *Seus alertas de preço*\n\n' + abertos.map(linhaDoPedido).join('\n\n')
-    + '\n\nPara parar um alerta, responda *SAIR* + o número dele na lista acima (ex.: *SAIR 1*). *SAIR* sozinho para todos.'
-    + '\nPara criar outro, cole aqui o link do produto.'
-    + '\nVeja a régua de preços de cada um em ' + SITE_ALERTAS;
+    + '\n\n———\n\n'
+    + 'Para parar um alerta, responda *SAIR* + o número dele (ex.: *SAIR 1*). *SAIR* sozinho para todos.\n\n'
+    + 'Para criar outro, é só colar aqui o link do produto.\n\n'
+    + '📈 O histórico de preço de cada um fica em ' + SITE_ALERTAS;
 }
 
 function lerValor(t) {
