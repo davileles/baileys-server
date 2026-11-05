@@ -29,6 +29,38 @@ const CONFIG_PATH    = './sessao/awin_config.json';
 let _ofertados = {};   // chave (loja|produto) -> ISO do ultimo envio
 let _cfg = null;       // config gravada pelo painel (null = ainda nao lida)
 
+// ── LOJAS LIBERADAS E REGRAS POR LOJA (05/11/2026) ──
+// Com regrasLojas preenchido, so essas lojas sao varridas e cada uma tem o
+// proprio corte: um minPct unico de 60% travava a Wine (vinho raramente passa
+// de 40%) e deixava a Dafiti passar demais (preco riscado o ano todo).
+// Chave = advertiserId da Awin. maxDia = teto de ofertas da loja por dia.
+// Ficam de fora: C&A (feed sem preco "De"), Posthaus e Vivara (publico/ticket
+// fora do que o grupo compra). Lojas sem feed (Under Armour, PUMA, Decathlon,
+// farmacias, Evino, grupo SBF de calcados) so entram pelos cupons.
+export const REGRAS_LOJAS_PADRAO = {
+  '17806': { nome: 'Centauro',      minPct: 50, minPreco: 80,  maxDia: 4 },
+  '17652': { nome: 'Nike',          minPct: 50, minPreco: 100, maxDia: 3 },
+  '17697': { nome: 'Dafiti',        minPct: 70, minPreco: 100, maxDia: 2 },
+  '17770': { nome: 'Wine',          minPct: 35, minPreco: 60,  maxDia: 2 },
+  '17698': { nome: 'Olympikus',     minPct: 50, minPreco: 80,  maxDia: 2 },
+  '23659': { nome: 'ASICS',         minPct: 50, minPreco: 150, maxDia: 2 },
+  '51271': { nome: 'Mizuno',        minPct: 50, minPreco: 150, maxDia: 2 },
+  '17893': { nome: 'Fut Fanatics',  minPct: 50, minPreco: 80,  maxDia: 2 },
+  '29407': { nome: 'Beleza na Web', minPct: 50, minPreco: 50,  maxDia: 2 },
+};
+
+// Cupons da Awin: so lojas que fazem sentido para o grupo e desconto que
+// chame atencao. As lojas das ofertas entram sozinhas; aqui vao as que so
+// tem cupom (sem feed de produtos).
+export const CUPONS_FILTRO_PADRAO = {
+  ativo: true,
+  lojas: ['17648', '17658', '17659', '17818', '17919', '18864', '19296',
+          '28773', '28775', '28777', '32675', '64086'],
+  minPct: 15,          // cupom de % abaixo disso nao vira card
+  minReais: 30,        // cupom de R$ abaixo disso nao vira card
+  maxMinimoVezes: 8,   // cupom de R$ com compra minima > 8x o valor e fraco
+};
+
 // Padrao usado quando nao ha nada gravado. As variaveis de ambiente continuam
 // valendo como valor inicial — o que o painel gravar passa a mandar, para o
 // operador poder calibrar sem redeploy.
@@ -51,6 +83,11 @@ function padraoDaConfig() {
     candidatoTtlHoras: n(process.env.AWIN_CANDIDATO_TTL_H, 12),
     maxFeedsPorRodada: n(process.env.AWIN_OFERTAS_MAX_FEEDS, 6),
     lojas: String(process.env.AWIN_OFERTAS_LOJAS || '').split(',').map(s => s.trim()).filter(Boolean),
+    regrasLojas:       REGRAS_LOJAS_PADRAO,
+    // No modo 'on', so sai sozinha a oferta com preco confirmado na pagina da
+    // loja; a que ficou so com o preco do feed vira card para aprovacao.
+    exigirConfirmacao: true,
+    cuponsFiltro:      CUPONS_FILTRO_PADRAO,
     // Cupons da Offers API: mesmo lugar, para a Awin ter uma config so.
     cupons:        (process.env.AWIN_CUPONS || 'off').toLowerCase(),       // off | fila | on
     cupomPollMin:  n(process.env.AWIN_POLL_MIN, 20),
@@ -68,6 +105,52 @@ export function carregarConfigOfertasAwin() {
 
 export function configOfertasAwin() {
   return { ...padraoDaConfig(), ...(_cfg || {}) };
+}
+
+function temRegras(cfg) {
+  return !!(cfg.regrasLojas && typeof cfg.regrasLojas === 'object' && Object.keys(cfg.regrasLojas).length);
+}
+
+/** Loja liberada? Sem regras gravadas, toda loja vale (comportamento antigo). */
+export function lojaLiberadaAwin(advertiserId, cfg = configOfertasAwin()) {
+  if (!temRegras(cfg)) return true;
+  return !!cfg.regrasLojas[String(advertiserId)];
+}
+
+/** Corte efetivo da loja: regra propria, senao o geral. */
+export function regraDaLojaAwin(advertiserId, cfg = configOfertasAwin()) {
+  const r = (temRegras(cfg) && cfg.regrasLojas[String(advertiserId)]) || {};
+  const num = (v, padrao) => (v === undefined || v === null || !isFinite(Number(v))) ? padrao : Number(v);
+  return {
+    minPct:   num(r.minPct, cfg.minPct),
+    minPreco: num(r.minPreco, cfg.minPreco),
+    maxDia:   num(r.maxDia, cfg.maxLojaDia),
+  };
+}
+
+/**
+ * Cupom da Awin vale virar card? Loja precisa estar nas lojas das ofertas ou
+ * na lista propria dos cupons, e o desconto precisa ser relevante.
+ */
+export function cupomAwinPassaFiltro(cupom, advertiserId, cfg = configOfertasAwin()) {
+  const f = cfg.cuponsFiltro || {};
+  if (f.ativo === false) return { ok: true };
+  const id = String(advertiserId || '');
+  const lojas = new Set([...(f.lojas || []).map(String),
+                         ...(temRegras(cfg) ? Object.keys(cfg.regrasLojas) : [])]);
+  if (lojas.size && !lojas.has(id)) return { ok: false, motivo: 'loja fora da lista dos cupons' };
+  const valor = Number(cupom?.valor) || 0;
+  if (cupom?.tipo === 'pct' && valor < (Number(f.minPct) || 0)) {
+    return { ok: false, motivo: valor + '% abaixo do minimo de ' + f.minPct + '%' };
+  }
+  if (cupom?.tipo === 'reais') {
+    if (valor < (Number(f.minReais) || 0)) return { ok: false, motivo: 'R$ ' + valor + ' abaixo do minimo de R$ ' + f.minReais };
+    const minimo = Number(cupom?.minimo) || 0;
+    if (f.maxMinimoVezes && minimo > valor * Number(f.maxMinimoVezes)) {
+      return { ok: false, motivo: 'compra minima de R$ ' + minimo + ' alta demais para R$ ' + valor + ' de desconto' };
+    }
+  }
+  return { ok: true };
 }
 
 // Faixas de validacao: um maxDia digitado como 600 no painel viraria spam, e um
@@ -107,6 +190,33 @@ export function salvarConfigOfertasAwin(dados = {}) {
     const [h, m] = v.split(':').map(Number);
     if (h > 23 || m > 59) throw new Error(campo + ' tem horario invalido');
     nova[campo] = v.padStart(5, '0');
+  }
+  if (dados.exigirConfirmacao !== undefined) nova.exigirConfirmacao = !!dados.exigirConfirmacao;
+  if (dados.regrasLojas !== undefined) {
+    if (!dados.regrasLojas || typeof dados.regrasLojas !== 'object') throw new Error('regrasLojas precisa ser objeto');
+    const limpas = {};
+    for (const [id, r] of Object.entries(dados.regrasLojas)) {
+      if (!/^\d+$/.test(String(id))) throw new Error('regrasLojas: chave ' + id + ' nao e advertiserId');
+      const item = { nome: String(r?.nome || '').slice(0, 60) };
+      for (const [campo, [min, max]] of [['minPct', [1, 99]], ['minPreco', [0, 100000]], ['maxDia', [0, 40]]]) {
+        if (r?.[campo] === undefined) continue;
+        const v = Number(r[campo]);
+        if (!isFinite(v) || v < min || v > max) throw new Error('regrasLojas.' + id + '.' + campo + ' fora da faixa (' + min + '-' + max + ')');
+        item[campo] = v;
+      }
+      limpas[String(id)] = item;
+    }
+    nova.regrasLojas = limpas;
+  }
+  if (dados.cuponsFiltro !== undefined) {
+    const f = dados.cuponsFiltro || {};
+    nova.cuponsFiltro = {
+      ativo: f.ativo !== false,
+      lojas: (Array.isArray(f.lojas) ? f.lojas : String(f.lojas || '').split(',')).map(x => String(x).trim()).filter(Boolean),
+      minPct: Math.max(0, Math.min(99, Number(f.minPct) || 0)),
+      minReais: Math.max(0, Number(f.minReais) || 0),
+      maxMinimoVezes: Math.max(0, Number(f.maxMinimoVezes) || 0),
+    };
   }
   if (dados.lojas !== undefined) {
     nova.lojas = (Array.isArray(dados.lojas) ? dados.lojas : String(dados.lojas).split(','))
@@ -221,11 +331,23 @@ export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
   // A lista de feeds so e baixada no boot. Credencial colada pelo painel depois
   // disso deixava o indice vazio e a varredura falhava pedindo uma "atualizacao"
   // que o operador nao tinha como disparar — agora ela se resolve sozinha.
-  let ids = cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : listarAnunciantesComFeed();
+  // Regras por loja mandam na lista; sem elas vale o filtro antigo (lojas) e,
+  // sem nada, todos os anunciantes com feed.
+  const lojasDaConfig = () => temRegras(cfg)
+    ? Object.keys(cfg.regrasLojas).map(Number).filter(Boolean)
+    : (cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : null);
+  const comFeed = () => {
+    const todos = listarAnunciantesComFeed();
+    const alvo = lojasDaConfig();
+    if (!alvo) return todos;
+    const temFeed = new Set(todos.map(Number));
+    return alvo.filter(id => temFeed.has(id));
+  };
+  let ids = comFeed();
   if (!ids.length) {
     try {
       await atualizarFeedList(true);
-      ids = cfg.lojas.length ? cfg.lojas.map(Number).filter(Boolean) : listarAnunciantesComFeed();
+      ids = comFeed();
     } catch (e) {
       return { ok: false, erro: 'nao foi possivel baixar a lista de feeds: ' + e.message };
     }
@@ -246,8 +368,9 @@ export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
   for (const id of fatia) {
     let achados = [];
     try {
+      const regra = regraDaLojaAwin(id, cfg);
       achados = await varrerFeedComDesconto(id, {
-        minPct: cfg.minPct, minPreco: cfg.minPreco, maxPreco: cfg.maxPreco, limite: 60,
+        minPct: regra.minPct, minPreco: regra.minPreco, maxPreco: cfg.maxPreco, limite: 60,
       });
     } catch (e) { console.log('[AWIN-OFERTAS] Falha na loja ' + id + ': ' + e.message); continue; }
 
@@ -296,7 +419,9 @@ export function candidatosRanqueados({ limite = 150 } = {}) {
   return _candidatos.slice(0, limite).map((c, i) => {
     // Conta acumulada: o 5o item da Nike ja estoura um teto de 4/dia mesmo que
     // nenhum tenha saido ainda, porque os anteriores da lista sairiam antes.
-    const noTeto = (usados[c.loja] || 0) >= cfg.maxLojaDia;
+    const tetoLoja = regraDaLojaAwin(c.advertiserId, cfg).maxDia;
+    const liberada = lojaLiberadaAwin(c.advertiserId, cfg);
+    const noTeto = (usados[c.loja] || 0) >= tetoLoja;
     usados[c.loja] = (usados[c.loja] || 0) + 1;
     return {
       posicao: i + 1,
@@ -312,7 +437,8 @@ export function candidatosRanqueados({ limite = 150 } = {}) {
       urlLoja: c.urlLoja || '',
       linkAfiliado: c.linkAfiliado || '',
       bloqueio: vencida ? 'preço pode estar vencido — varra os catálogos'
-              : (noTeto ? 'loja já no teto de hoje (' + cfg.maxLojaDia + '/dia)' : null),
+              : !liberada ? 'loja fora da lista liberada'
+              : (noTeto ? 'loja já no teto de hoje (' + tetoLoja + '/dia)' : null),
     };
   });
 }
@@ -380,7 +506,8 @@ export function proximosCandidatos({ simular = false } = {}) {
 
   for (const c of _candidatos) {
     if (escolhidos.length >= quantos) break;
-    if ((usadosLoja[c.loja] || 0) >= cfg.maxLojaDia) continue;
+    if (!lojaLiberadaAwin(c.advertiserId, cfg)) continue;
+    if ((usadosLoja[c.loja] || 0) >= regraDaLojaAwin(c.advertiserId, cfg).maxDia) continue;
     if (jaOfertado(c.chaveHistorico, cfg.repetirDias)) continue;
     escolhidos.push(c);
     usadosLoja[c.loja] = (usadosLoja[c.loja] || 0) + 1;

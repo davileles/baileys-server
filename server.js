@@ -161,6 +161,7 @@ import {
   carregarCandidatosAwin, reabastecerCandidatosAwin, estadoCandidatos,
   proximosCandidatos, dentroDaJanelaAwin, vagasAgora,
   candidatosRanqueados, retirarCandidatos,
+  regraDaLojaAwin, cupomAwinPassaFiltro,
 } from './awin-ofertas.js';
 import { formatarOfertaAwin, definirTtlPrecoAwin } from './radar-awin.js';
 import { definirTtlFeedHoras } from './awin-feed.js';
@@ -19430,6 +19431,7 @@ async function processarOfertasAwin({ simular = false } = {}) {
       // vence o feed (lerPaginaProduto ja troca pelo preco de socio quando ha).
       // Sem advertiserId de proposito, para nao cair de volta no proprio feed.
       // Pagina bloqueada/sem preco: segue com o feed, marcado como referencia.
+      let precoConfirmado = false;
       if (c.urlLoja) {
         try {
           const pg = await extrairProdutoAwin(c.urlLoja);
@@ -19446,9 +19448,10 @@ async function processarOfertasAwin({ simular = false } = {}) {
               console.log('[AWIN-OFERTAS] Preco da pagina ' + pg.preco + ' (feed ' + p.preco + ')'
                 + (pg.precoPublico ? ' — socio; publico ' + pg.precoPublico : '') + ' — ' + p.titulo.slice(0, 40));
             }
-            if (descPg < cfg.minPct) {
-              console.log('[AWIN-OFERTAS] Desconto real ' + descPg + '% abaixo do minimo ' + cfg.minPct
-                + '%, pulando — ' + p.titulo.slice(0, 50));
+            const minLoja = regraDaLojaAwin(c.advertiserId, cfg).minPct;
+            if (descPg < minLoja) {
+              console.log('[AWIN-OFERTAS] Desconto real ' + descPg + '% abaixo do minimo ' + minLoja
+                + '% da loja, pulando — ' + p.titulo.slice(0, 50));
               if (!simular) marcarOfertado(c.chaveHistorico);
               continue;
             }
@@ -19458,6 +19461,7 @@ async function processarOfertasAwin({ simular = false } = {}) {
             p.precoTexto = 'R$ ' + pg.preco.toFixed(2).replace('.', ',');
             p.precoDeTexto = deFinal ? 'R$ ' + deFinal.toFixed(2).replace('.', ',') : null;
             p.precoDeReferencia = false;
+            precoConfirmado = true;
             if (pg.precoPublico) p.precoPublico = pg.precoPublico;
             if (!p.imagemUrl && pg.imagem) p.imagemUrl = pg.imagem;
           }
@@ -19466,10 +19470,11 @@ async function processarOfertasAwin({ simular = false } = {}) {
         }
       }
 
-      // Cupom vigente da propria loja, se algum se aplicar a este preco. E o
-      // ganho de juntar as duas pontas: os cupons da Awin ja estao na base.
-      const mc = melhorCupomAplicavel(p.loja, p.preco);
-      const cupom = mc ? { reg: mc.reg, desconto: mc.desconto, citado: true } : null;
+      // Sem cupom automatico (05/11/2026): regra do TSP — cupom so entra
+      // quando citado na oferta monitorada ou escolhido pelo operador. O feed
+      // nao cita cupom, entao a oferta sai sem; os cupons da Awin seguem pelo
+      // caminho proprio deles.
+      const cupom = null;
       // Simulacao nao pode sujar o ledger de rastreio com produtos nao enviados.
       const mensagem = formatarOfertaAwin(p, { cupom, rastrear: !simular });
 
@@ -19523,7 +19528,14 @@ async function processarOfertasAwin({ simular = false } = {}) {
       // proposito do historico e nao repetir o produto, nao contar envios.
       marcarOfertado(c.chaveHistorico);
 
-      if (cfg.modo === 'on') {
+      // Trava de confirmacao (05/11/2026): preco so do feed pode estar horas
+      // atrasado — no modo 'on' ele vira card, nunca sai sozinho.
+      const segurarNaFila = cfg.modo === 'on' && cfg.exigirConfirmacao !== false && !precoConfirmado;
+      if (segurarNaFila) {
+        oferta.dadosExtraidos.motivoFila = 'preço não confirmado na página da loja (só do feed)';
+        console.log('[AWIN-OFERTAS] Preco nao confirmado na pagina, indo para aprovacao — ' + p.titulo.slice(0, 40));
+      }
+      if (cfg.modo === 'on' && !segurarNaFila) {
         try {
           const env = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta);
           oferta.status = 'enviado';
@@ -19834,6 +19846,14 @@ async function processarCuponsAwin({ semear = false, forcarEnvio = false } = {})
         observacao: 'Awin' + (base.atribuivel ? ' (atribuivel)' : '') + (base.exclusivo ? ' (exclusivo)' : ''),
       };
       if (!c.tipo || !(Number(c.valor) > 0)) { resumo.ignorados++; continue; }
+
+      // Filtro de loja e de atratividade (05/11/2026): cupom de loja fora do
+      // publico do grupo ou de desconto pequeno nao vira card.
+      const filtro = cupomAwinPassaFiltro(c, base.advertiserId);
+      if (!filtro.ok) {
+        console.log('[AWIN] Cupom ' + c.codigo + ' (' + c.loja + ') fora do filtro: ' + filtro.motivo);
+        resumo.ignorados++; continue;
+      }
 
       resumo.novos++;
       const r = await enfileirarCupomTSP(c, {
