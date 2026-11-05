@@ -181,7 +181,8 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 // tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
-         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido } from './avisos-preco.js';
+         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido,
+         pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -26338,6 +26339,17 @@ app.post('/avisos-preco/pedido', async (req, res) => {
   try { res.json(await avisosCriarPedido(req.body || {}, _ipDaReq(req))); }
   catch (e) { console.error('[AVISOS] Pedido:', e.message); res.status(500).json({ ok:false, erro:'Falha ao registrar o pedido. Tente de novo.' }); }
 });
+// "Meus alertas" da pagina: codigo de 6 digitos no WhatsApp -> token de 30 min.
+app.post('/avisos-preco/consulta/codigo', (req, res) => {
+  try { res.json(pedirCodigoConsulta(req.body?.telefone, _ipDaReq(req))); }
+  catch (e) { console.error('[AVISOS] Codigo:', e.message); res.status(500).json({ ok:false, erro:'Falha ao enviar o codigo.' }); }
+});
+app.post('/avisos-preco/consulta/entrar', (req, res) => {
+  try { res.json(entrarConsulta(req.body?.telefone, req.body?.codigo, _ipDaReq(req))); }
+  catch (e) { res.status(500).json({ ok:false, erro:'Falha ao entrar.' }); }
+});
+app.post('/avisos-preco/consulta/lista', (req, res) => { res.json(listaConsulta(req.body?.token)); });
+app.post('/avisos-preco/consulta/parar', (req, res) => { res.json(pararPelaConsulta(req.body?.token, String(req.body?.id || ''))); });
 // Painel (so raiz logada: a lista tem nome e telefone mascarado dos clientes).
 app.get('/avisos-preco', (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });

@@ -67,6 +67,13 @@ const CFG_PADRAO = {
 
 const RE_ATIVAR = /pedido\s*n?[ºo°.]?\s*#?\s*(\d{4,6})/i;
 const RE_SAIR = /^\s*(sair|parar|pare|cancelar|cancela|stop|descadastrar)\s*[.!]?\s*$/i;
+// SAIR 2: para só o alerta 2 da lista que o MEUS ALERTAS mostrou.
+const RE_SAIR_UM = /^\s*(?:sair|parar|pare|cancelar|cancela|stop)\s*#?\s*(\d{1,2})\s*[.!]?\s*$/i;
+const RE_MEUS = /^\s*(?:meus|minhas|ver)?\s*(?:alertas?|avisos?|lista)(?:\s+de\s+pre[cç]os?)?\s*[.!?]?\s*$/i;
+const RE_URL = /https?:\/\/[^\s<>"']+/i;
+const RE_OK = /^\s*(ok|okay|sim|pode|isso|beleza|blz|fechado|confirmo|confirmar|quero)\s*[.!]*\s*$/i;
+const RE_SEM_ALVO = /^\s*(qualquer|qualquer\s+queda|sem\s+pre[cç]o|tanto\s+faz)\s*[.!]*\s*$/i;
+const SITE_ALERTAS = 'ticapromos.com.br/avisos';
 
 let _estado = null;
 let _deps = {};
@@ -246,6 +253,14 @@ function registrarLeitura(p, leitura) {
   if (!(d in p.dias) || preco < p.dias[d]) p.dias[d] = preco;
   const corte = diaSP(Date.now() - 95 * MS_DIA);
   for (const k of Object.keys(p.dias)) if (k < corte) delete p.dias[k];
+  // Leituras recentes (para a régua da página antes de juntar dias): entra
+  // quando o preço muda ou passou 3 h da última; guarda as 60 últimas.
+  p.leituras = Array.isArray(p.leituras) ? p.leituras : [];
+  const ul = p.leituras[p.leituras.length - 1];
+  if (!ul || ul.p !== preco || Date.now() - Date.parse(ul.em) >= 3 * MS_H) {
+    p.leituras.push({ em: p.ult.em, p: preco });
+    if (p.leituras.length > 60) p.leituras = p.leituras.slice(-60);
+  }
   p.lidoEm = p.ult.em;
   p.falhas = 0; p.falhaMotivo = null;
 }
@@ -395,7 +410,8 @@ export function numeroDosAvisos() {
 function linkAtivacao(codigo) {
   const n = numeroDosAvisos();
   if (!n) return null;
-  const texto = 'Oi, Tico! Quero receber os avisos de preço do Tica Promos 🔔 (pedido ' + codigo + ')';
+  // Sem emoji: o wa.me troca caractere fora do plano básico por "�". Igual ao da página.
+  const texto = 'Oi, Tico! Quero receber os alertas de preço do Tica Promos (pedido ' + codigo + ')';
   return 'https://wa.me/' + n + '?text=' + encodeURIComponent(texto);
 }
 
@@ -588,6 +604,8 @@ export function observarMensagemAvisos(apelido, msg) {
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
 
     if (RE_SAIR.test(texto)) { tratarSair(jid, numeros); return; }
+    const mSairUm = RE_SAIR_UM.exec(texto);
+    if (mSairUm) { tratarSairUm(jid, numeros, Number(mSairUm[1])); return; }
 
     const mCod = RE_ATIVAR.exec(texto);
     const contatoExistente = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean) || null;
@@ -602,8 +620,12 @@ export function observarMensagemAvisos(apelido, msg) {
     }
     if (!pedidos.length) {
       if (mCod && !contatoExistente) {
-        responder(jid, 'Oi! Não encontrei o pedido ' + mCod[1] + '. Ele pode ter expirado. Faça um novo pedido em ticapromos.com.br/avisos 🙂');
+        responder(jid, 'Oi! Não encontrei o pedido ' + mCod[1] + '. Ele pode ter expirado. Faça um novo pedido em ' + SITE_ALERTAS + ' 🙂');
+        return;
       }
+      // Sem ativação pendente: comandos da conversa (lista, criar por link, ajuda).
+      tratarConversa(jid, numeros, texto, msg.pushName, contatoExistente)
+        .catch(e => console.warn('[AVISOS] Conversa: ' + e.message));
       return;
     }
 
@@ -624,7 +646,8 @@ export function observarMensagemAvisos(apelido, msg) {
 
     const lista = pedidos.map(p => '• ' + encurtar(p.titulo, 70) + (p.precoAlvo ? ' — seu preço: ' + brl(p.precoAlvo) : '')).join('\n');
     responder(jid, 'Pronto! 🔔 Vou te avisar por aqui quando o preço cair:\n\n' + lista
-      + '\n\nSalve este número como *Tico — Tica Promos* para não perder nenhum aviso.\nPara parar os avisos, responda SAIR.');
+      + '\n\nSalve este número como *Tico — Tica Promos* para não perder nenhum aviso.'
+      + '\n\nPor aqui você pode:\n• mandar *MEUS ALERTAS* para ver sua lista;\n• colar o link de outro produto para criar um alerta;\n• responder *SAIR* para parar todos.');
   } catch (e) { console.warn('[AVISOS] Mensagem recebida: ' + e.message); }
 }
 
@@ -641,7 +664,307 @@ function tratarSair(jid, numeros) {
   for (let i = _filaEnvio.length - 1; i >= 0; i--) if (_filaEnvio[i].jid === jid && !_filaEnvio[i].resposta) _filaEnvio.splice(i, 1);
   gravar();
   console.log('[AVISOS] SAIR de ' + mascarar(numeros[0] || jid) + ' — ' + alvo.length + ' pedido(s) cancelado(s).');
-  responder(jid, 'Feito, seus avisos de preço foram cancelados. Quando quiser voltar, é só pedir de novo em ticapromos.com.br/avisos 👋', true);
+  responder(jid, 'Feito, todos os seus alertas de preço foram cancelados. Quando quiser voltar, é só colar aqui o link de um produto ou pedir em ' + SITE_ALERTAS + ' 👋', true);
+}
+
+// ── Conversa com o Tico (sem IA: comandos fixos) ────────────────────────────
+// MEUS ALERTAS → lista numerada; SAIR n → para só aquele; link de produto →
+// cria alerta (o Tico pergunta o preço); qualquer outra coisa → ajuda.
+const _criacaoPendente = new Map();   // jid → { item, leitura, sugestao, em }
+const _respostasPorJid = new Map();   // jid → [ts] (trava contra laço com outro robô)
+const _ajudaPorJid = new Map();       // jid → ts da última ajuda a quem não é cliente
+
+function podeConversar(jid) {
+  const agora = Date.now();
+  const v = (_respostasPorJid.get(jid) || []).filter(t => agora - t < MS_H);
+  if (v.length >= 20) { _respostasPorJid.set(jid, v); return false; }
+  v.push(agora); _respostasPorJid.set(jid, v);
+  if (_respostasPorJid.size > 3000) _respostasPorJid.delete(_respostasPorJid.keys().next().value);
+  return true;
+}
+function falar(jid, texto) { if (podeConversar(jid)) enfileirarEnvio(jid, texto, { resposta: true }); }
+
+// Alertas em aberto de uma pessoa, na ordem em que foram criados (a numeração
+// do MEUS ALERTAS e do SAIR n é esta).
+function pedidosAbertosDe(jid, numeros, contato) {
+  const vs = new Set([...(numeros || []), ...((contato && contato.numeros) || [])].flatMap(n => [...variantesTelefone(n)]));
+  return E().pedidos
+    .filter(p => !ehFinal(p.status) && ((jid && p.jid === jid) || (contato?.jid && p.jid === contato.jid) || [...variantesTelefone(p.telefone)].some(v => vs.has(v))))
+    .sort((a, b) => String(a.criadoEm).localeCompare(String(b.criadoEm)));
+}
+
+function linhaDoPedido(p, i) {
+  const prod = E().produtos[p.produto] || {};
+  const atual = prod.ult?.preco;
+  let l = (i + 1) + '. *' + encurtar(p.titulo, 70) + '*' + (p.loja ? ' (' + p.loja + ')' : '');
+  const det = [];
+  if (p.status === 'aguardando') det.push('aguardando ativação');
+  if (p.pausado) det.push('pausado');
+  if (p.porNome) det.push('vamos procurar o produto');
+  if (atual) det.push('agora ' + brl(atual));
+  if (p.precoAlvo) {
+    if (atual && atual <= p.precoAlvo) det.push('seu preço ' + brl(p.precoAlvo) + ' ✅');
+    else det.push('seu preço ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
+  } else if (!p.porNome) det.push('aviso em quedas de ' + E().config.quedaSemAlvoPct + '%');
+  if (det.length) l += '\n   ' + det.join(' · ');
+  return l;
+}
+
+function textoAjuda(temAlertas) {
+  return 'Oi! Eu sou o Tico, do Tica Promos 🐦\n\n'
+    + 'Por aqui eu entendo só estes pedidos:\n'
+    + '• *cole o link* de um produto (Amazon, Mercado Livre ou Shopee) para criar um alerta de preço;\n'
+    + (temAlertas ? '• *MEUS ALERTAS* para ver sua lista;\n• *SAIR 2* para parar o alerta 2, ou *SAIR* para parar todos.\n' : '')
+    + '\nVocê também pode criar e ver seus alertas em ' + SITE_ALERTAS + '\n'
+    + 'Não consigo responder outras perguntas por aqui.';
+}
+
+function textoLista(abertos) {
+  if (!abertos.length) {
+    return 'Você não tem alertas de preço ativos no momento.\n\nPara criar um, cole aqui o link do produto (Amazon, Mercado Livre ou Shopee) ou use ' + SITE_ALERTAS;
+  }
+  return '🔔 *Seus alertas de preço*\n\n' + abertos.map(linhaDoPedido).join('\n\n')
+    + '\n\nPara parar um, responda *SAIR* e o número (ex.: SAIR ' + Math.min(2, abertos.length) + '). *SAIR* sozinho para todos.'
+    + '\nPara criar outro, cole aqui o link do produto.'
+    + '\nVeja a régua de preços de cada um em ' + SITE_ALERTAS;
+}
+
+function lerValor(t) {
+  let s = String(t || '').trim().replace(/^r\$\s*/i, '').replace(/\s*(reais|conto|pila)\s*$/i, '');
+  if (!/^\d[\d.,]*$/.test(s)) return null;
+  if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (/\.\d{3}$/.test(s)) s = s.replace(/\./g, '');
+  const n = Number(s);
+  return n > 0 ? arred(n) : null;
+}
+
+async function tratarConversa(jid, numeros, texto, pushName, contato) {
+  const abertos = pedidosAbertosDe(jid, numeros, contato);
+  const ehCliente = !!contato || abertos.length > 0;
+
+  if (RE_MEUS.test(texto)) {
+    if (!ehCliente) { falar(jid, textoAjuda(false)); return; }
+    falar(jid, textoLista(abertos));
+    return;
+  }
+
+  // Resposta à pergunta de preço de um alerta que está sendo criado.
+  const pend = _criacaoPendente.get(jid);
+  if (pend && Date.now() - pend.em > 30 * 60000) _criacaoPendente.delete(jid);
+  if (pend && _criacaoPendente.has(jid) && !RE_URL.test(texto)) {
+    let alvo;
+    if (RE_OK.test(texto)) alvo = pend.sugestao?.valor || null;
+    else if (RE_SEM_ALVO.test(texto)) alvo = null;
+    else {
+      alvo = lerValor(texto);
+      if (alvo == null) {
+        falar(jid, 'Não entendi o valor. Responda só com o preço que você quer pagar (ex.: ' + (pend.sugestao ? String(Math.floor(pend.sugestao.valor)) : '150') + '), *OK* para o preço sugerido ou *QUALQUER* para ser avisado de qualquer queda boa.');
+        return;
+      }
+      const atual = Number(pend.leitura?.preco);
+      if (atual > 0 && alvo >= atual) {
+        falar(jid, 'Esse valor já é igual ou maior que o preço de agora (' + brl(atual) + '). Mande um valor menor, *OK* para ' + (pend.sugestao ? brl(pend.sugestao.valor) : 'o sugerido') + ' ou *QUALQUER*.');
+        return;
+      }
+    }
+    _criacaoPendente.delete(jid);
+    const r = criarPedidoDaConversa({ jid, numeros, contato, pushName, item: pend.item, leitura: pend.leitura, alvo });
+    falar(jid, r.texto);
+    return;
+  }
+
+  const mUrl = RE_URL.exec(texto);
+  if (mUrl) {
+    const c = E().config;
+    if (!c.ativo) { falar(jid, 'Os alertas de preço estão pausados no momento. Tente de novo mais tarde.'); return; }
+    if (abertos.length >= c.limitePorCliente) {
+      falar(jid, 'Você já acompanha ' + abertos.length + ' produtos, o máximo por pessoa.\n\n' + textoLista(abertos));
+      return;
+    }
+    if (!limitarIp('wa:' + jid, 'previa-wa', 10, MS_H)) { falar(jid, 'Muitos links seguidos. Espere alguns minutos e tente de novo.'); return; }
+    let r;
+    try { r = await resolverLink(mUrl[0].replace(/[).,!?]+$/, '')); }
+    catch (e) { r = { erro: 'Não consegui ler esse link agora. Tente de novo em instantes.' }; }
+    if (r.erro) { falar(jid, r.erro + '\n\nSe preferir, faça o pedido em ' + SITE_ALERTAS); return; }
+    if (abertos.some(p => p.produto === r.item.asin)) {
+      falar(jid, 'Você já tem alerta para esse produto. Mande *MEUS ALERTAS* para ver sua lista.');
+      return;
+    }
+    const preco = Number(r.leitura?.preco);
+    const titulo = String(r.leitura?.titulo || r.item.nome || '').slice(0, 200);
+    if (!(preco > 0)) {
+      // Sem preço agora: cria o alerta sem alvo (avisa quando aparecer com queda).
+      const res = criarPedidoDaConversa({ jid, numeros, contato, pushName, item: r.item, leitura: r.leitura, alvo: null });
+      falar(jid, 'Esse produto está sem preço na loja agora. ' + res.texto);
+      return;
+    }
+    const sug = sugestaoDePreco(preco, historicoParaSugestao(r.item.asin));
+    _criacaoPendente.set(jid, { item: r.item, leitura: r.leitura, sugestao: sug, em: Date.now() });
+    if (_criacaoPendente.size > 2000) _criacaoPendente.delete(_criacaoPendente.keys().next().value);
+    falar(jid, 'Achei: *' + encurtar(titulo, 100) + '* (' + r.item.loja + ')\n'
+      + '💰 Preço agora: *' + brl(preco) + '*\n\n'
+      + 'Quanto você quer pagar? Responda só com o valor (ex.: ' + (sug ? String(Math.floor(sug.valor)) : String(Math.floor(preco * 0.9))) + ').\n'
+      + (sug ? '• *OK* para ' + brl(sug.valor) + ' (' + sug.motivo + ');\n' : '')
+      + '• *QUALQUER* para ser avisado de qualquer queda de ' + E().config.quedaSemAlvoPct + '% ou mais.');
+    return;
+  }
+
+  // Ajuda: cliente sempre (com trava de laço); quem nunca pediu, no máximo 1x/dia
+  // — o número também dispara em grupos e recebe conversa que não é para o Tico.
+  if (!ehCliente) {
+    const ult = _ajudaPorJid.get(jid) || 0;
+    if (Date.now() - ult < MS_DIA) return;
+    _ajudaPorJid.set(jid, Date.now());
+    if (_ajudaPorJid.size > 5000) _ajudaPorJid.delete(_ajudaPorJid.keys().next().value);
+  }
+  falar(jid, textoAjuda(ehCliente));
+}
+
+function criarPedidoDaConversa({ jid, numeros, contato, pushName, item, leitura, alvo }) {
+  const c = E().config;
+  const ct = contato || registrarContato(jid, numeros, pushName);
+  if (contato) registrarContato(jid, numeros, pushName);
+  guardarProduto(item, leitura);
+  const precoAtual = Number(leitura?.preco) > 0 ? arred(leitura.preco) : null;
+  const agora = new Date().toISOString();
+  const pedido = {
+    id: 'AV' + (++E().seq),
+    codigo: novoCodigo(), nome: String(ct.nome || pushName || 'Cliente WhatsApp').slice(0, 60),
+    telefone: (ct.numeros || [])[0] || numeros[0] || '',
+    produto: item.asin, loja: item.loja,
+    titulo: String(leitura?.titulo || item.nome || '').slice(0, 200),
+    precoInicial: precoAtual, precoAlvo: alvo != null && (!precoAtual || alvo < precoAtual) ? arred(alvo) : null,
+    status: 'ativo', jid,
+    criadoEm: agora, ativadoEm: agora,
+    expiraEm: new Date(Date.now() + c.validadeDias * MS_DIA).toISOString(),
+    avisos: [], ultimoAvisoPreco: null, ultimoAvisoEm: null,
+    origem: { canal: 'whatsapp' },
+  };
+  E().pedidos.push(pedido);
+  gravar();
+  console.log('[AVISOS] Pedido ' + pedido.id + ' pelo WhatsApp (' + pedido.loja + ' ' + pedido.produto + ', alvo ' + (pedido.precoAlvo ?? '—') + ').');
+  return {
+    pedido,
+    texto: 'Pronto! 🔔 Alerta criado para *' + encurtar(pedido.titulo, 80) + '*'
+      + (pedido.precoAlvo ? ' — te aviso quando chegar em ' + brl(pedido.precoAlvo) + ' ou cair bem perto disso.' : ' — te aviso quando o preço cair ' + c.quedaSemAlvoPct + '% ou mais.')
+      + '\n\nMande *MEUS ALERTAS* para ver sua lista ou *SAIR* para parar.',
+  };
+}
+
+function tratarSairUm(jid, numeros, n) {
+  const contato = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean) || null;
+  const abertos = pedidosAbertosDe(jid, numeros, contato);
+  if (!abertos.length) { if (contato) falar(jid, 'Você não tem alertas ativos no momento.'); return; }
+  const p = abertos[n - 1];
+  if (!p) { falar(jid, 'Não achei o alerta ' + n + '.\n\n' + textoLista(abertos)); return; }
+  p.status = 'cancelado'; p.canceladoEm = new Date().toISOString(); p.motivoFim = 'cliente mandou SAIR ' + n;
+  gravar();
+  console.log('[AVISOS] SAIR ' + n + ' de ' + mascarar(numeros[0] || jid) + ' — ' + p.id + ' cancelado.');
+  const resto = abertos.filter(x => x !== p);
+  falar(jid, 'Feito, parei o alerta de *' + encurtar(p.titulo, 80) + '*.'
+    + (resto.length ? '\n\n' + textoLista(resto) : '\n\nVocê não tem mais alertas ativos. Para criar um, cole aqui o link do produto.'));
+}
+
+// ── Consulta pela página (código no WhatsApp) ───────────────────────────────
+// A pessoa digita o número na página, o Tico manda um código de 6 dígitos
+// nesse WhatsApp e só com o código a lista aparece. Só vai código para quem já
+// falou com o número dos alertas (regra de não mandar mensagem a quem não pediu).
+const _codigosConsulta = new Map();   // telefone → { codigo, exp, tentativas }
+const _sessoesConsulta = new Map();   // token → { numeros, jid, exp }
+
+export function pedirCodigoConsulta(telefoneBruto, ip) {
+  const tel = normalizarTelefone(telefoneBruto);
+  if (!tel) return { ok: false, erro: 'Confira o WhatsApp: DDD + número, só números.' };
+  if (!limitarIp(ip, 'consulta-codigo', 8, MS_H)) return { ok: false, erro: 'Muitas tentativas. Espere alguns minutos.' };
+  if (!limitarIp('tel:' + tel, 'consulta-codigo-tel', 4, MS_H)) return { ok: false, erro: 'Já mandamos vários códigos para esse número. Espere alguns minutos.' };
+  const cfg = E().config;
+  const generico = { ok: true, mensagem: 'Se esse número já ativou alertas com o Tico, o código chega no WhatsApp em instantes.' };
+  const contato = contatoPorTelefone(tel);
+  if (!contato || !contato.jid) {
+    const aguardando = E().pedidos.some(p => p.status === 'aguardando' && [...variantesTelefone(p.telefone)].some(v => variantesTelefone(tel).has(v)));
+    if (aguardando) return { ok: false, erro: 'Seus alertas ainda não foram ativados. Mande a mensagem de ativação para o Tico no WhatsApp e tente de novo.' };
+    return generico;
+  }
+  if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) return { ok: false, erro: 'O WhatsApp do Tico está fora do ar agora. Tente de novo em alguns minutos.' };
+  const codigo = String(100000 + Math.floor(Math.random() * 900000));
+  _codigosConsulta.set(tel, { codigo, exp: Date.now() + 10 * 60000, tentativas: 0 });
+  enfileirarEnvio(contato.jid, 'Seu código para ver seus alertas no site: *' + codigo + '*\n\nVale por 10 minutos. Se não foi você que pediu, é só ignorar.', { resposta: true });
+  console.log('[AVISOS] Código de consulta para ' + mascarar(tel) + '.');
+  return generico;
+}
+
+export function entrarConsulta(telefoneBruto, codigoBruto, ip) {
+  const tel = normalizarTelefone(telefoneBruto);
+  const cod = String(codigoBruto || '').replace(/\D+/g, '');
+  if (!tel || cod.length !== 6) return { ok: false, erro: 'Confira o número e o código de 6 dígitos.' };
+  if (!limitarIp(ip, 'consulta-entrar', 20, MS_H)) return { ok: false, erro: 'Muitas tentativas. Espere alguns minutos.' };
+  const reg = _codigosConsulta.get(tel);
+  if (!reg || Date.now() > reg.exp) return { ok: false, erro: 'Código vencido. Peça um novo.' };
+  if (reg.codigo !== cod) {
+    reg.tentativas++;
+    if (reg.tentativas >= 5) _codigosConsulta.delete(tel);
+    return { ok: false, erro: 'Código errado. Confira a mensagem do Tico.' };
+  }
+  _codigosConsulta.delete(tel);
+  const contato = contatoPorTelefone(tel);
+  const token = createHash('sha256').update(tel + ':' + Date.now() + ':' + Math.random()).digest('hex').slice(0, 40);
+  _sessoesConsulta.set(token, { tel, jid: contato?.jid || null, exp: Date.now() + 30 * 60000 });
+  if (_sessoesConsulta.size > 2000) _sessoesConsulta.delete(_sessoesConsulta.keys().next().value);
+  return { ok: true, token, ...listaConsulta(token) };
+}
+
+function sessaoConsulta(token) {
+  const s = _sessoesConsulta.get(String(token || ''));
+  if (!s || Date.now() > s.exp) { _sessoesConsulta.delete(String(token || '')); return null; }
+  return s;
+}
+
+function serieDoProduto(prod) {
+  const dias = Object.entries(prod?.dias || {}).sort(([a], [b]) => a.localeCompare(b)).map(([d, p]) => ({ d, p }));
+  const leituras = (prod?.leituras || []).map(x => ({ em: x.em, p: x.p }));
+  const todos = [...dias.map(x => x.p), ...leituras.map(x => x.p)];
+  return {
+    dias, leituras,
+    min: todos.length ? Math.min(...todos) : null,
+    max: todos.length ? Math.max(...todos) : null,
+  };
+}
+
+export function listaConsulta(token) {
+  const s = sessaoConsulta(token);
+  if (!s) return { ok: false, erro: 'Sua sessão venceu. Peça um código novo.', sessao: false };
+  const contato = s.jid ? contatoPorJid(s.jid) : contatoPorTelefone(s.tel);
+  const abertos = pedidosAbertosDe(s.jid, [s.tel], contato);
+  return {
+    ok: true,
+    nome: contato?.nome || abertos[0]?.nome || '',
+    limite: E().config.limitePorCliente,
+    quedaSemAlvoPct: E().config.quedaSemAlvoPct,
+    alertas: abertos.map((p, i) => {
+      const prod = E().produtos[p.produto] || {};
+      return {
+        id: p.id, n: i + 1, titulo: p.titulo, loja: p.loja, imagem: prod.imagem || null,
+        status: p.status, pausado: !!p.pausado, porNome: !!p.porNome,
+        precoInicial: p.precoInicial, precoAlvo: p.precoAlvo,
+        precoAtual: prod.ult?.preco ?? null, disponivel: prod.ult ? prod.ult.disponivel !== false : null,
+        lidoEm: prod.lidoEm || null, criadoEm: p.criadoEm, expiraEm: p.expiraEm,
+        avisos: (p.avisos || []).map(a => ({ em: a.em, preco: a.preco, tipo: a.tipo })),
+        serie: serieDoProduto(prod),
+      };
+    }),
+  };
+}
+
+export function pararPelaConsulta(token, id) {
+  const s = sessaoConsulta(token);
+  if (!s) return { ok: false, erro: 'Sua sessão venceu. Peça um código novo.', sessao: false };
+  const contato = s.jid ? contatoPorJid(s.jid) : contatoPorTelefone(s.tel);
+  const p = pedidosAbertosDe(s.jid, [s.tel], contato).find(x => x.id === id);
+  if (!p) return { ok: false, erro: 'Alerta não encontrado.' };
+  p.status = 'cancelado'; p.canceladoEm = new Date().toISOString(); p.motivoFim = 'cliente parou pelo site';
+  gravar();
+  console.log('[AVISOS] ' + p.id + ' parado pelo site (' + mascarar(s.tel) + ').');
+  return listaConsulta(token);
 }
 
 function responder(jid, texto, forcar = false) {

@@ -236,7 +236,9 @@
         "app.post('/avisos-preco/pedido'",
         "app.post('/avisos-preco/previa'",
         "app.get('/avisos-preco/info'",
-        "observarMensagemAvisos('principal', mm)"
+        "observarMensagemAvisos('principal', mm)",
+        "app.post('/avisos-preco/consulta/codigo'",
+        "app.post('/avisos-preco/consulta/entrar'"
       ]
     },
     "radar-awin.js": {
@@ -554,7 +556,10 @@
         "export async function criarPedido(",
         "export async function varrerAvisos(",
         "const RE_SAIR",
-        "if (body?.aceite !== true)"
+        "if (body?.aceite !== true)",
+        "export function pedirCodigoConsulta(",
+        "export function listaConsulta(",
+        "const RE_SAIR_UM"
       ]
     }
   }
