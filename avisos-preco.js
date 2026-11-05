@@ -602,6 +602,7 @@ export function observarMensagemAvisos(apelido, msg) {
     if (ts && Date.now() - ts > 6 * MS_H) return;   // histórico antigo sincronizado na conexão
     const texto = textoDaMensagem(msg);
     if (!texto) return;
+    rastrear(jid, 'recebida', texto);
 
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
 
@@ -684,15 +685,49 @@ const _criacaoPendente = new Map();   // jid → { item, leitura, sugestao, em }
 const _respostasPorJid = new Map();   // jid → [ts] (trava contra laço com outro robô)
 const _ajudaPorJid = new Map();       // jid → ts da última ajuda a quem não é cliente
 
+// Trava contra laço (outro robô respondendo o Tico): 40 respostas/h por
+// conversa. Ao bater, avisa UMA vez em vez de sumir em silêncio.
+const _avisoTravaPorJid = new Map();
 function podeConversar(jid) {
   const agora = Date.now();
   const v = (_respostasPorJid.get(jid) || []).filter(t => agora - t < MS_H);
-  if (v.length >= 20) { _respostasPorJid.set(jid, v); return false; }
+  if (v.length >= 40) {
+    _respostasPorJid.set(jid, v);
+    rastrear(jid, 'trava', 'limite de 40 respostas/h');
+    if (agora - (_avisoTravaPorJid.get(jid) || 0) > MS_H) {
+      _avisoTravaPorJid.set(jid, agora);
+      enfileirarEnvio(jid, 'Recebi muitas mensagens seguidas 😅 Vou dar uma pausa de alguns minutos e já volto a responder.', { resposta: true });
+    }
+    return false;
+  }
   v.push(agora); _respostasPorJid.set(jid, v);
   if (_respostasPorJid.size > 3000) _respostasPorJid.delete(_respostasPorJid.keys().next().value);
   return true;
 }
-function falar(jid, texto) { if (podeConversar(jid)) { anotarConversa(jid, 'tico', texto); enfileirarEnvio(jid, texto, { resposta: true }); } }
+function falar(jid, texto) { if (podeConversar(jid)) { anotarConversa(jid, 'tico', texto); rastrear(jid, 'resposta', texto); enfileirarEnvio(jid, texto, { resposta: true }); } }
+
+// ── Rastro das conversas (diagnóstico no painel) ────────────────────────────
+// Últimos 300 eventos em memória: mensagem recebida, caminho tomado, resposta,
+// trava, falha de envio. GET /avisos-preco/conversas (só raiz).
+const _rastro = [];
+function rastrear(jid, tipo, detalhe) {
+  _rastro.push({ em: new Date().toISOString(), jid, tipo, detalhe: String(detalhe == null ? '' : detalhe).replace(/\s+/g, ' ').slice(0, 240) });
+  if (_rastro.length > 300) _rastro.splice(0, _rastro.length - 300);
+}
+export function rastroConversas({ tel = '', n = 80 } = {}) {
+  const vs = tel ? variantesTelefone(normalizarTelefone(tel) || String(tel).replace(/\D+/g, '')) : null;
+  const jidsDoTel = new Set();
+  if (vs && vs.size) {
+    for (const c of E().contatos) if ((c.numeros || []).some(x => vs.has(x))) jidsDoTel.add(c.jid);
+    for (const v of vs) jidsDoTel.add(v + '@s.whatsapp.net');
+  }
+  const ev = _rastro.filter(e => !vs || jidsDoTel.has(e.jid) || [...(vs || [])].some(v => String(e.jid).startsWith(v)));
+  return {
+    ok: true, conta: E().config.conta || null, contaConectada: E().config.conta ? !!_deps.contaConectada?.(E().config.conta) : false,
+    filaEnvio: _filaEnvio.length, iaLigada: !!_deps.ia,
+    eventos: ev.slice(-Math.min(300, Math.max(1, Number(n) || 80))),
+  };
+}
 
 // Alertas em aberto de uma pessoa, na ordem em que foram criados (a numeração
 // do MEUS ALERTAS e do SAIR n é esta).
@@ -784,9 +819,14 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
       return;
     }
     if (!limitarIp('wa:' + jid, 'previa-wa', 10, MS_H)) { falar(jid, 'Muitos links seguidos. Espere alguns minutos e tente de novo.'); return; }
+    rastrear(jid, 'link', mUrl[0]);
+    // Mercado Livre pode levar até ~20 s (página lida pela extensão): avisa que está olhando.
+    const espera = setTimeout(() => falar(jid, 'Só um instante, estou olhando esse produto 🔎'), 4000);
     let r;
     try { r = await resolverLink(mUrl[0].replace(/[).,!?]+$/, '')); }
-    catch (e) { r = { erro: 'Não consegui ler esse link agora. Tente de novo em instantes.' }; }
+    catch (e) { rastrear(jid, 'erro', 'leitura do link: ' + e.message); r = { erro: 'Não consegui ler esse link agora. Tente de novo em instantes.' }; }
+    finally { clearTimeout(espera); }
+    if (r.erro) rastrear(jid, 'link-erro', r.erro);
     if (r.erro) { falar(jid, r.erro + '\n\nSe preferir, faça o pedido em ' + SITE_ALERTAS); return; }
     if (abertos.some(p => p.produto === r.item.asin)) {
       falar(jid, 'Você já tem alerta para esse produto. Mande *MEUS ALERTAS* para ver sua lista.');
@@ -965,6 +1005,7 @@ async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos,
   const n = Number(r.n);
   const valor = Number(r.valor), pct = Number(r.pct);
   console.log('[AVISOS] IA: ' + r.acao + ' (' + mascarar(numeros[0] || jid) + ').');
+  rastrear(jid, 'ia', r.acao + (resposta ? ' · ' + resposta : ''));
 
   switch (r.acao) {
     case 'definir_alvo':
@@ -1206,9 +1247,10 @@ export function pararPelaConsulta(token, id) {
 
 function responder(jid, texto, forcar = false) {
   const ult = _ultimaRespostaPorJid.get(jid) || 0;
-  if (!forcar && Date.now() - ult < 30000) return;
+  if (!forcar && Date.now() - ult < 30000) { rastrear(jid, 'resposta-suprimida', texto); return; }
   _ultimaRespostaPorJid.set(jid, Date.now());
   anotarConversa(jid, 'tico', texto);
+  rastrear(jid, 'resposta', texto);
   enfileirarEnvio(jid, texto, { resposta: true });
 }
 
@@ -1228,6 +1270,7 @@ async function processarFila() {
       const c = E().config;
       if (!c.conta || !_deps.contaConectada?.(c.conta)) {
         console.warn('[AVISOS] Conta dos avisos (' + (c.conta || 'nenhuma') + ') desconectada — ' + _filaEnvio.length + ' mensagem(ns) esperando.');
+        rastrear(_filaEnvio[0]?.jid || '', 'conta-desconectada', c.conta || 'nenhuma');
         break;
       }
       const item = _filaEnvio[0];
@@ -1243,6 +1286,7 @@ async function processarFila() {
         if (item.aoEnviar) { try { item.aoEnviar(); } catch (e) {} }
       } catch (e) {
         console.warn('[AVISOS] Envio para ' + mascarar(digitosDeJid(item.jid) || item.jid) + ' falhou: ' + e.message);
+        rastrear(item.jid, 'envio-falhou', e.message);
         if (item.aoFalhar) { try { item.aoFalhar(e); } catch (e2) {} }
       }
       if (item.resposta) await new Promise(r => setTimeout(r, 2500));

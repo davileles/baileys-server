@@ -238,7 +238,8 @@
         "app.get('/avisos-preco/info'",
         "observarMensagemAvisos('principal', mm)",
         "app.post('/avisos-preco/consulta/codigo'",
-        "app.post('/avisos-preco/consulta/entrar'"
+        "app.post('/avisos-preco/consulta/entrar'",
+        "app.get('/avisos-preco/conversas'"
       ]
     },
     "radar-awin.js": {

@@ -182,7 +182,7 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido,
-         pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta } from './avisos-preco.js';
+         pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -26389,6 +26389,12 @@ app.post('/avisos-preco/pedido/:id/:acao', async (req, res) => {
   // 'vincular' {url}: liga um pedido feito pelo nome ao link certo do produto.
   if (req.params.acao === 'vincular') return res.json(await vincularLinkPedido(String(req.params.id), String(req.body?.url || '')));
   res.json(avisosAcaoPedido(String(req.params.id), String(req.params.acao)));
+});
+// Diagnóstico da conversa com o Tico (mensagens recebidas, caminho, respostas,
+// travas). ?tel=31999999999 filtra uma pessoa; ?n= quantos eventos (até 300).
+app.get('/avisos-preco/conversas', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(rastroConversas({ tel: String(req.query.tel || ''), n: req.query.n }));
 });
 app.post('/avisos-preco/varrer', async (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
