@@ -26,7 +26,7 @@ import QRCode from 'qrcode';
 import {
   carregarRadarConfig, salvarRadarConfig, radarConfig,
   radarFontes, radarDestinos, ehFonteRadar,
-  trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento, detalharRoteamento,
+  trilhas, salvarTrilhas, destinosGerais, destinosDasTrilhas, destinosDaOferta, explicarRoteamento, detalharRoteamento, nichoDaFonte,
   ehDestinoDeNicho,
   comRodapeExtra, rodapeExtraParaGrupo,
   comTagDoGrupo, previewComTagDoGrupo,
@@ -5889,6 +5889,14 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   }
 
   if (!alvos.length) {
+    // Fonte so de nicho e produto que o classificador nao confirmou no nicho:
+    // nao e erro de configuracao, e oferta possivelmente fora do nicho.
+    const _nichoFonte = nichoDaFonte(_rota.fonte);
+    if (_nichoFonte && trilhas().length) {
+      throw new Error('fora do nicho ' + _nichoFonte + '? o classificador nao confirmou a categoria'
+        + (_rota.categoria && _rota.categoriaConfiavel ? ' (leu ' + _rota.categoria + ')' : '')
+        + ' — marque a trilha a mao se for do nicho.');
+    }
     throw new Error(trilhas().length
       ? 'Nenhuma trilha entrega esta oferta — confira as fontes e destinos na aba Grupos.'
       : 'Nenhuma trilha configurada na aba Grupos.');

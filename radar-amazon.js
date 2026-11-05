@@ -389,13 +389,30 @@ function trilhaEntrega(t, { fonte, categoria, categoriaConfiavel, nichoBarrado }
   // Curadoria do nicho reprovou o produto: esta trilha recusa, venha de onde vier.
   if (nichoBarrado && t.categoria === nichoBarrado) return false;
   if (categoriaConfiavel && t.categoria === categoria) return true;
-  // Fonte dedicada cobre o buraco do classificador: entrega quando ele nao tem
-  // opiniao, e SO quando nao tem — categoria confirmada e diferente continua
-  // barrando, senao o grupo de bebe receberia a cerveja postada por engano.
-  if (fonteDedicadaA(fonte, t.categoria)) {
+  // Fonte dedicada NAO abre mais a trilha sozinha (decisao de 05/11/2026): o
+  // grupo-fonte "de bebe" tambem posta ar-condicionado, lavadora, pipoqueira,
+  // controle de videogame — e tudo o que o classificador nao reconhecia saia no
+  // grupo Baby e Kids. Agora a trilha de nicho so entrega com a categoria
+  // confirmada; o que fica sem categoria vai para revisao (card no bot), onde o
+  // operador pode marcar a trilha a mao. NICHO_FONTE_LIBERA=1 volta ao antigo.
+  if (process.env.NICHO_FONTE_LIBERA === '1' && fonteDedicadaA(fonte, t.categoria)) {
     return !(categoriaConfiavel && categoria && categoria !== t.categoria);
   }
   return false;
+}
+
+/**
+ * Categoria de nicho a que esta fonte se dedica (alimenta so trilhas daquela
+ * categoria), ou null. Usado para explicar por que uma oferta de fonte de nicho
+ * ficou sem destino: nao e configuracao errada, e produto fora do nicho.
+ */
+export function nichoDaFonte(fonte) {
+  const f = String(fonte || '').trim();
+  if (!f) return null;
+  for (const t of trilhas()) {
+    if (t.categoria && t.fontes.includes(f) && fonteDedicadaA(f, t.categoria)) return t.categoria;
+  }
+  return null;
 }
 
 export function destinosDaOferta({ fonte, categoria, categoriaConfiavel, nichoBarrado } = {}) {
