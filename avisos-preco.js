@@ -1063,7 +1063,7 @@ function textoPerguntaAlvo(item, titulo, preco, sug) {
   if (!preco) {
     l.push('Ainda não consegui ver o preço desse anúncio por aqui, mas vou ficar de olho nele. 👀');
     l.push('');
-    l.push('Quanto você gostaria de pagar? Dá uma olhada no preço na loja e me manda um valor, tipo *150*.');
+    l.push('Quanto você gostaria de pagar? Dá uma olhada no preço na loja e me manda um valor, tipo *R$ 150*.');
     l.push('');
     l.push('Se preferir, responda *QUALQUER* que eu te aviso de qualquer queda boa.');
     return l.join('\n');
@@ -1081,7 +1081,7 @@ function textoPerguntaAlvo(item, titulo, preco, sug) {
   l.push('');
   l.push('Quanto você gostaria de pagar? Pode me mandar do jeito que for mais fácil:');
   l.push('');
-  l.push('• um valor, tipo *' + Math.floor(preco * 0.85) + '*');
+  l.push('• um valor, tipo *R$ ' + Math.floor(preco * 0.85) + '*');
   l.push('• um desconto, tipo *15%*');
   if (sug) {
     const porque = /^menor/i.test(sug.motivo || '') ? 'o ' + sug.motivo : Math.round((1 - sug.valor / preco) * 100) + '% abaixo de hoje';
