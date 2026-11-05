@@ -4927,9 +4927,21 @@ async function verificarAdminGruposCupons() {
 // ja recebeu.
 // Cupom divide o mesmo marcapasso da oferta: o que o WhatsApp mede e mensagem
 // caindo no grupo, nao o tipo de conteudo que a gente atribuiu a ela.
+// ── CARIMBO DO DISPARO (04/11/2026) ──────────────────────────────────────────
+// Marca na oferta quando o envio aos grupos comecou (ja fora do portao) e quando
+// terminou. Vai para o historico duravel junto com a hora de coleta, para medir
+// coleta -> inicio -> fim de toda oferta do dia (antes so o fim ficava gravado e
+// a coleta sumia junto com a filaPendentes). Retomada/outbox preserva o inicio.
+async function comCarimboDeEnvio(oferta, fn) {
+  if (oferta && !oferta.envioInicioEm) oferta.envioInicioEm = new Date().toISOString();
+  const r = await fn();
+  if (oferta) oferta.envioFimEm = new Date().toISOString();
+  return r;
+}
+
 function enviarCupomParaGrupos(mensagem, imagem, oferta) {
   return comPortaoDePublicacao(
-    () => _despacharCupomParaGrupos(mensagem, imagem, oferta),
+    () => comCarimboDeEnvio(oferta, () => _despacharCupomParaGrupos(mensagem, imagem, oferta)),
     'cupom #' + (oferta?.id || '?'));
 }
 
@@ -5645,13 +5657,13 @@ function comPortaoDePublicacao(fn, rotulo = '', opcoes = {}) {
 // para o caminho de retomada/outbox, que reenvia o que ja tinha sido publicado
 // e nao deve consumir o ritmo de conteudo novo.
 function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
-  if (opcoes.semPortao) return _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes);
+  if (opcoes.semPortao) return comCarimboDeEnvio(oferta, () => _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes));
   return comPortaoDePublicacao(
     async () => {
       // A releitura roda na VEZ da oferta (depois da espera no portao), que e
       // quando o preco pode ter mudado.
       if (opcoes.revalidarPreco) await revalidarOfertaVelha(oferta);
-      return _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes);
+      return comCarimboDeEnvio(oferta, () => _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes));
     },
     'oferta #' + (oferta?.id || '?'),
     { perecivel: ofertaPerecivel(oferta) });
@@ -6208,6 +6220,9 @@ async function registrarEnvioHistorico(oferta) {
           loteTamanho:   oferta.loteCupons.length,
           mensagens:     i === 0 ? 1 : 0,
           enviadoEm:     quando,
+          capturadoEm:   c.capturadoEm || oferta.timestamp || null,
+          envioInicioEm: oferta.envioInicioEm || null,
+          envioFimEm:    oferta.envioFimEm || null,
           tipoConteudo:  'cupom_tsp',
           subtipo:       c.subtipo || null,
           loja:          c.loja || null,
@@ -6244,6 +6259,11 @@ async function registrarEnvioHistorico(oferta) {
     regs.push({
       id:            oferta.id,
       enviadoEm:     oferta.enviadoEm || new Date().toISOString(),
+      // Coleta -> inicio -> fim do disparo (04/11/2026). Lista e monitor tambem
+      // tem 'timestamp' (entrada na fila), entao a coleta deles e essa hora.
+      capturadoEm:   oferta.timestamp || null,
+      envioInicioEm: oferta.envioInicioEm || null,
+      envioFimEm:    oferta.envioFimEm || null,
       tipoConteudo:  oferta.tipoConteudo,
       subtipo:       d.subtipo || null,
       loja:          d.loja || null,
@@ -17706,6 +17726,8 @@ app.get('/operacao/fila', async (req, res) => {
           origemNome:    (origem && origem.endsWith && origem.endsWith('@g.us')) ? (NOMES_GRUPOS.get(origem) || null) : null,
           capturadoEm:   o.timestamp || null,
           enviadoEm:     o.enviadoEm || null,
+          envioInicioEm: o.envioInicioEm || null,
+          envioFimEm:    o.envioFimEm || null,
           gruposDestino: Array.isArray(o.gruposEnviados) ? o.gruposEnviados.length : null,
           // Previa da aba Fila tambem vale para o que ja saiu: mesma mensagem
           // e mesma flag de imagem dos itens aguardando.
