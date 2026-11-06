@@ -77,7 +77,21 @@ function zerarDia() {
 }
 function gravar() {
   if (!_arquivo) return;
-  try { escreverAtomico(_arquivo, JSON.stringify({ dia: _estado.dia, hoje: _estado.hoje, porMotivo: _estado.porMotivo, verificacao: _estado.verificacao })); } catch (e) {}
+  try { escreverAtomico(_arquivo, JSON.stringify({ dia: _estado.dia, hoje: _estado.hoje, porMotivo: _estado.porMotivo, verificacao: _estado.verificacao, zeradoEm: _estado.zeradoEm || null })); } catch (e) {}
+}
+
+// Zera a contagem do dia (o teto volta a valer do zero). Usado pela rota de
+// operador e, uma vez, no boot de 06/11/2026: as 200 paginas daquele dia
+// foram gastas pelo monitor antes da cota por finalidade existir.
+const ZERAR_NO_BOOT_DIA = '2026-11-06';
+export function zerarContagemPaginasMl(motivo = 'operador') {
+  zerarDia();
+  const antes = { hoje: _estado.hoje, porMotivo: { ..._estado.porMotivo } };
+  _estado.hoje = 0; _estado.porMotivo = {}; _estado.zeradoEm = _estado.dia;
+  gravar();
+  console.log('[ML] Contagem de paginas do dia zerada (' + motivo + '): eram ' + antes.hoje + '.');
+  acordarExtensao();
+  return { ok: true, antes, estado: estadoPaginasMl() };
 }
 
 /** Chamado no boot pelo server com o diretorio da sessao. */
@@ -88,9 +102,11 @@ export function iniciarPaginasMl(sessaoDir) {
       const m = JSON.parse(readFileSync(_arquivo, 'utf-8'));
       if (m?.dia === diaSp()) { _estado.dia = m.dia; _estado.hoje = Number(m.hoje) || 0; _estado.porMotivo = (m.porMotivo && typeof m.porMotivo === 'object') ? m.porMotivo : {}; }
       if (m?.verificacao?.url) _estado.verificacao = m.verificacao;
+      if (m?.dia === diaSp()) _estado.zeradoEm = m.zeradoEm || null;
     }
   } catch (e) {}
   zerarDia();
+  if (_estado.dia === ZERAR_NO_BOOT_DIA && _estado.zeradoEm !== ZERAR_NO_BOOT_DIA) zerarContagemPaginasMl('boot de ' + ZERAR_NO_BOOT_DIA);
   setInterval(() => { testarVerificacaoMl(false).catch(() => {}); }, 60000).unref?.();
 }
 

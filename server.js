@@ -219,7 +219,7 @@ import {
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
   formatarOfertaMl, amostrasCardSocialMl, paginaMlBloqueadaHtml,
 } from './radar-ml.js';
-import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl } from './paginas-ml.js';
+import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
 // variavel porque o endpoint interno pode mudar sem aviso.
@@ -22411,6 +22411,11 @@ app.post('/ml/pagina/testar', async (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
   try { res.json({ ok: true, ...(await testarVerificacaoMl(true)) }); }
   catch (e) { res.json({ ok: false, erro: e.message }); }
+});
+// Zera a contagem de paginas do dia (so administrador logado).
+app.post('/ml/pagina/zerar', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(zerarContagemPaginasMl('painel'));
 });
 app.get('/ml/pagina/estado', (req, res) => {
   res.set('Cache-Control', 'no-store');

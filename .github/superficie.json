@@ -554,7 +554,8 @@
       "obrigatorio": [
         "export function pedirPaginaMl(",
         "export function atenderLongPollPaginasMl(",
-        "export function registrarResultadoPaginaMl("
+        "export function registrarResultadoPaginaMl(",
+        "export function zerarContagemPaginasMl("
       ]
     },
     "avisos-preco.js": {
