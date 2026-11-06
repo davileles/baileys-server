@@ -30,7 +30,7 @@ import { createHash } from 'crypto';
 import { agendarPush } from './sync-github.js';
 import { gerarImagemAviso } from './cartao-aviso.js';
 import { lerPrecoProduto, lerPrecosAmazonEmLote, estatisticas as estatisticasMonitor } from './monitor-precos.js';
-import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon, buscarAmazonPorTermo, listarCuponsBase, cupomVigente } from './radar-amazon.js';
+import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon, buscarAmazonPorTermo, listarCuponsBase, cupomVigente, lerParcelamentoAmazon } from './radar-amazon.js';
 import { ehLinkShopee, extrairIdsShopee, buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk, buscarShopeePorTermo } from './radar-shopee.js';
 import { ehLinkMl, resolverLinhaVitrineMl, buscarDadosProdutoMl, tokenAffOk, cupomDaPaginaParaCatalogoMl } from './radar-ml.js';
 
@@ -914,6 +914,8 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     if (resp) { aplicarAlvoPendente({ jid, numeros, contato, pushName, pend, resp }); return; }
   }
 
+  if (!pend && tratarConfirmacaoAlvo(jid, texto)) return;
+
   const mUrl = RE_URL.exec(texto);
   if (mUrl) {
     const c = E().config;
@@ -1056,7 +1058,7 @@ O que você faz por aqui: alertas de preço. A pessoa cola o link de um produto 
 
 Outras lojas: depois que o alerta é criado, você procura sozinho o MESMO produto (mesma marca, modelo e versão) nas outras lojas — Amazon e Shopee; no Mercado Livre só quando a equipe acrescenta o link — e avisa pelo menor preço entre elas, com o link da loja mais barata. A busca nem sempre encontra (anúncio diferente, modelo parecido fica de fora). Se a pessoa quiser garantir uma loja específica, ela pode colar o link de lá e criar mais um alerta.
 
-Preço que vale: o preço à vista que a loja mostra no anúncio (com o cupom quando o próprio anúncio oferece). Você NÃO acompanha preço parcelado: as parcelas e o total parcelado mudam conforme o cartão e o número de parcelas. Na Amazon, vários vendedores ficam no mesmo anúncio: links diferentes do mesmo anúncio são o mesmo alerta.
+Preço que vale: o preço à vista que a loja mostra no anúncio (com o cupom quando o próprio anúncio oferece). O alerta compara sempre o preço à vista. Quando a pessoa disser quanto quer pagar NO PARCELADO (total parcelado ou valor da parcela), use a ação "alvo_parcelado": o sistema lê o parcelamento da loja e converte para o preço à vista equivalente — nunca faça essa conta você mesmo. Na Amazon, vários vendedores ficam no mesmo anúncio: links diferentes do mesmo anúncio são o mesmo alerta.
 
 Outros caminhos que você pode indicar: ofertas do dia em ticapromos.com.br; grupos de promoções em ir.ticapromos.com.br/geral. Você NÃO tem acesso a pedidos, entregas, trocas ou atendimento das lojas (isso é com a loja), nem lista cupons por aqui (cupons saem nos grupos e no site).
 
@@ -1067,7 +1069,7 @@ Regras:
 - Se não entender, diga com naturalidade o que você consegue fazer.
 
 Responda SÓ com um JSON, sem texto fora dele:
-{"acao": "...", "valor": null, "pct": null, "n": null, "resposta": "..."}
+{"acao": "...", "valor": null, "pct": null, "n": null, "parcelas": null, "tipo": null, "resposta": "..."}
 
 Ações:
 - "responder": só conversa; escreva a resposta em "resposta".
@@ -1079,7 +1081,81 @@ Ações:
 - "parar": quer parar UM alerta; "n" = número dele na lista do CONTEXTO.
 - "parar_todos": quer parar TODOS os alertas.
 - "mudar_alvo": quer trocar o preço desejado de um alerta existente; "n" = número na lista, e "valor" ou "pct".
+- "alvo_parcelado": quer que o PARCELADO chegue num valor. "valor" = o valor em reais que a pessoa disse; "tipo" = "total" (total parcelado) ou "parcela" (valor de cada parcela); "parcelas" = número de parcelas se ela disse (senão null); "n" = número do alerta na lista (null se for o alerta em criação ou se ela só tem um).
 Em todas as ações, "resposta" pode ficar vazia (o sistema escreve a confirmação), exceto em "responder".`;
+
+// ── Alvo pelo parcelado (06/11/2026) ──
+// O alerta compara o preço à vista; quando a pessoa pensa no parcelado, o
+// código lê a tabela de parcelamento da loja e converte para o à vista
+// equivalente. Só Amazon (as outras lojas não mostram a tabela para a gente).
+const _confirmacaoAlvo = new Map();   // jid → { pedidoId, valor, em }
+const RE_SIM = /^\s*(sim|s|pode|pode sim|ok|okay|isso|quero|claro|bora|fechado|beleza|blz|manda|faz|pode fazer|por favor)\s*[.!]*\s*$/i;
+const RE_NAO = /^\s*(n[aã]o|nao quero|deixa|deixa assim|n)\s*[.!]*\s*$/i;
+
+async function responderAlvoParcelado({ jid, numeros, contato, pushName, pend, pedido, valor, tipo, parcelas }) {
+  const item = pend ? pend.item : (E().produtos[pedido.produto] ? itemDoProduto(E().produtos[pedido.produto]) : null);
+  const titulo = pend ? (pend.titulo || item?.nome || '') : pedido.titulo;
+  const precoAgora = pend ? (Number(pend.leitura?.preco) || null) : (E().produtos[pedido.produto]?.ult?.preco || pedido.precoInicial || null);
+  if (!item || item.loja !== 'Amazon') {
+    falar(jid, 'O alerta acompanha o preço à vista. Nessa loja eu não consigo ver o parcelamento por aqui, então me diga quanto você quer pagar à vista e eu ajusto. 🙂');
+    return;
+  }
+  const tab = await lerParcelamentoAmazon(item.asin).catch(() => null);
+  const base = Number(tab?.precoPagina) || Number(precoAgora) || null;
+  if (!tab || !tab.opcoes?.length || !base) {
+    falar(jid, 'O alerta acompanha o preço à vista, e agora não consegui ver o parcelamento desse produto na loja. Me diga quanto você quer pagar à vista e eu ajusto o alerta. 🙂');
+    return;
+  }
+  const maxN = Math.max(...tab.opcoes.map(o => o.n));
+  const nEsc = parcelas && tab.opcoes.some(o => o.n === parcelas) ? parcelas : maxN;
+  const op = tab.opcoes.find(o => o.n === nEsc);
+  const total = tipo === 'parcela' ? valor * nEsc : valor;
+  const fator = op.juros ? op.total / base : 1;
+  const alvoVista = arred(Math.floor((total / fator) * 100) / 100);
+  const l = [];
+  if (op.juros) {
+    l.push('Hoje, na Amazon, em *' + nEsc + 'x* o total parcelado fica *' + Math.round((fator - 1) * 100) + '% acima* do preço à vista (' + brl(base) + ' à vista vira ' + brl(op.total) + ').');
+  } else {
+    l.push('Hoje, na Amazon, dá para parcelar em *' + nEsc + 'x sem juros*, então o parcelado é igual ao preço à vista.');
+  }
+  l.push('');
+  l.push('Para o parcelado em ' + nEsc + 'x ficar em ' + (tipo === 'parcela' ? '*' + brl(valor) + ' por mês* (' + brl(total) + ' no total)' : 'uns *' + brl(total) + '*')
+    + ', o preço à vista precisa chegar em *' + brl(alvoVista) + '*.');
+  if (base && alvoVista >= base) {
+    l.push('');
+    l.push('Isso já é igual ou acima do preço de agora, então pode comprar se o parcelamento te atende. 😉');
+    falar(jid, l.join('\n'));
+    return;
+  }
+  l.push('');
+  l.push('_Os juros mudam conforme o cartão; a conta usa o parcelamento que a loja mostra agora._');
+  if (pend) {
+    falar(jid, l.join('\n'));
+    aplicarAlvoPendente({ jid, numeros, contato, pushName, pend, resp: { tipo: 'valor', valor: alvoVista } });
+    return;
+  }
+  l.push('');
+  l.push('Quer que eu troque o seu alerta de *' + encurtar(titulo, 60) + '* para *' + brl(alvoVista) + '*? Responda *SIM*.');
+  _confirmacaoAlvo.set(jid, { pedidoId: pedido.id, valor: alvoVista, em: Date.now() });
+  if (_confirmacaoAlvo.size > 2000) _confirmacaoAlvo.delete(_confirmacaoAlvo.keys().next().value);
+  falar(jid, l.join('\n'));
+}
+
+function tratarConfirmacaoAlvo(jid, texto) {
+  const c = _confirmacaoAlvo.get(jid);
+  if (!c) return false;
+  if (Date.now() - c.em > 60 * 60000) { _confirmacaoAlvo.delete(jid); return false; }
+  if (RE_NAO.test(texto)) { _confirmacaoAlvo.delete(jid); falar(jid, 'Tudo bem, deixei o alerta como estava. 👍'); return true; }
+  if (!RE_SIM.test(texto)) return false;
+  _confirmacaoAlvo.delete(jid);
+  const p = E().pedidos.find(x => x.id === c.pedidoId);
+  if (!p || ehFinal(p.status)) { falar(jid, 'Esse alerta não está mais ativo. Mande *MEUS ALERTAS* para ver sua lista.'); return true; }
+  p.precoAlvo = c.valor; p.ultimoAvisoPreco = null;
+  gravar();
+  console.log('[AVISOS] ' + p.id + ' alvo trocado para ' + c.valor + ' (parcelado convertido) pela conversa.');
+  falar(jid, 'Pronto! 🎯 Seu alerta de *' + encurtar(p.titulo, 70) + '* agora espera *' + brl(c.valor) + '* à vista. Te aviso quando chegar lá.');
+  return true;
+}
 
 function contextoParaIa(jid, abertos, pend) {
   const l = [];
@@ -1146,6 +1222,13 @@ async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos,
     case 'parar_todos':
       tratarSair(jid, numeros);
       return true;
+    case 'alvo_parcelado': {
+      if (!(valor > 0)) break;
+      const alvoP = pend ? null : (abertos[n - 1] || (abertos.length === 1 ? abertos[0] : null));
+      if (!pend && !alvoP) break;
+      await responderAlvoParcelado({ jid, numeros, contato, pushName, pend, pedido: alvoP, valor, tipo: r.tipo === 'parcela' ? 'parcela' : 'total', parcelas: Number(r.parcelas) > 0 ? Number(r.parcelas) : null });
+      return true;
+    }
     case 'mudar_alvo': {
       const p = abertos[n - 1];
       if (!p) break;

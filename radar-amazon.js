@@ -2370,6 +2370,66 @@ export function avistaDoTexto(texto, precoApi) {
 }
 
 /** Preco a vista do ASIN, com cache. null quando o produto nao tem. */
+// ── PARCELAMENTO DA PDP (06/11/2026) ─────────────────────────────────────
+// A API não traz parcelas; a página traz a tabela "Prazo | Total (R$)" do
+// cartão (InstallmentCalculatorTableCredit). Usado pelo Tico quando o cliente
+// quer o alerta pelo valor parcelado: o código converte o parcelado desejado
+// no preço à vista equivalente. Cache de 2 h por ASIN; falha devolve null.
+const _parcelasCache = new Map();
+const RE_PARC_LINHA = /Em\s*(\d{1,2})x\s*de\s*R\$(?:&nbsp;|\s)*([\d.]+,\d{2})\s*<br>\s*<span[^>]*>\s*(sem|com)\s+juros\s*<\/span>\s*<\/td>\s*<td[^>]*>\s*R\$(?:&nbsp;|\s)*([\d.]+,\d{2})/gi;
+const numBr = s => Number(String(s).replace(/\./g, '').replace(',', '.'));
+export async function lerParcelamentoAmazon(asin) {
+  if (!/^[A-Z0-9]{10}$/i.test(String(asin || ''))) return null;
+  const c = _parcelasCache.get(asin);
+  if (c && Date.now() - c.em < 2 * 3600000) return c.r;
+  let html = '';
+  try {
+    const res = await fetch('https://www.amazon.com.br/dp/' + asin, {
+      redirect: 'follow',
+      headers: {
+        'User-Agent': UA_NAVEGADOR,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+        'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none', 'Upgrade-Insecure-Requests': '1',
+        ...(_avistaCookies ? { 'Cookie': _avistaCookies } : {}),
+      },
+      signal: AbortSignal.timeout(20000),
+    });
+    guardarCookiesAmazon(res);
+    if (!res.ok || !res.body) return null;
+    const leitor = res.body.getReader();
+    const dec = new TextDecoder('utf-8');
+    let bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await leitor.read();
+        if (done) break;
+        bytes += value.length;
+        html += dec.decode(value, { stream: true });
+        if (bytes >= 1800 * 1024) break;
+        const i = html.indexOf('InstallmentCalculatorTableCredit');
+        if (i >= 0 && html.indexOf('</table>', i) > 0) break;
+      }
+    } finally { try { await leitor.cancel(); } catch (_) {} }
+  } catch (e) { return null; }
+  const i = html.indexOf('InstallmentCalculatorTableCredit');
+  if (i < 0) { _parcelasCache.set(asin, { em: Date.now(), r: null }); return null; }
+  const tabela = html.slice(i, html.indexOf('</table>', i) + 8);
+  const opcoes = new Map();
+  let m; RE_PARC_LINHA.lastIndex = 0;
+  while ((m = RE_PARC_LINHA.exec(tabela))) {
+    const n = Number(m[1]);
+    if (!opcoes.has(n)) opcoes.set(n, { n, parcela: numBr(m[2]), total: numBr(m[4]), juros: m[3].toLowerCase() === 'com' });
+  }
+  const mV = RE_AVISTA_VALOR.exec(html);
+  const mP = /"priceAmount"\s*:\s*([\d.]+)/.exec(html);
+  const precoPagina = mV ? Number(mV[1]) : mP ? Number(mP[1]) : null;
+  const r = opcoes.size ? { precoPagina: precoPagina > 0 ? precoPagina : null, opcoes: [...opcoes.values()].sort((a, b) => a.n - b.n), em: new Date().toISOString() } : null;
+  _parcelasCache.set(asin, { em: Date.now(), r });
+  return r;
+}
+
 export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
   if (!asin || !precoApi) return null;
   const visto = _avistaCache.get(asin);
