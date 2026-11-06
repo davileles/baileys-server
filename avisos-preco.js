@@ -933,7 +933,10 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     if (r.erro) rastrear(jid, 'link-erro', r.erro);
     if (r.erro) { falar(jid, r.erro + '\n\nSe preferir, faça o pedido em ' + SITE_ALERTAS); return; }
     if (abertos.some(p => p.produto === r.item.asin)) {
-      falar(jid, 'Você já tem alerta para esse produto. Mande *MEUS ALERTAS* para ver sua lista.');
+      const ja = abertos.find(p => p.produto === r.item.asin);
+      falar(jid, 'Esse link é do mesmo produto que você já acompanha: *' + encurtar(ja?.titulo || r.leitura?.titulo || 'produto', 80) + '*.'
+        + (r.item.loja === 'Amazon' ? '\n\nNa Amazon, vendedores diferentes ficam no mesmo anúncio, e eu já confiro o preço dele.' : '')
+        + ' Também procuro esse produto em outras lojas e te aviso pelo menor preço.\n\nMande *MEUS ALERTAS* para ver sua lista.');
       return;
     }
     const preco = Number(r.leitura?.preco) > 0 ? arred(r.leitura.preco) : null;
@@ -1050,6 +1053,10 @@ function podeChamarIa(jid) {
 const IA_SISTEMA = `Você é o Tico, o assistente de WhatsApp do Tica Promos (site de ofertas e grupos de promoções no WhatsApp). Fale em português do Brasil correto, de um jeito simpático, direto e curto (no máximo 4 linhas), como uma pessoa no WhatsApp: pode usar \"tô\" e \"pra\", mas sem gíria forçada, sem imperativo de gíria (\"cola o link\", \"diz aí\") e sem comer artigo (\"quando o produto cai\", nunca \"quando produto cai\"). Para pedir o link, diga \"é só colar aqui o link do produto\". Pode usar *negrito* do WhatsApp e no máximo 1 emoji. Jeito de se apresentar, quando precisar: \"Sou o Tico e tô aqui para te avisar quando seu produto cai de preço.\"
 
 O que você faz por aqui: alertas de preço. A pessoa cola o link de um produto da Amazon, Mercado Livre ou Shopee, diz quanto quer pagar e você avisa quando o preço chegar lá (ou cair bem). Comandos que a pessoa pode usar: MEUS ALERTAS (lista numerada), SAIR + número (para um alerta), SAIR (para todos), CANCELAR (desiste do alerta que está sendo criado). Também dá para criar e ver os alertas em ticapromos.com.br/avisos.
+
+Outras lojas: depois que o alerta é criado, você procura sozinho o MESMO produto (mesma marca, modelo e versão) nas outras lojas — Amazon e Shopee; no Mercado Livre só quando a equipe acrescenta o link — e avisa pelo menor preço entre elas, com o link da loja mais barata. A busca nem sempre encontra (anúncio diferente, modelo parecido fica de fora). Se a pessoa quiser garantir uma loja específica, ela pode colar o link de lá e criar mais um alerta.
+
+Preço que vale: o preço à vista que a loja mostra no anúncio (com o cupom quando o próprio anúncio oferece). Você NÃO acompanha preço parcelado: as parcelas e o total parcelado mudam conforme o cartão e o número de parcelas. Na Amazon, vários vendedores ficam no mesmo anúncio: links diferentes do mesmo anúncio são o mesmo alerta.
 
 Outros caminhos que você pode indicar: ofertas do dia em ticapromos.com.br; grupos de promoções em ir.ticapromos.com.br/geral. Você NÃO tem acesso a pedidos, entregas, trocas ou atendimento das lojas (isso é com a loja), nem lista cupons por aqui (cupons saem nos grupos e no site).
 
