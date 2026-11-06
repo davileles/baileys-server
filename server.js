@@ -212,7 +212,7 @@ import {
   chavesCookieAff, lerCuponsAtivosMl, lerTodosCuponsMl, ativarCupomMl,
   extrairCuponsPaginaMl, juntarLeiturasCuponsMl, urlsLeituraCuponsMl, htmlLogadoBloqueado, validadeDeTexto, validadeDeVencimento,
   resolverLinhaVitrineMl, montarOfertasMlVitrine, dumpCupomMl, dumpCampanhasCupomMl,
-  sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida,
+  sincronizarCuponsContaMl, listarCampanhasMl, campanhaMlConhecida, alimentarCampanhasMlDeHtml,
   buscarDadosProdutoMl, resolverLinkMl, idProdutoMl, cupomDaPaginaParaCatalogoMl,
   verificarPaginaProdutoMl, saudePaginaMl, estadoAntibotMl, cookieAff,
   estadoOrigemSocialMl,
@@ -22492,6 +22492,35 @@ app.post('/cupons/auto/leitura', (req, res) => {
       return res.json({ ok: false, erro: 'nenhum cupom lido — sessão pode ter caído ou a página mudou', fontes });
     }
     const r = aplicarLeituraCuponsMl(cupons, { totalDeclarado, semCodigo, criarNovos: true });
+    // 06/11/2026: o mesmo HTML alimenta o mapa de campanhas (o sync pelo
+    // Railway esta pausado) e corrige na base o que o tracking do ML declara
+    // por codigo: campanha, percentual, minimo e teto. O rotulo do card nao
+    // traz campanha, e um valor errado da captura (MODASEMPRE gravado 12%,
+    // o ML diz 15%) fazia o cupom do anuncio cair em "fora da base".
+    let campanhasLidas = 0, corrigidosTracking = 0;
+    try {
+      const porCodigo = new Map();
+      for (const pg of paginas) {
+        if (!pg?.html) continue;
+        const ehAtivos = /\/cupons\/active/.test(String(pg.url || ''));
+        for (const t of alimentarCampanhasMlDeHtml(pg.html, { ehAtivos })) {
+          campanhasLidas++;
+          if (t.codigo && ehAtivos) porCodigo.set(String(t.codigo).toUpperCase(), t);
+        }
+      }
+      for (const reg of listarCuponsBase()) {
+        if (reg.loja !== 'Mercado Livre') continue;
+        const t = porCodigo.get(String(reg.codigo).toUpperCase());
+        if (!t) continue;
+        const campos = {};
+        if (t.idCampanhaLoja && String(reg.idCampanhaLoja || '') !== t.idCampanhaLoja) campos.idCampanhaLoja = t.idCampanhaLoja;
+        if (t.tipo && t.valor && (reg.tipo !== t.tipo || Number(reg.valor) !== Number(t.valor))) { campos.tipo = t.tipo; campos.valor = t.valor; }
+        if (t.minimo != null && Number(reg.minimo) !== Number(t.minimo)) campos.minimo = t.minimo;
+        if (t.limite != null && Number(reg.limite) !== Number(t.limite)) campos.limite = t.limite;
+        if (Object.keys(campos).length) { atualizarCupomBase(reg.chave, campos); corrigidosTracking++; }
+      }
+    } catch (e) { console.warn('[CUPONS-ML] Falha ao ler campanhas do tracking:', e.message); }
+    if (campanhasLidas) console.log('[CUPONS-ML] Tracking da leitura: ' + campanhasLidas + ' campanha(s) no mapa, ' + corrigidosTracking + ' cupom(ns) corrigido(s) na base.');
     // 07/10/2026: confirmados que a pagina nao mostrou vao de carona na proxima
     // visita de insercao para o ML dizer se ainda valem (insercao-ml-auto.js).
     let aReverificar = 0;

@@ -3591,6 +3591,31 @@ const _campanhasMl = new Map();
 export function campanhaMlConhecida(id) {
   return id ? (_campanhasMl.get(String(id)) || null) : null;
 }
+
+// ── MAPA DE CAMPANHAS PELA LEITURA DA EXTENSAO (06/11/2026) ────────────────
+// Com CUPONS_ML_PAUSADO o sync pelo Railway nao roda e o mapa ficava vazio para
+// sempre: o anuncio dizia a campanha do cupom e ninguem sabia o codigo dela.
+// A extensao ja abre as mesmas paginas de "Meus cupons" a cada 2 h e manda o
+// HTML — que traz o mesmo payload de tracking (campaign_id + code + regras).
+// Mesmas regras do registrarNoMapa do sync. Devolve os cupons lidos do tracking.
+export function alimentarCampanhasMlDeHtml(html, { ehAtivos = false } = {}) {
+  let lidos = [];
+  try { lidos = extrairCuponsTrackingMl(String(html || '')); } catch (e) { return []; }
+  for (const c of lidos) {
+    if (!c?.idCampanhaLoja) continue;
+    const anterior = _campanhasMl.get(c.idCampanhaLoja);
+    if (anterior && anterior.codigo && !c.codigo) continue;
+    _campanhasMl.set(c.idCampanhaLoja, {
+      ...(anterior || {}),
+      idCampanhaLoja: c.idCampanhaLoja, codigo: c.codigo, titulo: c.titulo,
+      tipo: c.tipo, valor: c.valor, minimo: c.minimo, limite: c.limite,
+      segmentado: ehAtivos ? (c.segmentacao?.collectors || 0) > 0 : (anterior?.segmentado || false),
+      segmentacaoConfirmada: !!ehAtivos || !!anterior?.segmentacaoConfirmada,
+      ativoNoMl: c.ativoNoMl,
+    });
+  }
+  return lidos;
+}
 /** Lista o mapa de campanhas, para conferir de fora o que o sync aprendeu. */
 export function listarCampanhasMl() {
   return [..._campanhasMl.values()].sort((a, b) =>
