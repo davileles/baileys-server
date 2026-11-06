@@ -2961,7 +2961,14 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     // item_id:{item}, que abre com preco e botao Comprar (conferido no Chrome).
     // Se o painel de afiliados recusar a URL com parametro, volta a do catalogo.
     const urlOferta = urlOfertaCatalogoMl(url, dados);
-    const tentativas = urlOferta ? [urlOferta, url] : [url];
+    // Ultima tentativa (06/11/2026): URL canonica montada pelo id. Link salvo
+    // em formato que o painel recusa ("URL Invalid.": curto /sec/, meli.la nao
+    // resolvido, slug estranho) deixava o alerta de preco do pedido 7653 sem
+    // link, com o anuncio no ar. Pelo id: /p/MLB (catalogo) ou /MLB-<n> (classico).
+    let urlPorId = null;
+    try { urlPorId = urlProdutoDeRastreadorMl(dados.itemId && !dados.catalogoId ? dados.itemId : (idProdutoMl(url) || salvo.asin)); } catch (e) { urlPorId = null; }
+    if (urlPorId && RE_ENCURTADOR_ML.test(urlPorId)) urlPorId = null;
+    const tentativas = [...new Set([urlOferta, url, urlPorId].filter(Boolean))];
     let r = null, erroPainel = null;
     for (const alvo of tentativas) {
       try { links = await gerarLinksAfiliadoMl([alvo], { titulos: { [alvo]: nomeReal } }); }
@@ -2970,6 +2977,8 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
       if (!r.erro) break;
       if (alvo === urlOferta) console.warn('[ML] ' + salvo.asin + ' — painel recusou o link fixado na oferta ('
         + r.erro + '); usando o link do catalogo');
+      else if (alvo !== tentativas[tentativas.length - 1]) console.warn('[ML] ' + salvo.asin + ' — painel recusou ' + alvo
+        + ' (' + r.erro + '); tentando pela URL do id');
     }
     if (!r && erroPainel) {
       descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: 'painel de afiliados: ' + erroPainel.message });
