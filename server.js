@@ -17025,7 +17025,10 @@ app.get('/radar/fila', (req, res) => {
 // Kill switch: LEMBRETE_ACABA_HOJE=off. LEMBRETE_ACABA_HOJE_CATS (CSV) restringe
 // a categorias especificas; vazio/"todas" = todas (padrao desde 18/10/2026).
 const LEMBRETES_RADAR_PATH = SESSAO_DIR + '/lembretes_radar.json';
-const LEMBRETE_OFERTAS_URL = process.env.LEMBRETE_OFERTAS_URL || 'https://painel.clubedoviajante.com.br/ofertas.json';
+// Desde out/2026 o conteúdo do painel sai pelo proxy, com chave de operador
+// (seguranca fase 2). O JSON público do Pages fica como reserva até o corte.
+const LEMBRETE_OFERTAS_URL = process.env.LEMBRETE_OFERTAS_URL || 'https://cdv-proxy-production.up.railway.app/conteudo/ofertas.json';
+const LEMBRETE_OFERTAS_URL_RESERVA = 'https://painel.clubedoviajante.com.br/ofertas.json';
 const LEMBRETE_HORA_PADRAO = '09:00';   // horario do lembrete no dia do prazo (SP)
 const LEMBRETE_HORA_LIMITE = '21:00';   // depois disso nao manda (servidor ficou fora o dia todo)
 const LEMBRETE_RETENCAO_DIAS = 60;
@@ -17121,10 +17124,26 @@ function mensagemAcabaHoje(msg) {
 }
 
 async function ofertasAprovadasCdv() {
-  const r = await fetch(LEMBRETE_OFERTAS_URL + '?t=' + Date.now(), { signal: AbortSignal.timeout(20000) });
-  if (!r.ok) throw new Error('ofertas.json status ' + r.status);
-  const j = await r.json();
-  return Array.isArray(j.items) ? j.items : [];
+  let r = null, erro = null;
+  try {
+    r = await fetch(LEMBRETE_OFERTAS_URL, {
+      headers: process.env.CAMPANHAS_KEY ? { 'X-CDV-Op': process.env.CAMPANHAS_KEY } : {},
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!r.ok) { erro = 'proxy status ' + r.status; r = null; }
+    else {
+      const j = await r.json();
+      // Formato diferente do esperado tambem cai na reserva: lista vazia aqui
+      // faria o ACABA HOJE parar em silencio.
+      if (Array.isArray(j?.items)) return j.items;
+      erro = 'proxy sem items';
+    }
+  } catch (e) { erro = 'proxy: ' + e.message; }
+  console.warn('[LEMBRETE] ofertas pelo proxy falharam (' + erro + '); usando o JSON publico.');
+  const r2 = await fetch(LEMBRETE_OFERTAS_URL_RESERVA + '?t=' + Date.now(), { signal: AbortSignal.timeout(20000) });
+  if (!r2.ok) throw new Error('ofertas.json status ' + r2.status);
+  const j2 = await r2.json();
+  return Array.isArray(j2.items) ? j2.items : [];
 }
 
 let lembreteChecando = false;
