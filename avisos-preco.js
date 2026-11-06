@@ -1679,7 +1679,7 @@ function melhorOferta(prod, { maxIdadeMs = Infinity } = {}) {
 function painelDoProduto(prod) {
   const mo = melhorOferta(prod);
   const ofertaPainel = q => ({
-    chave: q.asin, loja: q.loja, titulo: q.titulo || '', url: q.url || '',
+    chave: q.asin, loja: q.loja, titulo: q.titulo || '', url: q.url || '', imagem: q.imagem || null,
     preco: q.ult?.preco ?? null, disponivel: q.ult ? q.ult.disponivel !== false : null, lidoEm: q.lidoEm || null,
     falha: q.falhas ? q.falhaMotivo : null,
     cupomMl: q.loja === 'Mercado Livre' ? (q.cupomMl || null) : undefined,
