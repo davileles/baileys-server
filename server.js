@@ -182,7 +182,7 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 // tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
-         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora,
+         salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora, previaDisparoPedido,
          pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
          acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido,
          enviarMensagemOperador, encerrarAtendimento } from './avisos-preco.js';
@@ -26616,6 +26616,8 @@ app.post('/avisos-preco/pedido/:id/:acao', async (req, res) => {
   if (req.params.acao === 'vincular') return res.json(await vincularLinkPedido(String(req.params.id), String(req.body?.url || '')));
   // 'disparar': manda o aviso já, fora da janela e do limite diário (botão do painel).
   if (req.params.acao === 'disparar') return res.json(await dispararPedidoAgora(String(req.params.id)));
+  // 'previa': a mesma mensagem do disparo, sem enviar (o painel mostra antes de confirmar).
+  if (req.params.acao === 'previa') return res.json(await previaDisparoPedido(String(req.params.id)));
   res.json(avisosAcaoPedido(String(req.params.id), String(req.params.acao)));
 });
 // Diagnóstico da conversa com o Tico (mensagens recebidas, caminho, respostas,

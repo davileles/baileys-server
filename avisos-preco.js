@@ -1908,7 +1908,12 @@ function avisoPendente(pedido) {
 // Botão "Disparar agora" do painel: relê o preço na loja e manda o aviso já,
 // fora da janela e do limite diário (decisão do operador). Só manda se o
 // preço caiu de verdade desde o pedido (ou chegou no alvo).
-export async function dispararPedidoAgora(id) {
+// Prévia (06/11/2026): mesma montagem do disparo, sem fila nem gravação —
+// o painel mostra a mensagem antes de o operador confirmar.
+export async function previaDisparoPedido(id) {
+  return dispararPedidoAgora(id, { previa: true });
+}
+export async function dispararPedidoAgora(id, { previa = false } = {}) {
   const pedido = E().pedidos.find(x => x.id === id);
   if (!pedido) return { ok: false, erro: 'pedido não encontrado' };
   if (pedido.status !== 'ativo' || !pedido.jid) return { ok: false, erro: 'pedido não está ativo' };
@@ -1928,23 +1933,28 @@ export async function dispararPedidoAgora(id) {
   }
   const precoBruto = m.preco;
   m = { ...m, ...confirmarPrecos(mo, m.preco) };
-  if (!mo.cupom) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true });
+  if (!mo.cupom && !previa) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true });
   // Mesma régua do aviso automático (alvo, queda parcial ou queda sem alvo), só
   // sem a trava do último aviso: preço que voltou a subir não dispara nada.
   const av = avaliarPedido({ ...pedido, ultimoAvisoPreco: null }, m.preco);
   const tipo = av?.tipo || null;
   if (!tipo) {
-    gravar();
+    if (!previa) gravar();
     const cfg2 = E().config;
     const regra = pedido.precoAlvo
       ? 'só sai com o preço em ' + brl(pedido.precoAlvo) + ' ou menos' + (cfg2.avisarQuedaParcial ? ' (ou ' + cfg2.quedaParcialPct + '% abaixo do pedido)' : '')
       : 'só sai com queda de ' + cfg2.quedaSemAlvoPct + '% contra o pedido';
     return { ok: false, naoEnviado: true, preco: m.preco, erro: 'nada enviado: o preço relido agora é ' + brl(m.preco) + ' e o aviso ' + regra + '.' };
   }
+  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null });
+  const modoImg = E().config.imagemAviso || 'cartao';
+  const resp = { ok: true, tipo, preco: m.preco, loja: mo.prod.loja, cupom: mo.cupom || null, texto,
+    imagem: modoImg === 'texto' ? null : (mo.prod.imagem || null), imagemModo: modoImg };
+  if (previa) return { ...resp, previa: true };
   enfileirarAviso(pedido, mo, m, tipo, { manual: true });
   gravar();
   console.log('[AVISOS] Disparo manual pedido ' + pedido.id + ' a ' + brl(m.preco) + ' (' + tipo + ').');
-  return { ok: true, tipo, preco: m.preco, loja: mo.prod.loja, cupom: mo.cupom || null };
+  return resp;
 }
 
 // Trava do card de alerta de cliente para os grupos (06/11/2026): antes de sair
