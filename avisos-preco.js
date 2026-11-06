@@ -1525,10 +1525,18 @@ export async function dispararPedidoAgora(id) {
   try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { return { ok: false, erro: 'falha ao montar o link: ' + e.message }; }
   if (!m?.link || !m.preco) return { ok: false, erro: 'a loja não confirmou o preço agora' };
   if (!mo.cupom) registrarLeitura(mo.prod, { preco: m.preco, disponivel: true });
-  let tipo = null;
-  if (pedido.precoAlvo && m.preco <= pedido.precoAlvo) tipo = 'alvo';
-  else if (pedido.precoInicial && m.preco < pedido.precoInicial - 0.009) tipo = pedido.precoAlvo ? 'parcial' : 'queda';
-  if (!tipo) { gravar(); return { ok: false, erro: 'preço de agora (' + brl(m.preco) + ') não está abaixo do preço do pedido (' + brl(pedido.precoInicial) + ')' }; }
+  // Mesma régua do aviso automático (alvo, queda parcial ou queda sem alvo), só
+  // sem a trava do último aviso: preço que voltou a subir não dispara nada.
+  const av = avaliarPedido({ ...pedido, ultimoAvisoPreco: null }, m.preco);
+  const tipo = av?.tipo || null;
+  if (!tipo) {
+    gravar();
+    const cfg2 = E().config;
+    const regra = pedido.precoAlvo
+      ? 'só sai com o preço em ' + brl(pedido.precoAlvo) + ' ou menos' + (cfg2.avisarQuedaParcial ? ' (ou ' + cfg2.quedaParcialPct + '% abaixo do pedido)' : '')
+      : 'só sai com queda de ' + cfg2.quedaSemAlvoPct + '% contra o pedido';
+    return { ok: false, naoEnviado: true, preco: m.preco, erro: 'nada enviado: o preço relido agora é ' + brl(m.preco) + ' e o aviso ' + regra + '.' };
+  }
   enfileirarAviso(pedido, mo, m, tipo, { manual: true });
   gravar();
   console.log('[AVISOS] Disparo manual pedido ' + pedido.id + ' a ' + brl(m.preco) + ' (' + tipo + ').');
