@@ -4215,6 +4215,14 @@ _moduloPronto = true;
  * registro. Da proxima vez o casamento ja sai pela via 1. Em caso de empate
  * nao aprende nada — gravar o id no cupom errado envenenaria a base.
  */
+function cupomDivergeDaPagina(reg, pag) {
+  const tetoPag = Number(pag.teto) || 0, tetoReg = Number(reg.limite) || 0;
+  if (tetoPag && tetoReg && Math.abs(tetoPag - tetoReg) > 0.5) return true;
+  const minPag = Number(pag.minimo) || 0, minReg = Number(reg.minimo) || 0;
+  if (minPag && minReg && Math.abs(minPag - minReg) > 0.5) return true;
+  return false;
+}
+
 export function casarCupomDaPagina(loja, cupomPagina) {
   const vazio = { reg: null, candidatos: [], via: null, ambiguo: false };
   if (!cupomPagina || !cupomPagina.valor) return vazio;
@@ -4225,8 +4233,20 @@ export function casarCupomDaPagina(loja, cupomPagina) {
     if (!cupomVigente(reg)) continue;
     if (normalizarTexto(reg.loja) !== alvo) continue;
 
-    const mesmaCampanha = !!(cupomPagina.idCampanhaLoja && reg.idCampanhaLoja &&
+    let mesmaCampanha = !!(cupomPagina.idCampanhaLoja && reg.idCampanhaLoja &&
       String(reg.idCampanhaLoja) === String(cupomPagina.idCampanhaLoja));
+    // Teto ou minimo diferentes do que o anuncio declara = outro cupom, mesmo
+    // com o mesmo percentual (06/11/2026). OFICIAIS0511 (15%, minimo R$ 89,
+    // limite R$ 40) casou sozinho por valor com o cupom "favorito" de 15%,
+    // minimo R$ 149 e limite R$ 200 de um anuncio, aprendeu a campanha dele, e
+    // o alerta de preco e a montagem passaram a usar o limite de R$ 40.
+    if (cupomDivergeDaPagina(reg, cupomPagina)) {
+      if (mesmaCampanha) {
+        console.warn('[CUPONS] ' + reg.codigo + ': campanha ' + reg.idCampanhaLoja + ' desfeita (teto/minimo do anuncio nao batem com o cadastro).');
+        reg.idCampanhaLoja = null; reg.atualizadoEm = new Date().toISOString(); salvarCuponsBase();
+      }
+      continue;
+    }
     if (mesmaCampanha) porCampanha.push(reg);
 
     // Campanha divergente e PROVA de que nao e o mesmo cupom: o registro ja
