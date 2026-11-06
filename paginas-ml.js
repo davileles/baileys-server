@@ -43,16 +43,14 @@ const TESTE_MS   = Number(process.env.ML_PAGINA_TESTE_MIN || 15) * 60000; // tes
 const ONLINE_MS  = 90000;                                              // long-poll visto ha menos = extensao online
 const HTML_MAX   = 2.5 * 1024 * 1024;
 const [JAN_INI, JAN_FIM] = String(process.env.ML_PAGINA_JANELA || '8-23').split('-').map(Number);
-// Cota por finalidade (06/11/2026): a releitura de hora em hora do monitor de
-// precos pedia pagina para cada anuncio classico e /up/ da vitrine (~500 itens
-// que a API nao cobre) e queimava as 200 paginas do dia antes das 9h — o resto
-// (disparos, Catalogo, alertas de preco, clique manual) ficava sem leitura.
-// Agora o monitor tem teto proprio e pequeno, e uma reserva do teto geral so
-// pode ser usada por quem vai publicar ou foi pedido pelo operador.
-const TETO_MONITOR = Number(process.env.ML_PAGINA_TETO_MONITOR ?? 30);
-const RESERVA      = Number(process.env.ML_PAGINA_RESERVA ?? 50);
-// motivos que podem usar a reserva (quem publica ou responde a um pedido)
-const USA_RESERVA  = new Set(['leitura', 'catalogo', 'avisos', 'manual', 'teste']);
+// Teto so do monitor (06/11/2026, decisao do Davi): a releitura de hora em
+// hora do monitor de precos pedia pagina para cada anuncio classico e /up/ da
+// vitrine (~500 itens que a API nao cobre) e queimava as 200 paginas do dia
+// antes das 9h. Agora o teto vale SO para o monitor; o que vai ser divulgado
+// (captura dos grupos-fonte, montagem de disparo, Catalogo, alertas de preco,
+// clique manual) sempre passa pela extensao quando precisa. Os freios que
+// seguem valendo para todos: janela, extensao online e parada na verificacao.
+const TETO_MONITOR = Number(process.env.ML_PAGINA_TETO_MONITOR ?? TETO_DIA);
 
 let _seq = 0;
 const _fila = [];               // [{ id, url, criadoEm, resolve, timer, entregueEm }]
@@ -145,9 +143,6 @@ export function motivoIndisponivelPaginasMl(motivo = null) {
   if (_estado.verificacao) return 'aguardando_verificacao';
   if (!naJanela()) return 'fora_da_janela';
   zerarDia();
-  if (motivo === 'manual') return null;   // clique do operador: uma pagina, fura o teto
-  if (_estado.hoje >= TETO_DIA) return 'teto';
-  if (motivo && !USA_RESERVA.has(motivo) && _estado.hoje >= TETO_DIA - RESERVA) return 'reserva';
   if (motivo === 'monitor' && (_estado.porMotivo.monitor || 0) >= TETO_MONITOR) return 'teto_monitor';
   return null;
 }
@@ -189,11 +184,14 @@ function proximoParaEntregar() {
   // passou do prazo (a extensao espaca 4-8 s entre as buscas).
   if (_fila.some(p => p.entregueEm && Date.now() - p.entregueEm < ESPERA_MS)) return null;
   // O teste da verificacao vai na frente e ignora o freio; o resto espera.
-  // Manual primeiro (o operador esta olhando a tela); depois o resto, cada um
-  // conferido contra a cota da sua finalidade.
+  // Ordem: clique manual (o operador esta olhando a tela) > o que vai ser
+  // divulgado (captura, disparo, Catalogo, alertas) > monitor de precos, que
+  // so anda quando nao ha mais nada esperando.
+  const livre = p => !p.entregueEm && !p.forcar && !motivoIndisponivelPaginasMl(p.motivo);
   const p = _fila.find(p => !p.entregueEm && p.forcar)
-    || _fila.find(p => !p.entregueEm && !p.forcar && p.motivo === 'manual' && !motivoIndisponivelPaginasMl('manual'))
-    || _fila.find(p => !p.entregueEm && !p.forcar && !motivoIndisponivelPaginasMl(p.motivo));
+    || _fila.find(p => livre(p) && p.motivo === 'manual')
+    || _fila.find(p => livre(p) && p.motivo !== 'monitor')
+    || _fila.find(livre);
   if (!p) return null;
   p.entregueEm = Date.now();
   return { id: p.id, url: p.url, motivo: p.motivo };
@@ -283,8 +281,8 @@ export function estadoPaginasMl() {
     ligada: LIGADO, online: extensaoPaginasOnline(), motivo: motivoIndisponivelPaginasMl(),
     ultimoPollEm: _estado.ultimoPollEm ? new Date(_estado.ultimoPollEm).toISOString() : null,
     naFila: _fila.length, pollsEsperando: _esperando.length,
-    hoje: _estado.hoje, teto: TETO_DIA, janela: JAN_INI + '-' + JAN_FIM,
-    porMotivo: _estado.porMotivo, tetoMonitor: TETO_MONITOR, reserva: RESERVA,
+    hoje: _estado.hoje, teto: null, janela: JAN_INI + '-' + JAN_FIM,
+    porMotivo: _estado.porMotivo, tetoMonitor: TETO_MONITOR,
     recusasDesdeBoot: _estado.recusas || {},
     lidas: _estado.lidas, walls: _estado.walls,
     verificacao: _estado.verificacao ? {
