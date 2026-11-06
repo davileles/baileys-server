@@ -4265,7 +4265,29 @@ export function casarCupomDaPagina(loja, cupomPagina) {
     return { reg, candidatos: porValor, via: 'valor', ambiguo: false };
   }
   if (porValor.length > 1) {
-    return { reg: null, candidatos: porValor, via: 'valor', ambiguo: true };
+    // Desempate pelo que a propria pagina declara (06/11/2026). Dois cupons de
+    // mesmo percentual quase nunca tem o mesmo teto: a pagina traz o cap do
+    // desconto (teto) e o preco sobre o qual ele vale. Caso real: MODASEMPRE
+    // (12%, minimo R$ 79, teto R$ 60) e FAVORITO (12%, minimo R$ 149, teto
+    // R$ 200) vigentes juntos — o casamento empatava e a conferencia dava
+    // "cupom fora da base" com o codigo certo na base. Cada filtro so e
+    // aplicado se deixar alguem; sem resposta unica, segue ambiguo como antes.
+    let restantes = porValor;
+    const teto = Number(cupomPagina.teto) || 0;
+    if (teto) {
+      const f = restantes.filter(r => Number(r.limite) === teto);
+      if (f.length) restantes = f;
+    }
+    const preco = Number(cupomPagina.precoBase || cupomPagina.precoRef) || 0;
+    if (preco) {
+      const f = restantes.filter(r => !(Number(r.minimo) > preco));
+      if (f.length) restantes = f;
+    }
+    // Desempate nao grava idCampanhaLoja: e evidencia boa, mas nao exata.
+    if (restantes.length === 1) {
+      return { reg: restantes[0], candidatos: restantes, via: 'valor+teto', ambiguo: false };
+    }
+    return { reg: null, candidatos: restantes, via: 'valor', ambiguo: true };
   }
   return vazio;
 }

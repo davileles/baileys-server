@@ -3362,7 +3362,13 @@ export function resolverCupomPaginaMl(cupons, preco) {
   // botao "Aplicar" na pagina esta disponivel para quem abriu o anuncio, mesmo
   // que a varredura de cupons tenha marcado a campanha como segmentada — o
   // anuncio e evidencia direta, o mapa e inferencia.
-  if (naoResgatado && !conhecida?.codigo) {
+  // Com o mapa sem a campanha (sync pausado por CUPONS_ML_PAUSADO, ou logo
+  // apos redeploy), 'sem codigo' era presumido sem olhar a base — e um cupom
+  // de codigo vigente (MODASEMPRE, 06/11) saia como "fora da base". Agora a
+  // base e consultada antes; sem casamento unico, segue o caminho sem codigo.
+  const casadoAntes = (naoResgatado && !conhecida)
+    ? casarCupomDaPagina('Mercado Livre', { ...p, precoRef: preco }) : null;
+  if (naoResgatado && !conhecida?.codigo && !casadoAntes?.reg) {
     return {
       cupom: { codigo: null, semCodigo: true, segmentado: false, naoResgatado: true,
                desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
@@ -3397,7 +3403,7 @@ export function resolverCupomPaginaMl(cupons, preco) {
 
   // Campanha desconhecida (o sync ainda nao rodou nesta instancia): cai para o
   // casamento por (tipo, valor) contra a base.
-  const casado = casarCupomDaPagina('Mercado Livre', p);
+  const casado = casadoAntes || casarCupomDaPagina('Mercado Livre', { ...p, precoRef: preco });
   if (casado.ambiguo) {
     return {
       cupom: { codigo: casado.candidatos.map(r => r.codigo).join(' ou '), desconto,
