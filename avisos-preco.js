@@ -1680,11 +1680,17 @@ function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
       pedido.avisos.push({ em, preco: precoEnviado, tipo, loja: mo.prod.loja, cupom: mo.cupom || null, manual: !!extraMeta.manual });
       if (pedido.avisos.length > 30) pedido.avisos = pedido.avisos.slice(-30);
       if (tipo === 'alvo' && !pedido.alvoAtingidoEm) pedido.alvoAtingidoEm = em;
+      pedido.ultimaFalhaEnvio = null;
       E().envios.push({ jid: pedido.jid, dia: diaSP(), em, pedido: pedido.id, preco: precoEnviado, tipo, manual: !!extraMeta.manual });
       const corte = diaSP(Date.now() - 60 * MS_DIA);
       E().envios = E().envios.filter(e => e.dia >= corte);
       gravar();
       console.log('[AVISOS] Aviso ' + tipo + (extraMeta.manual ? ' (manual)' : '') + ' enviado — ' + pedido.id + ' a ' + brl(precoEnviado) + '.');
+    },
+    // Falha fica no pedido para o painel mostrar (06/11/2026: "Disparar agora" não dizia se saiu).
+    aoFalhar: (e) => {
+      pedido.ultimaFalhaEnvio = { em: new Date().toISOString(), erro: String(e?.message || e).slice(0, 160), manual: !!extraMeta.manual };
+      gravar();
     },
   });
 }
@@ -2149,6 +2155,10 @@ export function estadoAvisos() {
         porNome: !!p.porNome, linkInformado: p.linkInformado || null, textoOriginal: p.textoOriginal || null,
         produto: p.produto || null,
         avisoPendente: avisoPendente(p),
+        // Situação do envio deste pedido (para o painel acompanhar o "Disparar agora").
+        naFila: (() => { const i = _filaEnvio.findIndex(f => f.pedidoId === p.id); return i < 0 ? null : { posicao: i + 1, total: _filaEnvio.length }; })(),
+        contaAvisosConectada: !!(st.config.conta && _deps.contaConectada?.(st.config.conta)),
+        ultimaFalhaEnvio: p.ultimaFalhaEnvio || null,
         ultimaMensagem: um || null,
         atendimentoAte: p.jid && st.atendimentos[p.jid] && Date.parse(st.atendimentos[p.jid]) > Date.now() ? st.atendimentos[p.jid] : null,
       };
