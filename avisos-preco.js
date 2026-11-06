@@ -28,6 +28,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'fs';
 import { createHash } from 'crypto';
 import { agendarPush } from './sync-github.js';
+import { gerarImagemAviso } from './cartao-aviso.js';
 import { lerPrecoProduto, lerPrecosAmazonEmLote, estatisticas as estatisticasMonitor } from './monitor-precos.js';
 import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon, buscarAmazonPorTermo, listarCuponsBase, cupomVigente } from './radar-amazon.js';
 import { ehLinkShopee, extrairIdsShopee, buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk, buscarShopeePorTermo } from './radar-shopee.js';
@@ -65,6 +66,8 @@ const CFG_PADRAO = {
   espacoEntreEnviosS: [25, 50],
   // Alerta que chega no alvo (ou queda sem alvo) vira card no bot para ir aos grupos.
   cardGrupos: true,
+  // Imagem do aviso: 'cartao' (foto + faixa com o preço), 'foto' (só a foto) ou 'texto'.
+  imagemAviso: 'cartao',
 };
 
 const RE_ATIVAR = /pedido\s*n?[ºo°.]?\s*#?\s*(\d{4,6})/i;
@@ -1309,7 +1312,15 @@ async function processarFila() {
       }
       _filaEnvio.shift();
       try {
-        await _deps.enviarDm(c.conta, item.jid, item.texto);
+        let img = null;
+        if (typeof item.imagem === 'function') { try { img = await item.imagem(); } catch (e) { img = null; } }
+        if (img) {
+          try { await _deps.enviarDm(c.conta, item.jid, { imagem: img, legenda: item.texto }); }
+          catch (e) {
+            console.warn('[AVISOS] Envio com imagem falhou (' + e.message + ') — indo só o texto.');
+            await _deps.enviarDm(c.conta, item.jid, item.texto);
+          }
+        } else await _deps.enviarDm(c.conta, item.jid, item.texto);
         _ultimoEnvioEm = Date.now();
         if (item.aoEnviar) { try { item.aoEnviar(); } catch (e) {} }
       } catch (e) {
@@ -1409,6 +1420,15 @@ async function montarLink(p, cupom = null) {
   return { link: o.produto.link, preco: preco > 0 ? arred(preco) : null, titulo: o.produto.titulo || p.titulo };
 }
 
+// Título curto para a mensagem: até o primeiro separador e no máximo ~70 caracteres.
+function tituloCurto(t) {
+  let s = String(t || '').replace(/\s+/g, ' ').trim();
+  const corte = s.search(/\s[-–|]\s|,/);
+  if (corte >= 20) s = s.slice(0, corte).trim();
+  if (s.length > 70) { s = s.slice(0, 70); const esp = s.lastIndexOf(' '); if (esp > 40) s = s.slice(0, esp); s = s.replace(/[\s,;:–-]+$/, '') + '…'; }
+  return s;
+}
+
 function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   const linhas = [];
   const outraLoja = extra.loja && pedido.loja && extra.loja !== pedido.loja;
@@ -1416,14 +1436,17 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   else if (outraLoja) linhas.push('🔔 *Achei mais barato!*');
   else linhas.push('🔔 *Baixou o preço!*');
   linhas.push('');
-  linhas.push(encurtar(pedido.titulo, 120));
+  linhas.push('*' + tituloCurto(pedido.titulo) + '*');
   linhas.push('');
   if (outraLoja) { linhas.push('🏪 Mesmo produto, agora na *' + extra.loja + '*'); }
-  linhas.push('💰 Agora: *' + brl(preco) + '*' + (pedido.precoInicial ? ' (era ' + brl(pedido.precoInicial) + ' quando você pediu)' : ''));
+  linhas.push('💰 Agora: *' + brl(preco) + '*');
   if (extra.cupom) linhas.push('🎟️ Usando o cupom *' + extra.cupom + '* (aparece no anúncio)');
   if (pedido.precoAlvo) {
     if (preco <= pedido.precoAlvo) linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' ✅');
     else linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' (faltam ' + brl(preco - pedido.precoAlvo) + ')');
+  }
+  if (pedido.precoInicial && pedido.precoInicial - preco >= 0.01) {
+    linhas.push('💸 ' + brl(pedido.precoInicial - preco) + ' a menos do que quando você pediu (' + brl(pedido.precoInicial) + ')');
   }
   linhas.push('');
   linhas.push('👉 ' + link);
@@ -1436,9 +1459,19 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
 function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
   const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom });
   const precoEnviado = m.preco;
+  const modo = E().config.imagemAviso || 'cartao';
+  const p = mo.prod;
+  const precoDe = Number(p.ult?.precoDe) || null;
+  const lidoEm = new Date().toISOString();   // preço acabou de ser reconfirmado na loja
   enfileirarEnvio(pedido.jid, texto, {
     pedidoId: pedido.id,
     ...extraMeta,
+    // A imagem é montada na hora de sair (com o preço confirmado); falhou, vai só o texto.
+    imagem: modo === 'texto' || !p.imagem ? null : () => gerarImagemAviso({
+      modo, imagemUrl: p.imagem, tipo, outraLoja: !!(p.loja && pedido.loja && p.loja !== pedido.loja),
+      preco: m.preco, precoDe: precoDe && precoDe > m.preco ? precoDe : null, alvo: pedido.precoAlvo || null,
+      loja: p.loja, lidoEm, cupom: mo.cupom || null,
+    }),
     aoEnviar: () => {
       const em = new Date().toISOString();
       pedido.ultimoAvisoPreco = precoEnviado; pedido.ultimoAvisoEm = em;
@@ -1914,6 +1947,7 @@ export function salvarConfigAvisos(parcial = {}) {
   if ('quedaParcialPct' in parcial) c.quedaParcialPct = num(parcial.quedaParcialPct, 1, 80, c.quedaParcialPct);
   if ('avisarQuedaParcial' in parcial) c.avisarQuedaParcial = !!parcial.avisarQuedaParcial;
   if ('cardGrupos' in parcial) c.cardGrupos = !!parcial.cardGrupos;
+  if ('imagemAviso' in parcial && ['cartao', 'foto', 'texto'].includes(parcial.imagemAviso)) c.imagemAviso = parcial.imagemAviso;
   if ('novaQuedaPct' in parcial) c.novaQuedaPct = num(parcial.novaQuedaPct, 0, 50, c.novaQuedaPct);
   if (c.janelaFim <= c.janelaIni) c.janelaFim = Math.min(24, c.janelaIni + 1);
   gravar();

@@ -26471,12 +26471,16 @@ function _numeroDaContaAvisos(apelido) {
   const id = String(s?.user?.id || '');
   return id ? id.split('@')[0].split(':')[0] : null;
 }
+// texto (string) ou { imagem: Buffer JPEG, legenda } — o aviso com cartão de preço.
 async function _enviarDmAvisos(apelido, jid, texto) {
+  const conteudo = texto && typeof texto === 'object' && Buffer.isBuffer(texto.imagem)
+    ? { image: texto.imagem, caption: String(texto.legenda || ''), mimetype: 'image/jpeg' }
+    : { text: String(texto) };
   if (apelido === 'principal') {
     if (!conectado || !sock) throw new Error('principal desconectada');
-    return saidaSerializada(() => sock.sendMessage(jid, { text: texto }));
+    return saidaSerializada(() => sock.sendMessage(jid, conteudo));
   }
-  return enviarPelaConta(contaIdDe(TENANT_PADRAO, apelido), jid, { text: texto });
+  return enviarPelaConta(contaIdDe(TENANT_PADRAO, apelido), jid, conteudo);
 }
 function _listarContasAvisos() {
   const out = [{ apelido: 'principal', conectado: !!(conectado && sock), exclusiva: false }];
