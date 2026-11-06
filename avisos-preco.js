@@ -66,6 +66,9 @@ const CFG_PADRAO = {
   novaQuedaPct: 3,
   // De quanto em quanto tempo cada loja é relida (horas).
   intervaloHoras: { 'Amazon': 3, 'Shopee': 3, 'Mercado Livre': 4 },
+  // Horário em que as lojas são lidas (hora SP; fim exclusive). Editável no painel.
+  leituraIni: 7,
+  leituraFim: 23,
   // Espaço entre duas mensagens de aviso (segundos), para não sair em rajada.
   espacoEntreEnviosS: [25, 50],
   // Alerta que chega no alvo (ou queda sem alvo) vira card no bot para ir aos grupos.
@@ -1770,9 +1773,9 @@ export async function varrerAvisos({ manual = false } = {}) {
       if (p.status === 'aguardando' && numeroDosAvisos() && Date.parse(p.expiraEm) < agora) { p.status = 'expirado'; p.motivoFim = 'não ativou no WhatsApp'; res.expirados++; }
       else if (p.status === 'ativo' && Date.parse(p.expiraEm) < agora) { p.status = 'encerrado'; p.motivoFim = 'validade de ' + cfg.validadeDias + ' dias'; res.expirados++; }
     }
-    // 2. Leitura (só das 7h às 23h; fora disso a loja nem precisa ser incomodada).
+    // 2. Leitura só no horário de leitura (config; padrão 7h–23h).
     const h = horaSP();
-    if (manual || (h >= 7 && h < 23)) {
+    if (manual || (h >= cfg.leituraIni && h < cfg.leituraFim)) {
       const devidos = devidosParaLeitura();
       if (devidos.length) res.lidos = await lerProdutos(devidos);
     }
@@ -2175,6 +2178,16 @@ export function salvarConfigAvisos(parcial = {}) {
   if ('imagemAviso' in parcial && ['cartao', 'foto', 'texto'].includes(parcial.imagemAviso)) c.imagemAviso = parcial.imagemAviso;
   if ('novaQuedaPct' in parcial) c.novaQuedaPct = num(parcial.novaQuedaPct, 0, 50, c.novaQuedaPct);
   if (c.janelaFim <= c.janelaIni) c.janelaFim = Math.min(24, c.janelaIni + 1);
+  if ('leituraIni' in parcial) c.leituraIni = Math.round(num(parcial.leituraIni, 0, 23, c.leituraIni));
+  if ('leituraFim' in parcial) c.leituraFim = Math.round(num(parcial.leituraFim, 1, 24, c.leituraFim));
+  if (c.leituraFim <= c.leituraIni) c.leituraFim = Math.min(24, c.leituraIni + 1);
+  if (parcial.intervaloHoras && typeof parcial.intervaloHoras === 'object') {
+    const ih = { ...c.intervaloHoras };
+    for (const loja of ['Amazon', 'Mercado Livre', 'Shopee']) {
+      if (loja in parcial.intervaloHoras) ih[loja] = num(parcial.intervaloHoras[loja], 1, 24, ih[loja]);
+    }
+    c.intervaloHoras = ih;
+  }
   gravar();
   if (c.conta) processarFila();
   return c;
