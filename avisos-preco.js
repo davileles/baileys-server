@@ -112,6 +112,7 @@ function estruturar(bruto) {
     contatos: Array.isArray(e.contatos) ? e.contatos : [],
     envios: Array.isArray(e.envios) ? e.envios : [],
     cuponsMlVistos: Array.isArray(e.cuponsMlVistos) ? e.cuponsMlVistos : [],
+    mensagens: Array.isArray(e.mensagens) ? e.mensagens : [],
   };
 }
 
@@ -126,6 +127,25 @@ export function carregarAvisosPreco() {
 }
 
 function E() { if (!_estado) carregarAvisosPreco(); return _estado; }
+
+// Histórico durável das mensagens com cada cliente (06/11/2026): o que o Tico
+// mandou (aviso, resposta, código) e o que a pessoa escreveu. Painel → botão
+// "Conversa" de cada pedido. 60 dias, até 80 por conversa e 6.000 no total.
+function registrarMensagem(jid, de, texto, extra = {}) {
+  if (!jid || !texto) return;
+  const st = E();
+  st.mensagens.push({ jid, de, em: new Date().toISOString(), t: String(texto).slice(0, 2000), ...extra });
+  const corte = Date.now() - 60 * MS_DIA;
+  if (st.mensagens.length > 6000 || Date.parse(st.mensagens[0].em) < corte) {
+    st.mensagens = st.mensagens.filter(m => Date.parse(m.em) >= corte).slice(-6000);
+  }
+  const daConversa = st.mensagens.filter(m => m.jid === jid);
+  if (daConversa.length > 80) {
+    const sobra = new Set(daConversa.slice(0, daConversa.length - 80));
+    st.mensagens = st.mensagens.filter(m => !sobra.has(m));
+  }
+  gravar();
+}
 
 function gravar() {
   clearTimeout(_timerGravar);
@@ -611,6 +631,7 @@ export function observarMensagemAvisos(apelido, msg) {
     const texto = textoDaMensagem(msg);
     if (!texto) return;
     rastrear(jid, 'recebida', texto);
+    registrarMensagem(jid, 'cliente', texto);
 
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
 
@@ -722,6 +743,23 @@ function rastrear(jid, tipo, detalhe) {
   _rastro.push({ em: new Date().toISOString(), jid, tipo, detalhe: String(detalhe == null ? '' : detalhe).replace(/\s+/g, ' ').slice(0, 240) });
   if (_rastro.length > 300) _rastro.splice(0, _rastro.length - 300);
 }
+// Conversa de um pedido para o painel: mensagens trocadas com a pessoa (todos
+// os números/jids dela) + os avisos registrados no pedido.
+export function mensagensDoPedido(id) {
+  const p = E().pedidos.find(x => x.id === id);
+  if (!p) return { ok: false, erro: 'pedido não encontrado' };
+  const vs = variantesTelefone(normalizarTelefone(p.telefone) || p.telefone || '');
+  const jids = new Set([p.jid].filter(Boolean));
+  for (const c of E().contatos) {
+    if (c.jid === p.jid || (c.numeros || []).some(n => vs.has(n))) jids.add(c.jid);
+  }
+  for (const v of vs) jids.add(v + '@s.whatsapp.net');
+  const mensagens = E().mensagens.filter(m => jids.has(m.jid))
+    .map(m => ({ de: m.de, em: m.em, texto: m.t, aviso: !!m.aviso, pedido: m.pedido || null, imagem: !!m.imagem, manual: !!m.manual, falhou: m.falhou || null }));
+  return { ok: true, pedido: { id: p.id, codigo: p.codigo, titulo: p.titulo, nome: p.nome },
+           avisos: (p.avisos || []).slice(), mensagens, historicoDesde: E().mensagens.length ? E().mensagens[0].em : null };
+}
+
 export function rastroConversas({ tel = '', n = 80 } = {}) {
   const vs = tel ? variantesTelefone(normalizarTelefone(tel) || String(tel).replace(/\D+/g, '')) : null;
   const jidsDoTel = new Set();
@@ -1322,10 +1360,12 @@ async function processarFila() {
           }
         } else await _deps.enviarDm(c.conta, item.jid, item.texto);
         _ultimoEnvioEm = Date.now();
+        registrarMensagem(item.jid, 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, imagem: !!img, manual: !!item.manual });
         if (item.aoEnviar) { try { item.aoEnviar(); } catch (e) {} }
       } catch (e) {
         console.warn('[AVISOS] Envio para ' + mascarar(digitosDeJid(item.jid) || item.jid) + ' falhou: ' + e.message);
         rastrear(item.jid, 'envio-falhou', e.message);
+        registrarMensagem(item.jid, 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, falhou: String(e.message || e).slice(0, 160) });
         if (item.aoFalhar) { try { item.aoFalhar(e); } catch (e2) {} }
       }
       if (item.resposta) await new Promise(r => setTimeout(r, 2500));
