@@ -3476,7 +3476,15 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
   if (!reg || !cupomVigente(reg)) return { estado: 'fora_da_base', preco };
   if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) return { estado: 'sem_cupom', preco };
   const lido = cupons.find(c => c.idCampanhaLoja && c.idCampanhaLoja === cupom.idCampanhaLoja) || null;
-  return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto: cupom.desconto, preco,
+  // Teto do cupom (06/11/2026): o desconto pelo percentual passava do limite —
+  // OFICIAIS0511 (15%, limite R$ 40) deu R$ 66,78 num produto de R$ 459 e o
+  // alerta de preco do pedido 5142 marcou "chegou no alvo" com R$ 392,22,
+  // quando a montagem do link (checkout) dava R$ 419. Vale o menor entre o
+  // calculado, o teto lido no anuncio e o limite cadastrado na base.
+  let desconto = Number(cupom.desconto) || 0;
+  for (const t of [lido?.teto, reg.limite]) if (Number(t) > 0) desconto = Math.min(desconto, Number(t));
+  desconto = Math.round(desconto * 100) / 100;
+  return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto, preco,
            precoFinal: lido?.precoFinal || null,
            pct: lido?.tipo === 'pct' ? lido.valor : null, teto: lido?.teto || null };
 }
