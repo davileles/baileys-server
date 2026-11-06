@@ -3285,9 +3285,17 @@ function minimoDoCupomPaginaMl(c) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+const FONTES_CUPOM_ML = new Set(['meli_coupon', 'lightning_coupon']);
+
 function normalizarCupomBeneficioMl(c) {
   const d = c?.discount;
-  if (!d || String(c.source || 'meli_coupon') !== 'meli_coupon') return null;
+  // Fontes de cupom do ML (06/11/2026, pedido 5142): alem do 'meli_coupon', o
+  // cupom relampago vem como 'lightning_coupon' (pilula "R$ 367,63 com Cupom",
+  // "Encerra em 00:01:17", sem codigo, 20% ate R$ 80) e era descartado — a
+  // conferencia respondia "sem cupom". O Pix ('pix', payment_discount) nao e
+  // cupom: fica de fora e e lido por extrairPixMl.
+  const fonte = String(c?.source || 'meli_coupon').toLowerCase();
+  if (!d || !FONTES_CUPOM_ML.has(fonte)) return null;
   const valor = Number(d.value) || 0;
   if (!valor) return null;
   const tipo = String(d.mode || '').toLowerCase() === 'percentage' ? 'pct' : 'reais';
@@ -3309,6 +3317,7 @@ function normalizarCupomBeneficioMl(c) {
     status: status === 'applied' ? 'redeemed' : (status || null),
     tipoMl: restricoes.length ? restricoes.join(',') : (c.type || null),
     label: c.label || null,
+    relampago: fonte === 'lightning_coupon',
   };
 }
 
@@ -3623,7 +3632,7 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
 function rotuloCupomPaginaMl(c) {
   const v = Number(c?.valor) || 0;
   const base = c?.tipo === 'pct' ? (Math.round(v * 100) / 100) + '% OFF' : 'R$ ' + String(Math.round(v * 100) / 100).replace('.', ',') + ' OFF';
-  return base;
+  return c?.relampago ? base + ' relâmpago' : base;
 }
 
 // ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────
