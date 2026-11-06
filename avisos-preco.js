@@ -1432,6 +1432,76 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   return linhas.join('\n');
 }
 
+// Põe o aviso de um pedido na fila de envio e registra quando sai de fato.
+function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
+  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom });
+  const precoEnviado = m.preco;
+  enfileirarEnvio(pedido.jid, texto, {
+    pedidoId: pedido.id,
+    ...extraMeta,
+    aoEnviar: () => {
+      const em = new Date().toISOString();
+      pedido.ultimoAvisoPreco = precoEnviado; pedido.ultimoAvisoEm = em;
+      pedido.avisos.push({ em, preco: precoEnviado, tipo, loja: mo.prod.loja, cupom: mo.cupom || null, manual: !!extraMeta.manual });
+      if (pedido.avisos.length > 30) pedido.avisos = pedido.avisos.slice(-30);
+      if (tipo === 'alvo' && !pedido.alvoAtingidoEm) pedido.alvoAtingidoEm = em;
+      E().envios.push({ jid: pedido.jid, dia: diaSP(), em, pedido: pedido.id, preco: precoEnviado, tipo, manual: !!extraMeta.manual });
+      const corte = diaSP(Date.now() - 60 * MS_DIA);
+      E().envios = E().envios.filter(e => e.dia >= corte);
+      gravar();
+      console.log('[AVISOS] Aviso ' + tipo + (extraMeta.manual ? ' (manual)' : '') + ' enviado — ' + pedido.id + ' a ' + brl(precoEnviado) + '.');
+    },
+  });
+}
+
+// Por que o aviso de um pedido ativo ainda não saiu (painel). null = nada a avisar.
+function avisoPendente(pedido) {
+  if (pedido.status !== 'ativo' || !pedido.jid || !pedido.precoInicial) return null;
+  const prod = E().produtos[pedido.produto];
+  if (!prod) return null;
+  const mo = melhorOferta(prod);
+  if (!mo) return null;
+  const av = avaliarPedido(pedido, mo.preco);
+  if (!av) return null;
+  const cfg = E().config;
+  let motivo = 'sai na próxima varredura';
+  if (pedido.pausado) motivo = 'pedido pausado';
+  else if (_filaEnvio.some(f => f.pedidoId === pedido.id)) motivo = 'na fila de envio';
+  else if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) motivo = 'número dos alertas desconectado';
+  else if (!dentroDaJanela()) motivo = 'fora da janela (' + cfg.janelaIni + 'h–' + cfg.janelaFim + 'h)';
+  else if (avisosHoje(pedido.jid) >= cfg.avisosPorDia) motivo = 'cliente já recebeu o aviso do dia';
+  else if (Date.now() - Date.parse(mo.prod.ult?.em || 0) > 8 * MS_H) motivo = 'leitura com mais de 8 h, aguardando nova leitura';
+  return { tipo: av.tipo, preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null, motivo };
+}
+
+// Botão "Disparar agora" do painel: relê o preço na loja e manda o aviso já,
+// fora da janela e do limite diário (decisão do operador). Só manda se o
+// preço caiu de verdade desde o pedido (ou chegou no alvo).
+export async function dispararPedidoAgora(id) {
+  const pedido = E().pedidos.find(x => x.id === id);
+  if (!pedido) return { ok: false, erro: 'pedido não encontrado' };
+  if (pedido.status !== 'ativo' || !pedido.jid) return { ok: false, erro: 'pedido não está ativo' };
+  if (_filaEnvio.some(f => f.pedidoId === pedido.id)) return { ok: false, erro: 'já está na fila de envio' };
+  const cfg = E().config;
+  if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) return { ok: false, erro: 'número dos alertas (' + (cfg.conta || 'nenhum') + ') desconectado' };
+  const prod = E().produtos[pedido.produto];
+  if (!prod) return { ok: false, erro: 'produto sem link vinculado' };
+  const mo = melhorOferta(prod);
+  if (!mo) return { ok: false, erro: 'sem preço lido para este produto' };
+  let m = null;
+  try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { return { ok: false, erro: 'falha ao montar o link: ' + e.message }; }
+  if (!m?.link || !m.preco) return { ok: false, erro: 'a loja não confirmou o preço agora' };
+  if (!mo.cupom) registrarLeitura(mo.prod, { preco: m.preco, disponivel: true });
+  let tipo = null;
+  if (pedido.precoAlvo && m.preco <= pedido.precoAlvo) tipo = 'alvo';
+  else if (pedido.precoInicial && m.preco < pedido.precoInicial - 0.009) tipo = pedido.precoAlvo ? 'parcial' : 'queda';
+  if (!tipo) { gravar(); return { ok: false, erro: 'preço de agora (' + brl(m.preco) + ') não está abaixo do preço do pedido (' + brl(pedido.precoInicial) + ')' }; }
+  enfileirarAviso(pedido, mo, m, tipo, { manual: true });
+  gravar();
+  console.log('[AVISOS] Disparo manual pedido ' + pedido.id + ' a ' + brl(m.preco) + ' (' + tipo + ').');
+  return { ok: true, tipo, preco: m.preco, loja: mo.prod.loja, cupom: mo.cupom || null };
+}
+
 export async function varrerAvisos({ manual = false } = {}) {
   if (_varrendo) return { ok: false, erro: 'varredura em andamento' };
   const cfg = E().config;
@@ -1480,23 +1550,7 @@ export async function varrerAvisos({ manual = false } = {}) {
         if (!m?.link || !m.preco) continue;
         const conf = avaliarPedido(pedido, m.preco, cfg);
         if (!conf) { if (!mo.cupom) registrarLeitura(mo.prod, { preco: m.preco, disponivel: true }); continue; }
-        const texto = textoDoAviso(pedido, m.preco, conf.tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom });
-        const precoEnviado = m.preco;
-        enfileirarEnvio(pedido.jid, texto, {
-          pedidoId: pedido.id,
-          aoEnviar: () => {
-            const em = new Date().toISOString();
-            pedido.ultimoAvisoPreco = precoEnviado; pedido.ultimoAvisoEm = em;
-            pedido.avisos.push({ em, preco: precoEnviado, tipo: conf.tipo, loja: mo.prod.loja, cupom: mo.cupom || null });
-            if (pedido.avisos.length > 30) pedido.avisos = pedido.avisos.slice(-30);
-            if (conf.tipo === 'alvo' && !pedido.alvoAtingidoEm) pedido.alvoAtingidoEm = em;
-            E().envios.push({ jid: pedido.jid, dia: diaSP(), em, pedido: pedido.id, preco: precoEnviado, tipo: conf.tipo });
-            const corte = diaSP(Date.now() - 60 * MS_DIA);
-            E().envios = E().envios.filter(e => e.dia >= corte);
-            gravar();
-            console.log('[AVISOS] Aviso ' + conf.tipo + ' enviado — ' + pedido.id + ' a ' + brl(precoEnviado) + '.');
-          },
-        });
+        enfileirarAviso(pedido, mo, m, conf.tipo);
         res.avisos++;
         // Também para os grupos (card de revisão no bot), só alvo ou queda de verdade.
         if (conf.tipo === 'alvo' || conf.tipo === 'queda') {
@@ -1828,6 +1882,7 @@ export function estadoAvisos() {
         alvoAtingidoEm: p.alvoAtingidoEm || null, motivoFim: p.motivoFim || null,
         porNome: !!p.porNome, linkInformado: p.linkInformado || null, textoOriginal: p.textoOriginal || null,
         produto: p.produto || null,
+        avisoPendente: avisoPendente(p),
       };
     }),
     produtos: Object.fromEntries(produtosBase().map(prod => [prod.asin, painelDoProduto(prod)])),
