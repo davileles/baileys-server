@@ -1861,7 +1861,11 @@ function precoEfetivo(p, maxIdadeMs = Infinity) {
   if (c?.estado === 'ok' && c.codigo && c.desconto > 0 && c.precoRef
       && Date.now() - Date.parse(c.em) < 24 * MS_H) {
     if (Math.abs(preco - c.precoRef) / c.precoRef <= 0.05) {
-      preco = arred(Math.max(0.01, preco - c.desconto)); cupom = c.codigo;
+      // O desconto vale sobre o preco do ANUNCIO lido na pagina (precoRef), que
+      // pode ser o do Pix e diferir do lido pela API (06/11/2026, pedido 5142:
+      // API R$ 459, anuncio R$ 445,23, cupom -R$ 66,78 = R$ 378,45 na pagina;
+      // o painel mostrava R$ 392,22 tirando o desconto dos R$ 459).
+      preco = arred(Math.max(0.01, Math.min(preco, c.precoRef) - c.desconto)); cupom = c.codigo;
     } else if (c.pct > 0) {
       // Cupom percentual: recalcula sobre o preco atual, respeitando o teto.
       const d = preco * c.pct / 100;
