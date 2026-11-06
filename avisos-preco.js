@@ -192,6 +192,9 @@ function brl(v) {
   return Number.isFinite(n) ? 'R$ ' + n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—';
 }
 function arred(v) { return Math.round(Number(v) * 100) / 100; }
+function horaMinSP(ts) {
+  return new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ts));
+}
 function dentroDaJanela(ts = Date.now()) {
   const c = E().config, h = horaSP(ts);
   return h >= c.janelaIni && h < c.janelaFim;
@@ -1887,6 +1890,11 @@ function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
   });
 }
 
+// Releitura recusada na montagem: só tenta de novo com preço/cupom diferente
+// ou depois deste prazo.
+const CONFERENCIA_REPETE_MIN = 60;
+function baseConferencia(mo) { return (mo.prod?.asin || '') + '|' + arred(mo.preco) + '|' + (mo.cupom || ''); }
+
 // Por que o aviso de um pedido ativo ainda não saiu (painel). null = nada a avisar.
 function avisoPendente(pedido) {
   if (pedido.status !== 'ativo' || !pedido.jid || !pedido.precoInicial) return null;
@@ -1903,7 +1911,17 @@ function avisoPendente(pedido) {
   else if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) motivo = 'número dos alertas desconectado';
   else if (!dentroDaJanela()) motivo = 'fora da janela (' + cfg.janelaIni + 'h–' + cfg.janelaFim + 'h)';
   else if (Date.now() - Date.parse(mo.prod.ult?.em || 0) > 8 * MS_H) motivo = 'leitura com mais de 8 h, aguardando nova leitura';
-  return { tipo: av.tipo, preco: mo.preco, precoCartao: mo.precoCartao || null, loja: mo.prod.loja, cupom: mo.cupom || null, motivo };
+  else {
+    const cf = pedido.conferencia;
+    if (cf && cf.base === baseConferencia(mo)) {
+      const hm = horaMinSP(cf.em);
+      motivo = cf.preco
+        ? 'conferido na loja às ' + hm + ': ' + brl(cf.preco) + (cf.precoCartao ? ' no Pix (' + brl(cf.precoCartao) + ' no cartão)' : '') + ', acima do desejado — nada enviado; confere de novo com leitura nova ou em até ' + CONFERENCIA_REPETE_MIN + ' min'
+        : 'a loja não confirmou o preço às ' + hm + ' (' + cf.erro + ') — tenta de novo com leitura nova ou em até ' + CONFERENCIA_REPETE_MIN + ' min';
+    } else motivo = 'sai na próxima varredura (de 10 em 10 min)';
+  }
+  return { tipo: av.tipo, preco: mo.preco, precoCartao: mo.precoCartao || null, loja: mo.prod.loja, cupom: mo.cupom || null, motivo,
+           conferencia: pedido.conferencia && pedido.conferencia.base === baseConferencia(mo) ? pedido.conferencia : null };
 }
 
 // Botão "Disparar agora" do painel: relê o preço na loja e manda o aviso já,
@@ -1940,7 +1958,7 @@ export async function dispararPedidoAgora(id, { previa = false } = {}) {
   const av = avaliarPedido({ ...pedido, ultimoAvisoPreco: null }, m.preco);
   const tipo = av?.tipo || null;
   if (!tipo) {
-    if (!previa) gravar();
+    if (!previa) { pedido.conferencia = { em: new Date().toISOString(), base: baseConferencia(mo), preco: m.preco, precoCartao: m.precoCartao || null, cupom: mo.cupom || null, erro: null }; gravar(); }
     const cfg2 = E().config;
     const regra = pedido.precoAlvo
       ? 'só sai com o preço em ' + brl(pedido.precoAlvo) + ' ou menos' + (cfg2.avisarQuedaParcial ? ' (ou ' + cfg2.quedaParcialPct + '% abaixo do pedido)' : '')
@@ -1952,6 +1970,7 @@ export async function dispararPedidoAgora(id, { previa = false } = {}) {
   const resp = { ok: true, tipo, preco: m.preco, loja: mo.prod.loja, cupom: mo.cupom || null, texto,
     imagem: modoImg === 'texto' ? null : (mo.prod.imagem || null), imagemModo: modoImg };
   if (previa) return { ...resp, previa: true };
+  pedido.conferencia = null;
   enfileirarAviso(pedido, mo, m, tipo, { manual: true });
   gravar();
   console.log('[AVISOS] Disparo manual pedido ' + pedido.id + ' a ' + brl(m.preco) + ' (' + tipo + ').');
@@ -2013,15 +2032,33 @@ export async function varrerAvisos({ manual = false } = {}) {
         const mo = melhorOferta(prod, { maxIdadeMs: 8 * MS_H });
         if (!mo) continue;
         const av = avaliarPedido(pedido, mo.preco, cfg);
-        if (!av) continue;
+        if (!av) { pedido.conferencia = null; continue; }
+        // Já relido e recusado com a mesma base (preço e cupom): não remonta a
+        // cada 10 min — só com leitura nova ou depois de CONFERENCIA_REPETE_MIN.
+        const cf = pedido.conferencia;
+        if (cf && cf.base === baseConferencia(mo) && Date.now() - Date.parse(cf.em) < CONFERENCIA_REPETE_MIN * 60000) continue;
         // Confirma o preço na hora de montar o link (releitura da loja).
         let m = null;
-        try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + mo.prod.asin + '): ' + e.message); }
-        if (!m?.link || !m.preco) { if (m?.erro) console.warn('[AVISOS] Montagem recusou ' + mo.prod.asin + ' (pedido ' + pedido.id + '): ' + m.erro); continue; }
+        try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + mo.prod.asin + '): ' + e.message); m = { erro: e.message }; }
+        if (!m?.link || !m.preco) {
+          console.warn('[AVISOS] Montagem recusou ' + mo.prod.asin + ' (pedido ' + pedido.id + '): ' + (m?.erro || 'sem preço'));
+          pedido.conferencia = { em: new Date().toISOString(), base: baseConferencia(mo), preco: null, cupom: mo.cupom || null, erro: String(m?.erro || 'a loja não confirmou o preço').slice(0, 160) };
+          continue;
+        }
         const precoBruto = m.preco;
         m = { ...m, ...confirmarPrecos(mo, m.preco) };
         const conf = avaliarPedido(pedido, m.preco, cfg);
-        if (!conf) { if (!mo.cupom) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true }); continue; }
+        if (!conf) {
+          if (!mo.cupom) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true });
+          // 06/11/2026 (pedido 3699): a conta juntava o preço lido às 14:28 com o
+          // cupom conferido às 15:32 (R$ 403,80), mas na hora de mandar a loja já
+          // estava acima do desejado. Fica gravado para o painel dizer isso em vez
+          // de "sai na próxima varredura".
+          pedido.conferencia = { em: new Date().toISOString(), base: baseConferencia(mo), preco: m.preco, precoCartao: m.precoCartao || null, cupom: mo.cupom || null, erro: null };
+          console.log('[AVISOS] Pedido ' + pedido.id + ': conta dava ' + brl(mo.preco) + ', loja relida a ' + brl(m.preco) + ' — acima do desejado, nada enviado.');
+          continue;
+        }
+        pedido.conferencia = null;
         enfileirarAviso(pedido, mo, m, conf.tipo);
         res.avisos++;
         // Também para os grupos (card de revisão no bot), só alvo ou queda de verdade.
@@ -2302,12 +2339,15 @@ export async function trabalhoOutrasLojas() {
     // 2. Cupom da página do ML (pela extensão, uma página por vez).
     res.cuponsNovos = marcarCuponsNovosMl();
     const ml = produtosVigiados().filter(precisaConferirCupom);
-    for (const p of ml.slice(0, 4)) { await conferirCupomMl(p); res.cupons++; }
+    for (const p of ml.slice(0, 4)) { const r = await conferirCupomMl(p); res.cupons++; if (r?.estado === 'ok') res.cuponsOk = (res.cuponsOk || 0) + 1; }
     gravar();
   } finally {
     _trabalhando = false;
     _ultimaBuscaEquiv = res;
   }
+  // Cupom achado pode pôr um pedido no preço: avalia já, sem esperar a
+  // próxima varredura (06/11/2026, pedido 3699).
+  if (res.cuponsOk || res.buscas) varrerAvisos().catch(() => {});
   return { ok: true, ...res };
 }
 
