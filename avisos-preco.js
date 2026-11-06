@@ -18,6 +18,10 @@
 //      cada alerta avisa uma vez a cada preço e só volta a avisar quando o
 //      preço cai mais (novaQuedaPct) — inclusive no mesmo dia (06/11/2026).
 //   5. O preço é relido na montagem da mensagem: se não confirmar, não sai.
+//   6. Compra (06/11/2026): COMPREI encerra o alerta (status "comprado"). Uma
+//      pergunta "conseguiu comprar?" sai perguntaCompraHoras depois de cada
+//      aviso sem resposta — uma por aviso, no máximo uma por pessoa por dia,
+//      só na janela. Sem resposta, o alerta segue ativo e nada insiste.
 //
 // Lojas com leitura de preço: Amazon, Mercado Livre e Shopee (as mesmas do
 // monitor de preços). A leitura usa lerPrecoProduto do monitor-precos.js, sem
@@ -75,6 +79,9 @@ const CFG_PADRAO = {
   cardGrupos: true,
   // Imagem do aviso: 'cartao' (foto + faixa com o preço), 'foto' (só a foto) ou 'texto'.
   imagemAviso: 'cartao',
+  // Pergunta "conseguiu comprar?" depois de um aviso sem resposta (06/11/2026).
+  perguntaCompra: true,
+  perguntaCompraHoras: 8,
 };
 
 const RE_ATIVAR = /pedido\s*n?[ºo°.]?\s*#?\s*(\d{4,6})/i;
@@ -89,6 +96,11 @@ const RE_URL = /https?:\/\/[^\s<>"']+/i;
 const RE_OK = /^\s*(ok|okay|sim|pode|isso|beleza|blz|fechado|confirmo|confirmar|quero)\s*[.!]*\s*$/i;
 const RE_SEM_ALVO = /^\s*(qualquer|qualquer\s+queda|sem\s+pre[cç]o|tanto\s+faz)\s*[.!]*\s*$/i;
 const SITE_ALERTAS = 'ticapromos.com.br/avisos';
+// COMPREI / JÁ COMPREI / COMPREI 2 (com ou sem emoji no fim).
+const RE_COMPREI = /^\s*(?:sim[\s,.!]*)?(?:eu\s+)?(?:j[aá]\s+)?compr(?:ei|amos)(?:\s+(?:sim|j[aá]))?\s*#?\s*(\d{1,2})?[^\p{L}\p{N}]*$/iu;
+// Resposta à pergunta de compra: NÃO / AINDA NÃO / NÃO COMPREI / CONTINUA.
+const RE_NAO_COMPREI = /^\s*(?:n[aã]o(?:\s+compr(?:ei|amos))?(?:\s+ainda)?|ainda\s+n[aã]o(?:\s+compr(?:ei|amos))?|n|continua|continue|pode\s+continuar|segue|segue\s+de\s+olho|continua\s+de\s+olho)[^\p{L}\p{N}]*$/iu;
+const RE_SIM_COMPRA = /^\s*(?:sim|s|comprei\s+sim|sim\s+comprei|consegui|deu\s+certo)[^\p{L}\p{N}]*$/iu;
 const RE_PCT = /^\s*(?:-\s*)?(\d{1,2}(?:[.,]\d+)?)\s*%\s*(?:abaixo|de\s+desconto|off|a\s+menos)?\s*[.!]?\s*$/i;
 
 let _estado = null;
@@ -184,7 +196,7 @@ function dentroDaJanela(ts = Date.now()) {
   const c = E().config, h = horaSP(ts);
   return h >= c.janelaIni && h < c.janelaFim;
 }
-function ehFinal(st) { return st === 'cancelado' || st === 'expirado' || st === 'encerrado' || st === 'removido'; }
+function ehFinal(st) { return st === 'cancelado' || st === 'expirado' || st === 'encerrado' || st === 'removido' || st === 'comprado'; }
 
 // Telefone brasileiro em dígitos com 55. Devolve null se não parecer telefone.
 export function normalizarTelefone(t) {
@@ -864,7 +876,7 @@ function textoAjuda(temAlertas) {
   return 'Oi! Eu sou o Tico, do Tica Promos 🐦\n\n'
     + 'Por aqui eu entendo só estes pedidos:\n'
     + '• *cole o link* de um produto (Amazon, Mercado Livre ou Shopee) para criar um alerta de preço;\n'
-    + (temAlertas ? '• *MEUS ALERTAS* para ver sua lista numerada;\n• *SAIR* + o número do alerta para parar só aquele (ex.: *SAIR 1* para o primeiro da lista);\n• *SAIR* sozinho para parar todos.\n' : '')
+    + (temAlertas ? '• *MEUS ALERTAS* para ver sua lista numerada;\n• *COMPREI* + o número do alerta quando você comprar (ex.: *COMPREI 1*);\n• *SAIR* + o número do alerta para parar só aquele (ex.: *SAIR 1* para o primeiro da lista);\n• *SAIR* sozinho para parar todos.\n' : '')
     + '\nVocê também pode criar e ver seus alertas em ' + SITE_ALERTAS + '\n'
     + 'Não consigo responder outras perguntas por aqui.';
 }
@@ -875,6 +887,7 @@ function textoLista(abertos) {
   }
   return '🔔 *Seus alertas de preço*\n\n' + abertos.map(linhaDoPedido).join('\n\n')
     + '\n\n———\n\n'
+    + 'Comprou algum? Responda *COMPREI* + o número dele (ex.: *COMPREI 1*).\n\n'
     + 'Para parar um alerta, responda *SAIR* + o número dele (ex.: *SAIR 1*). *SAIR* sozinho para todos.\n\n'
     + 'Para criar outro, é só colar aqui o link do produto.\n\n'
     + '📈 O histórico de preço de cada um fica em ' + SITE_ALERTAS;
@@ -922,6 +935,9 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
   }
 
   if (!pend && tratarConfirmacaoAlvo(jid, texto)) return;
+
+  // Compra: COMPREI (n) a qualquer hora; SIM/NÃO só respondendo à pergunta.
+  if (!pend && tratarCompra(jid, numeros, contato, texto, abertos)) return;
 
   const mUrl = RE_URL.exec(texto);
   if (mUrl) {
@@ -1061,7 +1077,7 @@ function podeChamarIa(jid) {
 
 const IA_SISTEMA = `Você é o Tico, o assistente de WhatsApp do Tica Promos (site de ofertas e grupos de promoções no WhatsApp). Fale em português do Brasil correto, de um jeito simpático, direto e curto (no máximo 4 linhas), como uma pessoa no WhatsApp: pode usar \"tô\" e \"pra\", mas sem gíria forçada, sem imperativo de gíria (\"cola o link\", \"diz aí\") e sem comer artigo (\"quando o produto cai\", nunca \"quando produto cai\"). Para pedir o link, diga \"é só colar aqui o link do produto\". Pode usar *negrito* do WhatsApp e no máximo 1 emoji. Jeito de se apresentar, quando precisar: \"Sou o Tico e tô aqui para te avisar quando seu produto cai de preço.\"
 
-O que você faz por aqui: alertas de preço. A pessoa cola o link de um produto da Amazon, Mercado Livre ou Shopee, diz quanto quer pagar e você avisa quando o preço chegar lá (ou cair bem). Comandos que a pessoa pode usar: MEUS ALERTAS (lista numerada), SAIR + número (para um alerta), SAIR (para todos), CANCELAR (desiste do alerta que está sendo criado). Também dá para criar e ver os alertas em ticapromos.com.br/avisos.
+O que você faz por aqui: alertas de preço. A pessoa cola o link de um produto da Amazon, Mercado Livre ou Shopee, diz quanto quer pagar e você avisa quando o preço chegar lá (ou cair bem). Comandos que a pessoa pode usar: MEUS ALERTAS (lista numerada), COMPREI + número (avisa que comprou e o alerta para), SAIR + número (para um alerta), SAIR (para todos), CANCELAR (desiste do alerta que está sendo criado). Também dá para criar e ver os alertas em ticapromos.com.br/avisos.
 
 Outras lojas: depois que o alerta é criado, você procura sozinho o MESMO produto (mesma marca, modelo e versão) nas outras lojas — Amazon e Shopee; no Mercado Livre só quando a equipe acrescenta o link — e avisa pelo menor preço entre elas, com o link da loja mais barata. A busca nem sempre encontra (anúncio diferente, modelo parecido fica de fora). Se a pessoa quiser garantir uma loja específica, ela pode colar o link de lá e criar mais um alerta.
 
@@ -1088,6 +1104,8 @@ Ações:
 - "parar": quer parar UM alerta; "n" = número dele na lista do CONTEXTO.
 - "parar_todos": quer parar TODOS os alertas.
 - "mudar_alvo": quer trocar o preço desejado de um alerta existente; "n" = número na lista, e "valor" ou "pct".
+- "comprou": a pessoa conta que COMPROU o produto de um alerta (inclusive em outra loja ou na loja física); "n" = número na lista (null se não der para saber qual).
+- "nao_comprou": responde que ainda NÃO comprou e quer continuar recebendo avisos; "n" = número na lista (null se não der para saber).
 - "alvo_parcelado": quer que o PARCELADO chegue num valor. "valor" = o valor em reais que a pessoa disse; "tipo" = "total" (total parcelado) ou "parcela" (valor de cada parcela); "parcelas" = número de parcelas se ela disse (senão null); "n" = número do alerta na lista (null se for o alerta em criação ou se ela só tem um).
 Em todas as ações, "resposta" pode ficar vazia (o sistema escreve a confirmação), exceto em "responder".`;
 
@@ -1179,6 +1197,8 @@ function contextoParaIa(jid, abertos, pend) {
         + ' · seu preço ' + (p.precoAlvo ? brl(p.precoAlvo) : 'qualquer queda boa'));
     });
   } else l.push('ALERTAS DA PESSOA: nenhum.');
+  const pc = perguntaCompraPendente(abertos);
+  if (pc) l.push('PERGUNTA PENDENTE: o Tico perguntou se a pessoa conseguiu comprar o alerta ' + (abertos.indexOf(pc) + 1) + ' (' + encurtar(pc.titulo, 60) + ').');
   const h = (_historicoConversa.get(jid) || []).slice(0, -1);
   if (h.length) {
     l.push('CONVERSA RECENTE:');
@@ -1229,6 +1249,14 @@ async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos,
     case 'parar_todos':
       tratarSair(jid, numeros);
       return true;
+    case 'comprou':
+    case 'nao_comprou': {
+      const alvoC = abertos[n - 1] || perguntaCompraPendente(abertos) || alvoCompraSemNumero(abertos);
+      if (!alvoC) { falar(jid, textoQualComprou(abertos)); return true; }
+      if (r.acao === 'comprou') marcarComprado(jid, alvoC, 'ia', abertos);
+      else marcarNaoComprou(jid, alvoC, 'ia');
+      return true;
+    }
     case 'alvo_parcelado': {
       if (!(valor > 0)) break;
       const alvoP = pend ? null : (abertos[n - 1] || (abertos.length === 1 ? abertos[0] : null));
@@ -1340,6 +1368,122 @@ function textoConfirmacao(pedido, c) {
   l.push('Quer ver seus alertas? É só mandar *MEUS ALERTAS*. Para parar, mande *SAIR*.');
   return l.join('\n');
 }
+// ── Compra (06/11/2026) ─────────────────────────────────────────────────────
+// A loja não conta quem comprou, então a única fonte é a pessoa. COMPREI (n)
+// encerra o alerta; a pergunta "conseguiu comprar?" sai perguntaCompraHoras
+// depois de um aviso sem resposta (perguntasDeCompra, na varredura).
+const MS_PERGUNTA_VALE = 48 * MS_H;
+
+// Pergunta de compra ainda sem resposta (a mais recente), entre os abertos.
+function perguntaCompraPendente(abertos) {
+  let melhor = null;
+  for (const p of abertos) {
+    const q = p.perguntaCompra;
+    if (!q || q.respondidaEm || Date.now() - Date.parse(q.em) > MS_PERGUNTA_VALE) continue;
+    if (!melhor || q.em > melhor.perguntaCompra.em) melhor = p;
+  }
+  return melhor;
+}
+
+// COMPREI sem número: o alerta avisado mais recentemente (3 dias); só um aberto = ele.
+function alvoCompraSemNumero(abertos) {
+  const avisados = abertos.filter(p => p.ultimoAvisoEm && Date.now() - Date.parse(p.ultimoAvisoEm) < 3 * MS_DIA)
+    .sort((a, b) => String(b.ultimoAvisoEm).localeCompare(String(a.ultimoAvisoEm)));
+  if (avisados.length) return avisados[0];
+  return abertos.length === 1 ? abertos[0] : null;
+}
+
+function textoQualComprou(abertos) {
+  if (!abertos.length) return 'Você não tem alertas ativos agora. Quando quiser acompanhar outro produto, é só colar aqui o link dele. 🙂';
+  return 'Qual deles você comprou? Responda *COMPREI* + o número (ex.: *COMPREI 1*).\n\n'
+    + abertos.map((p, i) => (i + 1) + '. ' + encurtar(p.titulo, 70)).join('\n');
+}
+
+function marcarComprado(jid, p, via, abertos) {
+  const agora = new Date().toISOString();
+  p.status = 'comprado'; p.compradoEm = agora; p.motivoFim = 'cliente comprou';
+  p.respostaCompra = { em: agora, resposta: 'comprou', via, precoUltimoAviso: p.ultimoAvisoPreco || null };
+  if (p.perguntaCompra && !p.perguntaCompra.respondidaEm) p.perguntaCompra.respondidaEm = agora;
+  // Aviso desse alerta que ainda estava na fila não sai mais.
+  for (let i = _filaEnvio.length - 1; i >= 0; i--) {
+    const f = _filaEnvio[i];
+    if (!f.resposta && (f.pedidoId === p.id || f.pedidoPergunta === p.id)) _filaEnvio.splice(i, 1);
+  }
+  gravar();
+  console.log('[AVISOS] ' + p.id + ' comprado (' + via + ').');
+  const resto = (abertos || []).filter(x => x !== p && !ehFinal(x.status));
+  falar(jid, 'Que ótimo! 🎉 Boa compra! Parei os avisos de *' + encurtar(tituloCurto(p.titulo), 80) + '*.'
+    + (resto.length ? '\n\nSigo de olho ' + (resto.length === 1 ? 'no seu outro alerta' : 'nos seus outros ' + resto.length + ' alertas') + '. Mande *MEUS ALERTAS* para ver a lista.'
+      : '\n\nQuando quiser acompanhar outro produto, é só colar aqui o link dele.'));
+}
+
+function marcarNaoComprou(jid, p, via) {
+  const agora = new Date().toISOString();
+  p.respostaCompra = { em: agora, resposta: 'nao_comprou', via };
+  if (p.perguntaCompra && !p.perguntaCompra.respondidaEm) p.perguntaCompra.respondidaEm = agora;
+  gravar();
+  console.log('[AVISOS] ' + p.id + ' ainda não comprado (' + via + ').');
+  falar(jid, 'Beleza! Continuo de olho em *' + encurtar(p.titulo, 70) + '* e te aviso se o preço cair mais. 👀');
+}
+
+// Comandos de compra sem IA. Devolve true quando tratou a mensagem.
+function tratarCompra(jid, numeros, contato, texto, abertos) {
+  const mC = RE_COMPREI.exec(texto);
+  if (mC) {
+    if (!abertos.length) { falar(jid, textoQualComprou(abertos)); return true; }
+    const n = mC[1] ? Number(mC[1]) : null;
+    if (n && !abertos[n - 1]) { falar(jid, 'Não achei o alerta ' + n + '.\n\n' + textoQualComprou(abertos)); return true; }
+    const p = n ? abertos[n - 1] : (perguntaCompraPendente(abertos) || alvoCompraSemNumero(abertos));
+    if (!p) { falar(jid, textoQualComprou(abertos)); return true; }
+    marcarComprado(jid, p, 'comando', abertos);
+    return true;
+  }
+  const pc = perguntaCompraPendente(abertos);
+  if (!pc) return false;
+  if (RE_SIM_COMPRA.test(texto)) { marcarComprado(jid, pc, 'pergunta', abertos); return true; }
+  if (RE_NAO_COMPREI.test(texto)) { marcarNaoComprou(jid, pc, 'pergunta'); return true; }
+  return false;
+}
+
+function textoPerguntaCompra(p) {
+  return 'Oi! Conseguiu comprar *' + encurtar(tituloCurto(p.titulo), 80) + '*?'
+    + (p.ultimoAvisoPreco ? '\n\nTe avisei quando ele estava em *' + brl(p.ultimoAvisoPreco) + '*.' : '')
+    + '\n\nResponda *SIM* se comprou (eu paro os avisos dele) ou *NÃO* que eu continuo de olho.';
+}
+
+// Roda na varredura (já dentro da janela e com a conta conectada).
+function perguntasDeCompra(res) {
+  const cfg = E().config;
+  if (cfg.perguntaCompra === false) return;
+  const espera = Math.max(1, Number(cfg.perguntaCompraHoras) || 8) * MS_H;
+  const hoje = diaSP();
+  const perguntadosHoje = new Set(E().pedidos.filter(p => p.perguntaCompra && diaSP(Date.parse(p.perguntaCompra.em)) === hoje).map(p => p.jid));
+  const naFila = new Set(_filaEnvio.map(f => f.jid));
+  for (const p of E().pedidos) {
+    if (p.status !== 'ativo' || !p.jid || p.pausado || !p.ultimoAvisoEm) continue;
+    const avisoTs = Date.parse(p.ultimoAvisoEm);
+    const idade = Date.now() - avisoTs;
+    if (idade < espera || idade > MS_PERGUNTA_VALE) continue;
+    if (p.perguntaCompra && p.perguntaCompra.avisoEm === p.ultimoAvisoEm) continue;   // já perguntou sobre esse aviso
+    if (p.respostaCompra && Date.parse(p.respostaCompra.em) > avisoTs) continue;        // já respondeu depois do aviso
+    if (perguntadosHoje.has(p.jid) || naFila.has(p.jid)) continue;
+    if (atendimentoAtivo(p.jid)) continue;
+    const avisoEm = p.ultimoAvisoEm;
+    perguntadosHoje.add(p.jid);
+    naFila.add(p.jid);
+    enfileirarEnvio(p.jid, textoPerguntaCompra(p), {
+      pedidoPergunta: p.id,
+      aoEnviar: () => {
+        p.perguntaCompra = { em: new Date().toISOString(), avisoEm };
+        anotarConversa(p.jid, 'tico', textoPerguntaCompra(p));
+        gravar();
+        console.log('[AVISOS] Pergunta de compra enviada — ' + p.id + '.');
+      },
+    });
+    res.perguntas = (res.perguntas || 0) + 1;
+  }
+}
+
 function tratarSairUm(jid, numeros, n) {
   _criacaoPendente.delete(jid);
   const contato = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean) || null;
@@ -1673,7 +1817,9 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   linhas.push('');
   linhas.push('👉 ' + link);
   linhas.push('');
-  linhas.push('_Preço de agora, pode mudar a qualquer momento. Para parar os avisos, responda SAIR._');
+  linhas.push('_Preço de agora, pode mudar a qualquer momento._');
+  linhas.push('');
+  linhas.push('Comprou? Responda *COMPREI* que eu paro os avisos desse produto. Para parar todos, responda *SAIR*.');
   return linhas.join('\n');
 }
 
@@ -1846,6 +1992,7 @@ export async function varrerAvisos({ manual = false } = {}) {
         }
       }
       for (const g of paraGrupos.values()) await cardParaGrupos(g, res);
+      perguntasDeCompra(res);
     }
     gravar();
   } catch (e) {
@@ -2183,6 +2330,14 @@ export function estadoAvisos() {
       avisosHoje: st.envios.filter(e => e.dia === hoje).length,
       avisos7d: st.envios.filter(e => e.dia >= diaSP(Date.now() - 7 * MS_DIA)).length,
       filaEnvio: _filaEnvio.length,
+      compra: (() => {
+        const avisados = st.pedidos.filter(p => (p.avisos || []).length > 0);
+        const perguntas = st.pedidos.filter(p => p.perguntaCompra).length;
+        const comprou = st.pedidos.filter(p => p.status === 'comprado').length;
+        const naoComprou = st.pedidos.filter(p => p.respostaCompra?.resposta === 'nao_comprou' && p.status !== 'comprado').length;
+        return { avisados: avisados.length, perguntas, comprou, naoComprou,
+          taxa: avisados.length ? Math.round(comprou / avisados.length * 1000) / 10 : null };
+      })(),
     },
     ultimaVarredura: _ultimaVarredura,
     pedidos: st.pedidos.slice().reverse().slice(0, 500).map(p => {
@@ -2196,6 +2351,8 @@ export function estadoAvisos() {
         criadoEm: p.criadoEm, ativadoEm: p.ativadoEm, expiraEm: p.expiraEm,
         avisos: p.avisos.length, ultimoAvisoEm: p.ultimoAvisoEm, ultimoAvisoPreco: p.ultimoAvisoPreco,
         alvoAtingidoEm: p.alvoAtingidoEm || null, motivoFim: p.motivoFim || null,
+        compradoEm: p.compradoEm || null, respostaCompra: p.respostaCompra || null,
+        perguntaCompraEm: p.perguntaCompra?.em || null, perguntaCompraRespondida: !!p.perguntaCompra?.respondidaEm,
         porNome: !!p.porNome, linkInformado: p.linkInformado || null, textoOriginal: p.textoOriginal || null,
         produto: p.produto || null,
         avisoPendente: avisoPendente(p),
@@ -2236,6 +2393,8 @@ export function salvarConfigAvisos(parcial = {}) {
   if ('quedaParcialPct' in parcial) c.quedaParcialPct = num(parcial.quedaParcialPct, 1, 80, c.quedaParcialPct);
   if ('avisarQuedaParcial' in parcial) c.avisarQuedaParcial = !!parcial.avisarQuedaParcial;
   if ('cardGrupos' in parcial) c.cardGrupos = !!parcial.cardGrupos;
+  if ('perguntaCompra' in parcial) c.perguntaCompra = !!parcial.perguntaCompra;
+  if ('perguntaCompraHoras' in parcial) c.perguntaCompraHoras = num(parcial.perguntaCompraHoras, 1, 48, c.perguntaCompraHoras);
   if ('imagemAviso' in parcial && ['cartao', 'foto', 'texto'].includes(parcial.imagemAviso)) c.imagemAviso = parcial.imagemAviso;
   if ('novaQuedaPct' in parcial) c.novaQuedaPct = num(parcial.novaQuedaPct, 0, 50, c.novaQuedaPct);
   if (c.janelaFim <= c.janelaIni) c.janelaFim = Math.min(24, c.janelaIni + 1);
@@ -2260,6 +2419,11 @@ export function acaoPedido(id, acao) {
   if (acao === 'pausar') p.pausado = true;
   else if (acao === 'retomar') p.pausado = false;
   else if (acao === 'remover') { p.status = 'removido'; p.motivoFim = 'removido no painel'; p.removidoEm = new Date().toISOString(); }
+  else if (acao === 'comprado') {
+    const agora = new Date().toISOString();
+    p.status = 'comprado'; p.compradoEm = agora; p.motivoFim = 'marcado como comprado no painel';
+    p.respostaCompra = { em: agora, resposta: 'comprou', via: 'painel', precoUltimoAviso: p.ultimoAvisoPreco || null };
+  }
   else return { ok: false, erro: 'ação inválida' };
   gravar();
   return { ok: true, status: p.status, pausado: !!p.pausado };
