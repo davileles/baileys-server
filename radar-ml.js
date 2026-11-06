@@ -3032,8 +3032,12 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     // 'auto' e escolha automatica, nao ordem: o cupom que o operador vinculou ao
     // produto vence o automatico. Cupom fixo do disparo vence tudo; 'nenhum' sai
     // sem cupom mesmo quando o item tem vinculo.
+    // 'pagina' (avisos de preco, 06/11/2026): so o cupom que o anuncio
+    // declara, inclusive o sem codigo; nunca escolhe um cupom da base.
+    const soPagina = codigoCupom === 'pagina';
     const semCupom = codigoCupom === 'nenhum';
     const codigo = semCupom ? null
+                 : soPagina ? 'auto'
                  : (codigoCupom && codigoCupom !== 'auto') ? codigoCupom
                  : (salvo.cupom || codigoCupom);
     let cupom = null, avisoCupom = null;
@@ -3049,6 +3053,8 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
 
     if (daPagina.cupom) {
       cupom = daPagina.cupom;
+    } else if (codigo === 'auto' && soPagina) {
+      avisoCupom = 'o anuncio nao mostrou cupom nesta leitura';
     } else if (codigo === 'auto') {
       const m = melhorCupomAplicavel('Mercado Livre', p.preco);
       if (m) cupom = { reg: m.reg, desconto: m.desconto, citado: true };
@@ -3263,6 +3269,22 @@ const MARCA_CUPONS_ML = '"coupons":{"coupons":[';
 // mesmo campaign_id da lista antiga, entao o casamento com a base nao muda.
 const MARCA_BENEFICIOS_ML = '"benefits":{';
 
+// Compra minima declarada no cupom (06/11/2026, pedido 6281). A restricao
+// MIN_PURCHASE so DESCREVE a regra ("compra minima R$ 129"); nao diz que ela
+// deixou de ser cumprida. O valor vem do objeto da restricao ou do texto.
+function minimoDoCupomPaginaMl(c) {
+  for (const r of (Array.isArray(c?.restrictions) ? c.restrictions : [])) {
+    if (!r || typeof r !== 'object') continue;
+    for (const v of [r.value?.value, r.value, r.amount?.value, r.amount, r.min_amount?.value, r.min_amount, r.min_purchase?.value]) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  }
+  const m = JSON.stringify(c || {}).match(/m[ií]nim[ao][^R"]{0,20}R\$\s*([\d.]*\d(?:,\d+)?)/i);
+  const n = m ? Number(m[1].replace(/\./g, '').replace(',', '.')) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function normalizarCupomBeneficioMl(c) {
   const d = c?.discount;
   if (!d || String(c.source || 'meli_coupon') !== 'meli_coupon') return null;
@@ -3276,6 +3298,7 @@ function normalizarCupomBeneficioMl(c) {
   const restricoes = (Array.isArray(c.restrictions) ? c.restrictions : [])
     .map(r => typeof r === 'string' ? r : (r?.type || r?.id || '')).filter(Boolean);
   return {
+    minimo: minimoDoCupomPaginaMl(c),
     idCampanhaLoja: c.id ? String(c.id) : null,
     tipo, valor,
     descontoMl: Number.isFinite(aplicado) && aplicado > 0 ? aplicado : null,
@@ -3341,7 +3364,8 @@ export function extrairCupomMl(html) {
  */
 function descontoSeguroMl(c, preco) {
   const tetoPercentual = c.tipo === 'pct' ? (preco * c.valor / 100) : c.valor;
-  const bruto = c.descontoMl != null ? Math.min(c.descontoMl, tetoPercentual) : tetoPercentual;
+  let bruto = c.descontoMl != null ? Math.min(c.descontoMl, tetoPercentual) : tetoPercentual;
+  if (Number(c.teto) > 0) bruto = Math.min(bruto, Number(c.teto));
   return Math.min(Math.round(bruto * 100) / 100, preco || 0);
 }
 
@@ -3503,7 +3527,7 @@ export function extrairPixMl(html) {
   return null;
 }
 
-export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo = 'catalogo' } = {}) {
+export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo = 'catalogo', aceitarSemCodigo = false } = {}) {
   if (!url) return { estado: 'indisponivel', motivo: 'produto sem link' };
   let alvo = url;
   try { alvo = await resolverLinkMl(url); } catch (e) { /* segue com a original */ }
@@ -3528,35 +3552,78 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
       preco = Number(of?.price ?? of?.lowPrice) || null;
     } catch (e) { /* sem preco */ }
   }
-  // Cupom com minimo de compra nao atingido aparece na pagina, mas nao vale no checkout.
-  const cupons = extrairCupomMl(r.html).filter(c => !/MIN_PURCHASE|NOT_MIN/i.test(String(c.tipoMl || '')));
-  if (!cupons.length) return { estado: 'sem_cupom', preco, pix, titulo };
+  // Todos os cupons da pagina sao avaliados (06/11/2026, pedido 6281): a pagina
+  // mostrava "ITENS PARA CASA" 20% (sem codigo, resgate na pagina) e OFFNOML
+  // 15% (com codigo, cinza porque o outro e melhor). Antes o filtro tirava
+  // QUALQUER cupom com restricao MIN_PURCHASE (os dois) e a resposta era "sem
+  // cupom"; e so o maior era olhado, entao o sem codigo escondia o OFFNOML.
+  const todos = extrairCupomMl(r.html);
+  if (!todos.length) return { estado: 'sem_cupom', preco, pix, titulo };
   // O bloco de beneficios traz o preco do anuncio sobre o qual o cupom vale; a
   // API pode ter lido outra oferta do catalogo (pedido 8503: API R$ 393,29,
   // anuncio R$ 414 -> R$ 351,90 com o cupom).
-  const comBase = cupons.find(c => c.precoBase);
+  const comBase = todos.find(c => c.precoBase);
   if (comBase) preco = comBase.precoBase;
   if (!preco) return { estado: 'indisponivel', motivo: 'preco nao lido na pagina', titulo };
-  const { cupom } = resolverCupomPaginaMl(cupons, preco);
-  if (!cupom || !cupom.codigo || cupom.ambiguo || cupom.semCodigo) return { estado: 'fora_da_base', preco, pix, titulo };
-  const reg = cupom.reg || cupomPorCodigo('Mercado Livre', cupom.codigo);
-  if (!reg || !cupomVigente(reg)) return { estado: 'fora_da_base', preco, pix, titulo };
-  if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) return { estado: 'sem_cupom', preco, pix, titulo };
-  const lido = cupons.find(c => c.idCampanhaLoja && c.idCampanhaLoja === cupom.idCampanhaLoja) || null;
-  // Teto do cupom (06/11/2026): o desconto pelo percentual passava do limite —
-  // OFICIAIS0511 (15%, limite R$ 40) deu R$ 66,78 num produto de R$ 459 e o
-  // alerta de preco do pedido 5142 marcou "chegou no alvo" com R$ 392,22,
-  // quando a montagem do link (checkout) dava R$ 419. Vale o menor entre o
-  // calculado e o teto (do anuncio; sem ele, o limite cadastrado na base).
-  let desconto = Number(cupom.desconto) || 0;
-  // O teto declarado no anuncio e evidencia direta e vence o da base (no mesmo
-  // caso, o anuncio dizia teto de R$ 200); o limite da base so vale sem ele.
-  const tetoValido = Number(lido?.teto) > 0 ? Number(lido.teto) : Number(reg.limite);
-  if (tetoValido > 0) desconto = Math.min(desconto, tetoValido);
-  desconto = Math.round(desconto * 100) / 100;
-  return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto, preco,
-           precoFinal: lido?.precoFinal || null,
-           pct: lido?.tipo === 'pct' ? lido.valor : null, teto: lido?.teto || null, pix, titulo };
+  // Fica de fora so o cupom que a propria pagina marca como minimo nao
+  // atingido (NOT_MIN) ou cujo minimo declarado passa do preco do anuncio.
+  const cupons = todos.filter(c => !/NOT_MIN|NOT_REACHED|UNMET|INSUFFICIENT/i.test(String(c.tipoMl || ''))
+    && !(Number(c.minimo) > 0 && preco < Number(c.minimo)));
+  if (!cupons.length) return { estado: 'sem_cupom', preco, pix, titulo };
+  const opcoes = [];
+  let foraDaBase = false;
+  for (const lido of cupons) {
+    let resolvido = null;
+    try { resolvido = resolverCupomPaginaMl([lido], preco).cupom; } catch (e) { resolvido = null; }
+    const pct = lido.tipo === 'pct' ? lido.valor : null;
+    // Cupom sem codigo (campanha de resgate na pagina): so os avisos de preco
+    // aceitam, e ele conta para o preco-alvo (decisao do Davi, 06/11/2026).
+    // Cupom que nao casou com a base cai aqui tambem: esta na pagina com valor.
+    const semCodigo = !resolvido || resolvido.semCodigo || !resolvido.codigo;
+    if (semCodigo) {
+      if (!aceitarSemCodigo) { foraDaBase = true; continue; }
+      let d = descontoSeguroMl(lido, preco);
+      if (!(d > 0)) continue;
+      opcoes.push({ codigo: null, semCodigo: true, segmentado: !!resolvido?.segmentado,
+                    rotulo: rotuloCupomPaginaMl(lido), desconto: Math.round(d * 100) / 100,
+                    precoFinal: lido.precoFinal || null, pct, teto: lido.teto || null });
+      continue;
+    }
+    if (resolvido.ambiguo) { foraDaBase = true; continue; }
+    const reg = resolvido.reg || cupomPorCodigo('Mercado Livre', resolvido.codigo);
+    if (!reg || !cupomVigente(reg)) { foraDaBase = true; continue; }
+    if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) continue;
+    // Teto do cupom (06/11/2026): o desconto pelo percentual passava do limite —
+    // OFICIAIS0511 (15%, limite R$ 40) deu R$ 66,78 num produto de R$ 459 e o
+    // alerta de preco do pedido 5142 marcou "chegou no alvo" com R$ 392,22,
+    // quando a montagem do link (checkout) dava R$ 419. Vale o menor entre o
+    // calculado e o teto (do anuncio; sem ele, o limite cadastrado na base).
+    // O teto declarado no anuncio e evidencia direta e vence o da base (no mesmo
+    // caso, o anuncio dizia teto de R$ 200); o limite da base so vale sem ele.
+    let desconto = Number(resolvido.desconto) || 0;
+    const tetoValido = Number(lido.teto) > 0 ? Number(lido.teto) : Number(reg.limite);
+    if (tetoValido > 0) desconto = Math.min(desconto, tetoValido);
+    desconto = Math.round(desconto * 100) / 100;
+    if (!(desconto > 0)) continue;
+    opcoes.push({ codigo: reg.codigo || resolvido.codigo, semCodigo: false, desconto,
+                  precoFinal: lido.precoFinal || null, pct, teto: lido.teto || null });
+  }
+  if (!opcoes.length) return { estado: foraDaBase ? 'fora_da_base' : 'sem_cupom', preco, pix, titulo };
+  // O de maior desconto vale; o melhor COM codigo vai junto como alternativa
+  // (o sem codigo pode ser direcionado e nao aparecer para todos).
+  opcoes.sort((x, y) => y.desconto - x.desconto);
+  const melhor = opcoes[0];
+  const alt = melhor.semCodigo ? opcoes.find(o => o.codigo) : null;
+  return { estado: 'ok', ...melhor, preco, pix, titulo,
+           alternativa: alt ? { codigo: alt.codigo, desconto: alt.desconto, pct: alt.pct, teto: alt.teto } : null,
+           semCodigoNaPagina: !aceitarSemCodigo && foraDaBase };
+}
+
+// Nome curto do cupom sem codigo para a mensagem: "20% OFF" / "R$ 30 OFF".
+function rotuloCupomPaginaMl(c) {
+  const v = Number(c?.valor) || 0;
+  const base = c?.tipo === 'pct' ? (Math.round(v * 100) / 100) + '% OFF' : 'R$ ' + String(Math.round(v * 100) / 100).replace('.', ',') + ' OFF';
+  return base;
 }
 
 // ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────

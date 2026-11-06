@@ -858,7 +858,7 @@ function linhaDoPedido(p, i) {
   if (p.status === 'aguardando') l.push('⏳ Aguardando ativação');
   if (p.pausado) l.push('⏸️ Pausado');
   if (p.porNome) l.push('🔎 Ainda estamos procurando o produto');
-  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo?.precoCartao && mo.precoCartao - atual >= 0.01 ? ' no Pix (' + brl(mo.precoCartao) + ' no cartão)' : '') + (mo && mo.prod.loja !== p.loja ? ' na ' + mo.prod.loja : '') + (mo?.cupom ? ' com o cupom ' + mo.cupom : ''));
+  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo?.precoCartao && mo.precoCartao - atual >= 0.01 ? ' no Pix (' + brl(mo.precoCartao) + ' no cartão)' : '') + (mo && mo.prod.loja !== p.loja ? ' na ' + mo.prod.loja : '') + (mo?.cupom ? ' com o cupom ' + nomeDoCupom(mo.cupom) : ''));
   if (p.precoAlvo) {
     if (atual && atual <= p.precoAlvo) l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + ' ✅ chegou!');
     else l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
@@ -1781,7 +1781,7 @@ async function montarLink(p, cupom = null) {
   let montado = null;
   if (p.loja === 'Amazon') montado = await _deps.montarAmazon([p.asin], 'nenhum');
   else if (p.loja === 'Shopee') montado = await _deps.montarShopee([item], 'nenhum');
-  else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], cupom || 'nenhum');
+  else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], cupomParaMontagem(cupom) || 'nenhum');
   const o = montado?.prontos?.[0];
   if (!o?.produto?.link) {
     const d = montado?.descartados?.[0];
@@ -1831,7 +1831,8 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
     linhas.push('💰 Agora: *' + brl(preco) + ' no Pix*');
     linhas.push('💳 ' + brl(extra.precoCartao) + ' no cartão');
   } else linhas.push('💰 Agora: *' + brl(preco) + '*');
-  if (extra.cupom) linhas.push('🎟️ Usando o cupom *' + extra.cupom + '* (aparece no anúncio)');
+  if (extra.cupom && ehCupomPagina(extra.cupom)) linhas.push('🎟️ Com o cupom *' + extra.cupom.slice(PREFIXO_CUPOM_PAGINA.length) + '* do anúncio (sem código: é só resgatar na página antes de comprar)');
+  else if (extra.cupom) linhas.push('🎟️ Usando o cupom *' + extra.cupom + '* (aparece no anúncio)');
   if (pedido.precoAlvo) {
     if (preco <= pedido.precoAlvo) linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' ✅');
     else linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' (faltam ' + brl(preco - pedido.precoAlvo) + ')');
@@ -2061,6 +2062,20 @@ let _ultimaBuscaEquiv = null;
 const _errosBusca = {};
 let _trabalhando = false;
 
+// Cupom sem codigo da pagina do ML (06/11/2026, pedido 6281): campanha de
+// resgate no proprio anuncio ("ITENS PARA CASA" 20%). Conta para o preco-alvo
+// (decisao do Davi). Circula como 'pagina:<rotulo>' no lugar do codigo; a
+// montagem do link recebe 'pagina' (so o cupom do anuncio, nunca um da base).
+const PREFIXO_CUPOM_PAGINA = 'pagina:';
+function ehCupomPagina(cupom) { return typeof cupom === 'string' && cupom.startsWith(PREFIXO_CUPOM_PAGINA); }
+function cupomParaMontagem(cupom) { return ehCupomPagina(cupom) ? 'pagina' : cupom; }
+function nomeDoCupom(cupom) { return ehCupomPagina(cupom) ? 'de ' + (cupom.slice(PREFIXO_CUPOM_PAGINA.length) || 'desconto') + ' do anúncio' : cupom; }
+function cupomDoConferido(c) {
+  if (!c || c.estado !== 'ok') return null;
+  if (c.codigo) return c.codigo;
+  return c.semCodigo ? PREFIXO_CUPOM_PAGINA + (c.rotulo || '') : null;
+}
+
 function precoEfetivo(p, maxIdadeMs = Infinity) {
   if (!p?.ult?.preco || p.ult.disponivel === false) return null;
   if (Date.now() - Date.parse(p.ult.em) > maxIdadeMs) return null;
@@ -2073,28 +2088,28 @@ function precoEfetivo(p, maxIdadeMs = Infinity) {
   if (pix?.pct > 0 && pix.precoCartao && c.em && Date.now() - Date.parse(c.em) < 24 * MS_H
       && Math.abs(preco - pix.precoCartao) / pix.precoCartao <= 0.05) {
     let cartao = preco;
-    if (c.estado === 'ok' && c.codigo && (c.pct > 0 || c.desconto > 0)) {
+    if (cupomDoConferido(c) && (c.pct > 0 || c.desconto > 0)) {
       const d = c.pct > 0 ? cartao * c.pct / 100 : c.desconto;
       const teto = c.teto || (c.pct > 0 ? null : c.desconto);
       cartao = arred(Math.max(0.01, cartao - (teto ? Math.min(d, teto) : d)));
-      cupom = c.codigo;
+      cupom = cupomDoConferido(c);
     }
     return { preco: arred(cartao * (1 - pix.pct / 100)), precoCartao: cartao, pixPct: pix.pct, cupom };
   }
   // O desconto foi lido para um preço; com o preço mudando mais de 5% ele
   // pode não valer igual — espera a próxima conferência.
-  if (c?.estado === 'ok' && c.codigo && c.desconto > 0 && c.precoRef
+  if (cupomDoConferido(c) && c.desconto > 0 && c.precoRef
       && Date.now() - Date.parse(c.em) < 24 * MS_H) {
     if (Math.abs(preco - c.precoRef) / c.precoRef <= 0.05) {
       // O desconto vale sobre o preco do ANUNCIO lido na pagina (precoRef), que
       // pode ser o do Pix e diferir do lido pela API (06/11/2026, pedido 5142:
       // API R$ 459, anuncio R$ 445,23, cupom -R$ 66,78 = R$ 378,45 na pagina;
       // o painel mostrava R$ 392,22 tirando o desconto dos R$ 459).
-      preco = arred(Math.max(0.01, Math.min(preco, c.precoRef) - c.desconto)); cupom = c.codigo;
+      preco = arred(Math.max(0.01, Math.min(preco, c.precoRef) - c.desconto)); cupom = cupomDoConferido(c);
     } else if (c.pct > 0) {
       // Cupom percentual: recalcula sobre o preco atual, respeitando o teto.
       const d = preco * c.pct / 100;
-      preco = arred(Math.max(0.01, preco - (c.teto ? Math.min(d, c.teto) : d))); cupom = c.codigo;
+      preco = arred(Math.max(0.01, preco - (c.teto ? Math.min(d, c.teto) : d))); cupom = cupomDoConferido(c);
     }
   }
   return { preco, cupom };
@@ -2169,16 +2184,18 @@ function precisaConferirCupom(p) {
 async function conferirCupomMl(p, { manual = false } = {}) {
   p.cupomMlTentativaEm = new Date().toISOString();
   let r = null;
-  try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null, { motivo: manual ? 'manual' : 'avisos' }); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
+  try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null, { motivo: manual ? 'manual' : 'avisos', aceitarSemCodigo: true }); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
   if (r?.titulo) aplicarTituloLido(p, r.titulo);
   if (!r || r.estado === 'indisponivel') return r;   // fica o que já havia; tenta de novo em 1 h
   p.cupomMl = { estado: r.estado, codigo: r.codigo || null, desconto: r.desconto ? arred(r.desconto) : null,
                 precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null),
                 precoFinal: r.precoFinal ? arred(r.precoFinal) : null, pct: r.pct || null, teto: r.teto || null,
                 pix: r.pix?.pct > 0 && r.pix.precoCartao ? { pct: r.pix.pct, precoCartao: arred(r.pix.precoCartao) } : null,
+                semCodigo: !!r.semCodigo, rotulo: r.rotulo || null, segmentado: !!r.segmentado,
+                alternativa: r.alternativa || null,
                 em: new Date().toISOString() };
   p.cupomMlRechecar = false;
-  if (r.estado === 'ok') console.log('[AVISOS] Cupom ' + r.codigo + ' vale para ' + p.asin + ' (−' + brl(r.desconto) + ').');
+  if (r.estado === 'ok') console.log('[AVISOS] Cupom ' + (r.codigo || ((r.rotulo || '') + ' sem codigo')) + ' vale para ' + p.asin + ' (−' + brl(r.desconto) + ').');
   return r;
 }
 
@@ -2342,7 +2359,7 @@ async function cardParaGrupos(g, res) {
   const ult = p.cardGrupo;
   if (ult && Date.now() - Date.parse(ult.em) < 24 * MS_H && !(g.preco < ult.preco * 0.97)) return;
   try {
-    const r = await _deps.cardGrupos({ item: itemDoProduto(p), cupom: g.cupom, tipo: g.tipo, clientes: g.clientes, precoAviso: g.preco, alvo: g.alvo });
+    const r = await _deps.cardGrupos({ item: itemDoProduto(p), cupom: cupomParaMontagem(g.cupom), tipo: g.tipo, clientes: g.clientes, precoAviso: g.preco, alvo: g.alvo });
     if (r?.ok) { p.cardGrupo = { em: new Date().toISOString(), preco: g.preco, id: r.id }; res.cards = (res.cards || 0) + 1; }
     else if (r?.jaEnviado || r?.duplicado) p.cardGrupo = { em: new Date().toISOString(), preco: g.preco, pulado: r.jaEnviado ? 'já enviado nos grupos em 15 dias' : 'card pendente' };
     else console.warn('[AVISOS] Card para os grupos não criado (' + p.asin + '): ' + (r?.erro || '?'));
