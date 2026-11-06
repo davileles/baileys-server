@@ -19591,7 +19591,14 @@ async function processarOfertasAwin({ simular = false } = {}) {
         }
       }
 
+      if (!oferta.motivoFila && !oferta.dadosExtraidos.motivoFila) {
+        oferta.motivoFila = cfg.modo === 'on' ? 'envio automático falhou' : 'Awin em modo fila (calibração)';
+      } else if (!oferta.motivoFila) oferta.motivoFila = oferta.dadosExtraidos.motivoFila;
       filaPendentes.unshift(oferta); salvarFila();
+      // Card no @ticopromosbot (06/11/2026): antes a oferta da Awin so entrava
+      // na fila e o operador nao ficava sabendo. Fire-and-forget, como no radar.
+      enviarCardRevisaoTelegram(oferta).catch(e =>
+        console.warn('[BOT-TSP] Card da oferta Awin #' + oferta.id + ' falhou: ' + e.message));
       saida.naFila.push({ loja: p.loja, titulo: p.titulo, desconto: p.desconto });
       console.log('[AWIN-OFERTAS] Na fila — ' + p.loja + ' ' + p.desconto + '% — ' + p.titulo.slice(0, 40));
     }

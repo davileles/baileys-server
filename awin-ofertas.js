@@ -231,10 +231,46 @@ export function salvarConfigOfertasAwin(dados = {}) {
   return nova;
 }
 
+// ── MESMO MODELO EM OUTRO TAMANHO/COR (06/11/2026) ──
+// O feed repete a peca por tamanho e cor, e a chave do historico so tirava a
+// cor do FIM do nome: "Tenis ASICS Japan S - Roxo/Roxo - tam: 33.5" e "... tam:
+// 34" viravam duas ofertas. A chave do modelo tira tamanho e cor de qualquer
+// variante; o historico continua gravado pela chave antiga (compativel com o
+// que ja saiu) e o indice de modelos e derivado dele, sem inflar o usoDeHoje.
+const CORES_RE = '(preto|preta|branco|branca|azul|vermelho|vermelha|verde|amarelo|amarela|rosa|cinza|bege|marrom|roxo|roxa|laranja|dourado|dourada|prata|nude|vinho|caramelo|off white|multicolorido|marinho|grafite|chumbo|lilas|creme|areia|cafe|coral|mostarda|petroleo|vinho)';
+export function chaveModeloAwin(chaveHistorico) {
+  const partes = String(chaveHistorico || '').split('|');
+  if (partes.length < 3) return String(chaveHistorico || '');
+  const loja = partes[0], preco = partes[partes.length - 1];
+  let t = partes.slice(1, -1).join('|').toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  t = t.replace(/[-,|(]?\s*\b(tam(anho)?|tam\.|numero|num\.?)\s*[:.]?\s*[\w.,/]+\)?/g, ' ');
+  const corFim = new RegExp('[\\s\\-/,|]*\\b' + CORES_RE + '(\\s*/\\s*' + CORES_RE + ')*\\s*$');
+  const tamFim = /[\s\-/,|]*\b(pp|p|m|g|gg|xg|xgg|eg|u|unico|\d{2}(\.5|,5)?)\s*$/;
+  for (let i = 0; i < 4; i++) {
+    const antes = t;
+    t = t.replace(/[\s\-/,|]+$/, '').replace(corFim, '').replace(tamFim, '');
+    if (t === antes) break;
+  }
+  t = t.replace(/[^a-z0-9]+/g, ' ').trim();
+  return loja + '|' + t + '|' + preco;
+}
+
+let _modelos = new Map();   // chaveModelo -> ISO do ultimo envio (derivado de _ofertados)
+function reindexarModelos() {
+  _modelos = new Map();
+  for (const [k, v] of Object.entries(_ofertados)) {
+    const m = chaveModeloAwin(k);
+    const atual = _modelos.get(m);
+    if (!atual || String(v) > String(atual)) _modelos.set(m, v);
+  }
+}
+
 export function carregarOfertadosAwin() {
   try {
     if (existsSync(OFERTADOS_PATH)) _ofertados = JSON.parse(readFileSync(OFERTADOS_PATH, 'utf-8')) || {};
   } catch { _ofertados = {}; }
+  reindexarModelos();
   return _ofertados;
 }
 
@@ -245,6 +281,7 @@ function salvarOfertados() {
     const t = new Date(v).getTime();
     if (isFinite(t) && t < limite) delete _ofertados[k];
   }
+  reindexarModelos();
   try {
     if (!existsSync('./sessao')) mkdirSync('./sessao', { recursive: true });
     writeFileSync(OFERTADOS_PATH, JSON.stringify(_ofertados));
@@ -257,7 +294,7 @@ export function marcarOfertado(chave) {
 }
 
 function jaOfertado(chave, repetirDias) {
-  const quando = _ofertados[chave];
+  const quando = _ofertados[chave] || _modelos.get(chaveModeloAwin(chave));
   if (!quando) return false;
   const t = new Date(quando).getTime();
   if (!isFinite(t)) return false;
@@ -388,9 +425,16 @@ export async function reabastecerCandidatosAwin({ forcar = false } = {}) {
   if (!forcar) for (const c of _candidatos) porChave.set(c.chaveHistorico, c);
   for (const c of novos) porChave.set(c.chaveHistorico, c);
 
+  // Uma variante por modelo: os tamanhos/cores da mesma peca nao ocupam a fila.
+  const modelosVistos = new Set();
   _candidatos = [...porChave.values()]
     .filter(c => !jaOfertado(c.chaveHistorico, cfg.repetirDias))
     .sort((a, b) => (b.desconto - a.desconto) || (b.preco - a.preco))
+    .filter(c => {
+      const m = chaveModeloAwin(c.chaveHistorico);
+      if (modelosVistos.has(m)) return false;
+      modelosVistos.add(m); return true;
+    })
     .slice(0, 500);
   _candidatosEm = Date.now();
   salvarCandidatos();
@@ -509,6 +553,7 @@ export function proximosCandidatos({ simular = false } = {}) {
     if (!lojaLiberadaAwin(c.advertiserId, cfg)) continue;
     if ((usadosLoja[c.loja] || 0) >= regraDaLojaAwin(c.advertiserId, cfg).maxDia) continue;
     if (jaOfertado(c.chaveHistorico, cfg.repetirDias)) continue;
+    if (escolhidos.some(e => chaveModeloAwin(e.chaveHistorico) === chaveModeloAwin(c.chaveHistorico))) continue;
     escolhidos.push(c);
     usadosLoja[c.loja] = (usadosLoja[c.loja] || 0) + 1;
   }
