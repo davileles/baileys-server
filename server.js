@@ -184,7 +184,7 @@ import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previa
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora,
          pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
-         acaoEquivalente, trabalhoOutrasLojas } from './avisos-preco.js';
+         acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -17922,6 +17922,15 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   if (oferta.origem === 'avisos-preco' && oferta.expiraEm && Date.parse(oferta.expiraEm) < Date.now()) {
     oferta.status = 'expirado'; salvarFila();
     return res.status(410).json({ ok:false, erro:'Card do alerta de cliente expirou — o preço pode ter mudado.' });
+  }
+  // E dentro da validade o preco e relido na loja: subiu ou nao confirmou = nao sai.
+  if (oferta.origem === 'avisos-preco' && !req.body.ignorarPreco) {
+    const d = oferta.dadosExtraidos || {};
+    const base = d.precoFinal ?? d.preco;
+    const cp = await conferirPrecoCardAviso(d.asin, base, d.avisoPreco?.cupom || null).catch(e => ({ ok:false, motivo:e.message }));
+    const rs = v => 'R$ ' + Number(v).toFixed(2).replace('.', ',');
+    if (!cp?.ok) return res.status(409).json({ ok:false, erro:'Não deu para confirmar o preço na loja agora (' + (cp?.motivo || 'sem resposta') + '). O card não saiu.' });
+    if (cp.subiu) return res.status(409).json({ ok:false, erro:'Preço subiu na loja: ' + rs(base) + ' → ' + rs(cp.precoAgora) + '. Descarte o card.' });
   }
   // Card do monitor de precos: vencido nao sai, e o preco e relido na loja —
   // se voltou a subir, a oferta que justificou o card nao existe mais.

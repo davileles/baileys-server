@@ -1543,6 +1543,21 @@ export async function dispararPedidoAgora(id) {
   return { ok: true, tipo, preco: m.preco, loja: mo.prod.loja, cupom: mo.cupom || null };
 }
 
+// Trava do card de alerta de cliente para os grupos (06/11/2026): antes de sair
+// pelo /painel/aprovar, o preço é relido na loja com o mesmo cupom do card.
+// Subiu mais de 3% ou a loja não confirmou = o card não sai.
+export async function conferirPrecoCardAviso(chave, precoCard, cupom = null) {
+  const p = E().produtos[chave];
+  if (!p) return { ok: false, motivo: 'produto não está mais vigiado' };
+  let m = null;
+  try { m = await montarLink(p, cupom || null); } catch (e) { return { ok: false, motivo: e.message }; }
+  if (!m?.preco) return { ok: false, motivo: 'a loja não confirmou o preço agora' };
+  if (!cupom) { registrarLeitura(p, { preco: m.preco, disponivel: true }); gravar(); }
+  const base = Number(precoCard);
+  const subiu = Number.isFinite(base) && base > 0 && (m.preco - base) / base > 0.03;
+  return { ok: true, precoAgora: m.preco, subiu };
+}
+
 export async function varrerAvisos({ manual = false } = {}) {
   if (_varrendo) return { ok: false, erro: 'varredura em andamento' };
   const cfg = E().config;
