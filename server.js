@@ -184,7 +184,8 @@ import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previa
          criarPedido as avisosCriarPedido, infoPublica as avisosInfoPublica, estadoAvisos,
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora,
          pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
-         acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido } from './avisos-preco.js';
+         acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido,
+         enviarMensagemOperador, encerrarAtendimento } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -26545,6 +26546,16 @@ app.get('/avisos-preco', (req, res) => {
 app.post('/avisos-preco/config', (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
   res.json({ ok:true, config: salvarConfigAvisos(req.body || {}) });
+});
+// Atendimento humano: o operador responde o cliente pela conversa do pedido
+// (antes da rota genérica /:acao, que pegaria "mensagem").
+app.post('/avisos-preco/pedido/:id/mensagem', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(enviarMensagemOperador(String(req.params.id || ''), (req.body || {}).texto));
+});
+app.post('/avisos-preco/pedido/:id/atendimento/encerrar', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });
+  res.json(encerrarAtendimento(String(req.params.id || '')));
 });
 app.post('/avisos-preco/pedido/:id/:acao', async (req, res) => {
   if (!ehAdminRaiz(req)) return res.status(403).json({ ok:false, erro:'so o administrador' });

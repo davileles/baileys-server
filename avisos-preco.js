@@ -113,6 +113,7 @@ function estruturar(bruto) {
     envios: Array.isArray(e.envios) ? e.envios : [],
     cuponsMlVistos: Array.isArray(e.cuponsMlVistos) ? e.cuponsMlVistos : [],
     mensagens: Array.isArray(e.mensagens) ? e.mensagens : [],
+    atendimentos: e.atendimentos && typeof e.atendimentos === 'object' ? e.atendimentos : {},
   };
 }
 
@@ -632,9 +633,17 @@ export function observarMensagemAvisos(apelido, msg) {
     if (!texto) return;
     rastrear(jid, 'recebida', texto);
     registrarMensagem(jid, 'cliente', texto);
+    // Atendimento humano em andamento: a resposta é do operador pelo painel.
+    // SAIR / SAIR n continuam valendo; o resto não recebe resposta automática.
+    const humano = atendimentoAtivo(jid);
+    if (humano) estenderAtendimento(jid);
 
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
 
+    if (humano && !RE_SAIR.test(texto) && !RE_SAIR_UM.test(texto) && !RE_ATIVAR.test(texto)) {
+      rastrear(jid, 'atendimento-humano', 'sem resposta automática');
+      return;
+    }
     if (RE_CANCELAR.test(texto) && _criacaoPendente.has(jid)) {
       tratarConversa(jid, numeros, texto, msg.pushName, null).catch(e => console.warn('[AVISOS] Conversa: ' + e.message));
       return;
@@ -745,6 +754,42 @@ function rastrear(jid, tipo, detalhe) {
 }
 // Conversa de um pedido para o painel: mensagens trocadas com a pessoa (todos
 // os números/jids dela) + os avisos registrados no pedido.
+// ── Atendimento humano pelo painel (06/11/2026) ──
+// O operador responde o cliente pela conversa do pedido; enquanto o atendimento
+// está aberto (2 h desde a última mensagem de qualquer lado, ou até devolver
+// ao Tico), o número não responde sozinho essa pessoa.
+const ATENDIMENTO_MS = 2 * MS_H;
+function atendimentoAtivo(jid) {
+  const ate = E().atendimentos[jid];
+  if (!ate) return false;
+  if (Date.parse(ate) > Date.now()) return true;
+  delete E().atendimentos[jid]; gravar();
+  return false;
+}
+function estenderAtendimento(jid) { E().atendimentos[jid] = new Date(Date.now() + ATENDIMENTO_MS).toISOString(); gravar(); }
+
+export function enviarMensagemOperador(id, textoBruto) {
+  const p = E().pedidos.find(x => x.id === id);
+  if (!p) return { ok: false, erro: 'pedido não encontrado' };
+  if (!p.jid) return { ok: false, erro: 'o cliente ainda não falou com o número dos avisos (pedido não ativado)' };
+  const texto = String(textoBruto || '').trim().slice(0, 2000);
+  if (!texto) return { ok: false, erro: 'mensagem vazia' };
+  const c = E().config;
+  if (!c.conta || !_deps.contaConectada?.(c.conta)) return { ok: false, erro: 'número dos avisos (' + (c.conta || 'nenhum') + ') desconectado' };
+  estenderAtendimento(p.jid);
+  _criacaoPendente.delete(p.jid);
+  anotarConversa(p.jid, 'tico', texto);
+  rastrear(p.jid, 'operador', texto);
+  enfileirarEnvio(p.jid, texto, { resposta: true, de: 'operador' });
+  return { ok: true, atendimentoAte: E().atendimentos[p.jid] };
+}
+export function encerrarAtendimento(id) {
+  const p = E().pedidos.find(x => x.id === id);
+  if (!p) return { ok: false, erro: 'pedido não encontrado' };
+  if (p.jid && E().atendimentos[p.jid]) { delete E().atendimentos[p.jid]; gravar(); }
+  return { ok: true };
+}
+
 export function mensagensDoPedido(id) {
   const p = E().pedidos.find(x => x.id === id);
   if (!p) return { ok: false, erro: 'pedido não encontrado' };
@@ -756,7 +801,9 @@ export function mensagensDoPedido(id) {
   for (const v of vs) jids.add(v + '@s.whatsapp.net');
   const mensagens = E().mensagens.filter(m => jids.has(m.jid))
     .map(m => ({ de: m.de, em: m.em, texto: m.t, aviso: !!m.aviso, pedido: m.pedido || null, imagem: !!m.imagem, manual: !!m.manual, falhou: m.falhou || null }));
-  return { ok: true, pedido: { id: p.id, codigo: p.codigo, titulo: p.titulo, nome: p.nome },
+  const ate = p.jid && atendimentoAtivo(p.jid) ? E().atendimentos[p.jid] : null;
+  return { ok: true, pedido: { id: p.id, codigo: p.codigo, titulo: p.titulo, nome: p.nome, ativo: !!p.jid },
+           atendimentoAte: ate, contaConectada: E().config.conta ? !!_deps.contaConectada?.(E().config.conta) : false,
            avisos: (p.avisos || []).slice(), mensagens, historicoDesde: E().mensagens.length ? E().mensagens[0].em : null };
 }
 
@@ -1360,12 +1407,12 @@ async function processarFila() {
           }
         } else await _deps.enviarDm(c.conta, item.jid, item.texto);
         _ultimoEnvioEm = Date.now();
-        registrarMensagem(item.jid, 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, imagem: !!img, manual: !!item.manual });
+        registrarMensagem(item.jid, item.de || 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, imagem: !!img, manual: !!item.manual });
         if (item.aoEnviar) { try { item.aoEnviar(); } catch (e) {} }
       } catch (e) {
         console.warn('[AVISOS] Envio para ' + mascarar(digitosDeJid(item.jid) || item.jid) + ' falhou: ' + e.message);
         rastrear(item.jid, 'envio-falhou', e.message);
-        registrarMensagem(item.jid, 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, falhou: String(e.message || e).slice(0, 160) });
+        registrarMensagem(item.jid, item.de || 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, falhou: String(e.message || e).slice(0, 160) });
         if (item.aoFalhar) { try { item.aoFalhar(e); } catch (e2) {} }
       }
       if (item.resposta) await new Promise(r => setTimeout(r, 2500));
@@ -1951,6 +1998,8 @@ export function estadoAvisos() {
   const porStatus = {};
   for (const p of st.pedidos) porStatus[p.status] = (porStatus[p.status] || 0) + 1;
   const hoje = diaSP();
+  const ultimaPorJid = new Map();
+  for (const m of st.mensagens) ultimaPorJid.set(m.jid, { de: m.de, em: m.em });
   return {
     ok: true,
     config: st.config,
@@ -1968,6 +2017,7 @@ export function estadoAvisos() {
     ultimaVarredura: _ultimaVarredura,
     pedidos: st.pedidos.slice().reverse().slice(0, 500).map(p => {
       const prod = st.produtos[p.produto] || {};
+      const um = p.jid ? ultimaPorJid.get(p.jid) : null;
       return {
         id: p.id, codigo: p.codigo, nome: p.nome, telefone: mascarar(p.telefone),
         status: p.status, pausado: !!p.pausado, loja: p.loja, titulo: p.titulo, url: prod.url || '',
@@ -1979,6 +2029,8 @@ export function estadoAvisos() {
         porNome: !!p.porNome, linkInformado: p.linkInformado || null, textoOriginal: p.textoOriginal || null,
         produto: p.produto || null,
         avisoPendente: avisoPendente(p),
+        ultimaMensagem: um || null,
+        atendimentoAte: p.jid && st.atendimentos[p.jid] && Date.parse(st.atendimentos[p.jid]) > Date.now() ? st.atendimentos[p.jid] : null,
       };
     }),
     produtos: Object.fromEntries(produtosBase().map(prod => [prod.asin, painelDoProduto(prod)])),
