@@ -846,7 +846,7 @@ function linhaDoPedido(p, i) {
   if (p.status === 'aguardando') l.push('⏳ Aguardando ativação');
   if (p.pausado) l.push('⏸️ Pausado');
   if (p.porNome) l.push('🔎 Ainda estamos procurando o produto');
-  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo && mo.prod.loja !== p.loja ? ' na ' + mo.prod.loja : '') + (mo?.cupom ? ' com o cupom ' + mo.cupom : ''));
+  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo?.precoCartao && mo.precoCartao - atual >= 0.01 ? ' no Pix (' + brl(mo.precoCartao) + ' no cartão)' : '') + (mo && mo.prod.loja !== p.loja ? ' na ' + mo.prod.loja : '') + (mo?.cupom ? ' com o cupom ' + mo.cupom : ''));
   if (p.precoAlvo) {
     if (atual && atual <= p.precoAlvo) l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + ' ✅ chegou!');
     else l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
@@ -1437,7 +1437,7 @@ export function listaConsulta(token) {
         status: p.status, pausado: !!p.pausado, porNome: !!p.porNome,
         precoInicial: p.precoInicial, precoAlvo: p.precoAlvo,
         precoAtual: prod.ult?.preco ?? null, disponivel: prod.ult ? prod.ult.disponivel !== false : null,
-        melhor: (() => { const mo = prod.asin ? melhorOferta(prod) : null; return mo ? { preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null } : null; })(),
+        melhor: (() => { const mo = prod.asin ? melhorOferta(prod) : null; return mo ? { preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null, precoCartao: mo.precoCartao || null } : null; })(),
         lidoEm: prod.lidoEm || null, criadoEm: p.criadoEm, expiraEm: p.expiraEm,
         avisos: (p.avisos || []).map(a => ({ em: a.em, preco: a.preco, tipo: a.tipo })),
         serie: serieDoProduto(prod),
@@ -1622,6 +1622,23 @@ async function montarLink(p, cupom = null) {
   return { link: o.produto.link, preco: preco > 0 ? arred(preco) : null, titulo: o.produto.titulo || p.titulo };
 }
 
+// Preço relido na montagem do link, levado para a mesma base do melhor preço
+// (06/11/2026). Com Pix declarado, a montagem pode devolver o preço no cartão
+// (com cupom) ou já o do Pix; daqui sai sempre { preco: Pix, precoCartao }.
+function confirmarPrecos(mo, precoLido) {
+  const v = Number(precoLido);
+  if (!mo?.pixPct || !mo.precoCartao || !(v > 0)) return { preco: v, precoCartao: null, pixPct: null };
+  const f = 1 - mo.pixPct / 100;
+  // Já veio no Pix e bate com o esperado (o ML aplica cupom e Pix em ordens
+  // diferentes conforme o bloco: R$ 546,28 x R$ 551,08) — vale o maior, o que
+  // a página mostra, e o cartão já calculado.
+  if (v < mo.precoCartao * 0.97 && Math.abs(v - mo.preco) / mo.preco <= 0.02) {
+    return { preco: arred(Math.max(v, mo.preco)), precoCartao: mo.precoCartao, pixPct: mo.pixPct };
+  }
+  const cartao = v >= mo.precoCartao * 0.97 ? v : arred(v / f);
+  return { preco: arred(cartao * f), precoCartao: cartao, pixPct: mo.pixPct };
+}
+
 // Título curto para a mensagem: até o primeiro separador e no máximo ~70 caracteres.
 function tituloCurto(t) {
   let s = String(t || '').replace(/\s+/g, ' ').trim();
@@ -1641,7 +1658,10 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   linhas.push('*' + tituloCurto(pedido.titulo) + '*');
   linhas.push('');
   if (outraLoja) { linhas.push('🏪 Mesmo produto, agora na *' + extra.loja + '*'); }
-  linhas.push('💰 Agora: *' + brl(preco) + '*');
+  if (extra.precoCartao && extra.precoCartao - preco >= 0.01) {
+    linhas.push('💰 Agora: *' + brl(preco) + ' no Pix*');
+    linhas.push('💳 ' + brl(extra.precoCartao) + ' no cartão');
+  } else linhas.push('💰 Agora: *' + brl(preco) + '*');
   if (extra.cupom) linhas.push('🎟️ Usando o cupom *' + extra.cupom + '* (aparece no anúncio)');
   if (pedido.precoAlvo) {
     if (preco <= pedido.precoAlvo) linhas.push('🎯 Seu preço: ' + brl(pedido.precoAlvo) + ' ✅');
@@ -1659,7 +1679,7 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
 
 // Põe o aviso de um pedido na fila de envio e registra quando sai de fato.
 function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
-  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom });
+  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null });
   const precoEnviado = m.preco;
   const modo = E().config.imagemAviso || 'cartao';
   const p = mo.prod;
@@ -1711,7 +1731,7 @@ function avisoPendente(pedido) {
   else if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) motivo = 'número dos alertas desconectado';
   else if (!dentroDaJanela()) motivo = 'fora da janela (' + cfg.janelaIni + 'h–' + cfg.janelaFim + 'h)';
   else if (Date.now() - Date.parse(mo.prod.ult?.em || 0) > 8 * MS_H) motivo = 'leitura com mais de 8 h, aguardando nova leitura';
-  return { tipo: av.tipo, preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null, motivo };
+  return { tipo: av.tipo, preco: mo.preco, precoCartao: mo.precoCartao || null, loja: mo.prod.loja, cupom: mo.cupom || null, motivo };
 }
 
 // Botão "Disparar agora" do painel: relê o preço na loja e manda o aviso já,
@@ -1731,7 +1751,9 @@ export async function dispararPedidoAgora(id) {
   let m = null;
   try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { return { ok: false, erro: 'falha ao montar o link: ' + e.message }; }
   if (!m?.link || !m.preco) return { ok: false, erro: 'a loja não confirmou o preço agora' };
-  if (!mo.cupom) registrarLeitura(mo.prod, { preco: m.preco, disponivel: true });
+  const precoBruto = m.preco;
+  m = { ...m, ...confirmarPrecos(mo, m.preco) };
+  if (!mo.cupom) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true });
   // Mesma régua do aviso automático (alvo, queda parcial ou queda sem alvo), só
   // sem a trava do último aviso: preço que voltou a subir não dispara nada.
   const av = avaliarPedido({ ...pedido, ultimoAvisoPreco: null }, m.preco);
@@ -1810,8 +1832,10 @@ export async function varrerAvisos({ manual = false } = {}) {
         let m = null;
         try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + mo.prod.asin + '): ' + e.message); }
         if (!m?.link || !m.preco) continue;
+        const precoBruto = m.preco;
+        m = { ...m, ...confirmarPrecos(mo, m.preco) };
         const conf = avaliarPedido(pedido, m.preco, cfg);
-        if (!conf) { if (!mo.cupom) registrarLeitura(mo.prod, { preco: m.preco, disponivel: true }); continue; }
+        if (!conf) { if (!mo.cupom) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true }); continue; }
         enfileirarAviso(pedido, mo, m, conf.tipo);
         res.avisos++;
         // Também para os grupos (card de revisão no bot), só alvo ou queda de verdade.
@@ -1856,6 +1880,21 @@ function precoEfetivo(p, maxIdadeMs = Infinity) {
   if (Date.now() - Date.parse(p.ult.em) > maxIdadeMs) return null;
   let preco = p.ult.preco, cupom = null;
   const c = p.cupomMl;
+  // Pix x cartao (06/11/2026, pedido 7653): a pagina do ML declara o preco no
+  // cartao e o desconto do Pix. O aviso conta o menor (Pix) e mostra os dois.
+  // So vale com a leitura da pagina fresca e o preco no cartao batendo (5%).
+  const pix = c?.pix;
+  if (pix?.pct > 0 && pix.precoCartao && c.em && Date.now() - Date.parse(c.em) < 24 * MS_H
+      && Math.abs(preco - pix.precoCartao) / pix.precoCartao <= 0.05) {
+    let cartao = preco;
+    if (c.estado === 'ok' && c.codigo && (c.pct > 0 || c.desconto > 0)) {
+      const d = c.pct > 0 ? cartao * c.pct / 100 : c.desconto;
+      const teto = c.teto || (c.pct > 0 ? null : c.desconto);
+      cartao = arred(Math.max(0.01, cartao - (teto ? Math.min(d, teto) : d)));
+      cupom = c.codigo;
+    }
+    return { preco: arred(cartao * (1 - pix.pct / 100)), precoCartao: cartao, pixPct: pix.pct, cupom };
+  }
   // O desconto foi lido para um preço; com o preço mudando mais de 5% ele
   // pode não valer igual — espera a próxima conferência.
   if (c?.estado === 'ok' && c.codigo && c.desconto > 0 && c.precoRef
@@ -1886,7 +1925,7 @@ function melhorOferta(prod, { maxIdadeMs = Infinity } = {}) {
   for (const q of cands) {
     const ef = precoEfetivo(q, maxIdadeMs);
     if (!ef) continue;
-    if (!melhor || ef.preco < melhor.preco - 0.009) melhor = { prod: q, preco: ef.preco, cupom: ef.cupom };
+    if (!melhor || ef.preco < melhor.preco - 0.009) melhor = { prod: q, preco: ef.preco, cupom: ef.cupom, precoCartao: ef.precoCartao || null, pixPct: ef.pixPct || null };
   }
   return melhor;
 }
@@ -1901,7 +1940,7 @@ function painelDoProduto(prod) {
   });
   return {
     ...ofertaPainel(prod),
-    melhor: mo ? { chave: mo.prod.asin, loja: mo.prod.loja, preco: mo.preco, cupom: mo.cupom || null } : null,
+    melhor: mo ? { chave: mo.prod.asin, loja: mo.prod.loja, preco: mo.preco, cupom: mo.cupom || null, precoCartao: mo.precoCartao, pixPct: mo.pixPct } : null,
     equivalentes: (prod.equivalentes || []).map(eq => {
       const q = E().produtos[eq.chave] || { asin: eq.chave, loja: eq.loja, titulo: eq.titulo };
       return { ...ofertaPainel(q), confianca: eq.confianca ?? null, origem: eq.origem, motivo: eq.motivo || '',
@@ -1949,6 +1988,7 @@ async function conferirCupomMl(p, { manual = false } = {}) {
   p.cupomMl = { estado: r.estado, codigo: r.codigo || null, desconto: r.desconto ? arred(r.desconto) : null,
                 precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null),
                 precoFinal: r.precoFinal ? arred(r.precoFinal) : null, pct: r.pct || null, teto: r.teto || null,
+                pix: r.pix?.pct > 0 && r.pix.precoCartao ? { pct: r.pix.pct, precoCartao: arred(r.pix.precoCartao) } : null,
                 em: new Date().toISOString() };
   p.cupomMlRechecar = false;
   if (r.estado === 'ok') console.log('[AVISOS] Cupom ' + r.codigo + ' vale para ' + p.asin + ' (−' + brl(r.desconto) + ').');

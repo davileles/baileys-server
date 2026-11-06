@@ -3465,6 +3465,35 @@ export function resolverCupomPaginaMl(cupons, preco) {
 //   sem_cupom      -> a pagina nao oferece cupom (ou so com minimo nao atingido)
 //   fora_da_base   -> ha cupom na pagina, mas nao ha codigo vigente na base que case
 //   indisponivel   -> extensao offline, fora da janela, teto, bloqueio ou sem resposta
+// ── DESCONTO NO PIX DECLARADO NA PAGINA (06/11/2026) ───────────────────────
+// O bloco "benefits" traz o preco do anuncio no cartao (discounted_product_price)
+// e o desconto do Pix (cupom de source 'pix' + price_decrement). Os avisos de
+// preco mostram as duas formas de pagamento: no Pix (o menor) e no cartao.
+// Devolve null quando a pagina nao declara Pix.
+export function extrairPixMl(html) {
+  const txt = String(html || '');
+  let b = 0;
+  while ((b = txt.indexOf(MARCA_BENEFICIOS_ML, b)) !== -1) {
+    const bruto = fatiarJsonBalanceado(txt, b + MARCA_BENEFICIOS_ML.length - 1);
+    b += MARCA_BENEFICIOS_ML.length;
+    if (!bruto) continue;
+    let ben;
+    try { ben = JSON.parse(bruto); } catch (e) { continue; }
+    const precoCartao = Number(ben?.discounted_product_price?.value) || null;
+    const pix = (Array.isArray(ben?.coupons) ? ben.coupons : []).find(x => String(x?.source || '').toLowerCase() === 'pix');
+    if (!precoCartao || !pix?.discount) continue;
+    const base = Number(pix.base_price?.value) || precoCartao;
+    const valor = Number(pix.discount.value) || 0;
+    let pct = String(pix.discount.mode || '').toLowerCase() === 'percentage' ? valor : (base > 0 ? valor / base * 100 : 0);
+    const m = txt.slice(b, b + 20000).match(/"price_decrement":\{[^}]*"discount_percentage":([\d.]+)/);
+    if (m && Number(m[1]) > 0) pct = Number(m[1]);
+    pct = Math.round(pct * 100) / 100;
+    if (!(pct > 0 && pct < 50)) continue;
+    return { pct, precoCartao, precoPix: Math.round(precoCartao * (1 - pct / 100) * 100) / 100 };
+  }
+  return null;
+}
+
 export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo = 'catalogo' } = {}) {
   if (!url) return { estado: 'indisponivel', motivo: 'produto sem link' };
   let alvo = url;
@@ -3473,6 +3502,8 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
   try { r = await pedirPaginaMl(alvo, { esperaMs: motivo === 'manual' ? 45000 : 30000, motivo }); } catch (e) { r = null; }
   if (!r || !r.html) return { estado: 'indisponivel', motivo: motivoIndisponivelPaginasMl(motivo) || 'pagina nao respondeu a tempo' };
   if (r.bloqueada) return { estado: 'indisponivel', motivo: 'pagina bloqueada' };
+  let pix = null;
+  try { pix = extrairPixMl(r.html); } catch (e) { pix = null; }
   let preco = Number(precoRef) || null;
   if (!preco) {
     try {
@@ -3483,7 +3514,7 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
   }
   // Cupom com minimo de compra nao atingido aparece na pagina, mas nao vale no checkout.
   const cupons = extrairCupomMl(r.html).filter(c => !/MIN_PURCHASE|NOT_MIN/i.test(String(c.tipoMl || '')));
-  if (!cupons.length) return { estado: 'sem_cupom', preco };
+  if (!cupons.length) return { estado: 'sem_cupom', preco, pix };
   // O bloco de beneficios traz o preco do anuncio sobre o qual o cupom vale; a
   // API pode ter lido outra oferta do catalogo (pedido 8503: API R$ 393,29,
   // anuncio R$ 414 -> R$ 351,90 com o cupom).
@@ -3491,10 +3522,10 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
   if (comBase) preco = comBase.precoBase;
   if (!preco) return { estado: 'indisponivel', motivo: 'preco nao lido na pagina' };
   const { cupom } = resolverCupomPaginaMl(cupons, preco);
-  if (!cupom || !cupom.codigo || cupom.ambiguo || cupom.semCodigo) return { estado: 'fora_da_base', preco };
+  if (!cupom || !cupom.codigo || cupom.ambiguo || cupom.semCodigo) return { estado: 'fora_da_base', preco, pix };
   const reg = cupom.reg || cupomPorCodigo('Mercado Livre', cupom.codigo);
-  if (!reg || !cupomVigente(reg)) return { estado: 'fora_da_base', preco };
-  if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) return { estado: 'sem_cupom', preco };
+  if (!reg || !cupomVigente(reg)) return { estado: 'fora_da_base', preco, pix };
+  if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) return { estado: 'sem_cupom', preco, pix };
   const lido = cupons.find(c => c.idCampanhaLoja && c.idCampanhaLoja === cupom.idCampanhaLoja) || null;
   // Teto do cupom (06/11/2026): o desconto pelo percentual passava do limite —
   // OFICIAIS0511 (15%, limite R$ 40) deu R$ 66,78 num produto de R$ 459 e o
@@ -3509,7 +3540,7 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
   desconto = Math.round(desconto * 100) / 100;
   return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto, preco,
            precoFinal: lido?.precoFinal || null,
-           pct: lido?.tipo === 'pct' ? lido.valor : null, teto: lido?.teto || null };
+           pct: lido?.tipo === 'pct' ? lido.valor : null, teto: lido?.teto || null, pix };
 }
 
 // ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────
