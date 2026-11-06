@@ -14,7 +14,9 @@
 //   2. O número dos avisos é exclusivo (apelido aviso-*): DM em volume é o que
 //      derruba número, e nenhum número que dispara grupo pode correr esse risco.
 //   3. "SAIR" cancela tudo daquele contato, na hora.
-//   4. Uma mensagem de aviso por pessoa por dia, só dentro da janela.
+//   4. Avisos só dentro da janela. O limite é por alerta, não por pessoa:
+//      cada alerta avisa uma vez a cada preço e só volta a avisar quando o
+//      preço cai mais (novaQuedaPct) — inclusive no mesmo dia (06/11/2026).
 //   5. O preço é relido na montagem da mensagem: se não confirmar, não sai.
 //
 // Lojas com leitura de preço: Amazon, Mercado Livre e Shopee (as mesmas do
@@ -50,7 +52,9 @@ const CFG_PADRAO = {
   limitePorCliente: 5,
   janelaIni: 9,          // hora SP (inclusive)
   janelaFim: 21,         // hora SP (exclusive)
-  avisosPorDia: 1,       // por pessoa
+  // Sem uso desde 06/11/2026: o limite passou a ser por alerta (só nova
+  // queda de novaQuedaPct gera novo aviso). Fica para não quebrar a config gravada.
+  avisosPorDia: 1,
   ativacaoDias: 7,       // pedido aguardando ativação expira depois disso
   validadeDias: 90,      // pedido ativo encerra sozinho depois disso
   // Sem preço desejado: avisa quando cair pelo menos isto contra o preço do pedido.
@@ -1529,6 +1533,24 @@ function produtosVigiados() {
   return [...out.values()];
 }
 
+// Leitura devida: o produto pedido quando vence o intervalo da loja dele, e
+// junto as outras lojas vinculadas a ele (mesma cadência do link do cliente,
+// 06/11/2026). Outra loja que também é produto pedido de outro alerta segue
+// também a cadência própria.
+function devidosParaLeitura() {
+  const out = new Map();
+  for (const p of produtosBase()) {
+    if (!vencidos(p)) continue;
+    out.set(p.asin, p);
+    for (const eq of p.equivalentes || []) {
+      if (eq.ativo === false) continue;
+      const q = E().produtos[eq.chave];
+      if (q) out.set(q.asin, q);
+    }
+  }
+  return [...out.values()];
+}
+
 function vencidos(p) {
   const h = Number(E().config.intervaloHoras[p.loja]) || 4;
   return !p.lidoEm || Date.now() - Date.parse(p.lidoEm) >= h * MS_H - 5 * 60000;
@@ -1679,7 +1701,6 @@ function avisoPendente(pedido) {
   else if (_filaEnvio.some(f => f.pedidoId === pedido.id)) motivo = 'na fila de envio';
   else if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) motivo = 'número dos alertas desconectado';
   else if (!dentroDaJanela()) motivo = 'fora da janela (' + cfg.janelaIni + 'h–' + cfg.janelaFim + 'h)';
-  else if (avisosHoje(pedido.jid) >= cfg.avisosPorDia) motivo = 'cliente já recebeu o aviso do dia';
   else if (Date.now() - Date.parse(mo.prod.ult?.em || 0) > 8 * MS_H) motivo = 'leitura com mais de 8 h, aguardando nova leitura';
   return { tipo: av.tipo, preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null, motivo };
 }
@@ -1752,7 +1773,7 @@ export async function varrerAvisos({ manual = false } = {}) {
     // 2. Leitura (só das 7h às 23h; fora disso a loja nem precisa ser incomodada).
     const h = horaSP();
     if (manual || (h >= 7 && h < 23)) {
-      const devidos = produtosVigiados().filter(vencidos);
+      const devidos = devidosParaLeitura();
       if (devidos.length) res.lidos = await lerProdutos(devidos);
     }
     // 3. Avisos, só na janela e com a conta conectada.
@@ -1776,7 +1797,6 @@ export async function varrerAvisos({ manual = false } = {}) {
         if (!mo) continue;
         const av = avaliarPedido(pedido, mo.preco, cfg);
         if (!av) continue;
-        if (avisosHoje(pedido.jid) + _filaEnvio.filter(f => f.jid === pedido.jid && f.pedidoId).length >= cfg.avisosPorDia) continue;
         // Confirma o preço na hora de montar o link (releitura da loja).
         let m = null;
         try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + mo.prod.asin + '): ' + e.message); }
