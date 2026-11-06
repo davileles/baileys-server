@@ -1754,14 +1754,39 @@ function avisosHoje(jid) {
   return E().envios.filter(e => e.jid === jid && e.dia === hoje).length;
 }
 
+const NOME_PROVISORIO = /^Produto MLB\d+$/i;
+
+// Nome real do produto do ML a partir da página (o mesmo leitor do cupom).
+// Corrige o produto e os pedidos dele que ficaram com "Produto MLB...".
+function aplicarTituloLido(p, titulo) {
+  const t = String(titulo || '').replace(/\s*[|\-–]\s*Mercado Livre\s*$/i, '').trim();
+  if (!t || NOME_PROVISORIO.test(t)) return false;
+  if (p.titulo && !NOME_PROVISORIO.test(p.titulo)) return false;
+  p.titulo = t.slice(0, 200);
+  for (const ped of E().pedidos) if (ped.produto === p.asin && (!ped.titulo || NOME_PROVISORIO.test(ped.titulo))) ped.titulo = p.titulo;
+  console.log('[AVISOS] Nome de ' + p.asin + ' lido na página: "' + p.titulo + '".');
+  return true;
+}
+
+// Devolve { link, preco, titulo } ou { erro } com o motivo do descarte da
+// montagem (antes virava só "a loja não confirmou o preço agora").
 async function montarLink(p, cupom = null) {
+  // Sem nome real a montagem do ML descarta o item ("sem nome do produto").
+  if (p.loja === 'Mercado Livre' && p.url && (!p.titulo || NOME_PROVISORIO.test(p.titulo))
+      && !(p.tituloPaginaEm && Date.now() - Date.parse(p.tituloPaginaEm) < MS_H)) {
+    p.tituloPaginaEm = new Date().toISOString();
+    try { const r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null, { motivo: 'manual' }); if (r?.titulo && aplicarTituloLido(p, r.titulo)) gravar(); } catch (e) { /* segue */ }
+  }
   const item = itemDoProduto(p);
   let montado = null;
   if (p.loja === 'Amazon') montado = await _deps.montarAmazon([p.asin], 'nenhum');
   else if (p.loja === 'Shopee') montado = await _deps.montarShopee([item], 'nenhum');
   else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], cupom || 'nenhum');
   const o = montado?.prontos?.[0];
-  if (!o?.produto?.link) return null;
+  if (!o?.produto?.link) {
+    const d = montado?.descartados?.[0];
+    return { erro: d?.motivo ? String(d.motivo).slice(0, 220) : 'a montagem do link não devolveu o produto' };
+  }
   const preco = Number(o.precoFinal ?? o.produto.preco);
   return { link: o.produto.link, preco: preco > 0 ? arred(preco) : null, titulo: o.produto.titulo || p.titulo };
 }
@@ -1896,7 +1921,11 @@ export async function dispararPedidoAgora(id) {
   if (!mo) return { ok: false, erro: 'sem preço lido para este produto' };
   let m = null;
   try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { return { ok: false, erro: 'falha ao montar o link: ' + e.message }; }
-  if (!m?.link || !m.preco) return { ok: false, erro: 'a loja não confirmou o preço agora' };
+  if (!m?.link || !m.preco) {
+    const motivo = m?.erro || (m?.link ? 'sem preço na montagem do link' : '');
+    console.warn('[AVISOS] Disparo manual pedido ' + pedido.id + ' recusado: ' + (motivo || 'sem resposta'));
+    return { ok: false, erro: 'a loja não confirmou o preço agora' + (motivo ? ' (' + motivo + ')' : '') };
+  }
   const precoBruto = m.preco;
   m = { ...m, ...confirmarPrecos(mo, m.preco) };
   if (!mo.cupom) registrarLeitura(mo.prod, { preco: precoBruto, disponivel: true });
@@ -1926,7 +1955,7 @@ export async function conferirPrecoCardAviso(chave, precoCard, cupom = null) {
   if (!p) return { ok: false, motivo: 'produto não está mais vigiado' };
   let m = null;
   try { m = await montarLink(p, cupom || null); } catch (e) { return { ok: false, motivo: e.message }; }
-  if (!m?.preco) return { ok: false, motivo: 'a loja não confirmou o preço agora' };
+  if (!m?.preco) return { ok: false, motivo: 'a loja não confirmou o preço agora' + (m?.erro ? ' (' + m.erro + ')' : '') };
   if (!cupom) { registrarLeitura(p, { preco: m.preco, disponivel: true }); gravar(); }
   const base = Number(precoCard);
   const subiu = Number.isFinite(base) && base > 0 && (m.preco - base) / base > 0.03;
@@ -1977,7 +2006,7 @@ export async function varrerAvisos({ manual = false } = {}) {
         // Confirma o preço na hora de montar o link (releitura da loja).
         let m = null;
         try { m = await montarLink(mo.prod, mo.cupom); } catch (e) { console.warn('[AVISOS] Montagem falhou (' + mo.prod.asin + '): ' + e.message); }
-        if (!m?.link || !m.preco) continue;
+        if (!m?.link || !m.preco) { if (m?.erro) console.warn('[AVISOS] Montagem recusou ' + mo.prod.asin + ' (pedido ' + pedido.id + '): ' + m.erro); continue; }
         const precoBruto = m.preco;
         m = { ...m, ...confirmarPrecos(mo, m.preco) };
         const conf = avaliarPedido(pedido, m.preco, cfg);
@@ -2131,6 +2160,7 @@ async function conferirCupomMl(p, { manual = false } = {}) {
   p.cupomMlTentativaEm = new Date().toISOString();
   let r = null;
   try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null, { motivo: manual ? 'manual' : 'avisos' }); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
+  if (r?.titulo) aplicarTituloLido(p, r.titulo);
   if (!r || r.estado === 'indisponivel') return r;   // fica o que já havia; tenta de novo em 1 h
   p.cupomMl = { estado: r.estado, codigo: r.codigo || null, desconto: r.desconto ? arred(r.desconto) : null,
                 precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null),
