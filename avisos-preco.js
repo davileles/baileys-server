@@ -1926,10 +1926,10 @@ function precisaConferirCupom(p) {
   return c.precoRef && Math.abs(p.ult.preco - c.precoRef) / c.precoRef > 0.05;
 }
 
-async function conferirCupomMl(p) {
+async function conferirCupomMl(p, { manual = false } = {}) {
   p.cupomMlTentativaEm = new Date().toISOString();
   let r = null;
-  try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
+  try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null, { motivo: manual ? 'manual' : 'avisos' }); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
   if (!r || r.estado === 'indisponivel') return r;   // fica o que já havia; tenta de novo em 1 h
   p.cupomMl = { estado: r.estado, codigo: r.codigo || null, desconto: r.desconto ? arred(r.desconto) : null,
                 precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null), em: new Date().toISOString() };
@@ -2062,7 +2062,7 @@ export async function acaoEquivalente({ produto, acao, chave, url } = {}) {
   if (acao === 'cupom') {
     const alvo = chave ? E().produtos[chave] : prod;
     if (!alvo || alvo.loja !== 'Mercado Livre') return { ok: false, erro: 'só produtos do Mercado Livre têm cupom de página' };
-    const r = await conferirCupomMl(alvo); gravar();
+    const r = await conferirCupomMl(alvo, { manual: true }); gravar();
     return { ok: true, cupom: r, produto: painelDoProduto(prod) };
   }
   if (acao === 'remover' || acao === 'trocar') {

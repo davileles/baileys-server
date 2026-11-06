@@ -1140,7 +1140,7 @@ export function regraDoNicho(nicho) {
 // Leitura BARATA de proposito: so preco, sem gerar link de afiliado. O link (e
 // o rastreio) so e gerado no disparo, para nao queimar cota de API criando
 // shortlink de produto que nao vai sair.
-async function lerPreco(item) {
+async function lerPreco(item, { motivoPagina = 'monitor' } = {}) {
   if (item.loja === 'Shopee') {
     if (!credenciaisShopeeOk()) throw new Error('Shopee nao configurada');
     const node = await buscarProdutoShopee({ shopId: item.shopId, itemId: item.itemId });
@@ -1178,7 +1178,8 @@ async function lerPreco(item) {
     const _cat = idCatalogoMl(item.asin, item.url);
     if (_cat && await catalogoSemOfertaMl(_cat)) return { preco: null, precoDe: null, disponivel: false, titulo: null, fonte: 'api' };
     if (!tokenAffOk()) throw new Error('Mercado Livre nao configurado (ML_AFF_TOKEN) e sem cobertura da API oficial para este item');
-    const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin), { id: item.asin });
+    // Pagina pela extensao com a cota da finalidade (monitor: teto proprio).
+    const d = await buscarDadosProdutoMl(item.url || ('https://www.mercadolivre.com.br/p/' + item.asin), { id: item.asin, motivoPagina });
     return { preco: d.preco, precoDe: d.precoDe, disponivel: d.disponivel !== false, titulo: d.titulo };
   }
   if (ehItemAmazon(item)) {
@@ -1196,7 +1197,7 @@ async function lerPreco(item) {
  * avisos-preco.js). Mesmo caminho da varredura, sem tocar a serie do monitor:
  * quem chama decide o que fazer com o preco.
  */
-export async function lerPrecoProduto(item) { return lerPreco(item); }
+export async function lerPrecoProduto(item, opts = {}) { return lerPreco(item, { motivoPagina: opts.motivoPagina || 'avisos' }); }
 export async function lerPrecosAmazonEmLote(itens) { return lerPrecosAmazon(itens); }
 
 /**

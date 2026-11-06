@@ -57,7 +57,7 @@ import { tagMlDoProduto, salvarItemVitrine } from './radar-amazon.js';
 // link precisa saber classificar. categorizador.js so depende de fs e do sync,
 // entao nao ha ciclo de import aqui.
 import { classificarProduto, categoriaConfiavel } from './categorizador.js';
-import { pedirPaginaMl, extensaoPaginasOnline } from './paginas-ml.js';
+import { pedirPaginaMl, extensaoPaginasOnline, motivoIndisponivelPaginasMl } from './paginas-ml.js';
 
 function carregarToken() {
   try { if (existsSync(tokenPath())) tokDef(JSON.parse(readFileSync(tokenPath(), 'utf-8'))); }
@@ -1320,7 +1320,7 @@ export async function buscarDadosProdutoMl(url, opcoes = {}) {
     // sendo a fonte do preco de catalogo (passa pela regra de oferta suspeita);
     // a pagina acrescenta o que so ela tem — cupom declarado no anuncio e o
     // "De" — e vira a fonte inteira para anuncio classico, que a API nao cobre.
-    const pagPromessa = opcoes.semPagina ? Promise.resolve(null) : paginaPelaExtensaoMl(alvoUrl);
+    const pagPromessa = opcoes.semPagina ? Promise.resolve(null) : paginaPelaExtensaoMl(alvoUrl, opcoes.motivoPagina || 'leitura');
     const viaApi = await dadosViaApiMl(alvoUrl, url, opcoes);
     const pag = await pagPromessa;
     if (viaApi) {
@@ -1399,10 +1399,10 @@ async function paginaPelaExtensaoMlBruta(alvoUrl) {
   } catch (e) { return null; }
 }
 
-async function paginaPelaExtensaoMl(alvoUrl) {
+async function paginaPelaExtensaoMl(alvoUrl, motivo = 'leitura') {
   if (!extensaoPaginasOnline()) return null;
   try {
-    const r = await pedirPaginaMl(alvoUrl);
+    const r = await pedirPaginaMl(alvoUrl, { motivo });
     if (!r) return null;
     if (r.bloqueada) {
       console.warn('[ML] Pagina pela extensao veio bloqueada (antibot no Chrome do operador): ' + alvoUrl);
@@ -3390,13 +3390,13 @@ export function resolverCupomPaginaMl(cupons, preco) {
 //   sem_cupom      -> a pagina nao oferece cupom (ou so com minimo nao atingido)
 //   fora_da_base   -> ha cupom na pagina, mas nao ha codigo vigente na base que case
 //   indisponivel   -> extensao offline, fora da janela, teto, bloqueio ou sem resposta
-export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null) {
+export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo = 'catalogo' } = {}) {
   if (!url) return { estado: 'indisponivel', motivo: 'produto sem link' };
   let alvo = url;
   try { alvo = await resolverLinkMl(url); } catch (e) { /* segue com a original */ }
   let r = null;
-  try { r = await pedirPaginaMl(alvo, { esperaMs: 30000, motivo: 'catalogo' }); } catch (e) { r = null; }
-  if (!r || !r.html) return { estado: 'indisponivel', motivo: 'pagina nao lida' };
+  try { r = await pedirPaginaMl(alvo, { esperaMs: motivo === 'manual' ? 45000 : 30000, motivo }); } catch (e) { r = null; }
+  if (!r || !r.html) return { estado: 'indisponivel', motivo: motivoIndisponivelPaginasMl(motivo) || 'pagina nao respondeu a tempo' };
   if (r.bloqueada) return { estado: 'indisponivel', motivo: 'pagina bloqueada' };
   let preco = Number(precoRef) || null;
   if (!preco) {

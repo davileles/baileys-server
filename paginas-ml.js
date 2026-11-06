@@ -43,6 +43,16 @@ const TESTE_MS   = Number(process.env.ML_PAGINA_TESTE_MIN || 15) * 60000; // tes
 const ONLINE_MS  = 90000;                                              // long-poll visto ha menos = extensao online
 const HTML_MAX   = 2.5 * 1024 * 1024;
 const [JAN_INI, JAN_FIM] = String(process.env.ML_PAGINA_JANELA || '8-23').split('-').map(Number);
+// Cota por finalidade (06/11/2026): a releitura de hora em hora do monitor de
+// precos pedia pagina para cada anuncio classico e /up/ da vitrine (~500 itens
+// que a API nao cobre) e queimava as 200 paginas do dia antes das 9h — o resto
+// (disparos, Catalogo, alertas de preco, clique manual) ficava sem leitura.
+// Agora o monitor tem teto proprio e pequeno, e uma reserva do teto geral so
+// pode ser usada por quem vai publicar ou foi pedido pelo operador.
+const TETO_MONITOR = Number(process.env.ML_PAGINA_TETO_MONITOR ?? 30);
+const RESERVA      = Number(process.env.ML_PAGINA_RESERVA ?? 50);
+// motivos que podem usar a reserva (quem publica ou responde a um pedido)
+const USA_RESERVA  = new Set(['leitura', 'catalogo', 'avisos', 'manual', 'teste']);
 
 let _seq = 0;
 const _fila = [];               // [{ id, url, criadoEm, resolve, timer, entregueEm }]
@@ -52,6 +62,7 @@ let _estado = {
   dia: null, hoje: 0, ultimaUrl: null, ultimaEm: null, ultimoErro: null, semResposta: 0,
   // { desde, url, ultimoTesteEm, testes } enquanto o ML espera a verificacao manual
   verificacao: null,
+  porMotivo: {},                // { motivo: paginas entregues hoje }
 };
 let _aoPedirVerificacao = null;  // (url) => Promise — aviso no WhatsApp (server.js)
 let _aoLiberar = null;           // (verificacao) => Promise
@@ -62,11 +73,11 @@ function horaSp() { return Number(new Date().toLocaleTimeString('en-GB', { timeZ
 function naJanela() { const h = horaSp(); return h >= JAN_INI && h < JAN_FIM; }
 function zerarDia() {
   const d = diaSp();
-  if (_estado.dia !== d) { _estado.dia = d; _estado.hoje = 0; gravar(); }
+  if (_estado.dia !== d) { _estado.dia = d; _estado.hoje = 0; _estado.porMotivo = {}; gravar(); }
 }
 function gravar() {
   if (!_arquivo) return;
-  try { escreverAtomico(_arquivo, JSON.stringify({ dia: _estado.dia, hoje: _estado.hoje, verificacao: _estado.verificacao })); } catch (e) {}
+  try { escreverAtomico(_arquivo, JSON.stringify({ dia: _estado.dia, hoje: _estado.hoje, porMotivo: _estado.porMotivo, verificacao: _estado.verificacao })); } catch (e) {}
 }
 
 /** Chamado no boot pelo server com o diretorio da sessao. */
@@ -75,7 +86,7 @@ export function iniciarPaginasMl(sessaoDir) {
   try {
     if (existsSync(_arquivo)) {
       const m = JSON.parse(readFileSync(_arquivo, 'utf-8'));
-      if (m?.dia === diaSp()) { _estado.dia = m.dia; _estado.hoje = Number(m.hoje) || 0; }
+      if (m?.dia === diaSp()) { _estado.dia = m.dia; _estado.hoje = Number(m.hoje) || 0; _estado.porMotivo = (m.porMotivo && typeof m.porMotivo === 'object') ? m.porMotivo : {}; }
       if (m?.verificacao?.url) _estado.verificacao = m.verificacao;
     }
   } catch (e) {}
@@ -108,14 +119,20 @@ export function extensaoPaginasOnline() {
   return LIGADO && Date.now() - _estado.ultimoPollEm < ONLINE_MS;
 }
 
-/** Por que um pedido nao seria atendido agora (null = pode). */
-export function motivoIndisponivelPaginasMl() {
+/**
+ * Por que um pedido nao seria atendido agora (null = pode).
+ * Sem motivo: a pergunta geral do painel (teto do dia inteiro).
+ */
+export function motivoIndisponivelPaginasMl(motivo = null) {
   if (!LIGADO) return 'desligada';
   if (!extensaoPaginasOnline()) return 'extensao_offline';
   if (_estado.verificacao) return 'aguardando_verificacao';
   if (!naJanela()) return 'fora_da_janela';
   zerarDia();
+  if (motivo === 'manual') return null;   // clique do operador: uma pagina, fura o teto
   if (_estado.hoje >= TETO_DIA) return 'teto';
+  if (motivo && !USA_RESERVA.has(motivo) && _estado.hoje >= TETO_DIA - RESERVA) return 'reserva';
+  if (motivo === 'monitor' && (_estado.porMotivo.monitor || 0) >= TETO_MONITOR) return 'teto_monitor';
   return null;
 }
 
@@ -126,8 +143,8 @@ export function motivoIndisponivelPaginasMl() {
  */
 export function pedirPaginaMl(url, { esperaMs = ESPERA_MS, motivo = 'leitura', forcar = false } = {}) {
   // forcar: so o teste da verificacao passa por cima do freio (precisa da extensao online)
-  const porque = forcar ? (LIGADO && extensaoPaginasOnline() ? null : 'extensao_offline') : motivoIndisponivelPaginasMl();
-  if (porque) return Promise.resolve(null);
+  const porque = forcar ? (LIGADO && extensaoPaginasOnline() ? null : 'extensao_offline') : motivoIndisponivelPaginasMl(motivo);
+  if (porque) { _estado.recusas = _estado.recusas || {}; const k = motivo + ':' + porque; _estado.recusas[k] = (_estado.recusas[k] || 0) + 1; return Promise.resolve(null); }
   // A mesma URL pedida duas vezes seguidas (dois grupos-fonte publicando junto)
   // vai uma vez so: o segundo pedido pega carona no primeiro.
   const igual = !forcar && _fila.find(p => p.url === url && !p.entregueEm && !p.forcar);
@@ -156,7 +173,11 @@ function proximoParaEntregar() {
   // passou do prazo (a extensao espaca 4-8 s entre as buscas).
   if (_fila.some(p => p.entregueEm && Date.now() - p.entregueEm < ESPERA_MS)) return null;
   // O teste da verificacao vai na frente e ignora o freio; o resto espera.
-  const p = _fila.find(p => !p.entregueEm && p.forcar) || (motivoIndisponivelPaginasMl() ? null : _fila.find(p => !p.entregueEm && !p.forcar));
+  // Manual primeiro (o operador esta olhando a tela); depois o resto, cada um
+  // conferido contra a cota da sua finalidade.
+  const p = _fila.find(p => !p.entregueEm && p.forcar)
+    || _fila.find(p => !p.entregueEm && !p.forcar && p.motivo === 'manual' && !motivoIndisponivelPaginasMl('manual'))
+    || _fila.find(p => !p.entregueEm && !p.forcar && !motivoIndisponivelPaginasMl(p.motivo));
   if (!p) return null;
   p.entregueEm = Date.now();
   return { id: p.id, url: p.url, motivo: p.motivo };
@@ -207,6 +228,7 @@ export function registrarResultadoPaginaMl(corpo, bloqueadaFn) {
   const status = Number(corpo.status) || 0;
   zerarDia();
   _estado.hoje++; _estado.ultimaUrl = p.url; _estado.ultimaEm = new Date().toISOString();
+  _estado.porMotivo[p.motivo || 'leitura'] = (_estado.porMotivo[p.motivo || 'leitura'] || 0) + 1;
   gravar();
   if (corpo.erro || !html) {
     _estado.ultimoErro = String(corpo.erro || 'HTML vazio');
@@ -246,6 +268,8 @@ export function estadoPaginasMl() {
     ultimoPollEm: _estado.ultimoPollEm ? new Date(_estado.ultimoPollEm).toISOString() : null,
     naFila: _fila.length, pollsEsperando: _esperando.length,
     hoje: _estado.hoje, teto: TETO_DIA, janela: JAN_INI + '-' + JAN_FIM,
+    porMotivo: _estado.porMotivo, tetoMonitor: TETO_MONITOR, reserva: RESERVA,
+    recusasDesdeBoot: _estado.recusas || {},
     lidas: _estado.lidas, walls: _estado.walls,
     verificacao: _estado.verificacao ? {
       desde: new Date(_estado.verificacao.desde).toISOString(), url: _estado.verificacao.url, testes: _estado.verificacao.testes || 0,
