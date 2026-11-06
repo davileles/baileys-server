@@ -2977,6 +2977,20 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     }
     if (!r || r.erro) { descartados.push({ asin: salvo.asin, nome: salvo.nome, motivo: (r && r.erro) || 'sem resposta do painel' }); continue; }
 
+    // Preco do ANUNCIO lido na pagina (06/11/2026). O bloco de cupons da pagina
+    // traz o preco sobre o qual o cupom vale — o que o cliente ve em destaque,
+    // em geral o do Pix — e a API pode ter devolvido o de outros meios ou de
+    // outra oferta do catalogo (pedido 5142: API R$ 459, anuncio R$ 445,23,
+    // com o FAVORITO R$ 378,45 na pagina; a mensagem saia com R$ 390,15).
+    // Vale so quando e menor e ate 10% abaixo: diferenca maior e outro anuncio.
+    if (dados.fontePagina === 'extensao' && Array.isArray(dados.cuponsPagina)) {
+      const base = Number((dados.cuponsPagina.find(c => Number(c.precoBase) > 0) || {}).precoBase) || 0;
+      if (base > 0 && dados.preco > 0 && base < dados.preco && (dados.preco - base) / dados.preco <= 0.10) {
+        console.log('[ML] ' + salvo.asin + ' — preco do anuncio na pagina R$ ' + base + ' (API R$ ' + dados.preco + ')');
+        dados = { ...dados, precoApi: dados.preco, preco: base };
+      }
+    }
+
     const p = {
       asin: salvo.asin, id: salvo.asin,
       titulo: nomeReal,
