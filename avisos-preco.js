@@ -1853,9 +1853,14 @@ function precoEfetivo(p, maxIdadeMs = Infinity) {
   // O desconto foi lido para um preço; com o preço mudando mais de 5% ele
   // pode não valer igual — espera a próxima conferência.
   if (c?.estado === 'ok' && c.codigo && c.desconto > 0 && c.precoRef
-      && Math.abs(preco - c.precoRef) / c.precoRef <= 0.05
       && Date.now() - Date.parse(c.em) < 24 * MS_H) {
-    preco = arred(Math.max(0.01, preco - c.desconto)); cupom = c.codigo;
+    if (Math.abs(preco - c.precoRef) / c.precoRef <= 0.05) {
+      preco = arred(Math.max(0.01, preco - c.desconto)); cupom = c.codigo;
+    } else if (c.pct > 0) {
+      // Cupom percentual: recalcula sobre o preco atual, respeitando o teto.
+      const d = preco * c.pct / 100;
+      preco = arred(Math.max(0.01, preco - (c.teto ? Math.min(d, c.teto) : d))); cupom = c.codigo;
+    }
   }
   return { preco, cupom };
 }
@@ -1932,7 +1937,9 @@ async function conferirCupomMl(p, { manual = false } = {}) {
   try { r = await cupomDaPaginaParaCatalogoMl(p.url, p.ult?.preco || null, { motivo: manual ? 'manual' : 'avisos' }); } catch (e) { r = { estado: 'indisponivel', motivo: e.message }; }
   if (!r || r.estado === 'indisponivel') return r;   // fica o que já havia; tenta de novo em 1 h
   p.cupomMl = { estado: r.estado, codigo: r.codigo || null, desconto: r.desconto ? arred(r.desconto) : null,
-                precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null), em: new Date().toISOString() };
+                precoRef: r.preco ? arred(r.preco) : (p.ult?.preco || null),
+                precoFinal: r.precoFinal ? arred(r.precoFinal) : null, pct: r.pct || null, teto: r.teto || null,
+                em: new Date().toISOString() };
   p.cupomMlRechecar = false;
   if (r.estado === 'ok') console.log('[AVISOS] Cupom ' + r.codigo + ' vale para ' + p.asin + ' (−' + brl(r.desconto) + ').');
   return r;

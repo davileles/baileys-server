@@ -3229,9 +3229,63 @@ function normalizarCupomPagina(c) {
 
 const MARCA_CUPONS_ML = '"coupons":{"coupons":[';
 
+// ── FORMATO NOVO DO CUPOM NA PAGINA (06/11/2026) ──────────────────────────
+// O ML passou a mostrar o cupom como pilula de preco final ("R$ 351,9 com
+// Cupom") e a lista "coupons":{"coupons":[...]} veio com amount:0 — o
+// normalizador antigo descartava a entrada e TODA conferencia dava
+// "sem cupom" (pedido 8503: Airfryer Philips MLB62495595, 15% ate R$ 200, so
+// aparecia na pagina). Os numeros de verdade estao no bloco
+// "benefits":{..., "coupons":[{ id, status, restrictions, base_price,
+// partial_price, discount:{mode, value, cap, applied_amount} }]}. O id e o
+// mesmo campaign_id da lista antiga, entao o casamento com a base nao muda.
+const MARCA_BENEFICIOS_ML = '"benefits":{';
+
+function normalizarCupomBeneficioMl(c) {
+  const d = c?.discount;
+  if (!d || String(c.source || 'meli_coupon') !== 'meli_coupon') return null;
+  const valor = Number(d.value) || 0;
+  if (!valor) return null;
+  const tipo = String(d.mode || '').toLowerCase() === 'percentage' ? 'pct' : 'reais';
+  const aplicado = Number(d.applied_amount?.value);
+  const status = String(c.status || '').toLowerCase();
+  // Restricao declarada (minimo de compra etc.) vai no tipoMl para o filtro de
+  // MIN_PURCHASE de quem chama continuar valendo.
+  const restricoes = (Array.isArray(c.restrictions) ? c.restrictions : [])
+    .map(r => typeof r === 'string' ? r : (r?.type || r?.id || '')).filter(Boolean);
+  return {
+    idCampanhaLoja: c.id ? String(c.id) : null,
+    tipo, valor,
+    descontoMl: Number.isFinite(aplicado) && aplicado > 0 ? aplicado : null,
+    teto: Number(d.cap?.value) > 0 ? Number(d.cap.value) : null,
+    precoBase: Number(c.base_price?.value) > 0 ? Number(c.base_price.value) : null,
+    precoFinal: Number(c.partial_price?.value) > 0 ? Number(c.partial_price.value) : null,
+    // 'applied' = ja esta na conta (equivale ao 'redeemed' do formato antigo).
+    status: status === 'applied' ? 'redeemed' : (status || null),
+    tipoMl: restricoes.length ? restricoes.join(',') : (c.type || null),
+    label: c.label || null,
+  };
+}
+
 /** Cupons que a pagina do produto anuncia. Lista vazia quando nao ha nenhum. */
 export function extrairCupomMl(html) {
   const achados = new Map();
+  // 1) Bloco de beneficios (formato novo, com os numeros completos).
+  let b = 0;
+  while ((b = html.indexOf(MARCA_BENEFICIOS_ML, b)) !== -1) {
+    const bruto = fatiarJsonBalanceado(html, b + MARCA_BENEFICIOS_ML.length - 1);
+    b += MARCA_BENEFICIOS_ML.length;
+    if (!bruto) continue;
+    let ben;
+    try { ben = JSON.parse(bruto); } catch (e) { continue; }
+    for (const c of (Array.isArray(ben?.coupons) ? ben.coupons : [])) {
+      const n = normalizarCupomBeneficioMl(c);
+      if (!n) continue;
+      const k = (n.idCampanhaLoja || '') + '|' + n.tipo + '|' + n.valor;
+      if (!achados.has(k)) achados.set(k, n);
+    }
+  }
+  const campanhasVistas = new Set([...achados.values()].map(n => n.idCampanhaLoja).filter(Boolean));
+  // 2) Lista antiga ("coupons":{"coupons":[...]}), para pagina no formato velho.
   let i = 0;
   // O estado aparece duas vezes no HTML (SSR + hidratacao); a dedup por
   // campanha+valor resolve sem depender de qual bloco veio primeiro.
@@ -3245,6 +3299,7 @@ export function extrairCupomMl(html) {
     for (const c of lista) {
       const n = normalizarCupomPagina(c);
       if (!n) continue;
+      if (n.idCampanhaLoja && campanhasVistas.has(n.idCampanhaLoja)) continue;   // ja veio pelos beneficios
       const k = (n.idCampanhaLoja || '') + '|' + n.tipo + '|' + n.valor;
       if (!achados.has(k)) achados.set(k, n);
     }
@@ -3409,13 +3464,21 @@ export async function cupomDaPaginaParaCatalogoMl(url, precoRef = null, { motivo
   // Cupom com minimo de compra nao atingido aparece na pagina, mas nao vale no checkout.
   const cupons = extrairCupomMl(r.html).filter(c => !/MIN_PURCHASE|NOT_MIN/i.test(String(c.tipoMl || '')));
   if (!cupons.length) return { estado: 'sem_cupom', preco };
+  // O bloco de beneficios traz o preco do anuncio sobre o qual o cupom vale; a
+  // API pode ter lido outra oferta do catalogo (pedido 8503: API R$ 393,29,
+  // anuncio R$ 414 -> R$ 351,90 com o cupom).
+  const comBase = cupons.find(c => c.precoBase);
+  if (comBase) preco = comBase.precoBase;
   if (!preco) return { estado: 'indisponivel', motivo: 'preco nao lido na pagina' };
   const { cupom } = resolverCupomPaginaMl(cupons, preco);
   if (!cupom || !cupom.codigo || cupom.ambiguo || cupom.semCodigo) return { estado: 'fora_da_base', preco };
   const reg = cupom.reg || cupomPorCodigo('Mercado Livre', cupom.codigo);
   if (!reg || !cupomVigente(reg)) return { estado: 'fora_da_base', preco };
   if (Number(reg.minimo) > 0 && preco < Number(reg.minimo)) return { estado: 'sem_cupom', preco };
-  return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto: cupom.desconto, preco };
+  const lido = cupons.find(c => c.idCampanhaLoja && c.idCampanhaLoja === cupom.idCampanhaLoja) || null;
+  return { estado: 'ok', codigo: reg.codigo || cupom.codigo, desconto: cupom.desconto, preco,
+           precoFinal: lido?.precoFinal || null,
+           pct: lido?.tipo === 'pct' ? lido.valor : null, teto: lido?.teto || null };
 }
 
 // ── DIAGNOSTICO: campaign_id na pagina de cupons da conta ──────────────────
