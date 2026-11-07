@@ -385,7 +385,9 @@
         "export function extrairCuponsPaginaMl",
         "export function juntarLeiturasCuponsMl",
         "export function urlsLeituraCuponsMl",
-        "export function paginaMlBloqueadaHtml("
+        "export function paginaMlBloqueadaHtml(",
+        "export async function buscarMlPorTermo(",
+        "export function interpretarBuscaMl("
       ]
     },
     "radar-shopee.js": {

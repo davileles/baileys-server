@@ -190,7 +190,10 @@ function proximoParaEntregar() {
   const livre = p => !p.entregueEm && !p.forcar && !motivoIndisponivelPaginasMl(p.motivo);
   const p = _fila.find(p => !p.entregueEm && p.forcar)
     || _fila.find(p => livre(p) && p.motivo === 'manual')
-    || _fila.find(p => livre(p) && p.motivo !== 'monitor')
+    || _fila.find(p => livre(p) && p.motivo !== 'monitor' && p.motivo !== 'busca')
+    // Busca de outras lojas dos avisos de preço (07/11/2026): atrás das páginas
+    // de produto, à frente só do monitor.
+    || _fila.find(p => livre(p) && p.motivo === 'busca')
     || _fila.find(livre);
   if (!p) return null;
   p.entregueEm = Date.now();

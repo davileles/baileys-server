@@ -38,7 +38,7 @@ import { gerarImagemAviso } from './cartao-aviso.js';
 import { lerPrecoProduto, lerPrecosAmazonEmLote, estatisticas as estatisticasMonitor } from './monitor-precos.js';
 import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon, buscarAmazonPorTermo, listarCuponsBase, cupomVigente, lerParcelamentoAmazon } from './radar-amazon.js';
 import { ehLinkShopee, extrairIdsShopee, buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk, buscarShopeePorTermo } from './radar-shopee.js';
-import { ehLinkMl, resolverLinhaVitrineMl, buscarDadosProdutoMl, tokenAffOk, cupomDaPaginaParaCatalogoMl } from './radar-ml.js';
+import { ehLinkMl, resolverLinhaVitrineMl, buscarDadosProdutoMl, tokenAffOk, cupomDaPaginaParaCatalogoMl, buscarMlPorTermo } from './radar-ml.js';
 
 const SESSAO_DIR = './sessao';
 const ARQ = 'avisos_preco.json';
@@ -133,6 +133,7 @@ function estruturar(bruto) {
     cuponsMlVistos: Array.isArray(e.cuponsMlVistos) ? e.cuponsMlVistos : [],
     mensagens: Array.isArray(e.mensagens) ? e.mensagens : [],
     atendimentos: e.atendimentos && typeof e.atendimentos === 'object' ? e.atendimentos : {},
+    buscaMl: e.buscaMl && typeof e.buscaMl === 'object' ? e.buscaMl : {},
   };
 }
 
@@ -2275,7 +2276,40 @@ async function candidatosNaLoja(loja, termo) {
       .map(({ n, x }) => ({ loja, item: { asin: 'SHOPEE-' + n.shopId + '-' + n.itemId, loja, shopId: String(n.shopId), itemId: String(n.itemId), url: n.productLink || n.offerLink || '', nome: x.titulo },
                              leitura: { preco: x.preco, precoDe: x.precoDe, disponivel: true, titulo: x.titulo, imagem: x.imagemUrl || null } }));
   }
+  if (loja === 'Mercado Livre') {
+    // Busca pela extensão (07/11/2026): a API do ML não busca por termo.
+    const r = await buscarMlPorTermo(termo, { max: 10 });
+    if (r.estado === 'bloqueada') pausarBuscaMl('o ML pediu verificação');
+    if (r.estado !== 'ok') { const e = new Error(r.motivo || r.estado); e.adiar = true; throw e; }
+    contarBuscaMl();
+    return r.itens.map(x => ({ loja, item: { asin: x.id, loja, url: x.url, nome: x.titulo },
+      leitura: { preco: x.preco, precoDe: x.precoDe, disponivel: true, titulo: x.titulo, imagem: x.imagem || null, pix: !!x.pix } }));
+  }
   return [];
+}
+
+// Freios da busca no ML (07/11/2026): a página de busca abre no mesmo Chrome
+// que lê as páginas de produto dos disparos — uma tela de verificação ali para
+// tudo. Teto diário de buscas e pausa de 6 h depois de qualquer verificação.
+const BUSCA_ML_TETO_DIA = Number(process.env.AVISOS_BUSCA_ML_TETO || 30);
+const BUSCA_ML_PAUSA_H = 6;
+function estadoBuscaMl() {
+  const s = E().buscaMl = E().buscaMl || {};
+  if (s.dia !== diaSP()) { s.dia = diaSP(); s.hoje = 0; }
+  return s;
+}
+function contarBuscaMl() { const s = estadoBuscaMl(); s.hoje++; s.ultimaEm = new Date().toISOString(); }
+function pausarBuscaMl(motivo) {
+  const s = estadoBuscaMl();
+  s.pausadaAte = new Date(Date.now() + BUSCA_ML_PAUSA_H * MS_H).toISOString(); s.motivoPausa = motivo;
+  console.warn('[AVISOS] Busca no ML pausada por ' + BUSCA_ML_PAUSA_H + ' h: ' + motivo);
+}
+function buscaMlTravada() {
+  if (process.env.AVISOS_BUSCA_ML === '0') return 'desligada';
+  const s = estadoBuscaMl();
+  if (s.pausadaAte && Date.parse(s.pausadaAte) > Date.now()) return 'pausada até ' + new Date(s.pausadaAte).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }) + ' (' + (s.motivoPausa || 'verificação') + ')';
+  if (s.hoje >= BUSCA_ML_TETO_DIA) return 'teto de ' + BUSCA_ML_TETO_DIA + ' buscas do dia';
+  return null;
 }
 
 const IA_EQUIV = `Você compara anúncios de lojas online brasileiras. Recebe o PRODUTO ORIGINAL e uma lista numerada de CANDIDATOS de outras lojas. Diga quais candidatos são EXATAMENTE o mesmo produto: mesma marca, mesmo modelo/linha, mesma versão (tamanho, capacidade, volume, voltagem, cor quando faz diferença) e mesma quantidade de unidades no pacote. NÃO é o mesmo: kit ou pack com quantidade diferente, acessório, refil, capa, peça, modelo parecido ou de outra geração, produto genérico "compatível". Na dúvida, deixe de fora.
@@ -2286,11 +2320,15 @@ export async function buscarEquivalentesDe(prod, { manual = false } = {}) {
   prod.equivBusca = busca;
   prod.equivalentes = Array.isArray(prod.equivalentes) ? prod.equivalentes : [];
   if (!busca.termo || !_deps.ia) { busca.erro = !busca.termo ? 'produto sem título' : 'IA indisponível'; return busca; }
-  const lojas = ['Amazon', 'Shopee'].filter(l => l !== prod.loja);
+  const lojas = ['Amazon', 'Shopee', 'Mercado Livre'].filter(l => l !== prod.loja);
   const cands = [];
   for (const loja of lojas) {
     // Loja com link escolhido à mão no painel fica como está.
     if (prod.equivalentes.some(eq => eq.loja === loja && eq.origem === 'manual' && eq.ativo !== false)) { busca.lojas[loja] = 'manual'; continue; }
+    if (loja === 'Mercado Livre') {
+      const trava = buscaMlTravada();
+      if (trava) { busca.lojas[loja] = 'adiada: ' + trava; busca.mlPendente = true; continue; }
+    }
     try {
       const lista = (await candidatosNaLoja(loja, busca.termo))
         .filter(c => c.item.asin !== prod.asin && !prod.equivalentes.some(eq => eq.chave === c.item.asin && eq.ativo === false))
@@ -2299,6 +2337,7 @@ export async function buscarEquivalentesDe(prod, { manual = false } = {}) {
       cands.push(...lista);
       delete _errosBusca[loja];
     } catch (e) {
+      if (e.adiar) { busca.lojas[loja] = 'adiada: ' + String(e.message || e).slice(0, 140); busca.mlPendente = true; continue; }
       busca.lojas[loja] = 'erro: ' + String(e.message || e).slice(0, 140);
       _errosBusca[loja] = { em: busca.em, erro: busca.lojas[loja] };
       console.warn('[AVISOS] Busca na ' + loja + ' falhou: ' + e.message);
@@ -2306,7 +2345,7 @@ export async function buscarEquivalentesDe(prod, { manual = false } = {}) {
   }
   if (!cands.length) { gravar(); return busca; }
   const texto = 'PRODUTO ORIGINAL (' + prod.loja + '): ' + prod.titulo + (prod.ult?.preco ? ' — ' + brl(prod.ult.preco) : '')
-    + '\n\nCANDIDATOS:\n' + cands.map((c, i) => (i + 1) + '. [' + c.loja + '] ' + String(c.leitura.titulo || '').slice(0, 220) + ' — ' + brl(c.leitura.preco)).join('\n');
+    + '\n\nCANDIDATOS:\n' + cands.map((c, i) => (i + 1) + '. [' + c.loja + '] ' + String(c.leitura.titulo || '').slice(0, 220) + ' — ' + brl(c.leitura.preco) + (c.leitura.pix ? ' no Pix' : '')).join('\n');
   let r = null;
   try { r = await _deps.ia(IA_EQUIV, texto, 600, 'claude-sonnet-4-6'); } catch (e) { busca.erro = 'IA: ' + e.message; }
   const iguais = Array.isArray(r?.iguais) ? r.iguais : [];
@@ -2322,7 +2361,15 @@ export async function buscarEquivalentesDe(prod, { manual = false } = {}) {
     if (!atual || conf > atual.conf || (conf === atual.conf && c.leitura.preco < atual.c.leitura.preco)) porLoja[c.loja] = { c, conf, motivo: String(g.motivo || '').slice(0, 120) };
   }
   for (const [loja, { c, conf, motivo }] of Object.entries(porLoja)) {
-    const q = guardarProduto(c.item, c.leitura);
+    // ML: o preço da busca pode ser o do Pix; a leitura de sempre dá o preço
+    // que os avisos usam (cai no da busca se a leitura falhar).
+    let leitura = c.leitura;
+    if (loja === 'Mercado Livre') {
+      try { const l = await lerPrecoProduto(c.item); if (l?.preco > 0) leitura = { ...c.leitura, preco: l.preco, precoDe: l.precoDe || c.leitura.precoDe, disponivel: l.disponivel !== false }; }
+      catch (e) { console.warn('[AVISOS] Equivalente ML ' + c.item.asin + ' sem leitura (fica o preço da busca): ' + e.message); }
+      delete leitura.pix;
+    }
+    const q = guardarProduto(c.item, leitura);
     // Troca o automático anterior da mesma loja; o manual nunca é trocado.
     prod.equivalentes = prod.equivalentes.filter(eq => !(eq.loja === loja && eq.origem === 'auto' && eq.ativo !== false && eq.chave !== q.asin));
     const ja = prod.equivalentes.find(eq => eq.chave === q.asin);
@@ -2339,6 +2386,10 @@ function precisaBuscarEquiv(p) {
   if (!p.titulo) return false;
   const b = p.equivBusca;
   if (!b) return true;
+  // ML adiado (extensão offline, verificação, teto) ou nunca tentado (busca
+  // anterior a 07/11/2026): tenta de novo depois de 3 h.
+  if (p.loja !== 'Mercado Livre' && (b.mlPendente || !b.lojas?.['Mercado Livre'])
+      && Date.now() - Date.parse(b.em) >= 3 * MS_H) return true;
   return Date.now() - Date.parse(b.em) >= EQUIV_REBUSCA_DIAS * MS_DIA;
 }
 
@@ -2479,7 +2530,7 @@ export function estadoAvisos() {
       };
     }),
     produtos: Object.fromEntries(produtosBase().map(prod => [prod.asin, painelDoProduto(prod)])),
-    buscaOutrasLojas: { ultima: _ultimaBuscaEquiv, erros: _errosBusca },
+    buscaOutrasLojas: { ultima: _ultimaBuscaEquiv, erros: _errosBusca, mercadoLivre: { ...estadoBuscaMl(), teto: BUSCA_ML_TETO_DIA, travada: buscaMlTravada() } },
   };
 }
 

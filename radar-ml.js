@@ -655,7 +655,81 @@ function paginaMlBloqueada(res, html, ld) {
 }
 /** Mesma regra, para HTML que chegou pela extensao (server.js, /ml/pagina/resultado). */
 export function paginaMlBloqueadaHtml(urlFinal, html) {
+  // Página de busca (lista.mercadolivre) com resultados não é tela de verificação,
+  // mesmo que o HTML cite /captcha/wall (vem no referer quando o operador acabou
+  // de resolver uma) — só a URL final conta (07/11/2026).
+  if (ehPaginaBuscaMl(urlFinal) && RE_CARD_BUSCA_ML.test(html || '')) return RE_ANTIBOT_URL_ML.test(urlFinal || '');
   return paginaMlBloqueada({ url: urlFinal }, html, extrairLdProduto(html || ''));
+}
+
+// ── BUSCA DO ML PELA EXTENSAO (07/11/2026) ──────────────────────────────────
+// A API do ML não busca por termo; a página de busca abre no Chrome do
+// operador (mesma fila da leitura de páginas, motivo 'busca', atrás das páginas
+// de produto). Usado pelos avisos de preço para achar o mesmo produto no ML.
+// Formato lido em 07/11/2026: <li class="ui-search-layout__item"> com
+// poly-card; título em <a class="poly-component__title" href>; preço em
+// .poly-price__current (aria-label "188 reais com 91 centavos"); "De" em
+// andes-money-amount--previous ("Antes: …"); patrocinado = link click1 /
+// is_advertising=true (repete os orgânicos e esconde o produto na query).
+const RE_CARD_BUSCA_ML = /class="ui-search-layout__item|class="[^"]*\bpoly-card\b/;
+function ehPaginaBuscaMl(u) { return /^https?:\/\/lista\.mercadolivre\.com\.br\//i.test(String(u || '')); }
+
+export function urlBuscaMl(termo) {
+  const slug = String(termo || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 120);
+  return slug ? 'https://lista.mercadolivre.com.br/' + slug : null;
+}
+
+// "188 reais com 91 centavos" / "Antes: 1.299 reais" → número.
+function precoDoAriaMl(s) {
+  const m = String(s || '').replace(/^Antes:\s*/i, '').match(/([\d.]+)\s*reais?(?:\s*com\s*(\d{1,2})\s*centavos?)?/i);
+  if (!m) return null;
+  const v = Number(m[1].replace(/\./g, '')) + (m[2] ? Number(m[2]) / 100 : 0);
+  return v > 0 ? Math.round(v * 100) / 100 : null;
+}
+
+export function interpretarBuscaMl(html, { max = 12 } = {}) {
+  const partes = String(html || '').split(/<li class="ui-search-layout__item/).slice(1);
+  const out = [], vistos = new Set();
+  for (const bruto of partes) {
+    const card = bruto.split(/<\/li>/)[0];
+    const tag = card.match(/<a\s[^>]*class="poly-component__title"[^>]*>([\s\S]*?)<\/a>/);
+    if (!tag) continue;
+    const href = decodificarEntidades((tag[0].match(/href="([^"]+)"/) || [])[1] || '');
+    if (!href || /click1\.mercadolivre|is_advertising=true/i.test(href)) continue;
+    const url = urlCanonicaMl(href);
+    const id = idProdutoMl(url);
+    if (!id || vistos.has(id)) continue;
+    const titulo = decodificarEntidades(tag[1].replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+    const atual = card.match(/poly-price__current[\s\S]*?aria-label="([^"]+)"/);
+    const preco = precoDoAriaMl(atual?.[1]);
+    if (!titulo || !preco) continue;
+    const de = card.match(/andes-money-amount--previous[^>]*aria-label="([^"]+)"/);
+    const img = card.match(/<img\s[^>]*class="poly-component__picture"[^>]*\ssrc="([^"]+)"/) || card.match(/<img\s[^>]*\ssrc="(https:\/\/http2\.mlstatic\.com[^"]+)"/);
+    const pix = /poly-price__discount-complement[\s\S]{0,200}?no Pix/i.test(card);
+    vistos.add(id);
+    out.push({ id, url, titulo, preco, precoDe: precoDoAriaMl(de?.[1]), pix, imagem: img ? img[1] : null });
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/**
+ * Busca no ML pela extensão.
+ * @returns {Promise<{estado:'ok'|'indisponivel'|'bloqueada'|'erro', itens:Array, motivo?:string, url?:string}>}
+ */
+export async function buscarMlPorTermo(termo, { max = 10, esperaMs = 60000 } = {}) {
+  const url = urlBuscaMl(termo);
+  if (!url) return { estado: 'erro', itens: [], motivo: 'termo vazio' };
+  const porque = motivoIndisponivelPaginasMl('busca');
+  if (porque) return { estado: 'indisponivel', itens: [], motivo: porque, url };
+  let r = null;
+  try { r = await pedirPaginaMl(url, { motivo: 'busca', esperaMs }); } catch (e) { r = null; }
+  if (!r) return { estado: 'indisponivel', itens: [], motivo: 'sem resposta da extensão', url };
+  if (r.bloqueada) return { estado: 'bloqueada', itens: [], motivo: 'o ML pediu verificação', url };
+  const itens = interpretarBuscaMl(r.html, { max });
+  if (!itens.length && !RE_CARD_BUSCA_ML.test(r.html || '')) return { estado: 'erro', itens, motivo: 'página sem resultados reconhecíveis', url };
+  return { estado: 'ok', itens, url };
 }
 
 function apiMlAutorizada() {
