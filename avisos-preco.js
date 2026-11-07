@@ -1823,14 +1823,21 @@ function tituloCurto(t) {
 function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   const linhas = [];
   const outraLoja = extra.loja && pedido.loja && extra.loja !== pedido.loja;
-  if (tipo === 'alvo') linhas.push('🔔 *Chegou no seu preço!*');
-  else if (outraLoja) linhas.push('🔔 *Achei mais barato!*');
+  // Outra loja (07/11/2026, decisão do Davi): diz claramente que é outra loja,
+  // mostra o preço de agora na loja que a pessoa pediu e pede para conferir —
+  // o equivalente vem de comparação de títulos e pode ser outra versão.
+  if (tipo === 'alvo') linhas.push(outraLoja ? '🔔 *Chegou no seu preço, em outra loja!*' : '🔔 *Chegou no seu preço!*');
+  else if (outraLoja) linhas.push('🔔 *Achei mais barato em outra loja!*');
   else linhas.push('🔔 *Baixou o preço!*');
   linhas.push('');
   linhas.push('*' + tituloCurto(pedido.titulo) + '*');
   linhas.push('');
-  if (outraLoja) { linhas.push('🏪 Mesmo produto, agora na *' + extra.loja + '*'); }
-  if (extra.precoCartao && extra.precoCartao - preco >= 0.01) {
+  if (outraLoja) {
+    const pix = extra.precoCartao && extra.precoCartao - preco >= 0.01;
+    linhas.push('🏪 ' + extra.loja + ': *' + brl(preco) + (pix ? ' no Pix' : '') + '*');
+    if (pix) linhas.push('💳 ' + brl(extra.precoCartao) + ' no cartão');
+    if (extra.precoLojaPedida > 0) linhas.push('🛒 ' + pedido.loja + ' (o link que você pediu): ' + brl(extra.precoLojaPedida));
+  } else if (extra.precoCartao && extra.precoCartao - preco >= 0.01) {
     linhas.push('💰 Agora: *' + brl(preco) + ' no Pix*');
     linhas.push('💳 ' + brl(extra.precoCartao) + ' no cartão');
   } else linhas.push('💰 Agora: *' + brl(preco) + '*');
@@ -1846,15 +1853,25 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   linhas.push('');
   linhas.push('👉 ' + link);
   linhas.push('');
+  if (outraLoja) linhas.push('⚠️ Parece ser o mesmo produto: confira modelo, vendedor e frete antes de comprar. Seu alerta da ' + pedido.loja + ' continua ativo.');
   linhas.push('_Preço de agora, pode mudar a qualquer momento._');
   linhas.push('');
   linhas.push('Comprou? Responda *COMPREI* que eu paro os avisos desse produto. Para parar todos, responda *SAIR*.');
   return linhas.join('\n');
 }
 
+// Preço de agora (com cupom do anúncio) na loja que a pessoa pediu, quando o
+// aviso sai por outra loja; null se for a mesma loja ou sem leitura.
+function precoDaLojaPedida(pedido, mo) {
+  const pp = E().produtos[pedido.produto];
+  if (!pp || !mo?.prod || pp === mo.prod) return null;
+  const ef = precoEfetivo(pp);
+  return ef?.preco > 0 ? ef.preco : null;
+}
+
 // Põe o aviso de um pedido na fila de envio e registra quando sai de fato.
 function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
-  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null });
+  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null, precoLojaPedida: precoDaLojaPedida(pedido, mo) });
   const precoEnviado = m.preco;
   const modo = E().config.imagemAviso || 'cartao';
   const p = mo.prod;
@@ -1965,7 +1982,7 @@ export async function dispararPedidoAgora(id, { previa = false } = {}) {
       : 'só sai com queda de ' + cfg2.quedaSemAlvoPct + '% contra o pedido';
     return { ok: false, naoEnviado: true, preco: m.preco, erro: 'nada enviado: o preço relido agora é ' + brl(m.preco) + ' e o aviso ' + regra + '.' };
   }
-  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null });
+  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null, precoLojaPedida: precoDaLojaPedida(pedido, mo) });
   const modoImg = E().config.imagemAviso || 'cartao';
   const resp = { ok: true, tipo, preco: m.preco, loja: mo.prod.loja, cupom: mo.cupom || null, texto,
     imagem: modoImg === 'texto' ? null : (mo.prod.imagem || null), imagemModo: modoImg };

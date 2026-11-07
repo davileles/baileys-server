@@ -116,7 +116,7 @@ export async function gerarImagemAviso(o = {}) {
     partes.push(texto('ALERTA DE PREÇO', 42, 52, 22, COR.branco).svg);
     // Faixa da marca.
     partes.push('<rect x="0" y="' + ALT_FOTO + '" width="' + L + '" height="' + (ALT - ALT_FOTO) + '" fill="' + COR.navy + '"/>');
-    const titulo = o.tipo === 'alvo' ? 'CHEGOU NO SEU PREÇO!' : o.outraLoja ? 'ACHEI MAIS BARATO!' : 'BAIXOU O PREÇO!';
+    const titulo = o.tipo === 'alvo' ? (o.outraLoja ? 'SEU PREÇO EM OUTRA LOJA!' : 'CHEGOU NO SEU PREÇO!') : o.outraLoja ? 'MAIS BARATO EM OUTRA LOJA!' : 'BAIXOU O PREÇO!';
     partes.push(texto(titulo, L / 2, ALT_FOTO + 62, 36, COR.coral, { align: 'centro', maxL: L - 80 }).svg);
     let y = ALT_FOTO + 62;
     if (o.precoDe && o.precoDe > o.preco * 1.01) {
