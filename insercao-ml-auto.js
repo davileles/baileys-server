@@ -118,7 +118,12 @@ const REVERIF_INTERVALO_MS = 24 * 60 * 60 * 1000;  // o mesmo cupom no maximo 1x
 const VISITA_EXPIRA_MS = 7 * 60000;        // visita SEM ATIVIDADE ha tanto: lote volta para a fila
 const EXTENSAO_AUSENTE_MS = 30 * 60000;    // sem contato ha tanto = extensao fora do ar
 const RE_CODIGO = /^[A-Za-z0-9._-]{2,23}$/;  // 23 = maxlength do campo do ML
-const VEREDITOS = new Set(['inserido', 'ja_tinha', 'esgotado', 'vencido', 'inexistente', 'indisponivel', 'problema', 'sem_login', 'pagina_mudou', 'erro']);
+const VEREDITOS = new Set(['inserido', 'ja_tinha', 'esgotado', 'vencido', 'inexistente', 'indisponivel', 'problema', 'verificacao', 'sem_login', 'pagina_mudou', 'erro']);
+
+// 07/11/2026: tela de verificacao (captcha) no input-code tem o mesmo 403 da
+// restricao de conta. A extensao 2.12.0+ separa as duas (veredito
+// 'verificacao'); o disjuntor abre do mesmo jeito, mas o aviso diz o que fazer.
+const MOTIVO_VERIFICACAO = 'o ML pediu verificação (captcha) no Chrome da extensão — não é bloqueio da conta';
 const INDISPONIVEL = 'indisponivel';       // o ML disse que o cupom nao esta disponivel PARA ESTA CONTA
 // 01/10/2026: "INVALID_5: O cupom não está disponível" (HTTP 200) chegou como
 // "problema" e abriu o disjuntor como se fosse restricao da conta. Resposta
@@ -322,7 +327,7 @@ async function enviarResumo(cabecalho) {
   try { await dep.avisarTelegram(texto); } catch (e) {}
 }
 
-async function abrirDisjuntor(motivo, codigo) {
+async function abrirDisjuntor(motivo, codigo, orientacao) {
   if (estado.disjuntor) return;
   estado.disjuntor = { em: new Date().toISOString(), motivo, codigo: codigo || null };
   salvar();
@@ -333,7 +338,7 @@ async function abrirDisjuntor(motivo, codigo) {
     + 'Motivo: ' + motivo + (codigo ? '\nCupom: ' + codigo : '') + '\n'
     + (devolvidos ? devolvidos + ' cupom(ns) voltaram para o /inserir.\n' : '')
     + '\nNada mais será inserido pela extensão até você religar no bot (/autoinserir). '
-    + 'Se for bloqueio de conta, espere 24–48h antes de religar ou de inserir à mão.';
+    + (orientacao || 'Se for bloqueio de conta, espere 24–48h antes de religar ou de inserir à mão.');
   await enviarResumo('🧩 Inserção pela extensão — o que saiu antes do desligamento');
   try { await dep.avisarTelegram(texto); } catch (e) {}
   try { await dep.avisarOperador(texto); } catch (e) {}
@@ -504,6 +509,12 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
     if (estado.falhas >= FALHAS_MAX) await abrirDisjuntor(FALHAS_MAX + ' erros seguidos na extensão (' + msg + ')', codigo);
     return { ok: true };
   }
+  if (veredito === 'verificacao') {
+    marcar(reg, { insercaoMl: FILA });
+    salvar();
+    await abrirDisjuntor(MOTIVO_VERIFICACAO, codigo, 'Abra mercadolivre.com.br/cupons no Chrome da extensão, resolva a verificação e religue com /autoinserir. Pode inserir à mão normalmente.');
+    return { ok: true };
+  }
   if (veredito === 'sem_login') {
     marcar(reg, { insercaoMl: FILA });
     salvar();
@@ -623,6 +634,11 @@ async function registrarReverificacao(reg, { veredito, rc, status, mensagem, ven
   if (veredito === 'erro') {
     estado.falhas++; salvar();
     if (estado.falhas >= FALHAS_MAX) await abrirDisjuntor(FALHAS_MAX + ' erros seguidos na extensão (' + msg + ')', codigo);
+    return { ok: true };
+  }
+  if (veredito === 'verificacao') {
+    salvar();
+    await abrirDisjuntor(MOTIVO_VERIFICACAO, codigo, 'Abra mercadolivre.com.br/cupons no Chrome da extensão, resolva a verificação e religue com /autoinserir. Pode inserir à mão normalmente.');
     return { ok: true };
   }
   if (veredito === 'sem_login') {
