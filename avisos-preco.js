@@ -1742,15 +1742,31 @@ async function lerProdutos(lista) {
 export function avaliarPedido(pedido, preco, cfg = E().config) {
   if (!(preco > 0)) return null;
   const ref = pedido.ultimoAvisoPreco;
-  if (ref && preco > ref * (1 - cfg.novaQuedaPct / 100)) return null;
+  // 07/11/2026 (pedido 4507, decisão do Davi): além da nova queda de
+  // novaQuedaPct, avisa de novo quando o preço subiu depois do último aviso
+  // (marcado em subiuDesdeAviso) e voltou ao último preço avisado ou menos.
+  // Sem isso, uma queda de 3% difícil de chegar travava o alerta para sempre.
+  const retorno = !!(ref && pedido.subiuDesdeAviso && preco <= ref + 0.009);
+  if (ref && !retorno && preco > ref * (1 - cfg.novaQuedaPct / 100)) return null;
   const ini = pedido.precoInicial;
   if (pedido.precoAlvo) {
-    if (preco <= pedido.precoAlvo) return { tipo: 'alvo' };
-    if (cfg.avisarQuedaParcial && ini && preco <= ini * (1 - cfg.quedaParcialPct / 100)) return { tipo: 'parcial' };
+    if (preco <= pedido.precoAlvo) return { tipo: 'alvo', retorno };
+    if (cfg.avisarQuedaParcial && ini && preco <= ini * (1 - cfg.quedaParcialPct / 100)) return { tipo: 'parcial', retorno };
     return null;
   }
-  if (ini && preco <= ini * (1 - cfg.quedaSemAlvoPct / 100)) return { tipo: 'queda' };
+  if (ini && preco <= ini * (1 - cfg.quedaSemAlvoPct / 100)) return { tipo: 'queda', retorno };
   return null;
+}
+
+// Preço subiu pelo menos novaQuedaPct acima do último aviso: marca, para o
+// alerta voltar a sair quando ele retornar ao último preço avisado.
+function marcarSubida(pedido, preco, cfg = E().config) {
+  const ref = pedido.ultimoAvisoPreco;
+  if (!ref || !(preco > 0) || pedido.subiuDesdeAviso) return;
+  if (preco >= ref * (1 + cfg.novaQuedaPct / 100)) {
+    pedido.subiuDesdeAviso = { em: new Date().toISOString(), preco: arred(preco) };
+    console.log('[AVISOS] Pedido ' + pedido.id + ': subiu para ' + brl(preco) + ' (último aviso ' + brl(ref) + ') — avisa de novo se voltar.');
+  }
 }
 
 function avisosHoje(jid) {
@@ -1832,6 +1848,7 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   else linhas.push('🔔 *Baixou o preço!*');
   linhas.push('');
   linhas.push('*' + tituloCurto(pedido.titulo) + '*');
+  if (extra.retorno) linhas.push('O preço tinha subido e voltou ao menor valor que te avisei.');
   linhas.push('');
   if (outraLoja) {
     const pix = extra.precoCartao && extra.precoCartao - preco >= 0.01;
@@ -1872,7 +1889,7 @@ function precoDaLojaPedida(pedido, mo) {
 
 // Põe o aviso de um pedido na fila de envio e registra quando sai de fato.
 function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
-  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null, precoLojaPedida: precoDaLojaPedida(pedido, mo) });
+  const texto = textoDoAviso(pedido, m.preco, tipo, m.link, { loja: mo.prod.loja, cupom: mo.cupom, precoCartao: m.precoCartao || null, precoLojaPedida: precoDaLojaPedida(pedido, mo), retorno: !!extraMeta.retorno });
   const precoEnviado = m.preco;
   const modo = E().config.imagemAviso || 'cartao';
   const p = mo.prod;
@@ -1890,7 +1907,8 @@ function enfileirarAviso(pedido, mo, m, tipo, extraMeta = {}) {
     aoEnviar: () => {
       const em = new Date().toISOString();
       pedido.ultimoAvisoPreco = precoEnviado; pedido.ultimoAvisoEm = em;
-      pedido.avisos.push({ em, preco: precoEnviado, tipo, loja: mo.prod.loja, cupom: mo.cupom || null, manual: !!extraMeta.manual });
+      delete pedido.subiuDesdeAviso;
+      pedido.avisos.push({ em, preco: precoEnviado, tipo, loja: mo.prod.loja, cupom: mo.cupom || null, manual: !!extraMeta.manual, ...(extraMeta.retorno ? { retorno: true } : {}) });
       if (pedido.avisos.length > 30) pedido.avisos = pedido.avisos.slice(-30);
       if (tipo === 'alvo' && !pedido.alvoAtingidoEm) pedido.alvoAtingidoEm = em;
       pedido.ultimaFalhaEnvio = null;
@@ -2049,6 +2067,7 @@ export async function varrerAvisos({ manual = false } = {}) {
         // Menor preço entre a loja pedida e as equivalentes (com cupom do ML).
         const mo = melhorOferta(prod, { maxIdadeMs: 8 * MS_H });
         if (!mo) continue;
+        marcarSubida(pedido, mo.preco, cfg);
         const av = avaliarPedido(pedido, mo.preco, cfg);
         if (!av) { pedido.conferencia = null; continue; }
         // Já relido e recusado com a mesma base (preço e cupom): não remonta a
@@ -2077,7 +2096,7 @@ export async function varrerAvisos({ manual = false } = {}) {
           continue;
         }
         pedido.conferencia = null;
-        enfileirarAviso(pedido, mo, m, conf.tipo);
+        enfileirarAviso(pedido, mo, m, conf.tipo, conf.retorno ? { retorno: true } : {});
         res.avisos++;
         // Também para os grupos (card de revisão no bot), só alvo ou queda de verdade.
         if (conf.tipo === 'alvo' || conf.tipo === 'queda') {
