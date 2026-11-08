@@ -4958,10 +4958,12 @@ async function comCarimboDeEnvio(oferta, fn) {
   return r;
 }
 
-function enviarCupomParaGrupos(mensagem, imagem, oferta) {
+// opcoes.prioridade: true = prioridade maxima no portao (bot, aprovacao no painel).
+function enviarCupomParaGrupos(mensagem, imagem, oferta, opcoes = {}) {
   return comPortaoDePublicacao(
     () => comCarimboDeEnvio(oferta, () => _despacharCupomParaGrupos(mensagem, imagem, oferta)),
-    'cupom #' + (oferta?.id || '?'));
+    'cupom #' + (oferta?.id || '?'),
+    opcoes.prioridade !== undefined ? { prioridade: !!opcoes.prioridade } : {});
 }
 
 // ── CUPOM NOS GRUPOS DE NICHO ─────────────────────────────────────────────────
@@ -5685,7 +5687,8 @@ function enviarOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {}) {
       return comCarimboDeEnvio(oferta, () => _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes));
     },
     'oferta #' + (oferta?.id || '?'),
-    { perecivel: ofertaPerecivel(oferta) });
+    { perecivel: ofertaPerecivel(oferta),
+      ...(opcoes.prioridade !== undefined ? { prioridade: !!opcoes.prioridade } : {}) });
 }
 
 // ── FRESCOR DA OFERTA CAPTURADA (03/11/2026) ────────────────────────────────
@@ -17888,6 +17891,9 @@ app.post('/painel/aprovar/:id', async (req, res) => {
   }
   const mensagem  = req.body.mensagem || oferta.mensagemFormatada;
   const agendarEm = req.body.agendarEm || null;
+  // Prioridade maxima (painel e bot, 08/11/2026): o item fura a fila do portao
+  // de publicacao, como Criar oferta/cupom na janela, lista e envio unico.
+  const prioridadeAprov = req.body.prioridade === true;
 
   // Campos corrigidos no painel entram em dadosExtraidos ANTES do envio, para
   // que o worker (unico ponto de gravacao definitiva) registre em
@@ -17922,7 +17928,7 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     oferta.enviandoDesde = new Date().toISOString();
     salvarFila();
     try {
-      await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0], oferta);
+      await enviarCupomParaGrupos(mensagem, oferta.imagens?.[0], oferta, { prioridade: prioridadeAprov });
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
       oferta.enviadoEm = new Date().toISOString();
       delete oferta.enviadosParciais; delete oferta.envioInterrompido; delete oferta.enviandoDesde;
@@ -17981,7 +17987,8 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     // Com naoEsperar, a resposta sai na hora com a previsao e o despacho segue
     // em background. Quem cair no meio e retomado por
     // retomarEnviosInterrompidos(), que ja cobre o status 'enviando'.
-    const despachar = enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta);
+    const despachar = enviarOfertaParaDestinos(mensagem, oferta.imagens?.[0], oferta,
+      prioridadeAprov ? { prioridade: true } : {});
     const concluir = despachar.then(r => {
       oferta.status = 'enviado'; oferta.mensagemFinal = mensagem;
       oferta.enviadoEm = new Date().toISOString();
@@ -18006,6 +18013,12 @@ app.post('/painel/aprovar/:id', async (req, res) => {
     if (req.body.naoEsperar && portaoOcupado()) {
       concluir.catch(e => console.error('[PORTAO] Oferta #' + oferta.id
         + ' falhou apos a espera: ' + e.message));
+      if (prioridadeAprov) {
+        // Na frente da fila: so espera a que esta saindo e as prioritarias que ja estavam.
+        const posicao = _portaoFila.filter(x => x.prioridade).length + (_portaoEmVoo ? 1 : 0);
+        return res.json({ ok:true, naFila:true, prioridade:true, posicao,
+          esperaSeg: Math.round((Math.max(0, posicao - 1) * 60000 + PRIORIDADE_FOLGA_MS) / 1000) });
+      }
       return res.json({ ok:true, naFila:true,
         posicao: _portaoNaFila, esperaSeg: Math.round(esperaPrevistaMs() / 1000) });
     }
@@ -26262,7 +26275,7 @@ iniciarFeedPublico({ resolverLink: linkDoCupomTSP });
 // segue a mesma regra da lista "nicho + geral": classificador decide o nicho
 // (so quando confiante) e o despacho passa pelo caminho unico do radar
 // (rastreio, rodape por grupo, preview, historico).
-async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = null, precoFinal = null } = {}) {
+async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = null, precoFinal = null, prioridade = false } = {}) {
   const lojaN = loja || produto.loja || 'Amazon';
   let cls = { categoria: null, confianca: 0 };
   try {
@@ -26297,6 +26310,7 @@ async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = 
   // Sem fonte, destinosDaOferta so ve as trilhas gerais; categoriaNicho traz os
   // destinos da trilha do nicho confirmado. Sem nicho confiavel: so gerais.
   const opcoes = confiavel ? { categoriaNicho: cls.categoria } : {};
+  if (prioridade) opcoes.prioridade = true;
   console.log('[BOT-TSP] Oferta "' + String(produto.titulo || '').slice(0, 60) + '" -> '
     + (confiavel ? 'nicho ' + cls.categoria + ' + gerais' : 'so gerais (sem nicho confiavel)'));
   const r = await enviarOfertaParaDestinos(mensagem, null, oferta, opcoes);

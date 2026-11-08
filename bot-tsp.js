@@ -247,6 +247,7 @@ async function previewCupom(chatId, s, editar) {
     '*Prévia da mensagem* 👇\n\n- - - - - - - - - -\n' + msg + '\n- - - - - - - - - -' + selo,
     teclado([
       [['🚀 Enviar agora', 'a:enviar'], ['📋 Mandar pra fila', 'a:fila']],
+      [['⚡ Enviar com prioridade máxima', 'a:enviarp']],
       [['🗂 Só cadastrar na base', 'a:base']],
       [['🔁 Refazer', 'a:refazer'], ['❌ Cancelar', 'a:cancelar']],
     ]), editar);
@@ -383,7 +384,8 @@ async function previewOferta(chatId, s, editar) {
   if (d.codigoCupom) extras.push(['🚫 Sem cupom', 'o:cupom:']);
   linhas.push(extras);
   linhas.push([['⚠️ Importante' + (d.importante ? ' ✏️' : ''), 'o:imp:__menu']]);
-  linhas.push([['🚀 Enviar agora', 'a:enviar'], ['❌ Cancelar', 'a:cancelar']]);
+  linhas.push([['🚀 Enviar agora', 'a:enviar'], ['⚡ Prioridade máxima', 'a:enviarp']]);
+  linhas.push([['❌ Cancelar', 'a:cancelar']]);
 
   const aviso = r.avisoCupom ? `\n\n⚠️ _${r.avisoCupom}_` : '';
   return falar(chatId,
@@ -513,8 +515,13 @@ async function textoLivre(chatId, s, t, msgEntrada) {
 }
 
 // ── ENVIO ────────────────────────────────────────────────────────────────────
-async function confirmarEnvio(chatId, s, acao, editar) {
+// prioridade: o "⚡ Prioridade máxima" do bot — o mesmo da caixa do painel e da
+// extensão: o envio fura a fila do portão de publicação.
+async function confirmarEnvio(chatId, s, acao, editar, prioridade = false) {
   const d = s.dados;
+  if (prioridade) d.prioridade = true;
+  const prio = d.prioridade ? { prioridade: true } : {};
+  const seloPrio = d.prioridade ? '⚡ ' : '';
 
   if (s.fluxo === 'cupom') {
     const c = dadosCupom(s);
@@ -554,10 +561,10 @@ async function confirmarEnvio(chatId, s, acao, editar) {
       return falar(chatId, `📋 Cupom *#${r.oferta.id}* na fila.\n\nAprove em: https://davileles.github.io/tudo-sobre-promos/`, null, editar);
     }
 
-    const res = await dep.enviarCupomParaGrupos(d.mensagem, null);
+    const res = await dep.enviarCupomParaGrupos(d.mensagem, null, null, prio);
     if (r.oferta) { r.oferta.status = 'aprovada'; dep.salvarFila(); }
     sessoes.delete(String(chatId));
-    return falar(chatId, `✅ Cupom enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, editar);
+    return falar(chatId, `✅ ${seloPrio}Cupom enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, editar);
   }
 
   // Oferta segue o roteamento por trilha (gerais + nicho classificado) e
@@ -569,9 +576,9 @@ async function confirmarEnvio(chatId, s, acao, editar) {
   try {
     if (s.fluxo === 'oferta') {
       const res = await dep.enviarOfertaBot({ mensagem: d.mensagem, produto: d.produto || {},
-        loja: d.loja, cupom: d.cupomInfo, precoFinal: d.precoFinal });
+        loja: d.loja, cupom: d.cupomInfo, precoFinal: d.precoFinal, prioridade: !!d.prioridade });
       sessoes.delete(String(chatId));
-      return falar(chatId, `✅ Enviado em *${res.enviados}* grupo(s)`
+      return falar(chatId, `✅ ${seloPrio}Enviado em *${res.enviados}* grupo(s)`
         + (res.falhas ? ` (${res.falhas} falha(s))` : '') + '.\n'
         + (res.nicho ? `🧭 Nicho: *${res.nicho}* + grupos gerais.` : '🧭 Sem nicho reconhecido — só grupos gerais.'),
         null, editar);
@@ -943,7 +950,7 @@ function corpoCard(o, extra) {
 // Descartar longe do Enviar, na ultima linha, para nao sair por toque errado.
 function tecladoCard(id) {
   return teclado([
-    [['🚀 Enviar agora', 'r:enviar:' + id]],
+    [['🚀 Enviar agora', 'r:enviar:' + id], ['⚡ Prioridade máxima', 'r:enviarp:' + id]],
     [['💲 Por', 'r:preco:' + id], ['🔖 De', 'r:precode:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
     [['✏️ Título', 'r:titulo:' + id], ['🔝 Topo', 'r:topo:' + id], ['⚠️ Importante', 'r:importante:' + id]],
     [['🧭 Trilhas', 'r:trilhas:' + id]],
@@ -1114,14 +1121,15 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
 
   if (acao === 'ver') { registrarCard(chatId, msgId, id); return falarHtml(chatId, corpoCard(o), tecladoCard(id), msgId); }
 
-  if (acao === 'enviar') {
+  if (acao === 'enviar' || acao === 'enviarp') {
+    const prio = acao === 'enviarp';
     // Tira os botoes ANTES do await: o envio com espacamento entre grupos leva
     // segundos, e um segundo toque duplicaria a mensagem nos grupos.
-    await falarHtml(chatId, corpoCard(o, '⏳ Enviando...'), null, msgId);
+    await falarHtml(chatId, corpoCard(o, prio ? '⏳ Enviando com prioridade máxima...' : '⏳ Enviando...'), null, msgId);
     // naoEsperar: aprovar cinco seguidas nao pode pendurar cinco requisicoes ate
     // o portao liberar cada uma. Com fila, o servidor confirma na hora e publica
     // depois; o toque em 🔄 Atualizar mostra o desfecho.
-    const env = await apiLocal('POST', '/painel/aprovar/' + id, { naoEsperar: true });
+    const env = await apiLocal('POST', '/painel/aprovar/' + id, prio ? { naoEsperar: true, prioridade: true } : { naoEsperar: true });
     if (!env.ok) return falarHtml(chatId, corpoCard(o, '❌ Falha no envio: ' + (env.erro || env.http)), tecladoCard(id), msgId);
     if (env.naFila) {
       const min = Math.round((env.esperaSeg || 0) / 60);
@@ -1131,9 +1139,9 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
       // Quem quiser acompanhar o desfecho abre /fila; deixar um botao para isso
       // devolvia ao chat a linha que a limpeza acabou de tirar.
       return encerrarCard(chatId, msgId,
-        reciboCard(o, '🕒 Na fila de publicação (' + env.posicao + 'º, sai ' + quando + '):'), ctx);
+        reciboCard(o, (prio ? '⚡ ' : '') + '🕒 Na fila de publicação (' + env.posicao + 'º, sai ' + quando + '):'), ctx);
     }
-    return encerrarCard(chatId, msgId, reciboCard(o, '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'), ctx);
+    return encerrarCard(chatId, msgId, reciboCard(o, (prio ? '⚡ ' : '') + '✅ Enviada em ' + (env.enviados ?? '?') + ' grupo(s):'), ctx);
   }
 
   if (acao === 'descartar') {
@@ -1687,8 +1695,10 @@ async function tratarBotao(chatId, msgId, data, ctx) {
       if (!s.dados.mensagem) return telaLivre(chatId, s, '⚠️ Mensagem vazia — preencha ao menos um campo.', msgId);
     }
     if (chave === 'enviar' || chave === 'fila' || chave === 'base') return confirmarEnvio(chatId, s, chave, msgId);
+    if (chave === 'enviarp') return confirmarEnvio(chatId, s, 'enviar', msgId, true);
     if (chave === 'forcar') {
-      const res = await dep.enviarCupomParaGrupos(s.dados.mensagem, null);
+      const res = await dep.enviarCupomParaGrupos(s.dados.mensagem, null, null,
+        s.dados.prioridade ? { prioridade: true } : {});
       sessoes.delete(String(chatId));
       return falar(chatId, `✅ Enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, msgId);
     }
@@ -1769,7 +1779,7 @@ async function tratarBotao(chatId, msgId, data, ctx) {
 // ── TRAVA DE TOQUE REPETIDO ──────────────────────────────────────────────────
 const travas = new Set();
 function chaveTrava(chatId, data) {
-  const r = /^r:(enviar|descartar):([^:]+)/.exec(data);
+  const r = /^r:(enviar|enviarp|descartar):([^:]+)/.exec(data);
   if (r) return chatId + ':r:' + r[2];
   // Troca de trilha: um toque por vez por item, senao o segundo redesenha a
   // tela com o estado de antes do primeiro.
@@ -1777,7 +1787,7 @@ function chaveTrava(chatId, data) {
   if (tr) return chatId + ':t:' + tr[2];
   const mi = /^m:(ok|venc|pular):(.+)$/.exec(data);
   if (mi) return chatId + ':m:' + mi[2];
-  if (/^a:(enviar|fila|base|forcar)$/.test(data)) return chatId + ':a:envio';
+  if (/^a:(enviar|enviarp|fila|base|forcar)$/.test(data)) return chatId + ':a:envio';
   return null;
 }
 
