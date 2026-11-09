@@ -4960,6 +4960,8 @@ async function comCarimboDeEnvio(oferta, fn) {
 
 // opcoes.prioridade: true = prioridade maxima no portao (bot, aprovacao no painel).
 function enviarCupomParaGrupos(mensagem, imagem, oferta, opcoes = {}) {
+  // semPortao: "⚡ Agora" — sai na hora, sem esperar o espacamento (igual ao site).
+  if (opcoes.semPortao) return comCarimboDeEnvio(oferta, () => _despacharCupomParaGrupos(mensagem, imagem, oferta));
   return comPortaoDePublicacao(
     () => comCarimboDeEnvio(oferta, () => _despacharCupomParaGrupos(mensagem, imagem, oferta)),
     'cupom #' + (oferta?.id || '?'),
@@ -5985,20 +5987,44 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
 // virgula. Entrada torta vira lista vazia (= grupos gerais), nunca excecao.
 function parseTrilhasForm(v) {
   if (Array.isArray(v)) return v;
-  const s = String(v || '').trim();
+  const s = String(v ?? '').trim();
+  // Ausente ou "null" = destino automatico (painel com 🤖 Automatico marcado).
+  if (v === undefined || v === null || s === 'null') return null;
   if (!s) return [];
   if (s[0] === '[') { try { const a = JSON.parse(s); return Array.isArray(a) ? a : []; } catch { return []; } }
   return s.split(',').map(x => x.trim()).filter(Boolean);
 }
 
+// DESTINO AUTOMATICO (08/11/2026, regra do Davi: site, extensao e bot iguais).
+// trilhas ausentes/null = "Automatico", o mesmo roteamento que o servidor usa
+// sozinho: cupom = gerais + grupos de nicho onde ele serve (rotaNichoDoCupom,
+// o mesmo do cupom capturado); oferta com categoria = gerais + trilhas do
+// nicho; o resto = gerais. Lista de trilhas (mesmo vazia) = escolha do operador.
+function destinosAutomaticos({ tipo, mensagem, categoria } = {}) {
+  const t = String(tipo || '').toLowerCase();
+  const gerais = destinosGerais();
+  if (t === 'cupom') {
+    let nicho = [];
+    try { nicho = rotaNichoDoCupom(mensagem, null).destinos || []; } catch (e) {}
+    return [...new Set([...gerais, ...nicho])];
+  }
+  const cat = String(categoria || '').trim();
+  if (cat) {
+    const doNicho = trilhas().filter(tr => tr.categoria === cat).flatMap(tr => tr.destinos || []);
+    return [...new Set([...gerais, ...doNicho])];
+  }
+  return gerais;
+}
+
 async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categoria, trilhasIds }) {
   const ehCupom  = String(tipo || '').toLowerCase() === 'cupom';
-  // Sem escolha explicita, mensagem escrita a mao vai para os GERAIS — nicho e
-  // territorio do radar, que sabe a categoria do produto, e texto livre sem
-  // classificacao cairia em todos os grupos de nicho ao mesmo tempo.
-  // Com trilhas marcadas no painel, quem manda e o operador: ele viu o produto.
-  const escolhidos = destinosDasTrilhas(trilhasIds);
-  const destinos = escolhidos.length ? escolhidos : destinosGerais();
+  // Com trilhas marcadas no painel/bot, quem manda e o operador: ele viu o produto.
+  // Sem lista (null/ausente) = destino automatico, igual em todas as plataformas.
+  // Lista vazia segue o comportamento antigo: so os gerais.
+  const automatico = !Array.isArray(trilhasIds);
+  const escolhidos = automatico ? [] : destinosDasTrilhas(trilhasIds);
+  const destinos = automatico ? destinosAutomaticos({ tipo, mensagem, categoria })
+    : (escolhidos.length ? escolhidos : destinosGerais());
   const soCupons = new Set(GRUPOS['tsp_cupons'] || []);
   const alvos = ehCupom
     ? [...new Set([...destinos, ...soCupons])]
@@ -22132,6 +22158,35 @@ app.post('/cupons/montar', (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
+// Cupom criado a mao no site (aba Criar cupom) entra na base e no registro de
+// cupons vistos ANTES do envio — o mesmo que o bot faz no "Enviar". Duplicata
+// recente volta como ignorado:true e o painel pergunta se envia mesmo assim
+// (08/11/2026, paridade site x bot).
+app.post('/cupons/registrar-criado', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const num = v => (v === '' || v === null || v === undefined) ? null : Number(v);
+    const cup = {
+      loja: String(b.loja || '').trim(), tipo: b.tipo === 'pct' ? 'pct' : 'reais',
+      valor: num(b.valor) || 0, minimo: num(b.minimo), maximo: num(b.maximo), limite: num(b.limite),
+      codigo: String(b.codigo || '').trim().toUpperCase(), gatilho: b.gatilho || '',
+      aviso: b.aviso || '', linkManual: String(b.link || '').trim(),
+      minimoDesconhecido: !!b.minimoDesconhecido, restrito: b.restrito === true,
+    };
+    if (!cup.loja) return res.status(400).json({ ok:false, erro:'informe a loja' });
+    if (!cup.codigo) return res.json({ ok:true, semCodigo:true });
+    if (b.soBase) {
+      const reg = registrarCupomBase(cup);
+      try { ativarCupomCapturadoMl(cup, reg); } catch (e) { console.warn('[CUPONS] Ativacao no ML falhou:', e.message); }
+      return res.json({ ok:true, base:true, codigo: reg?.codigo || cup.codigo, validadeAte: reg?.validadeAte || null });
+    }
+    const r = await enfileirarCupomTSP(cup, { origem: 'painel', textoOriginal: '[criado no painel]', somenteFila: true });
+    if (r?.ignorado) return res.json({ ok:true, ignorado:true, motivo: r.motivo || 'duplicata' });
+    if (r?.oferta) { r.oferta.status = 'aprovada'; salvarFila(); }
+    res.json({ ok:true, id: r?.oferta?.id || null });
+  } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
+});
+
 app.delete('/templates/:loja', (req, res) => {
   if (!removerTemplate(req.params.loja)) {
     return res.status(400).json({ ok:false, erro:'Template nao encontrado, ou e o padrao (que nao pode ser removido).' });
@@ -23044,6 +23099,19 @@ app.post('/mkt/montar', async (req, res) => {
 
   const loja = p.loja || pipe.loja;
 
+  // Ajustes do operador (bot = mesmos campos do site e da extensao, 08/11/2026):
+  // nome, "Por" (sem cupom) e "De" digitados valem sobre o lido na loja, e o
+  // cupom e calculado sobre o "Por" ajustado.
+  const b = req.body || {};
+  if (typeof b.titulo === 'string' && b.titulo.trim()) p.titulo = b.titulo.trim();
+  if (b.preco != null && b.preco !== '' && Number(b.preco) > 0) p.preco = Math.round(Number(b.preco) * 100) / 100;
+  if (b.precoDe !== undefined && b.precoDe !== null && b.precoDe !== '') {
+    p.precoDe = Number(b.precoDe) > 0 ? Math.round(Number(b.precoDe) * 100) / 100 : null;
+  }
+  if ((b.preco != null && b.preco !== '') || (b.precoDe !== undefined && b.precoDe !== null && b.precoDe !== '')) {
+    p.desconto = p.precoDe && p.preco && p.precoDe > p.preco ? Math.round((1 - p.preco / p.precoDe) * 100) : 0;
+  }
+
   // Cupons vinculaveis: TODOS os que estao ativos na base para esta loja,
   // inclusive os que nao abatem neste preco (vem marcados com aplicavel:false).
   // 'cupons' segue existindo so com os que rendem desconto porque o painel do
@@ -23055,7 +23123,15 @@ app.post('/mkt/montar', async (req, res) => {
   // da base" anunciaria um desconto que ele nao escolheu.
   let cupom = null, avisoCupom = null;
   const codigo = String(req.body?.cupom || '').trim();
-  if (codigo) {
+  // Cupom digitado a mao com tipo e valor (fora da base): mesmo recurso do
+  // "Digitar o cupom a mao" do site e da extensao. Sem valor, so o codigo sai.
+  const cm = req.body?.cupomManual;
+  if (cm && String(cm.codigo || '').trim()) {
+    const reg = { codigo: String(cm.codigo).trim().toUpperCase(), loja,
+      tipo: cm.tipo === 'reais' ? 'reais' : 'pct', valor: Number(cm.valor) || 0,
+      minimo: null, maximo: null, limite: null };
+    cupom = { reg, desconto: reg.valor > 0 ? calcularDesconto(reg, p.preco) : 0, citado: true, manual: true };
+  } else if (codigo) {
     const reg = cupomPorCodigo(loja, codigo);
     if (!reg)                    avisoCupom = 'cupom ' + codigo + ' nao esta na base de ' + loja;
     else if (!cupomVigente(reg)) avisoCupom = 'cupom ' + codigo + ' expirado ou inativo';
@@ -23086,6 +23162,7 @@ app.post('/mkt/montar', async (req, res) => {
     linkOriginal: bruto,
     linkExpandido: link,
     expandiu: link !== bruto,
+    nicho: categoriaNichoDoProduto(p, loja),
     produto: {
       titulo: p.titulo || '', marca: p.marca || '', link: p.link || link,
       imagemUrl: p.imagemUrl || null, preco: p.preco, precoDe: p.precoDe || null,
@@ -23421,6 +23498,22 @@ app.get('/mkt/fila', (req, res) => {
 app.get('/mkt/oferta/:id', (req, res) => {
   const o = ofertaDaFilaPara(req, req.params.id);
   if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  res.json({ ok:true, oferta: resumoOfertaFila(o), cupons: cuponsDoCard(o) });
+});
+
+// Texto inteiro editado no card do bot — o mesmo que a caixa "Mensagem
+// formatada" da aba Aprovar do site (08/11/2026, paridade site x bot).
+app.post('/mkt/texto/:id', (req, res) => {
+  const o = ofertaDaFilaPara(req, req.params.id);
+  if (!o) return res.status(404).json({ ok:false, erro:'Oferta nao encontrada.' });
+  if (o.status !== 'pendente') {
+    return res.status(409).json({ ok:false, erro:'Oferta com status ' + o.status + ' — nao da para editar.' });
+  }
+  const msg = String(req.body?.mensagem || '');
+  if (!msg.trim()) return res.status(400).json({ ok:false, erro:'texto vazio' });
+  o.mensagemFormatada = msg;
+  o.textoEditado = true;
+  salvarFila();
   res.json({ ok:true, oferta: resumoOfertaFila(o), cupons: cuponsDoCard(o) });
 });
 
@@ -26275,7 +26368,8 @@ iniciarFeedPublico({ resolverLink: linkDoCupomTSP });
 // segue a mesma regra da lista "nicho + geral": classificador decide o nicho
 // (so quando confiante) e o despacho passa pelo caminho unico do radar
 // (rastreio, rodape por grupo, preview, historico).
-async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = null, precoFinal = null, prioridade = false } = {}) {
+async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = null, precoFinal = null, prioridade = false,
+                                   trilhas = null, semPortao = false } = {}) {
   const lojaN = loja || produto.loja || 'Amazon';
   let cls = { categoria: null, confianca: 0 };
   try {
@@ -26309,10 +26403,17 @@ async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = 
 
   // Sem fonte, destinosDaOferta so ve as trilhas gerais; categoriaNicho traz os
   // destinos da trilha do nicho confirmado. Sem nicho confiavel: so gerais.
-  const opcoes = confiavel ? { categoriaNicho: cls.categoria } : {};
+  // Destino escolhido no bot (trilhas) vale como no card: vai em trilhasManuais
+  // e dispensa o roteamento automatico pelo nicho.
+  const manual = Array.isArray(trilhas) && trilhas.length;
+  const opcoes = manual ? {} : (confiavel ? { categoriaNicho: cls.categoria } : {});
+  if (manual) oferta.trilhasManuais = trilhas.map(String);
   if (prioridade) opcoes.prioridade = true;
+  if (semPortao) opcoes.semPortao = true;
   console.log('[BOT-TSP] Oferta "' + String(produto.titulo || '').slice(0, 60) + '" -> '
-    + (confiavel ? 'nicho ' + cls.categoria + ' + gerais' : 'so gerais (sem nicho confiavel)'));
+    + (manual ? 'trilhas ' + trilhas.join(', ')
+      : confiavel ? 'nicho ' + cls.categoria + ' + gerais' : 'so gerais (sem nicho confiavel)')
+    + (semPortao ? ' (agora)' : prioridade ? ' (prioridade)' : ''));
   const r = await enviarOfertaParaDestinos(mensagem, null, oferta, opcoes);
   oferta.status         = 'enviado';
   oferta.enviadoEm      = new Date().toISOString();
@@ -26320,7 +26421,100 @@ async function enviarOfertaDoBot({ mensagem, produto = {}, loja = null, cupom = 
   oferta.falhas         = r.falhas;
   registrarEnvioHistorico(oferta);
   return { enviados: r.enviados.length, falhas: r.falhas.length,
-           nicho: confiavel ? (cls.nome || cls.categoria) : null };
+           nicho: manual ? null : confiavel ? (cls.nome || cls.categoria) : null };
+}
+
+// Categoria de nicho confiavel de um produto (para o "Automatico" do site e do
+// bot pre-marcarem o nicho, igual ao roteamento do radar).
+function categoriaNichoDoProduto(produto = {}, loja = null) {
+  try {
+    const cls = classificarProduto({ titulo: produto.titulo || '', asin: produto.asin || null,
+      loja: loja || produto.loja || 'Amazon', trilha: produto.trilha || null }) || {};
+    return categoriaConfiavel(cls) ? { categoria: cls.categoria, nome: cls.nome || cls.categoria } : null;
+  } catch (e) { return null; }
+}
+
+// ── ENVIO PELO BOT COM AS MESMAS OPCOES DO SITE ──────────────────────────────
+// 08/11/2026, regra do Davi: a funcionalidade tem de ser igual no site, na
+// extensao e no bot. Os tres fluxos do bot (cupom, oferta, mensagem livre)
+// ganham o "Quando enviar" do site:
+//   janela  — dentro da janela de disparos entra no portao de publicacao
+//             (espacado, ⚡ prioridade fura a fila); fora, vira agendamento
+//             para a proxima abertura (aparece em Agendados).
+//   agora   — sai na hora, sem portao.
+//   agendar — agendamento na data/hora escolhida (passada = agora).
+// trilhas: lista = destino escolhido; null = automatico (destinosAutomaticos).
+function _portaoPosicaoPrevista(prioridade) {
+  if (prioridade) {
+    const posicao = _portaoFila.filter(x => x.prioridade).length + (_portaoEmVoo ? 1 : 0) + 1;
+    return { posicao, esperaSeg: Math.round(((posicao - 1) * 60000 + (posicao > 1 ? PRIORIDADE_FOLGA_MS : 0)) / 1000) };
+  }
+  return { posicao: _portaoNaFila + 1, esperaSeg: Math.round(esperaPrevistaMs() / 1000) };
+}
+
+async function enviarDoBot({ fluxo, mensagem, quando = 'janela', agendarEm = null, prioridade = false,
+                             trilhas = null, cupomOferta = null, oferta = null } = {}) {
+  if (!String(mensagem || '').trim()) throw new Error('mensagem vazia');
+  const tipoEnvio = fluxo === 'cupom' ? 'cupom' : fluxo === 'oferta' ? 'oferta' : 'manual';
+  const tipoJanela = fluxo === 'cupom' ? 'cupom' : 'oferta';
+  const trilhasEf = Array.isArray(trilhas) ? trilhas.map(String) : null;
+  const categoria = fluxo === 'oferta' && !trilhasEf ? (categoriaNichoDoProduto(oferta?.produto, oferta?.loja)?.categoria || null) : null;
+
+  // O cupom criado no bot entra na fila so como registro (base + historico):
+  // marca ja como aprovado para nao aparecer pendente na aba Aprovar enquanto
+  // espera o portao ou o agendamento — senao daria para aprovar duas vezes.
+  if (fluxo === 'cupom' && cupomOferta) { cupomOferta.status = 'aprovada'; salvarFila(); }
+
+  let dispararEm = null, janela = null;
+  if (quando === 'agendar') {
+    dispararEm = Date.parse(agendarEm || '');
+    if (isNaN(dispararEm)) throw new Error('data de agendamento invalida');
+  } else if (quando === 'janela') {
+    janela = janelaDeDisparoManual(Date.now(), tipoJanela);
+    if (!janela.ok) dispararEm = janela.proximoEm;
+  }
+
+  if (dispararEm && dispararEm > Date.now() + 30000) {
+    const p = oferta?.produto || {};
+    const id = gerarId();
+    agendamentos.push({ id, grupo: 'tsp', mensagem, dispararEm, status: 'aguardando', direto: false,
+      conta: null, tipo: tipoEnvio === 'manual' ? null : tipoEnvio, dados: null, fonteRegistro: null,
+      categoria, trilhas: trilhasEf,
+      preview: fluxo === 'oferta' && p.link ? { link: p.link, titulo: p.titulo || '',
+        descricao: p.preco ? 'R$ ' + Number(p.preco).toFixed(2).replace('.', ',') + ' · ' + (oferta.loja || '') : '',
+        imagemUrl: p.imagemUrl || null } : null,
+      anexo: null, origem: 'bot-telegram', criadoEm: new Date().toISOString() });
+    salvarAgendamentos();
+    const horario = new Intl.DateTimeFormat('pt-BR', { timeZone: TZ_SP, dateStyle: 'short', timeStyle: 'short' }).format(new Date(dispararEm));
+    console.log('[BOT-TSP] ' + fluxo + ' agendado para ' + horario + (janela && !janela.ok ? ' (fora da janela)' : ''));
+    return { agendado: true, id, horario, foraDaJanela: !!(janela && !janela.ok), janelas: janela?.janelas || null };
+  }
+
+  const agora = quando === 'agora' || quando === 'agendar';
+  const despachar = () => {
+    if (fluxo === 'oferta') {
+      return enviarOfertaDoBot({ ...(oferta || {}), mensagem, prioridade: !agora && prioridade,
+        trilhas: trilhasEf, semPortao: agora })
+        .then(r => ({ enviados: r.enviados, falhas: r.falhas, nicho: r.nicho }));
+    }
+    if (fluxo === 'cupom' && !trilhasEf) {
+      return enviarCupomParaGrupos(mensagem, null, cupomOferta, agora ? { semPortao: true } : { prioridade: !!prioridade })
+        .then(r => ({ enviados: r?.enviados?.length ?? 0, falhas: r?.falhas?.length ?? 0 }));
+    }
+    const fn = () => enviarManualParaGrupos({ mensagem, tipo: tipoEnvio, trilhasIds: trilhasEf, categoria });
+    const pr = agora ? fn() : comPortaoDePublicacao(fn, fluxo + ' do bot', { prioridade: !!prioridade });
+    return pr.then(r => ({ enviados: r.enviados.length, falhas: r.falhas.length }));
+  };
+
+  if (agora || !portaoOcupado()) {
+    const r = await despachar();
+    return { ...r, agora };
+  }
+  const prev = _portaoPosicaoPrevista(!!prioridade);
+  despachar()
+    .then(r => console.log('[BOT-TSP] ' + fluxo + ' saiu do portao: ' + r.enviados + ' grupo(s)'))
+    .catch(e => console.error('[BOT-TSP] ' + fluxo + ' falhou no portao: ' + e.message));
+  return { naFila: true, prioridade: !!prioridade, ...prev };
 }
 
 bootBotTsp({
@@ -26341,6 +26535,9 @@ bootBotTsp({
   // Oferta e mensagem livre do bot: mesmo roteamento do painel (trilhas).
   enviarOfertaBot: enviarOfertaDoBot,
   enviarLivreBot: (mensagem) => enviarManualParaGrupos({ mensagem, tipo: 'manual' }),
+  enviarDoBot,
+  trilhasParaBot: () => trilhas().map(t => ({ id: t.id, nome: t.nome || t.id, categoria: t.categoria || null, grupos: (t.destinos || []).length })),
+  categoriaNichoDoProduto,
   salvarFila,
   // Lista /inserir (insercao manual de cupons na conta do ML) e /autoinserir.
   listarCuponsBase,

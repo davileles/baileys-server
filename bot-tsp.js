@@ -133,6 +133,134 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// ── QUANDO ENVIAR / PRIORIDADE / DESTINO ─────────────────────────────────────
+// 08/11/2026, regra do Davi: as opcoes de envio sao as MESMAS no site (abas
+// Criar cupom, Criar oferta e Mensagem livre), na extensao e no bot:
+//   🕐 Na janela (padrao) — segue a janela de disparos; dentro dela entra na
+//      fila de publicacao, fora vira agendamento para a proxima abertura.
+//   ⚡ Agora — sai na hora, sem esperar o espacamento.
+//   📅 Agendar — data e hora escolhidas (horario de Brasilia).
+//   ⚡ Prioridade maxima (so na janela) — passa na frente da fila.
+//   🧭 Destino — 🤖 Automatico (o roteamento do servidor) ou trilhas escolhidas.
+const QUANDO_ROT   = { janela: '🕐 Na janela', agora: '⚡ Agora', agendar: '📅 Agendar' };
+const QUANDO_BOTAO = { janela: '🕐 Enviar na janela', agora: '⚡ Enviar agora', agendar: '📅 Agendar envio' };
+
+function horaSP(iso) {
+  try {
+    return new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit',
+      hour: '2-digit', minute: '2-digit' }).format(new Date(iso));
+  } catch (e) { return '?'; }
+}
+
+// "14:30" (hoje), "25/11 14:30" ou "25/11/2026 14:30" — sempre horario de
+// Brasilia (-03:00 fixo). Devolve ISO ou null.
+function lerDataHoraSP(t) {
+  const s = String(t || '').trim().replace(/\s+(as|às|h)\s+/i, ' ');
+  const hoje = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Sao_Paulo' }).format(new Date());
+  let [ano, mes, dia] = hoje.split('-');
+  let m = /^(\d{1,2})[:h](\d{2})$/.exec(s);
+  let hh, mi;
+  if (m) { hh = m[1]; mi = m[2]; }
+  else {
+    m = /^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\s+(\d{1,2})[:h](\d{2})$/.exec(s);
+    if (!m) return null;
+    dia = m[1]; mes = m[2]; if (m[3]) ano = m[3].length === 2 ? '20' + m[3] : m[3];
+    hh = m[4]; mi = m[5];
+  }
+  const p2 = v => String(v).padStart(2, '0');
+  if (Number(hh) > 23 || Number(mi) > 59 || Number(mes) > 12 || Number(dia) > 31) return null;
+  const ms = Date.parse(ano + '-' + p2(mes) + '-' + p2(dia) + 'T' + p2(hh) + ':' + p2(mi) + ':00-03:00');
+  return isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
+function trilhasDisponiveis() {
+  try { return (dep && dep.trilhasParaBot) ? dep.trilhasParaBot() : []; } catch (e) { return []; }
+}
+
+function resumoDestino(d) {
+  if (!Array.isArray(d.trilhas)) return '🤖 Automático';
+  if (!d.trilhas.length) return 'nenhuma trilha';
+  const nomes = trilhasDisponiveis().filter(t => d.trilhas.includes(t.id)).map(t => t.nome || t.id);
+  const txt = nomes.join(', ');
+  return txt.length > 40 ? nomes.length + ' trilhas' : txt;
+}
+
+function linhasEnvio(d) {
+  const q = d.quando || 'janela';
+  const op = k => [(q === k ? '● ' : '') + QUANDO_ROT[k], 'e:q:' + k];
+  const linhas = [[op('janela'), op('agora'), op('agendar')]];
+  if (q === 'janela') linhas.push([[(d.prioridade ? '✅' : '⬜') + ' ⚡ Prioridade máxima', 'e:prio']]);
+  linhas.push([['🧭 Destino: ' + resumoDestino(d), 'e:dest']]);
+  const quando = q === 'agendar' ? (d.agendarEm ? ' · ' + horaSP(d.agendarEm) : ' · escolher hora') : '';
+  linhas.push([[QUANDO_BOTAO[q] + quando, 'a:enviar']]);
+  return linhas;
+}
+
+// Redesenha a tela final do fluxo aberto (cupom, oferta ou mensagem livre).
+function telaFinal(chatId, s, editar, nota) {
+  if (s.fluxo === 'cupom')  return previewCupom(chatId, s, editar);
+  if (s.fluxo === 'oferta') return telaOferta(chatId, s, editar, nota);
+  return telaLivre(chatId, s, nota, editar);
+}
+
+async function telaDestino(chatId, s, editar) {
+  const d = s.dados;
+  const lista = trilhasDisponiveis();
+  const auto = !Array.isArray(d.trilhas);
+  const linhas = [[[(auto ? '✅ ' : '') + '🤖 Automático', 'e:auto']]];
+  lista.forEach((t, i) => {
+    const on = !auto && d.trilhas.includes(t.id);
+    linhas.push([[(on ? '✅ ' : '⬜ ') + (t.nome || t.id) + (t.categoria ? ' · nicho' : ' · geral'), 'e:tri:' + i]]);
+  });
+  linhas.push([['⬅️ Voltar', 'e:voltar']]);
+  const explica = s.fluxo === 'cupom'
+    ? 'Automático = grupos gerais + só-cupons + grupos de nicho onde o cupom serve.'
+    : s.fluxo === 'oferta'
+    ? 'Automático = grupos gerais + o nicho do produto, quando reconhecido.'
+    : 'Automático = só os grupos gerais.';
+  return falarPlano(chatId, '🧭 DESTINO\n\n' + explica + '\n\nOu marque as trilhas que devem receber.', teclado(linhas), editar);
+}
+
+// Botoes 'e:*' — opcoes de envio de qualquer fluxo aberto.
+async function tratarBotaoEnvio(chatId, msgId, s, partes) {
+  if (!s || !['cupom', 'oferta', 'msg'].includes(s.fluxo)) return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
+  const d = s.dados;
+  const [, acao, arg] = partes;
+  if (s.fluxo === 'msg') s.msgId = msgId;
+  if (acao === 'q' && QUANDO_ROT[arg]) {
+    d.quando = arg;
+    if (arg === 'agendar') {
+      s.passoAntes = s.passo;
+      s.passo = 'agendar';
+      return falarPlano(chatId, '📅 AGENDAR\n\nMande a data e a hora (horário de Brasília):\n• 14:30 → hoje\n• 25/11 14:30\n\n'
+        + (d.agendarEm ? 'Hoje está: ' + horaSP(d.agendarEm) : ''),
+        teclado([[['⬅️ Voltar', 'e:voltar']]]), msgId);
+    }
+  } else if (acao === 'prio') {
+    d.prioridade = !d.prioridade;
+  } else if (acao === 'dest') {
+    return telaDestino(chatId, s, msgId);
+  } else if (acao === 'auto') {
+    d.trilhas = null;
+    return telaDestino(chatId, s, msgId);
+  } else if (acao === 'tri') {
+    const t = trilhasDisponiveis()[Number(arg)];
+    if (t) {
+      const atual = Array.isArray(d.trilhas) ? d.trilhas.slice() : [];
+      const k = atual.indexOf(t.id);
+      if (k >= 0) atual.splice(k, 1); else atual.push(t.id);
+      d.trilhas = atual;
+    }
+    return telaDestino(chatId, s, msgId);
+  } else if (acao === 'voltar') {
+    if (s.passo === 'agendar') {
+      s.passo = s.passoAntes || null;
+      if (!d.agendarEm) d.quando = 'janela';
+    }
+  }
+  return telaFinal(chatId, s, msgId);
+}
+
 // ── FLUXO CUPOM ──────────────────────────────────────────────────────────────
 const LOJAS = ['Amazon', 'Mercado Livre', 'Shopee', 'Magazine Luiza', 'Zé Delivery'];
 
@@ -231,6 +359,9 @@ function dadosCupom(s) {
     gatilho: d.gatilho || '',
     minimoDesconhecido: !!d.minimoDesconhecido,
     restrito: d.restrito === true,
+    // Mesmos campos do "Criar cupom" do site (link de resgate e Importante).
+    linkManual: d.linkResgate || '',
+    aviso:      d.importante || '',
   };
 }
 
@@ -243,12 +374,14 @@ async function previewCupom(chatId, s, editar) {
   const selo = s.dados.restrito === true
     ? '\n\n🎯 _Marcado como só produtos específicos: fica na base, mas fora da escolha automática, do combo “Cupons ativos” e do site público._'
     : '';
+  const d = s.dados;
   return falar(chatId,
     '*Prévia da mensagem* 👇\n\n- - - - - - - - - -\n' + msg + '\n- - - - - - - - - -' + selo,
     teclado([
-      [['🚀 Enviar agora', 'a:enviar'], ['📋 Mandar pra fila', 'a:fila']],
-      [['⚡ Enviar com prioridade máxima', 'a:enviarp']],
-      [['🗂 Só cadastrar na base', 'a:base']],
+      [['🔗 Link de resgate' + (d.linkResgate ? ' ✅' : ''), 'c:link:__menu'],
+       ['⚠️ Importante' + (d.importante ? ' ✅' : ''), 'c:imp:__menu']],
+      ...linhasEnvio(d),
+      [['📋 Mandar pra fila', 'a:fila'], ['🗂 Só cadastrar na base', 'a:base']],
       [['🔁 Refazer', 'a:refazer'], ['❌ Cancelar', 'a:cancelar']],
     ]), editar);
 }
@@ -256,13 +389,25 @@ async function previewCupom(chatId, s, editar) {
 // ── FLUXO OFERTA ─────────────────────────────────────────────────────────────
 // Um link basta: o pipeline do radar le preco, titulo e imagem, e o template da
 // loja monta a mensagem — a mesma das ofertas automaticas.
-async function montarOfertaPorLink(link, cupom, importante) {
+// Campos da oferta iguais aos do site (Criar oferta) e da extensao: gatilho,
+// nome, De, Por (sem cupom) e cupom da base ou digitado com tipo e valor.
+async function montarOfertaPorLink(link, cupom, importante, extra = {}) {
   const r = await fetch(`http://127.0.0.1:${dep.PORT}/mkt/montar`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ link, cupom: cupom || '', importante: importante || '' }),
+    body: JSON.stringify({ link, cupom: cupom || '', importante: importante || '', ...extra }),
   });
   return r.json();
+}
+
+function ajustesOferta(d) {
+  const ex = {};
+  if (d.gatilho) ex.gatilho = d.gatilho;
+  if (d.titulo) ex.titulo = d.titulo;
+  if (d.preco) ex.preco = d.preco;
+  if (d.precoDe !== undefined) ex.precoDe = d.precoDe === null ? 0 : d.precoDe;
+  if (d.cupomManual) ex.cupomManual = d.cupomManual;
+  return ex;
 }
 
 // ── LINHA IMPORTANTE: TEXTOS PRONTOS ─────────────────────────────────────────
@@ -357,7 +502,7 @@ function resumoCupons(cupons, mostrados) {
 async function previewOferta(chatId, s, editar) {
   s.passo = 'preview';
   const d = s.dados;
-  const r = await montarOfertaPorLink(d.link, d.codigoCupom, d.importante);
+  const r = await montarOfertaPorLink(d.link, d.cupomManual ? '' : d.codigoCupom, d.importante, ajustesOferta(d));
   if (!r.ok) {
     s.passo = 'link';
     return falar(chatId, '⚠️ Não consegui ler esse produto:\n`' + (r.erro || 'erro desconhecido') + '`\n\nMande outro link.',
@@ -371,26 +516,46 @@ async function previewOferta(chatId, s, editar) {
   d.loja       = r.loja || null;
   d.cupomInfo  = r.cupom || null;
   d.precoFinal = r.precoFinal ?? null;
+  d.nicho      = r.nicho || null;
+  d.montagem   = { cuponsBase: r.cuponsBase || r.cupons || [], avisoCupom: r.avisoCupom || null };
+  return telaOferta(chatId, s, editar);
+}
 
+// Desenha a previa da oferta com o que ja foi montado — trocar opcao de envio
+// ou destino nao rele o produto na loja.
+async function telaOferta(chatId, s, editar, nota) {
+  const d = s.dados;
+  const m = d.montagem || { cuponsBase: [] };
   // Todos os cupons ativos da loja viram botao — os que nao abatem este preco
   // inclusive, marcados no rotulo. O cupom nunca entra sozinho: quem escolhe e
   // o operador, e ele pode trocar ou tirar a qualquer momento.
-  const todos  = r.cuponsBase || r.cupons || [];
+  const todos  = m.cuponsBase || [];
   const daBase = todos.slice(0, MAX_BOTOES_CUPOM);
-  const linhas = daBase.length ? linhasDeCupons(daBase, d.codigoCupom, 'o:cupom:') : [];
+  const escolhido = d.cupomManual ? d.cupomManual.codigo : d.codigoCupom;
+  const linhas = daBase.length ? linhasDeCupons(daBase, d.cupomManual ? null : d.codigoCupom, 'o:cupom:') : [];
   // Digitar codigo sempre disponivel: alcanca o cupom que ficou fora do corte e
-  // tambem o que o operador viu na loja e ainda nao foi capturado.
-  const extras = [['🔎 Digitar código', 'o:cupom:__digitar']];
-  if (d.codigoCupom) extras.push(['🚫 Sem cupom', 'o:cupom:']);
+  // tambem o que o operador viu na loja e ainda nao foi capturado (com tipo e
+  // valor, como o "Digitar o cupom a mao" do site e da extensao).
+  const extras = [['🔎 Digitar cupom', 'o:cupom:__digitar']];
+  if (escolhido) extras.push(['🚫 Sem cupom', 'o:cupom:']);
   linhas.push(extras);
-  linhas.push([['⚠️ Importante' + (d.importante ? ' ✏️' : ''), 'o:imp:__menu']]);
-  linhas.push([['🚀 Enviar agora', 'a:enviar'], ['⚡ Prioridade máxima', 'a:enviarp']]);
+  // Codigo digitado que nao esta na base: o operador informa o desconto (ou
+  // manda so o codigo), igual ao cupom digitado a mao no site e na extensao.
+  if (!d.cupomManual && d.codigoCupom && /nao esta na base/i.test(m.avisoCupom || '')) {
+    linhas.push([['% Informar desconto', 'o:cman:pct'], ['R$ Informar desconto', 'o:cman:reais'], ['Só o código', 'o:cman:so']]);
+  }
+  const v = k => d[k] !== undefined && d[k] !== null && d[k] !== '' ? ' ✏️' : '';
+  linhas.push([['🚨 Gatilho' + v('gatilho'), 'o:campo:gatilho'], ['📝 Nome' + v('titulo'), 'o:campo:titulo']]);
+  linhas.push([['🔖 De' + (d.precoDe !== undefined ? ' ✏️' : ''), 'o:campo:precoDe'], ['💲 Por' + v('preco'), 'o:campo:preco'],
+               ['⚠️ Importante' + (d.importante ? ' ✏️' : ''), 'o:imp:__menu']]);
+  linhas.push(...linhasEnvio(d));
   linhas.push([['❌ Cancelar', 'a:cancelar']]);
 
-  const aviso = r.avisoCupom ? `\n\n⚠️ _${r.avisoCupom}_` : '';
+  const aviso = m.avisoCupom ? `\n\n⚠️ _${m.avisoCupom}_` : '';
+  const nicho = !Array.isArray(d.trilhas) && d.nicho ? `\n🧭 _Nicho reconhecido: ${d.nicho.nome} (vai junto no automático)_` : '';
   return falar(chatId,
-    '*Prévia da oferta* 👇\n\n- - - - - - - - - -\n' + r.mensagem + '\n- - - - - - - - - -' + aviso
-    + '\n\n' + resumoCupons(todos, daBase.length),
+    '*Prévia da oferta* 👇\n\n- - - - - - - - - -\n' + d.mensagem + '\n- - - - - - - - - -' + aviso + nicho
+    + '\n\n' + resumoCupons(todos, daBase.length) + (nota ? '\n\n' + nota : ''),
     teclado(linhas), editar);
 }
 
@@ -443,7 +608,7 @@ async function telaLivre(chatId, s, nota, editar) {
     [bt('loja'), bt('importante')],
     [bt('link')],
   ];
-  if (msg) linhas.push([['🚀 Enviar agora', 'a:enviar']]);
+  if (msg) linhas.push(...linhasEnvio(d));
   linhas.push([['❌ Cancelar', 'a:cancelar']]);
   const texto = '📢 MENSAGEM LIVRE\n\n'
     + (msg ? '- - - - - - - - - -\n' + msg + '\n- - - - - - - - - -' : '(vazia — preencha ao menos um campo)')
@@ -517,11 +682,8 @@ async function textoLivre(chatId, s, t, msgEntrada) {
 // ── ENVIO ────────────────────────────────────────────────────────────────────
 // prioridade: o "⚡ Prioridade máxima" do bot — o mesmo da caixa do painel e da
 // extensão: o envio fura a fila do portão de publicação.
-async function confirmarEnvio(chatId, s, acao, editar, prioridade = false) {
+async function confirmarEnvio(chatId, s, acao, editar, forcar = false) {
   const d = s.dados;
-  if (prioridade) d.prioridade = true;
-  const prio = d.prioridade ? { prioridade: true } : {};
-  const seloPrio = d.prioridade ? '⚡ ' : '';
 
   if (s.fluxo === 'cupom') {
     const c = dadosCupom(s);
@@ -544,52 +706,67 @@ async function confirmarEnvio(chatId, s, acao, editar, prioridade = false) {
         null, editar);
     }
 
-    const ctx = { origem: 'bot-telegram', textoOriginal: '[criado no bot]', somenteFila: true };
-    let r;
-    try { r = await dep.enfileirarCupomTSP(c, ctx); }
-    catch (e) { return falar(chatId, '⚠️ Erro ao registrar o cupom: ' + e.message, null, editar); }
+    if (!forcar) {
+      const ctx = { origem: 'bot-telegram', textoOriginal: '[criado no bot]', somenteFila: true };
+      let r;
+      try { r = await dep.enfileirarCupomTSP(c, ctx); }
+      catch (e) { return falar(chatId, '⚠️ Erro ao registrar o cupom: ' + e.message, null, editar); }
 
-    if (r?.ignorado) {
-      // Duplicata: o gate existe para o monitoramento, nao para o operador. Ele
-      // decide se manda mesmo assim — mas precisa saber que ja saiu antes.
-      return falar(chatId, '⚠️ Esse cupom já foi capturado recentemente (duplicata).\n\nEnviar mesmo assim?',
-        teclado([[['🚀 Enviar assim mesmo', 'a:forcar'], ['❌ Cancelar', 'a:cancelar']]]), editar);
+      if (r?.ignorado) {
+        // Duplicata: o gate existe para o monitoramento, nao para o operador. Ele
+        // decide se manda mesmo assim — mas precisa saber que ja saiu antes.
+        return falar(chatId, '⚠️ Esse cupom já foi capturado recentemente (duplicata).\n\nEnviar mesmo assim?',
+          teclado([[['🚀 Enviar assim mesmo', 'a:forcar'], ['❌ Cancelar', 'a:cancelar']]]), editar);
+      }
+
+      if (acao === 'fila') {
+        sessoes.delete(String(chatId));
+        return falar(chatId, `📋 Cupom *#${r.oferta.id}* na fila.\n\nAprove em: https://gestao.ticapromos.com.br/`, null, editar);
+      }
+      s.cupomOferta = r.oferta || null;
     }
-
-    if (acao === 'fila') {
-      sessoes.delete(String(chatId));
-      return falar(chatId, `📋 Cupom *#${r.oferta.id}* na fila.\n\nAprove em: https://davileles.github.io/tudo-sobre-promos/`, null, editar);
-    }
-
-    const res = await dep.enviarCupomParaGrupos(d.mensagem, null, null, prio);
-    if (r.oferta) { r.oferta.status = 'aprovada'; dep.salvarFila(); }
-    sessoes.delete(String(chatId));
-    return falar(chatId, `✅ ${seloPrio}Cupom enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, editar);
   }
 
-  // Oferta segue o roteamento por trilha (gerais + nicho classificado) e
-  // mensagem livre vai so para as gerais — as duas pelo caminho do painel, com
-  // rastreio de link e historico. O envio passa grupo a grupo e leva segundos:
-  // sem trocar o card ANTES, o toque parecia nao ter pegado e o segundo toque
-  // publicava de novo.
-  await falarPlano(chatId, '⏳ Enviando... não toque de novo.', null, editar);
+  if (s.fluxo === 'msg') {
+    d.mensagem = montarLivre(d);
+    if (!d.mensagem) return telaLivre(chatId, s, '⚠️ Mensagem vazia — preencha ao menos um campo.', editar);
+  }
+  const quando = d.quando || 'janela';
+  if (quando === 'agendar' && !d.agendarEm) {
+    return tratarBotaoEnvio(chatId, editar, s, ['e', 'q', 'agendar']);
+  }
+
+  // As tres opcoes de envio saem pelo mesmo caminho do servidor (enviarDoBot),
+  // com o comportamento das abas do site. O card troca ANTES: o envio "agora"
+  // passa grupo a grupo e leva segundos, e um segundo toque publicaria de novo.
+  const seloPrio = quando === 'janela' && d.prioridade ? '⚡ ' : '';
+  const enviar = falarPlano;   // nomes de trilha podem ter _ ou *: sem Markdown
+  await falarPlano(chatId, quando === 'agora' ? '⏳ Enviando... não toque de novo.' : '⏳ Registrando o envio...', null, editar);
   try {
-    if (s.fluxo === 'oferta') {
-      const res = await dep.enviarOfertaBot({ mensagem: d.mensagem, produto: d.produto || {},
-        loja: d.loja, cupom: d.cupomInfo, precoFinal: d.precoFinal, prioridade: !!d.prioridade });
-      sessoes.delete(String(chatId));
-      return falar(chatId, `✅ ${seloPrio}Enviado em *${res.enviados}* grupo(s)`
-        + (res.falhas ? ` (${res.falhas} falha(s))` : '') + '.\n'
-        + (res.nicho ? `🧭 Nicho: *${res.nicho}* + grupos gerais.` : '🧭 Sem nicho reconhecido — só grupos gerais.'),
-        null, editar);
-    }
-    const res = await dep.enviarLivreBot(d.mensagem);
+    const res = await dep.enviarDoBot({
+      fluxo: s.fluxo, mensagem: d.mensagem, quando, agendarEm: d.agendarEm || null,
+      prioridade: quando === 'janela' && !!d.prioridade, trilhas: Array.isArray(d.trilhas) ? d.trilhas : null,
+      cupomOferta: s.cupomOferta || null,
+      oferta: s.fluxo === 'oferta' ? { produto: d.produto || {}, loja: d.loja, cupom: d.cupomInfo, precoFinal: d.precoFinal } : null,
+    });
     sessoes.delete(String(chatId));
-    return falar(chatId, `✅ Enviado em *${res.enviados.length}* grupo(s) gerais`
-      + (res.falhas.length ? ` (${res.falhas.length} falha(s))` : '') + '.', null, editar);
+    const destino = '🧭 Destino: ' + resumoDestino(d)
+      + (s.fluxo === 'oferta' && !Array.isArray(d.trilhas) ? (res.nicho || d.nicho ? ' (nicho ' + (res.nicho || d.nicho.nome) + ' + gerais)' : ' (só gerais)') : '');
+    if (res.agendado) {
+      return enviar(chatId, (res.foraDaJanela
+        ? '🕐 Fora da janela (' + res.janelas + ') — agendado para ' + res.horario + '.'
+        : '📅 Agendado para ' + res.horario + '.') + '\n' + destino + '\nAparece em Agendados no site.', null, editar);
+    }
+    if (res.naFila) {
+      const min = Math.round((res.esperaSeg || 0) / 60);
+      return enviar(chatId, seloPrio + '🕐 Na fila de publicação (' + res.posicao + 'º, sai '
+        + ((res.esperaSeg || 0) < 90 ? 'em instantes' : 'em ~' + min + ' min') + ').\n' + destino, null, editar);
+    }
+    return enviar(chatId, seloPrio + '✅ Enviado em ' + res.enviados + ' grupo(s)'
+      + (res.falhas ? ' (' + res.falhas + ' falha(s))' : '') + '.\n' + destino, null, editar);
   } catch (e) {
     sessoes.delete(String(chatId));
-    return falar(chatId, '⚠️ Erro no envio: ' + e.message, null, editar);
+    return falarPlano(chatId, '⚠️ Erro no envio: ' + e.message, null, editar);
   }
 }
 
@@ -953,7 +1130,7 @@ function tecladoCard(id) {
     [['🚀 Enviar agora', 'r:enviar:' + id], ['⚡ Prioridade máxima', 'r:enviarp:' + id]],
     [['💲 Por', 'r:preco:' + id], ['🔖 De', 'r:precode:' + id], ['🏷️ Cupom', 'r:cupom:' + id]],
     [['✏️ Título', 'r:titulo:' + id], ['🔝 Topo', 'r:topo:' + id], ['⚠️ Importante', 'r:importante:' + id]],
-    [['🧭 Trilhas', 'r:trilhas:' + id]],
+    [['🧭 Trilhas', 'r:trilhas:' + id], ['✏️ Texto inteiro', 'r:texto:' + id]],
     [['🔄 Atualizar', 'r:ver:' + id], ['📋 Fila', 'r:fila:0'], ['🗑️ Descartar', 'r:descartar:' + id]],
   ]);
 }
@@ -1166,6 +1343,16 @@ async function tratarRevisao(chatId, msgId, partes, ctx) {
     const nota = como === 'produto' ? ' (monitor não sugere mais este produto)'
       : como === 'loja' ? ' (monitor passa a evitar a loja)' : '';
     return encerrarCard(chatId, msgId, reciboCard(o, '🗑️ Descartada' + nota + ':'), ctx);
+  }
+
+  // Editar o texto inteiro, como a caixa "Mensagem formatada" da aba Aprovar do
+  // site. Vale o que for digitado; um ajuste de Por/De/Cupom depois remonta.
+  if (acao === 'texto') {
+    const s = abrir(chatId, 'revisao');
+    s.passo = 'texto'; s.ofertaId = id; s.msgId = msgId;
+    return falarHtml(chatId, cabecalhoCard(o) + '\n\n'
+      + esc('Mande o TEXTO INTEIRO da mensagem, do jeito que deve sair no WhatsApp (*negrito*, _itálico_). Não apague o link.'),
+      teclado([[['⬅️ Voltar', 'r:ver:' + id]]]), msgId);
   }
 
   if (acao === 'preco' || acao === 'precode' || acao === 'titulo' || acao === 'topo' || acao === 'importante') {
@@ -1574,6 +1761,18 @@ async function tratarTexto(chatId, texto, msgEntrada) {
   const s = sessao(chatId);
   if (!s) return falar(chatId, MENU, MENU_KB());
 
+  // Data/hora do "📅 Agendar" (cupom, oferta e mensagem livre).
+  if (s.passo === 'agendar' && ['cupom', 'oferta', 'msg'].includes(s.fluxo)) {
+    const iso = lerDataHoraSP(t);
+    if (!iso) return falar(chatId, 'Não entendi a data. Mande assim: `14:30` (hoje) ou `25/11 14:30`.');
+    if (Date.parse(iso) < Date.now() - 60000) return falar(chatId, 'Esse horário já passou. Mande um horário futuro.');
+    s.dados.agendarEm = iso;
+    s.dados.quando = 'agendar';
+    s.passo = s.passoAntes || null;
+    await apagarEntrada(chatId, msgEntrada);
+    return telaFinal(chatId, s, s.fluxo === 'msg' ? s.msgId : s.cardId);
+  }
+
   // ── entrada de texto por passo ──
   if (s.fluxo === 'revisao') {
     let ov = null;
@@ -1585,6 +1784,18 @@ async function tratarTexto(chatId, texto, msgEntrada) {
       const v = num(t);
       if (v === null || v < 0) return falar(chatId, 'Preço inválido. Digite só o número (ex: `249,90`) ou toque em *Sem preço de*.');
       ov = { precoDe: v };
+    } else if (s.passo === 'texto') {
+      const { ofertaId, msgId } = s;
+      sessoes.delete(String(chatId));
+      const r = await apiLocal('POST', '/mkt/texto/' + ofertaId, { mensagem: t });
+      await apagarEntrada(chatId, msgEntrada);
+      if (!r.ok) {
+        const atual = await apiLocal('GET', '/mkt/oferta/' + ofertaId);
+        return falarHtml(chatId, atual.ok ? corpoCard(atual.oferta, '❌ ' + (r.erro || 'falha ao gravar o texto')) : esc('❌ ' + (r.erro || 'falha')),
+          atual.ok ? tecladoCard(ofertaId) : null, msgId);
+      }
+      registrarCard(chatId, msgId, ofertaId);
+      return falarHtml(chatId, corpoCard(r.oferta, '✏️ Texto atualizado'), tecladoCard(ofertaId), msgId);
     } else if (s.passo === 'titulo') ov = { titulo: t };
     else if (s.passo === 'topo')     ov = { gatilho: t };
     else if (s.passo === 'importante') ov = { importante: t };
@@ -1631,9 +1842,39 @@ async function tratarTexto(chatId, texto, msgEntrada) {
         return falar(chatId, 'Código inválido. Mande só o código, sem espaços (ex: `MELIMAISPOSDD`).');
       }
       s.dados.codigoCupom = cod;
+      delete s.dados.cupomManual;
       await falar(chatId, '⏳ Remontando a oferta...');
       return previewOferta(chatId, s);
     }
+    if (s.passo === 'cupomvalor') {
+      const v = num(t);
+      if (v === null || v <= 0) return falar(chatId, 'Valor inválido. Digite só o número (ex: `10`).');
+      s.dados.cupomManual = { codigo: s.dados.codigoCupom, tipo: s.dados.cupomTipoPend || 'pct', valor: v };
+      await apagarEntrada(chatId, msgEntrada);
+      await falar(chatId, '⏳ Remontando a oferta...', null, s.cardId);
+      return previewOferta(chatId, s, s.cardId);
+    }
+    if (String(s.passo || '').startsWith('ocampo:')) {
+      const k = s.passo.slice(7);
+      if (k === 'preco' || k === 'precoDe') {
+        const v = num(t);
+        if (v === null || v <= 0) return falar(chatId, 'Valor inválido. Digite só o número (ex: `199,90`).');
+        s.dados[k] = v;
+      } else s.dados[k] = t.replace(/\s+/g, ' ').trim();
+      await apagarEntrada(chatId, msgEntrada);
+      await falar(chatId, '⏳ Remontando a oferta...', null, s.cardId);
+      return previewOferta(chatId, s, s.cardId);
+    }
+  }
+
+  if (s.fluxo === 'cupom' && (s.passo === 'cplink' || s.passo === 'cimp')) {
+    if (s.passo === 'cplink') {
+      if (!/^https?:\/\/\S+$/i.test(t.trim())) return falar(chatId, 'Isso não parece um link. Mande a URL completa (https://...).');
+      s.dados.linkResgate = t.trim();
+    } else s.dados.importante = t.replace(/\s+/g, ' ').trim();
+    s.passo = 'preview';
+    await apagarEntrada(chatId, msgEntrada);
+    return previewCupom(chatId, s);
   }
 
   if (s.fluxo === 'cupom') {
@@ -1667,6 +1908,7 @@ async function tratarBotao(chatId, msgId, data, ctx) {
   const s = sessao(chatId);
   const [ns, chave, valor] = partes;
 
+  if (ns === 'e') { if (s) s.cardId = msgId; return tratarBotaoEnvio(chatId, msgId, s, partes); }
   if (ns === 'l') return tratarBotaoLivre(chatId, msgId, s, partes);
 
   if (ns === 'a') {
@@ -1690,22 +1932,50 @@ async function tratarBotao(chatId, msgId, data, ctx) {
       s.passo = s.fluxo === 'oferta' ? 'link' : 'texto';
       return falar(chatId, 'Manda de novo.', teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
     }
-    if (chave === 'enviar' && s.fluxo === 'msg') {
-      s.dados.mensagem = montarLivre(s.dados);
-      if (!s.dados.mensagem) return telaLivre(chatId, s, '⚠️ Mensagem vazia — preencha ao menos um campo.', msgId);
-    }
     if (chave === 'enviar' || chave === 'fila' || chave === 'base') return confirmarEnvio(chatId, s, chave, msgId);
-    if (chave === 'enviarp') return confirmarEnvio(chatId, s, 'enviar', msgId, true);
-    if (chave === 'forcar') {
-      const res = await dep.enviarCupomParaGrupos(s.dados.mensagem, null, null,
-        s.dados.prioridade ? { prioridade: true } : {});
-      sessoes.delete(String(chatId));
-      return falar(chatId, `✅ Enviado em *${res?.enviados?.length ?? '?'}* grupo(s).`, null, msgId);
-    }
+    // Card antigo (antes da chave de prioridade): liga a prioridade e envia na janela.
+    if (chave === 'enviarp') { s.dados.quando = 'janela'; s.dados.prioridade = true; return confirmarEnvio(chatId, s, 'enviar', msgId); }
+    if (chave === 'forcar') return confirmarEnvio(chatId, s, 'enviar', msgId, true);
     return;
   }
 
   if (!s) return falar(chatId, 'Essa sessão expirou.', MENU_KB(), msgId);
+
+  if (ns === 'o' && chave === 'campo') {
+    const d = s.dados;
+    const op = partes[3];
+    const ROT = { gatilho: '🚨 GATILHO', titulo: '📝 NOME DO PRODUTO', preco: '💲 POR (sem cupom, R$)', precoDe: '🔖 DE (valor original, R$)' };
+    if (!ROT[valor]) return;
+    if (op === '__original') { delete d[valor]; await falar(chatId, '⏳ Remontando a oferta...', null, msgId); return previewOferta(chatId, s, msgId); }
+    if (op === '__sem') { d[valor] = valor === 'precoDe' ? null : ''; await falar(chatId, '⏳ Remontando a oferta...', null, msgId); return previewOferta(chatId, s, msgId); }
+    s.passo = 'ocampo:' + valor;
+    s.cardId = msgId;
+    const linhas = [];
+    if (valor === 'precoDe') linhas.push([['🚫 Sem preço De', 'o:campo:precoDe:__sem']]);
+    if (valor === 'gatilho' && d.gatilho) linhas.push([['🧹 Sem gatilho', 'o:campo:gatilho:__sem']]);
+    if (d[valor] !== undefined) linhas.push([['↩️ Voltar ao da loja', 'o:campo:' + valor + ':__original']]);
+    linhas.push([['⬅️ Voltar', 'o:voltar']]);
+    const lido = valor === 'preco' ? d.produto?.preco : valor === 'precoDe' ? d.produto?.precoDe : valor === 'titulo' ? d.produto?.titulo : null;
+    return falarPlano(chatId, ROT[valor] + '\n\n' + (valor === 'preco' || valor === 'precoDe'
+      ? 'Digite o valor (ex: 199,90).' : 'Digite o texto.')
+      + (lido ? '\nNa oferta agora: ' + lido : ''), teclado(linhas), msgId);
+  }
+  if (ns === 'o' && chave === 'voltar') { s.passo = 'preview'; return telaOferta(chatId, s, msgId); }
+  if (ns === 'o' && chave === 'cman') {
+    const d = s.dados;
+    if (valor === 'so') {
+      d.cupomManual = { codigo: d.codigoCupom, tipo: 'pct', valor: 0 };
+      await falar(chatId, '⏳ Remontando a oferta...', null, msgId);
+      return previewOferta(chatId, s, msgId);
+    }
+    d.cupomTipoPend = valor === 'reais' ? 'reais' : 'pct';
+    s.passo = 'cupomvalor';
+    s.cardId = msgId;
+    return falar(chatId, d.cupomTipoPend === 'pct'
+      ? 'Digite o *percentual* do cupom ' + d.codigoCupom + ' (ex: `10`).'
+      : 'Digite o *valor em reais* do cupom ' + d.codigoCupom + ' (ex: `30`).',
+      teclado([[['⬅️ Voltar', 'o:voltar']]]), msgId);
+  }
 
   if (ns === 'o' && chave === 'imp') {
     const d = s.dados;
@@ -1738,7 +2008,29 @@ async function tratarBotao(chatId, msgId, data, ctx) {
         teclado([[['❌ Cancelar', 'a:cancelar']]]), msgId);
     }
     s.dados.codigoCupom = valor;
+    delete s.dados.cupomManual;
     return previewOferta(chatId, s, msgId);
+  }
+
+  if (ns === 'c' && (chave === 'link' || chave === 'imp')) {
+    const d = s.dados;
+    const campo = chave === 'link' ? 'linkResgate' : 'importante';
+    if (valor === '__menu') {
+      s.passo = chave === 'link' ? 'cplink' : 'cimp';
+      const linhas = chave === 'imp' ? linhasImportantesProntos(d.importante, 'c:imp:') : [];
+      if (d[campo]) linhas.push([['🧹 Deixar vazio', 'c:' + chave + ':__sem']]);
+      linhas.push([['⬅️ Voltar', 'c:' + chave + ':__voltar']]);
+      return falarPlano(chatId, (chave === 'link'
+        ? '🔗 LINK DE RESGATE\nMande a URL onde o cupom é resgatado (https://...).'
+        : '⚠️ IMPORTANTE\nToque num texto pronto ou digite o seu.\n\nProntos:\n' + listaImportantesProntos())
+        + '\n\nHoje: ' + (d[campo] || 'vazio'), teclado(linhas), msgId);
+    }
+    if (valor === '__sem') d[campo] = '';
+    else if (valor !== '__voltar' && chave === 'imp') {
+      const pronto = IMPORTANTES_PRONTOS[Number(valor)];
+      if (pronto) d.importante = pronto.texto;
+    }
+    return previewCupom(chatId, s, msgId);
   }
 
   if (ns === 'c') {
