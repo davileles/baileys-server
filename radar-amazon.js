@@ -3063,8 +3063,13 @@ function _varsDoProdutoBase(p, cupom) {
     // Cupom sem codigo digitavel ocupa a mesma linha do template, com a
     // instrucao no lugar do codigo — nao ha o que copiar, mas o desconto existe
     // e some da mensagem se a linha for suprimida.
+    // Cupom de resgate por link (Shopee, 09/11/2026): sem codigo, o que o
+    // cliente precisa e o link — vai na propria linha CUPOM, para funcionar em
+    // qualquer template que ja tenha {{cupom}}.
     cupom: cupom
-      ? (cupom.semCodigo
+      ? (cupom.resgate?.link
+          ? (cupom.resgate.rotulo || 'Cupom') + ' — resgate antes de comprar: ' + cupom.resgate.link
+          : cupom.semCodigo
           ? (cupom.naoResgatado
               ? 'Cupom disponível no anúncio — clique em aplicar na página do produto antes de finalizar'
               : cupom.segmentado
@@ -3073,6 +3078,8 @@ function _varsDoProdutoBase(p, cupom) {
           : (cupom.codigo || cupom.reg?.codigo || ''))
       : '',
     cupom_desconto: cupom ? brl(cupom.desconto) : '',
+    cupom_rotulo: cupom?.resgate?.rotulo || '',
+    link_cupom: cupom?.resgate?.link || '',
     alerta: String(p.importante || '').trim(),
     importante: String(p.importante || '').trim(),
     link: p.link || '',
@@ -3106,6 +3113,8 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'economia',      desc:'Quanto o cliente economiza, em R$' },
   { chave:'cupom',         desc:'Código do cupom (vazio quando não há)' },
   { chave:'cupom_desconto',desc:'Valor do desconto do cupom, em R$' },
+  { chave:'cupom_rotulo',  desc:'Só o valor do cupom de resgate por link — ex: "R$ 100 OFF" (vazio fora desse caso)' },
+  { chave:'link_cupom',    desc:'Link (nosso) de resgate do cupom, quando a Shopee exige resgatar antes de comprar. Já vai dentro de {{cupom}}' },
   { chave:'alerta',        desc:'Linha IMPORTANTE — texto que VOCÊ digita; vazio some da mensagem' },
   { chave:'importante',    desc:'Mesmo conteúdo de {{alerta}}, com nome mais claro' },
   { chave:'link',          desc:'Link do produto com a sua tag de afiliado' },

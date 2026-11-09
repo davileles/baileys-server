@@ -967,7 +967,8 @@ function blocoPreco(o) {
   const final = d.precoFinal ?? d.preco;
   const cadeia = [];
   if (d.precoDe && Number(d.precoDe) > Number(d.preco ?? 0)) cadeia.push(d.precoDe);
-  const cupomAbate = d.cupom?.codigo && d.preco != null && Number(final) < Number(d.preco);
+  const temCupom = !!(d.cupom?.codigo || d.cupom?.resgate?.link);
+  const cupomAbate = temCupom && d.preco != null && Number(final) < Number(d.preco);
   if (cupomAbate) cadeia.push(d.preco);
   const linhas = [];
   if (final != null) {
@@ -981,6 +982,11 @@ function blocoPreco(o) {
   if (d.cupom?.codigo) {
     const abate = cupomAbate ? '  −' + esc(brlCurto(Number(d.preco) - Number(final))) : '  (preço já final)';
     linhas.push('🏷️ <code>' + esc(d.cupom.codigo) + '</code>' + abate);
+  } else if (d.cupom?.resgate?.link) {
+    // Cupom da Shopee resgatado por link: sem codigo, o que importa e o valor
+    // e que o link de resgate ja e o nosso.
+    const abate = cupomAbate ? '  −' + esc(brlCurto(Number(d.preco) - Number(final))) : '  (preço já final)';
+    linhas.push('🏷️ ' + esc(d.cupom.resgate.rotulo || 'cupom') + ' · resgate pelo nosso link' + abate);
   }
   return linhas.join('\n');
 }

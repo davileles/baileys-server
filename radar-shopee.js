@@ -22,7 +22,7 @@ import { resolverPrecoDe, FONTE_API } from './preco-de.js';
 import {
   melhorCupom, cupomPorCodigo, cupomVigente, calcularDesconto,
   templateDaLoja, renderTemplate, varsDoProduto, melhorCupomAplicavel,
-  refDoDisparo, aplicarRefNoLink,
+  refDoDisparo, aplicarRefNoLink, blocoDoLink,
 } from './radar-amazon.js';
 
 const API_URL = 'https://open-api.affiliate.shopee.com.br/graphql';
@@ -130,27 +130,136 @@ export async function resolverEncurtadorShopee(url, tentativas = 5) {
   return atual;
 }
 
-/** Extrai os pares {shopId,itemId} de todos os links Shopee de um texto. */
-export async function extrairIdsShopee(texto) {
+/**
+ * Resolve cada link Shopee do texto UMA vez: produto ({ids}) ou outra pagina
+ * ({final}: campanha, cupom, loja). O link que nao e produto deixou de ser so
+ * descartado — e nele que mora o resgate do cupom (ver CUPOM DE RESGATE).
+ */
+async function resolverLinksShopee(texto) {
   if (!texto) return [];
   const urls = [...new Set(String(texto).match(REGEX_URL_SHOPEE) || [])]
-    .map(u => u.replace(/[)\]}.,;!]+$/, ''));
-  const achados = [];
-  const vistos = new Set();
-
+    .map(u => u.replace(/[)\]}.,;!*_~]+$/, ''));
+  const saida = [];
   for (const url of urls) {
     let ids = idsDeUrl(url);
+    let final = null;
     if (!ids) {
-      try { ids = idsDeUrl(await resolverEncurtadorShopee(url)); }
-      catch (e) { console.warn('[SHOPEE] Falha ao resolver', url, '-', e.message); }
+      try {
+        final = await resolverEncurtadorShopee(url);
+        ids = idsDeUrl(final);
+      } catch (e) { console.warn('[SHOPEE] Falha ao resolver', url, '-', e.message); }
     }
-    if (!ids) { console.warn('[SHOPEE] Sem itemId para', url); continue; }
-    const chave = ids.shopId + ':' + ids.itemId;
+    saida.push({ url, ids: ids || null, final: ids ? null : final });
+  }
+  return saida;
+}
+
+function idsUnicos(links) {
+  const achados = [];
+  const vistos = new Set();
+  for (const l of links) {
+    if (!l.ids) { console.warn('[SHOPEE] Sem itemId para', l.url); continue; }
+    const chave = l.ids.shopId + ':' + l.ids.itemId;
     if (vistos.has(chave)) continue;
     vistos.add(chave);
-    achados.push(ids);
+    achados.push(l.ids);
   }
   return achados;
+}
+
+/** Extrai os pares {shopId,itemId} de todos os links Shopee de um texto. */
+export async function extrairIdsShopee(texto) {
+  return idsUnicos(await resolverLinksShopee(texto));
+}
+
+// ── CUPOM DE RESGATE (09/11/2026) ─────────────────────────────────────────
+// Na Shopee o desconto do cupom quase sempre exige RESGATAR o cupom numa
+// pagina de campanha antes de comprar ("Use o cupom R$100 Off, resgate o cupom
+// aqui: <link>"). Nao ha codigo para a base casar, entao a oferta saia pelo
+// preco cheio, sem a linha do cupom e sem o link de resgate. Agora o link que
+// nao e produto e que o post apresenta como resgate de cupom vira o NOSSO link
+// de afiliado (generateShortLink sobre a pagina, sem os parametros de rastreio
+// do afiliado de origem), o valor lido do post abate do preco e a mensagem
+// leva os dois links: o do cupom na linha CUPOM e o do produto no LINK.
+// Regra de sempre do TSP mantida: o cupom so entra porque o POST o citou.
+
+// Parametros de rastreio de quem postou. Os demais ficam: pagina de cupom pode
+// precisar de promotionId/evcode/signature para abrir o cupom certo.
+const RE_PARAM_TERCEIRO = /^(?:mmp_pid|uls_\w+|utm_\w+|af_\w+|pid|c|is_retargeting|exp_group|sub_id\d*|smtt|deep_and_deferred|gads_t_sig|share_channel_code|xptdk|__mobile__)$/i;
+
+export function limparLinkResgate(url) {
+  try {
+    const u = new URL(url);
+    for (const k of [...u.searchParams.keys()]) if (RE_PARAM_TERCEIRO.test(k)) u.searchParams.delete(k);
+    u.hash = '';
+    return u.toString();
+  } catch { return null; }
+}
+
+const VALOR_RS = '(\\d{1,3}(?:\\.\\d{3})+(?:,\\d{1,2})?|\\d+(?:,\\d{1,2})?)';
+const numBr = s => Number(String(s).replace(/\./g, '').replace(',', '.'));
+const rsCurto = v => 'R$ ' + (Number.isInteger(v) ? String(v) : v.toFixed(2).replace('.', ','));
+
+/**
+ * Le o cupom que o post manda resgatar: "cupom R$100 Off", "R$ 20 de desconto",
+ * "cupom de 10%", "15% OFF ate R$ 30", "acima de R$ 99". Texto em letras
+ * estilizadas (𝐫𝐞𝐬𝐠𝐚𝐭𝐞) e normalizado antes (NFKC). null quando o trecho
+ * nao fala de cupom ou nao da um valor.
+ */
+export function lerCupomResgate(trecho) {
+  const t = String(trecho || '').normalize('NFKC')
+    .replace(/https?:\/\/\S+/g, ' ').replace(/[*_~`]/g, '')
+    .toLowerCase().replace(/[ \t]+/g, ' ');
+  if (!/cupo[mn]|resgat|voucher/.test(t)) return null;
+  let tipo = null, valor = null, m;
+  m = t.match(new RegExp('r\\$ ?' + VALOR_RS + ' ?(?:reais )?(?:de )?(?:off|desconto)\\b'))
+   || t.match(new RegExp('cupo[mn]s? ?:? ?(?:de desconto )?(?:de )?:? ?r\\$ ?' + VALOR_RS))
+   || t.match(new RegExp(VALOR_RS + ' ?reais (?:de )?(?:off|desconto)\\b'));
+  if (m) { tipo = 'valor'; valor = numBr(m[1]); }
+  else {
+    m = t.match(/(\d{1,2}) ?% ?(?:de )?(?:off|desconto)\b/) || t.match(/cupo[mn]s? ?:? ?(?:de desconto )?(?:de )?:? ?(\d{1,2}) ?%/);
+    if (m) { tipo = 'pct'; valor = Number(m[1]); }
+  }
+  if (!(valor > 0) || (tipo === 'pct' && valor > 90)) return null;
+  const mMin = t.match(new RegExp('(?:acima de|a partir de|m[ií]nim[oa](?: de)?|compras? (?:acima )?de) ?:? ?r\\$ ?' + VALOR_RS));
+  const minimo = mMin ? numBr(mMin[1]) : null;
+  let teto = null;
+  if (tipo === 'pct') {
+    const mTeto = t.match(new RegExp('(?:at[eé]|limite(?: de)?|m[aá]ximo(?: de)?) ?r\\$ ?' + VALOR_RS));
+    teto = mTeto ? numBr(mTeto[1]) : null;
+  }
+  const rotulo = (tipo === 'valor' ? rsCurto(valor) + ' OFF' : valor + '% OFF')
+    + (teto ? ' (até ' + rsCurto(teto) + ')' : '')
+    + (minimo ? ' acima de ' + rsCurto(minimo) : '');
+  return { tipo, valor, minimo, teto, rotulo };
+}
+
+/** Quanto o cupom de resgate abate deste preco (0 quando nao atinge o minimo). */
+export function descontoCupomResgate(info, preco) {
+  const pr = Number(preco);
+  if (!info || !(pr > 0)) return 0;
+  if (info.minimo && pr < info.minimo) return 0;
+  let d = info.tipo === 'pct' ? pr * info.valor / 100 : Number(info.valor);
+  if (info.tipo === 'pct' && info.teto) d = Math.min(d, info.teto);
+  d = Math.min(d, pr);
+  return Math.round(d * 100) / 100;
+}
+
+/** Links do post que nao sao produto e que o texto apresenta como resgate de cupom. */
+function linksDeResgate(texto, links) {
+  const outros = links.filter(l => !l.ids && l.final && /shopee\.com\.br/i.test(l.final));
+  const saida = [];
+  for (const l of outros) {
+    const bloco = blocoDoLink(texto, l.url) || '';
+    let info = lerCupomResgate(bloco);
+    // O valor as vezes vem depois do link ("Resgate aqui: <link> / R$ 20 OFF").
+    // Com um so link de resgate, o post inteiro fala dele.
+    if (!info && outros.length === 1) info = lerCupomResgate(texto);
+    const fala = /cupo[mn]|resgat|voucher/.test(String(bloco).normalize('NFKC').toLowerCase());
+    if (!info && !fala) continue;
+    saida.push({ url: l.url, final: l.final, limpa: limparLinkResgate(l.final), info });
+  }
+  return saida;
 }
 
 // ── CONSULTA DE PRODUTO ───────────────────────────────────────────────────
@@ -287,8 +396,12 @@ export function formatarOfertaShopee(p, opcoes = {}) {
  * o codigo aparecer no texto original.
  */
 export async function processarTextoShopee(texto, opcoes = {}) {
-  const ids = await extrairIdsShopee(texto);
+  const links = await resolverLinksShopee(texto);
+  const ids = idsUnicos(links);
   if (!ids.length) return [];
+  // Cupom de resgate so vale em post de UM produto: numa lista, o post nao diz
+  // a qual item o cupom serve e o comportamento antigo (sem cupom) continua.
+  const resgates = (!opcoes.leitura && ids.length === 1) ? linksDeResgate(texto, links) : [];
 
   const saida = [];
   for (const par of ids) {
@@ -331,16 +444,64 @@ export async function processarTextoShopee(texto, opcoes = {}) {
 
     await marcarRastreio(p, node);
 
-    const cupom = melhorCupom('Shopee', p.preco, texto);
+    let cupom = melhorCupom('Shopee', p.preco, texto);
     if (cupom) {
       console.log('[SHOPEE] ' + p.itemId + ' + cupom ' + cupom.reg.codigo +
         ' (-R$ ' + cupom.desconto.toFixed(2) + ')');
     }
+
+    // ── CUPOM DE RESGATE ────────────────────────────────────────────────
+    // Cupom com codigo citado no post vence (e o que a regra sempre fez). Sem
+    // ele, o link de resgate do post vira o nosso. Qualquer coisa que impeca
+    // montar o cupom certo (valor ilegivel, preco abaixo do minimo, link nosso
+    // que nao saiu) segura a oferta para revisao: sair pelo preco cheio com o
+    // post prometendo cupom e o que esta regra existe para evitar.
+    let cupomResgatePendente = null;
+    if (!cupom && resgates.length) {
+      const rg = resgates.length === 1 ? resgates[0] : null;
+      if (!rg) {
+        cupomResgatePendente = { motivo: 'post traz ' + resgates.length + ' links de resgate de cupom' };
+      } else if (!rg.info) {
+        cupomResgatePendente = { motivo: 'post pede para resgatar um cupom mas não deu para ler o valor', origem: rg.url };
+      } else {
+        const desconto = descontoCupomResgate(rg.info, p.preco);
+        if (!(desconto > 0)) {
+          cupomResgatePendente = { motivo: 'cupom ' + rg.info.rotulo + ' não se aplica ao preço da loja (R$ '
+            + p.preco.toFixed(2).replace('.', ',') + ')', origem: rg.url };
+        } else {
+          let linkNosso = null;
+          try {
+            const ref = refDoDisparo(p);
+            linkNosso = rg.limpa ? await gerarLinkAfiliado(rg.limpa, [ref || 'tsp']) : null;
+          } catch (e) { console.warn('[SHOPEE] link de resgate do cupom falhou:', e.message); }
+          if (!linkNosso) {
+            cupomResgatePendente = { motivo: 'não deu para gerar o nosso link de resgate do cupom', origem: rg.url };
+          } else {
+            cupom = { desconto, citado: true, resgate: {
+              link: linkNosso, rotulo: rg.info.rotulo, tipo: rg.info.tipo, valor: rg.info.valor,
+              minimo: rg.info.minimo, teto: rg.info.teto, pagina: rg.limpa, origem: rg.url,
+            } };
+            console.log('[SHOPEE] ' + p.itemId + ' + cupom de resgate ' + rg.info.rotulo
+              + ' (-R$ ' + desconto.toFixed(2) + ') ' + rg.limpa + ' -> ' + linkNosso);
+          }
+        }
+      }
+      if (cupomResgatePendente) console.log('[SHOPEE] ' + p.itemId + ' cupom de resgate pendente: ' + cupomResgatePendente.motivo);
+    }
+
     saida.push({
       produto: p,
-      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado } : null,
+      cupom: cupom
+        ? (cupom.resgate
+            ? { codigo: '', desconto: cupom.desconto, citado: true, resgate: cupom.resgate }
+            : { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado })
+        : null,
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       mensagem: formatarOfertaShopee(p, { ...opcoes, cupom }),
+      // Links do post que sao do cupom, nao do produto: o gate do preco do post
+      // nao pode conta-los como "mais de um produto".
+      linksResgate: resgates.map(r => r.url),
+      cupomResgatePendente,
     });
     // Espacamento leve entre itens do mesmo lote para nao bater no rate limit.
     if (ids.length > 1) await new Promise(r => setTimeout(r, 400));

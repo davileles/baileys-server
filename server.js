@@ -202,6 +202,7 @@ import {
   processarTextoShopee, ehLinkShopee, extrairIdsShopee, buscarProdutoShopee,
   normalizarShopee, credenciaisShopeeOk, montarOfertasShopeeVitrine,
   validarAtribuicao, resolverEncurtadorShopee, chamarShopee, formatarOfertaShopee,
+  descontoCupomResgate,
 } from './radar-shopee.js';
 
 // ── RADAR MERCADO LIVRE ───────────────────────────────────────────────────────
@@ -8913,8 +8914,10 @@ function precoDoPostParaOferta(texto, p, r, umProdutoSo) {
   if (!LOJAS_PRECO_DO_POST.has(p?.loja)) return null;
   if (p.semApi || r.precoDeReferencia) return null;
   if (!umProdutoSo) return null;
+  // Link de resgate de cupom (Shopee) nao e outro produto: fica fora da conta.
+  const _resgates = new Set((r.linksResgate || []).map(u => String(u).replace(/[)\]}.,;!*_~]+$/, '')));
   const links = new Set((String(texto || '').match(RE_LINK_LOJA_POST) || [])
-    .map(u => u.replace(/[)\]}.,;!*_~]+$/, '')));
+    .map(u => u.replace(/[)\]}.,;!*_~]+$/, '')).filter(u => !_resgates.has(u)));
   if (links.size > 1) return null;
   const lido = precoPorDoPost(texto);
   if (!lido) return null;
@@ -9719,6 +9722,10 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // link: sai pelo preco cheio enquanto o post promete desconto. Segura na
     // fila, como cupomForaDaBase.
     if (r.cupomAmbiguo) oferta.cupomAmbiguo = r.cupomAmbiguo;
+    // Post da Shopee manda resgatar um cupom por link e nao deu para montar o
+    // nosso (valor ilegivel, preco abaixo do minimo, link nao gerado): sairia
+    // pelo preco cheio enquanto o post promete o cupom. Segura na fila.
+    if (!r.cupom && r.cupomResgatePendente) oferta.cupomResgatePendente = r.cupomResgatePendente;
     // Procedencia do produto quando o link veio de perfil de afiliado.
     // 'vitrine' = o item saiu do casamento por og:title numa pagina SEM CTA de
     // produto, isto e, pode ser um card qualquer de uma lista de cupons. Nesta
@@ -9774,7 +9781,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     }
     if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
         && !_filtro?.bloqueia
-        && !oferta.cupomAmbiguo
+        && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente
         && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
       try {
         const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta, { revalidarPreco: true });
@@ -9819,6 +9826,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       : oferta.cupomForaDaBase ? 'cupom fora da base'
       : oferta.cupomAmbiguo    ? 'post cita ' + oferta.cupomAmbiguo.codigos.length
           + ' cupons e nenhum e do bloco deste link'
+      : oferta.cupomResgatePendente ? 'cupom de resgate: ' + oferta.cupomResgatePendente.motivo
       : oferta.precoDivergente ? 'post anuncia R$ ' + oferta.precoDivergente.declarado
           + ' e calculamos R$ ' + oferta.precoDivergente.calculado
       : oferta.precoDoPost?.retem ? (oferta.precoDoPost.aplicado
@@ -23269,6 +23277,9 @@ function cupomVigenteDaOferta(o, p, opc = {}) {
       return desconto > 0 ? { reg, desconto, citado: true } : null;
     }
   }
+  // Cupom de resgate por link (Shopee): a regra (valor, %, minimo, teto) viaja
+  // com ele, entao o desconto e recalculado sobre o preco novo.
+  if (c.resgate?.link) return { ...c, desconto: descontoCupomResgate(c.resgate, p.preco) };
   return { ...c, desconto: Number(c.desconto) || 0 };
 }
 
@@ -23349,7 +23360,8 @@ function remontarOfertaFila(oferta, ov = {}) {
   d.preco    = p.preco;
   d.precoDe  = p.precoDe ?? null;
   d.desconto = p.desconto;
-  d.cupom      = cupom ? { codigo: cupom.codigo || cupom.reg?.codigo || '', desconto: cupom.desconto } : null;
+  d.cupom      = cupom ? { codigo: cupom.codigo || cupom.reg?.codigo || '', desconto: cupom.desconto,
+                           ...(cupom.resgate ? { resgate: cupom.resgate } : {}) } : null;
   d.precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
   oferta.ajustes = { ...(oferta.ajustes || {}) };
   for (const k of Object.keys(ov)) oferta.ajustes[k] = true;
@@ -23385,6 +23397,7 @@ function resumoOfertaFila(o) {
     revisaoDeEdicao: !!o.revisaoDeEdicao,
     cupomForaDaBase: o.cupomForaDaBase || null,
     cupomAmbiguo: o.cupomAmbiguo || null,
+    cupomResgatePendente: o.cupomResgatePendente || null,
     precoDivergente: o.precoDivergente || null,
     precoDoPost: o.precoDoPost || null,
     // 'post' = preco a vista deduzido do texto do grupo, nao lido da PDP.
@@ -23485,7 +23498,7 @@ app.get('/mkt/fila', (req, res) => {
       monitor: o.origem === 'monitor-precos',
       avisoPreco: o.origem === 'avisos-preco',
       // Um unico sinal para o rotulo do botao: o motivo detalhado esta no card.
-      aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.precoDivergente || d.precoDeReferencia),
+      aviso: !!(o.cupomForaDaBase || o.cupomAmbiguo || o.cupomResgatePendente || o.precoDivergente || d.precoDeReferencia),
       timestamp: o.timestamp || null,
       // Nichos que recebem a oferta: o botao da lista mostra de relance quando o
       // item sai num grupo nichado alem do geral.
