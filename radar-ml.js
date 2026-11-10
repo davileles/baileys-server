@@ -2877,9 +2877,17 @@ export async function resolverLinhaVitrineMl(linha) {
 
   // Titulo real da pagina. Se o cookie estiver fora, cai no slug em vez de
   // recusar o cadastro: o disparo tenta de novo e reporta o erro la.
+  // Primeiro so pela API (resposta em ~1 s). A pagina pela extensao custa ate
+  // ML_PAGINA_ESPERA_MS (20 s) por link: com 12 links colados o cadastro
+  // levava 4 min e o painel ficava parado em "Resolvendo…" (10/11/2026). A
+  // pagina so e pedida quando a API nao devolve titulo (anuncio classico).
   let titulo = '';
-  try { titulo = (await buscarDadosProdutoMl(canonica))?.titulo || ''; }
-  catch (e) { console.warn('[ML] Vitrine — sem titulo da pagina:', e.message); }
+  try { titulo = (await buscarDadosProdutoMl(canonica, { semPagina: true }))?.titulo || ''; }
+  catch (e) { /* anuncio fora da API: tenta a pagina abaixo */ }
+  if (!titulo) {
+    try { titulo = (await buscarDadosProdutoMl(canonica))?.titulo || ''; }
+    catch (e) { console.warn('[ML] Vitrine — sem titulo da pagina:', e.message); }
+  }
 
   // Nome manual que e so o comeco do titulo real e recorte de captura, nao
   // escolha do operador — a extensao corta em ~180 chars. Nesse caso o titulo
