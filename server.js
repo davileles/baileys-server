@@ -6130,8 +6130,11 @@ async function enviarManualParaGrupos({ mensagem, tipo, imagem, preview, categor
 
 // Envia um cupom aprovado pelo gate para os grupos de cupons e marca a oferta
 // como enviada. Lanca excecao se o envio principal falhar (caller decide o fallback).
+// Cupom capturado (grupo-fonte/Telegram) sai SEMPRE com prioridade maxima no
+// portao: cupom tem prazo e esgota (10/11/2026: MP1011 do ML esperou 5 min
+// atras de 3 ofertas capturadas, uma delas chegou depois dele).
 async function despacharCupomAuto(oferta) {
-  await enviarCupomParaGrupos(oferta.mensagemFormatada, oferta.imagens?.[0], oferta);
+  await enviarCupomParaGrupos(oferta.mensagemFormatada, oferta.imagens?.[0], oferta, { prioridade: true });
   _ultimoAutoEnvio     = Date.now();
   oferta.status        = 'enviado';
   oferta.mensagemFinal = oferta.mensagemFormatada;
