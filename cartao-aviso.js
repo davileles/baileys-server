@@ -138,7 +138,7 @@ export async function gerarImagemAviso(o = {}) {
     }
     const rodY = ALT - 34;
     partes.push('<rect x="40" y="' + (rodY - 40) + '" width="' + (L - 80) + '" height="1.5" fill="#4A5170"/>');
-    const lido = 'Preço lido' + (o.loja ? ' na ' + o.loja : '') + (o.lidoEm ? ' às ' + horaLeitura(o.lidoEm) : '');
+    const lido = 'Preço lido' + (o.loja ? (o.loja === 'Mercado Livre' ? ' no ' : ' na ') + o.loja : '') + (o.lidoEm ? ' às ' + horaLeitura(o.lidoEm) : '');
     partes.push(texto(lido, 40, rodY, 21, COR.slate, { maxL: L - 300 }).svg);
     partes.push(texto('@TICAPROMOS', L - 40, rodY, 21, COR.coral, { align: 'dir' }).svg);
 

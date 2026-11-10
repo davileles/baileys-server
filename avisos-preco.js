@@ -862,7 +862,7 @@ function linhaDoPedido(p, i) {
   if (p.status === 'aguardando') l.push('⏳ Aguardando ativação');
   if (p.pausado) l.push('⏸️ Pausado');
   if (p.porNome) l.push('🔎 Ainda estamos procurando o produto');
-  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo?.precoCartao && mo.precoCartao - atual >= 0.01 ? ' no Pix (' + brl(mo.precoCartao) + ' no cartão)' : '') + (mo && mo.prod.loja !== p.loja ? ' na ' + mo.prod.loja : '') + (mo?.cupom ? ' com o cupom ' + nomeDoCupom(mo.cupom) : ''));
+  if (atual) l.push('💰 Hoje: ' + brl(atual) + (mo?.precoCartao && mo.precoCartao - atual >= 0.01 ? ' no Pix (' + brl(mo.precoCartao) + ' no cartão)' : '') + (mo && mo.prod.loja !== p.loja ? ' ' + comLoja('em', mo.prod.loja) : '') + (mo?.cupom ? ' com o cupom ' + nomeDoCupom(mo.cupom) : ''));
   if (p.precoAlvo) {
     if (atual && atual <= p.precoAlvo) l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + ' ✅ chegou!');
     else l.push('🎯 Seu preço: ' + brl(p.precoAlvo) + (atual ? ' (faltam ' + brl(atual - p.precoAlvo) + ')' : ''));
@@ -1837,6 +1837,13 @@ function tituloCurto(t) {
   return s;
 }
 
+// "do Mercado Livre", "na Amazon", "da Shopee": artigo certo para o nome da loja.
+const LOJAS_MASCULINAS = new Set(['Mercado Livre']);
+function comLoja(prep, loja) {
+  const m = LOJAS_MASCULINAS.has(loja);
+  return (prep === 'em' ? (m ? 'no' : 'na') : (m ? 'do' : 'da')) + ' ' + loja;
+}
+
 function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   const linhas = [];
   const outraLoja = extra.loja && pedido.loja && extra.loja !== pedido.loja;
@@ -1871,7 +1878,7 @@ function textoDoAviso(pedido, preco, tipo, link, extra = {}) {
   linhas.push('');
   linhas.push('👉 ' + link);
   linhas.push('');
-  if (outraLoja) linhas.push('⚠️ Parece ser o mesmo produto: confira modelo, vendedor e frete antes de comprar. Seu alerta da ' + pedido.loja + ' continua ativo.');
+  if (outraLoja) linhas.push('⚠️ Parece ser o mesmo produto: confira modelo, vendedor e frete antes de comprar. Seu alerta ' + comLoja('de', pedido.loja) + ' continua ativo.');
   linhas.push('_Preço de agora, pode mudar a qualquer momento._');
   linhas.push('');
   linhas.push('Comprou? Responda *COMPREI* que eu paro os avisos desse produto. Para parar todos, responda *SAIR*.');
