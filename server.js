@@ -185,7 +185,7 @@ import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previa
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora, previaDisparoPedido,
          pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
          acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido,
-         enviarMensagemOperador, encerrarAtendimento } from './avisos-preco.js';
+         enviarMensagemOperador, encerrarAtendimento, numeroDosAvisos } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
 
@@ -15624,6 +15624,117 @@ app.post('/grupos-gestao/info', async (req, res) => {
     alvo: null, origem: 'painel-' + (b.operacao || '?'), total: pedidos.length });
   _gmRodarInfo(j, { pedidos, nome, descricao }).catch(e => _gmFimJob(j, e.message));
   res.status(202).json({ ok: true, jobId: j.id, total: pedidos.length });
+});
+
+// ── Acrescentar um bloco ao FIM da descricao de cada grupo (10/11/2026) ─────
+// Pedido do Davi: avisar em todos os grupos do Tica Promos que o Tico (o numero
+// dos alertas de preco) atende no privado. Cada grupo tem a descricao propria,
+// entao nao da para usar o /grupos-gestao/info (que grava o MESMO texto em
+// todos): aqui o servidor le a descricao atual de cada grupo e so acrescenta o
+// bloco no final. Cuidados contra bloqueio (a principal ja caiu por acao em
+// massa em grupos): NUNCA executa pela principal, so por tico admin do grupo em
+// rodizio (o que agiu menos nesta tarefa primeiro), pula conta em quarentena,
+// pausa de 2 a 4 min entre grupos, so das 9h as 21h e para se a conta cair.
+// Idempotente: grupo cuja descricao ja tem o numero e pulado — rodar de novo
+// depois de uma parada so faz o que falta. {numero} no texto vira o numero dos
+// alertas (+55 DD XXXXX-XXXX). simular:true devolve a previa sem mexer em nada.
+const GM_PAUSA_BLOCO = [120000, 240000];
+
+function _gmFmtTel(d) {
+  d = String(d || '').replace(/\D/g, '');
+  const m = /^55(\d{2})(\d{4,5})(\d{4})$/.exec(d);
+  return m ? '+55 ' + m[1] + ' ' + m[2] + '-' + m[3] : (d ? '+' + d : '');
+}
+
+function _gmPlanoBloco(retratos, jid, bloco, numero, usos) {
+  const md = _gmMeta(retratos, jid);
+  const nome = md?.subject || NOMES_GRUPOS.get(jid) || jid.split('@')[0];
+  if (!md) return { jid, nome, estado: 'bloqueado', detalhe: 'nenhuma conta conectada participa deste grupo' };
+  const atual = String(md.desc || '');
+  const fim8 = String(numero).slice(-8);
+  if (fim8 && atual.replace(/\D/g, '').includes(fim8)) return { jid, nome, estado: 'pulado', detalhe: 'a descricao ja tem o numero do Tico' };
+  const nova = atual.trim() ? atual.replace(/\s+$/, '') + '\n\n' + bloco : bloco;
+  if (nova.length > 2048) return { jid, nome, estado: 'bloqueado', detalhe: 'a descricao ficaria com ' + nova.length + ' caracteres (limite 2048)' };
+  const ticos = retratos.filter(r => r.id !== 'principal' && !ehContaCampanha(r.id)
+    && !waEnvioContaEmQuarentena(r.id) && _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin);
+  if (!ticos.length) return { jid, nome, estado: 'bloqueado', detalhe: 'nenhum tico conectado e admin deste grupo (a principal nao executa)' };
+  ticos.sort((a, b) => (usos.get(a.id) || 0) - (usos.get(b.id) || 0) || Math.random() - 0.5);
+  return { jid, nome, estado: 'vai-mudar', por: ticos[0].id, exec: ticos[0], tamanho: nova.length, nova };
+}
+
+async function _gmRodarBloco(j, { pedidos, bloco, numero }) {
+  const usos = new Map();
+  const viva = (r) => _gmContas().some(c => c.id === r.id && c.sock === r.sock);
+  for (let i = 0; i < pedidos.length; i++) {
+    const h = horaSP();
+    if (h < 9 || h >= 21) return _gmFimJob(j, 'fora da janela (9h-21h) — parei aqui. Rode de novo: os grupos que ja tem o numero sao pulados.');
+    const retratos = await _gmRetratos(true);
+    if (!retratos.length) return _gmFimJob(j, 'nenhuma conta conseguiu ler os grupos agora');
+    const p = _gmPlanoBloco(retratos, pedidos[i], bloco, numero, usos);
+    j.atual = p.nome;
+    if (p.estado !== 'vai-mudar') {
+      if (p.estado === 'pulado') j.pulados++; else j.falhas++;
+      j.resultados.push({ jid: p.jid, nome: p.nome, estado: p.estado, detalhe: p.detalhe });
+      continue;
+    }
+    try {
+      await p.exec.sock.groupUpdateDescription(p.jid, p.nova);
+      usos.set(p.por, (usos.get(p.por) || 0) + 1);
+      j.feitos++;
+      j.resultados.push({ jid: p.jid, nome: p.nome, estado: 'ok', por: p.por, detalhe: 'bloco acrescentado (' + p.tamanho + ' caracteres)' });
+    } catch (e) {
+      j.falhas++;
+      j.resultados.push({ jid: p.jid, nome: p.nome, estado: 'falha', por: p.por, detalhe: e.message });
+      if (!viva(p.exec)) return _gmFimJob(j, 'a conta ' + p.por + ' caiu no meio da tarefa — parei aqui. Confira a conexao dela antes de rodar de novo.');
+    }
+    if (!viva(p.exec)) return _gmFimJob(j, 'a conta ' + p.por + ' caiu logo depois de "' + p.nome + '" — parei aqui. Confira a conexao dela antes de rodar de novo.');
+    if (i < pedidos.length - 1) await _gmPausa(j, GM_PAUSA_BLOCO);
+  }
+  _gmFimJob(j);
+}
+
+// Body: { operacao: 'tsp', texto (com {numero}), jids? (vazio = todos os grupos
+// da operacao, menos o do operador), simular? }
+app.post('/grupos-gestao/descricao-acrescentar', async (req, res) => {
+  if (!_gmSoPadrao(req, res)) return;
+  const b = req.body || {};
+  const op = String(b.operacao || 'tsp');
+  const numero = String(numeroDosAvisos() || '').replace(/\D/g, '');
+  if (!numero) return res.status(503).json({ ok: false, erro: 'numero dos alertas de preco nao definido (config conta dos avisos)' });
+  const bloco = String(b.texto || '').trim().split('{numero}').join(_gmFmtTel(numero));
+  if (!bloco) return res.status(400).json({ ok: false, erro: 'informe o texto do bloco' });
+  if (bloco.length > 600) return res.status(400).json({ ok: false, erro: 'bloco longo demais (maximo 600 caracteres)' });
+  let pedidos = [...new Set((Array.isArray(b.jids) ? b.jids : []).map(x => String(x || '').trim()).filter(x => x.endsWith('@g.us')))];
+  if (!pedidos.length) {
+    let operador = null; try { operador = op === 'tsp' ? grupoOperadorTsp() : null; } catch (e) {}
+    pedidos = _gmGruposOperacao(op).filter(x => x !== operador);
+  }
+  if (!pedidos.length) return res.status(400).json({ ok: false, erro: 'nenhum grupo encontrado' });
+  if (pedidos.length > GM_MAX_GRUPOS_POR_TAREFA) return res.status(400).json({ ok: false, erro: 'no maximo ' + GM_MAX_GRUPOS_POR_TAREFA + ' grupos por tarefa' });
+  if (!_gmContas().length) return res.status(503).json({ ok: false, erro: 'nenhuma conta do WhatsApp conectada' });
+
+  if (b.simular) {
+    try {
+      const retratos = await _gmRetratos(true);
+      const usos = new Map();
+      const grupos = pedidos.map(jid => {
+        const p = _gmPlanoBloco(retratos, jid, bloco, numero, usos);
+        if (p.estado === 'vai-mudar') usos.set(p.por, (usos.get(p.por) || 0) + 1);
+        return { jid: p.jid, nome: p.nome, estado: p.estado, por: p.por || null, detalhe: p.detalhe || null, tamanho: p.tamanho || null };
+      }).sort((a, c) => String(a.nome).localeCompare(String(c.nome), 'pt-BR'));
+      const vao = grupos.filter(g => g.estado === 'vai-mudar').length;
+      return res.json({ ok: true, simulacao: true, numero: _gmFmtTel(numero), bloco, total: grupos.length, vaoMudar: vao,
+        porConta: Object.fromEntries(usos), minutosEstimados: Math.round(Math.max(0, vao - 1) * 3), grupos });
+    } catch (e) { return res.status(500).json({ ok: false, erro: e.message }); }
+  }
+
+  const st = _gm();
+  if (st.ativo) return res.status(409).json({ ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo });
+  const h = horaSP();
+  if (h < 9 || h >= 21) return res.status(409).json({ ok: false, erro: 'so das 9h as 21h' });
+  const j = _gmNovoJob({ tipo: 'info', acao: 'descricao', alvo: null, origem: 'painel-' + op + '-bloco', total: pedidos.length });
+  _gmRodarBloco(j, { pedidos, bloco, numero }).catch(e => _gmFimJob(j, e.message));
+  res.status(202).json({ ok: true, jobId: j.id, total: pedidos.length, numero: _gmFmtTel(numero), bloco });
 });
 
 // Body: { conta, nome, descricao?, imagem? (data URL), participantes: [{ telefone, admin }],

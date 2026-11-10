@@ -121,6 +121,7 @@
         "app.post('/grupos-gestao/criar-lote'",
         "app.post('/grupos-gestao/foto'",
         "app.post('/grupos-gestao/info'",
+        "app.post('/grupos-gestao/descricao-acrescentar'",
         "app.post('/grupos-gestao/participante'",
         "app.post('/grupos/censo/atualizar'",
         "app.post('/grupos/censo/importar'",
