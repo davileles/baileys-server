@@ -5059,8 +5059,8 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   const jaRecebeu = new Set(Array.isArray(oferta?.enviadosParciais) ? oferta.enviadosParciais : []);
   const enviados = [], falhas = [], pulados = [];
 
-  for (const jid of alvos) {
-    if (jaRecebeu.has(jid)) { pulados.push(jid); continue; }
+  // Envia num grupo; true = saiu (o espacamento so vem depois de envio real).
+  const _enviarCupomNoGrupo = async (jid) => {
     const op = { conta: contaDoGrupo(jid) };
     // Rodape extra por grupo: com categoria reconhecida no cupom, casam tambem
     // as regras daquela categoria (mesmo convite cruzado da oferta). Cupom
@@ -5090,14 +5090,43 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
         oferta.enviadosParciais = [...jaRecebeu, ...enviados];
         salvarFila();
       }
-      // Espacamento entre grupos: mesmo padrao das ofertas do radar, evita
-      // rajada identica em varios grupos no mesmo segundo.
-      if (alvos.length > 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
+      return true;
     } catch(e) {
       console.error('[CUPONS] Falha ao enviar em ' + jid + ':', e.message);
       falhas.push({ jid, erro: e.message });
       outboxEnfileirar({ id: _execId, jid, texto, conta: op.conta, origem: 'cupom', erro: e.message });
+      return false;
     }
+  };
+
+  // Paralelo POR NUMERO (10/11/2026, igual a oferta): cada conta manda os seus
+  // grupos em sequencia, com o espacamento de sempre entre eles, e as contas
+  // andam ao mesmo tempo. Antes o cupom percorria todos os grupos numa fila so
+  // e os outros ticos esperavam parados (MP1011: 2 min 50 s).
+  // ENVIO_PARALELO_CONTAS=0 volta ao sequencial.
+  const _pendentes = [];
+  for (const jid of alvos) {
+    if (jaRecebeu.has(jid)) pulados.push(jid); else _pendentes.push(jid);
+  }
+  const _porConta = new Map();
+  for (const jid of _pendentes) {
+    const c = contaDoGrupo(jid) || 'principal';
+    if (!_porConta.has(c)) _porConta.set(c, []);
+    _porConta.get(c).push(jid);
+  }
+  const _filas = (envioParaleloAtivo() && _porConta.size > 1) ? [..._porConta.values()] : [_pendentes];
+  const _t0 = Date.now();
+  await Promise.all(_filas.map(async (lista) => {
+    for (let i = 0; i < lista.length; i++) {
+      const ok = await _enviarCupomNoGrupo(lista[i]);
+      // Espacamento entre grupos do mesmo numero: evita rajada identica.
+      if (ok && i < lista.length - 1) await new Promise(r => setTimeout(r, msEntreGrupos()));
+    }
+  }));
+  if (_filas.length > 1) {
+    console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' em paralelo por ' + _filas.length + ' numero(s) ('
+      + [..._porConta.entries()].map(([c, l]) => c + ':' + l.length).join(', ') + ') em '
+      + Math.round((Date.now() - _t0) / 1000) + 's.');
   }
 
   // Reenvio em que todos os grupos ja tinham recebido nao e falha: nao ha o que
