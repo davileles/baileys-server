@@ -133,7 +133,10 @@ const INDISPONIVEL = 'indisponivel';       // o ML disse que o cupom nao esta di
 // 05/10/2026: "NOT_IN_TARGET_AUDIENCE: Este cupom não se aplica a você" (HTTP
 // 200) abriu o disjuntor em 03/10 — e o mesmo caso: cupom restrito a outro
 // publico, canal vivo.
-const RE_INDISPONIVEL = /\bINVALID_(?![16]\b)\d+\b|n[ãa]o est[áa] dispon[íi]vel|\bNOT_IN_TARGET_AUDIENCE\b|n[ãa]o se aplica a voc[êe]/i;
+// 11/11/2026: "SOLD_OUT_USER: Você já usou este cupom" (HTTP 200, cupom
+// APROVEITAAGORA) abriu o disjuntor como restricao da conta. E a conta que ja
+// usou o cupom — ele segue valendo para os grupos; canal vivo.
+const RE_INDISPONIVEL = /\bINVALID_(?![16]\b)\d+\b|n[ãa]o est[áa] dispon[íi]vel|\bNOT_IN_TARGET_AUDIENCE\b|n[ãa]o se aplica a voc[êe]|\bSOLD_OUT_USER\b|j[áa] usou (este|esse|o) cupom/i;
 
 let dep = null;
 let ESTADO_PATH = './sessao/insercao_ml_auto.json';
