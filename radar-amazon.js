@@ -2226,14 +2226,26 @@ async function baixarPaginaProduto(asin) {
 function extrairAVista(html, precoApi) {
   const mValor = RE_AVISTA_VALOR.exec(html);
   const mMsg   = RE_AVISTA_MSG.exec(html);
-  if (!mValor || !mMsg) return null;
+  if (!mValor) return null;
 
   const preco = Number(mValor[1]);
-  const pct   = Number(mMsg[2]);
   const api   = Number(precoApi);
-  if (!Number.isFinite(preco) || !Number.isFinite(api) || !pct) return null;
+  if (!Number.isFinite(preco) || !Number.isFinite(api)) return null;
   if (preco >= api || preco < api * 0.5) return null;
 
+  // Buy box sem a frase "a vista no X (N% off)" (11/11/2026, #44507: API
+  // R$ 55,43, pagina R$ 47,12, frase ausente em todas as 126 leituras do cache).
+  // O customerVisiblePrice e o numero que o cliente ve ao abrir o link: vale
+  // como preco da loja. Sem a frase nao se sabe a condicao, entao nao se
+  // anuncia Pix nem parcelamento (semCondicao) — so o preco.
+  if (!mMsg) {
+    const pctCalc = Math.round((1 - preco / api) * 100);
+    if (!(pctCalc > 0)) return null;
+    return { preco, percentual: pctCalc, meios: null, parcelas: null, semCondicao: true };
+  }
+
+  const pct = Number(mMsg[2]);
+  if (!pct) return null;
   const mPar = RE_AVISTA_PARCELA.exec(html);
   return {
     preco,
@@ -2470,7 +2482,7 @@ export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
   _avistaFalhas = 0;
 
   _avistaCache.set(asin, { em: Date.now(), dados });
-  if (dados) console.log('[AVISTA] ' + asin + ' R$ ' + dados.preco + ' (' + dados.percentual + '% no ' + dados.meios + ')');
+  if (dados) console.log('[AVISTA] ' + asin + ' R$ ' + dados.preco + ' (' + dados.percentual + '% ' + (dados.semCondicao ? 'no buy box, sem frase de condicao' : 'no ' + dados.meios) + ')');
   return dados;
 }
 
@@ -2522,6 +2534,7 @@ export async function comPrecoAVista(p, texto = '') {
   p.avistaPct   = a.percentual;
   p.avistaMeios = a.meios;
   p.avistaParcelas = a.parcelas;
+  p.avistaSemCondicao = !!a.semCondicao;
   p.avistaOrigem = a.origem || 'pdp';
   if (a.origem === 'post') {
     console.log('[AVISTA] ' + p.asin + ' R$ ' + a.preco + ' (' + a.percentual + '%) deduzido do post');
@@ -3024,9 +3037,9 @@ function _varsDoProdutoBase(p, cupom) {
     // Vazias quando nao ha a vista, e a regra de omissao do renderTemplate faz
     // a linha inteira sumir — template com as duas linhas serve para as lojas
     // que nao tem desconto de meio de pagamento sem precisar de condicional.
-    preco_prazo: avista ? brl(precoPrazo) : '',
-    avista_str: avista ? ('\u00e0 vista no ' + (p.avistaMeios || 'Pix') + ' (' + p.avistaPct + '% off)') : '',
-    parcelas_str: !avista ? ''
+    preco_prazo: avista && !p.avistaSemCondicao ? brl(precoPrazo) : '',
+    avista_str: avista && !p.avistaSemCondicao ? ('\u00e0 vista no ' + (p.avistaMeios || 'Pix') + ' (' + p.avistaPct + '% off)') : '',
+    parcelas_str: (!avista || p.avistaSemCondicao) ? ''
       : (p.avistaParcelas
           ? ('ou em at\u00e9 ' + p.avistaParcelas + 'x de R$ '
              + brl(Math.ceil(precoPrazo / p.avistaParcelas * 100) / 100)
