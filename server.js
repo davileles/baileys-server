@@ -14404,6 +14404,23 @@ const GM_PAUSA = {                               // [min, max] entre grupos
 };
 const GM_MAX_GRUPOS_POR_TAREFA = 60;
 const GM_ACOES = new Set(['add', 'remove', 'promote', 'demote']);
+// Remocao feita SO pelos ticos (soTico:true, desde 11/11/2026): usada pelo proxy
+// do CDV para tirar dos grupos quem ficou com a assinatura invalida. Nunca a
+// principal nem camp-*/aviso-*; executor em rodizio (o tico que removeu menos
+// hoje primeiro) e teto diario por conta. Contagem em memoria (zera no deploy;
+// o proxy tem o proprio teto diario, gravado no repo de dados).
+const GM_REMOVE_TICO_MAX_DIA = Math.max(1, parseInt(process.env.GM_REMOVE_TICO_MAX_DIA || '8', 10) || 8);
+function _gmRemocoesTicoHoje(id) {
+  const st = _gm();
+  const dia = new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+  if (!st.remocoesTico || st.remocoesTico.dia !== dia) st.remocoesTico = { dia, porConta: {} };
+  return st.remocoesTico.porConta[id] || 0;
+}
+function _gmContarRemocaoTico(id) {
+  _gmRemocoesTicoHoje(id);
+  const pc = _gm().remocoesTico.porConta;
+  pc[id] = (pc[id] || 0) + 1;
+}
 
 // Estado em propriedade de funcao, e nao em const de modulo: os handlers de
 // mensagem chamam isto e nao podem cair em TDZ se um evento chegar cedo.
@@ -14882,9 +14899,11 @@ function _gmFimJob(j, erro) {
 
 // Cria (e dispara) a tarefa de participante. Devolve { status, body } para o
 // endpoint responder — a reentrada do CDV usa o mesmo caminho.
-async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, origem }) {
+async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, origem, soTico }) {
   acao = String(acao || '').trim();
   if (!GM_ACOES.has(acao)) return { status: 400, body: { ok: false, erro: 'acao invalida — use add, remove, promote ou demote' } };
+  soTico = soTico === true;
+  if (soTico && acao !== 'remove') return { status: 400, body: { ok: false, erro: 'soTico vale so para remocao' } };
   const st = _gm();
   if (st.ativo) return { status: 409, body: { ok: false, erro: 'ja ha uma tarefa de grupos em andamento — aguarde terminar.', jobId: st.ativo } };
   const pedidos = [...new Set((Array.isArray(jids) ? jids : []).map(j => String(j || '').trim()).filter(j => j.endsWith('@g.us')))];
@@ -14937,14 +14956,14 @@ async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, 
   }
 
   const j = _gmNovoJob({ tipo: 'participante', acao, alvo: digitos || partId, origem: origem || 'painel',
-    total: pedidos.length, executorFixo: contato ? contato.conta : null });
-  _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa })
+    total: pedidos.length, executorFixo: contato ? contato.conta : null, soTico });
+  _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa, soTico })
     .catch(e => _gmFimJob(j, e.message));
   return { status: 202, body: { ok: true, jobId: j.id, total: pedidos.length, executor: j.executorFixo,
     contatoEm: contato ? new Date(contato.em).toISOString() : null } };
 }
 
-async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa }) {
+async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa, soTico }) {
   const variantes = digitos ? _reVariantes(digitos) : new Set();
   let retratos = await _gmRetratos(true);
   if (!retratos.length) return _gmFimJob(j, 'nenhuma conta conseguiu ler os grupos agora');
@@ -15017,6 +15036,19 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
           : 'nenhuma conta conectada e admin deste grupo' });
         continue;
       }
+    } else if (soTico) {
+      const ticos = retratos.filter(r => /^tico-/i.test(r.id) && _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin
+        && !_gmIdsParticipante(_gmEuNoGrupo(r.sock, r.mapa[jid])).some(n => idsAlvo.has(n)));
+      const livres = ticos.filter(r => _gmRemocoesTicoHoje(r.id) < GM_REMOVE_TICO_MAX_DIA)
+        .sort((a, b) => _gmRemocoesTicoHoje(a.id) - _gmRemocoesTicoHoje(b.id) || a.id.localeCompare(b.id));
+      exec = livres[0] || null;
+      if (!exec) {
+        j.falhas++;
+        push({ estado: 'bloqueado', detalhe: ticos.length
+          ? 'limite de ' + GM_REMOVE_TICO_MAX_DIA + ' remocoes hoje atingido nos ticos admin deste grupo'
+          : 'nenhum tico conectado e admin deste grupo (a principal nao remove)' });
+        continue;
+      }
     } else {
       exec = retratos.find(r => {
         const eu = _gmEuNoGrupo(r.sock, r.mapa[jid]);
@@ -15042,6 +15074,7 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
         j.feitos++;
         push({ estado: 'ok', por: exec.id, detalhe: { add: 'incluido', remove: 'removido', promote: 'agora e admin', demote: 'deixou de ser admin' }[acao] });
         if (acao === 'add') _gmContarAdicao(exec.id, digitos);
+        if (soTico && acao === 'remove') _gmContarRemocaoTico(exec.id);
       } else if (stt === '409') {
         j.pulados++; push({ estado: 'pulado', por: exec.id, detalhe: 'o WhatsApp respondeu que ja estava assim' });
       } else if (acao === 'add' && (stt === '403' || stt === '408' || stt === '401')) {
@@ -15546,7 +15579,8 @@ app.get('/grupos-gestao/grupos', async (req, res) => {
     }).sort((a, b) => String(a.nome || a.jid).localeCompare(String(b.nome || b.jid), 'pt-BR'));
     const st = _gm();
     res.json({ ok: true, operacao: op, contas: contas.map(c => ({ id: c.id, numero: c.numero })),
-      tarefaAtiva: st.ativo, limiteInclusoesDia: GM_ADD_MAX_DIA, total: grupos.length, grupos });
+      tarefaAtiva: st.ativo, limiteInclusoesDia: GM_ADD_MAX_DIA, remocaoSoTico: true, limiteRemocoesTicoDia: GM_REMOVE_TICO_MAX_DIA,
+      total: grupos.length, grupos });
   } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
 
@@ -15600,7 +15634,8 @@ app.get('/grupos-gestao/contato', async (req, res) => {
 app.post('/grupos-gestao/participante', async (req, res) => {
   if (!_gmSoPadrao(req, res)) return;
   const b = req.body || {};
-  const r = await _gmCriarTarefaParticipante({ acao: b.acao, telefone: b.telefone, participante: b.participante, jids: b.jids, origem: 'painel-' + (b.operacao || '?') });
+  const r = await _gmCriarTarefaParticipante({ acao: b.acao, telefone: b.telefone, participante: b.participante, jids: b.jids,
+    origem: b.origem === 'assinatura-invalida' ? 'cdv-assinatura-invalida' : 'painel-' + (b.operacao || '?'), soTico: b.soTico === true });
   res.status(r.status).json(r.body);
 });
 

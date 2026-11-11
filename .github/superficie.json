@@ -245,7 +245,9 @@
         "app.post('/avisos-preco/outras-lojas'",
         "async function criarCardAvisoPreco(",
         "async function _faGrupoSuspenso(",
-        "function _faProximo("
+        "function _faProximo(",
+        "function _gmContarRemocaoTico(",
+        "remocaoSoTico: true"
       ]
     },
     "radar-awin.js": {
