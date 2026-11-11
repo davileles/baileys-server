@@ -17082,6 +17082,10 @@ function carregarFilaRadar() {
     const lista = JSON.parse(readFileSync(FILA_RADAR_PATH, 'utf-8'));
     if (Array.isArray(lista)) {
       filaRadar.push(...lista.filter(x => x && x.mensagem && x.grupo));
+      // Itens gravados antes do grupoChave: todo item nao-lembrete chega pelo
+      // /radar/enviar com 'cdv_ofertas' (proxy /ofertas/enviar e
+      // /ofertas/aprovar-e-enviar), entao passa a seguir o grupo da Config.
+      for (const x of filaRadar) if (!x.grupoChave && !x.lembrete) x.grupoChave = 'cdv_ofertas';
       if (filaRadar.length) console.log('[RADAR] ' + filaRadar.length + ' item(ns) recuperado(s) do disco.');
     }
   } catch (e) { console.error('[RADAR] Erro ao carregar fila:', e.message); }
@@ -17112,6 +17116,18 @@ async function radarWorker() {
     }
     const item = filaRadar[0];
     if (!item) break;
+    // Grupo resolvido NA HORA DO ENVIO: trocar o grupo de ofertas na Config do
+    // CDV vale tambem para o que ja estava na fila (antes o JID ficava
+    // congelado no enfileiramento e a fila seguia mandando para o grupo antigo).
+    if (item.grupoChave) {
+      const atual = GRUPOS[item.grupoChave];
+      if (atual && atual !== item.grupo) {
+        console.log('[RADAR] Grupo de "' + item.id + '" atualizado: ' + (NOMES_GRUPOS.get(item.grupo) || item.grupo)
+          + ' -> ' + (NOMES_GRUPOS.get(atual) || atual));
+        item.grupo = atual;
+        salvarFilaRadar();
+      }
+    }
     try {
       console.log('[RADAR] Enviando oferta "' + item.id + '" para ' + item.grupo + ' (' + filaRadar.length + ' na fila)');
       await enviarMensagem(item.grupo, { text: item.mensagem });
@@ -17155,9 +17171,12 @@ app.post('/radar/enviar', (req, res) => {
   if (!mensagem?.trim()) return res.status(400).json({ ok: false, erro: 'mensagem obrigatória' });
   const grupoId = grupo ? (GRUPOS[grupo] || grupo) : GRUPOS['cdv_ofertas'];
   if (!grupoId) return res.status(400).json({ ok: false, erro: 'grupo inválido: ' + grupo });
+  // Apelido (cdv_ofertas, cdv_emissao...) fica guardado para o worker resolver
+  // o JID no momento do envio; JID cru continua fixo.
+  const grupoChave = !grupo ? 'cdv_ofertas' : (GRUPOS[grupo] ? grupo : null);
 
   const posicao = filaRadar.length;
-  filaRadar.push({ id: id || ('r_' + Date.now()), mensagem, grupo: grupoId, tentativas: 0 });
+  filaRadar.push({ id: id || ('r_' + Date.now()), mensagem, grupo: grupoId, grupoChave, tentativas: 0 });
   salvarFilaRadar();
 
   const agora = Date.now();
@@ -17182,6 +17201,7 @@ app.get('/radar/fila', (req, res) => {
       posicao: idx + 1,
       id: item.id,
       tentativas: item.tentativas || 0,
+      grupo: (() => { const g = (item.grupoChave && GRUPOS[item.grupoChave]) || item.grupo; return NOMES_GRUPOS.get(g) || g; })(),
       preview: item.mensagem.substring(0, 80) + (item.mensagem.length > 80 ? '...' : ''),
     })),
   });
