@@ -125,7 +125,7 @@ export function registrarPublicacao(oferta, grupos = 0) {
 
     const item = {
       id:         String(oferta.id || ''),
-      loja:       d.loja || '',
+      loja:       nomeLojaPublico(d.loja),
       titulo:     String(d.titulo).slice(0, 180),
       link:       d.link,
       imagem:     imagemParaVitrine(d.imagemUrl),
@@ -154,6 +154,13 @@ export function registrarPublicacao(oferta, grupos = 0) {
 
 // Loja a partir do dominio do link, para envio manual (o card do painel nao
 // traz a loja num campo proprio quando a descricao vem vazia).
+// Lojas fora das principais chegam como "Outro: Nome" (convencao interna da
+// extracao). No site publico aparece so o nome. O link de afiliado continua
+// resolvido com o valor original.
+function nomeLojaPublico(loja) {
+  return String(loja || '').replace(/^\s*outros?\s*:\s*/i, '').trim();
+}
+
 function lojaDoLink(url) {
   let h = '';
   try { h = new URL(url).hostname.toLowerCase(); } catch { return ''; }
@@ -187,7 +194,7 @@ export function registrarEnvioManual(preview, grupos = 0) {
         link:      preview.link,
         titulo:    preview.titulo,
         imagemUrl: preview.imagemUrl || null,
-        loja:      lojaDesc || lojaDoLink(preview.link),
+        loja:      nomeLojaPublico(lojaDesc) || lojaDoLink(preview.link),
         preco,
       },
     }, grupos);
@@ -230,7 +237,7 @@ function montarCupons() {
     .filter(cupomGeralDisponivel)
     .map(c => ({
       codigo:     c.codigo,
-      loja:       c.loja,
+      loja:       nomeLojaPublico(c.loja),
       tipo:       c.tipo,               // 'pct' | 'reais'
       valor:      c.valor,
       minimo:     c.minimo ?? null,     // piso do pedido
