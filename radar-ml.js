@@ -56,7 +56,7 @@ import { tagMlDoProduto, salvarItemVitrine } from './radar-amazon.js';
 // A etiqueta do ML e escolhida pela CATEGORIA do produto, entao a geracao de
 // link precisa saber classificar. categorizador.js so depende de fs e do sync,
 // entao nao ha ciclo de import aqui.
-import { classificarProduto, categoriaConfiavel } from './categorizador.js';
+import { classificarProduto, categoriaConfiavel, palavraDaTrilhaNoTexto } from './categorizador.js';
 import { pedirPaginaMl, extensaoPaginasOnline, motivoIndisponivelPaginasMl } from './paginas-ml.js';
 
 function carregarToken() {
@@ -1256,6 +1256,13 @@ export function tituloDoTextoMl(texto, trilha) {
     if (!catAlvo) continue;
     if (cls.categoria !== catAlvo) continue;
     return { titulo: linha, sinal: 'categoria:' + catAlvo + ' (' + (cls.sinal || '?') + ')' };
+  }
+  // Rede de seguranca: prateleira sem palavra-chave na taxonomia (ex.: moveis
+  // em Casa e Limpeza) fazia todo post ser recusado. A linha que cita o ultimo
+  // nivel da trilha ("Sofa ..." x "... > Sofas") tambem prova que e o produto.
+  for (const linha of candidatas) {
+    const palavra = palavraDaTrilhaNoTexto(linha, trilha);
+    if (palavra) return { titulo: linha, sinal: 'trilha-cita:' + palavra };
   }
   return null;
 }

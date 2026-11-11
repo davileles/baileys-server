@@ -83,6 +83,25 @@ function contemTermo(textoNorm, termo) {
   return (' ' + textoNorm + ' ').includes(' ' + t + ' ');
 }
 
+// Palavra do ultimo nivel da trilha que aparece numa linha de texto. Serve de
+// prova de que a linha nomeia ESTE produto quando a taxonomia ainda nao tem
+// palavra-chave para a prateleira: "Sofa Cama Elo 1,90m" cita "Sofas", ultimo
+// nivel de "Casa, Moveis e Decoracao > ... > Sofas" (11/11/2026, dois sofas da
+// Cama Inbox descartados por falta de nome). Palavras genericas de prateleira
+// (acessorios, outros, kit) nao contam: provariam qualquer linha.
+const _GENERICAS_TRILHA = new Set(['outro','outra','acessorio','kit','peca','parte','geral',
+  'diverso','item','produto','conjunto','linha','tipo','para','com','sem','como','mais',
+  'casa','moveis','movel','decoracao','refil','reposicao']);
+export function palavraDaTrilhaNoTexto(linha, trilha) {
+  const segs = String(trilha || '').split('>').map(s => s.trim()).filter(Boolean);
+  if (!segs.length) return null;
+  const t = normSing(linha);
+  if (!t) return null;
+  const palavras = normSing(segs[segs.length - 1]).split(' ')
+    .filter(w => w.length >= 4 && !_GENERICAS_TRILHA.has(w));
+  return palavras.find(w => contemTermo(t, w)) || null;
+}
+
 // ── Carga / persistencia ─────────────────────────────────────────────────────
 export function carregarCategorias() {
   try {
