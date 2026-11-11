@@ -187,7 +187,7 @@ import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previa
          acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido,
          enviarMensagemOperador, encerrarAtendimento, numeroDosAvisos } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
-import { rastrearParaGrupo, resolverCodigo, estadoRastreio } from './links-rastreio.js';
+import { rastrearParaGrupo, resolverCodigo, estadoRastreio, gruposDosEnviosDoDia } from './links-rastreio.js';
 
 // Espalha os prazos da config para os modulos que os usam. Chamado no boot e
 // depois de cada gravacao, para valer sem redeploy.
@@ -17838,6 +17838,64 @@ app.get('/operacao/historico-envios', async (req, res) => {
     const local = (req.tenantId === TENANT_PADRAO) ? nome : 'tenants/' + req.tenantId + '/' + nome;
     const regs = await _registrosDoShard(local);
     res.json({ ok: true, mes, total: regs.length, registros: regs });
+  } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
+});
+
+// ── DIVULGACOES POR GRUPO ────────────────────────────────────────────────────
+// O historico duravel so guarda QUANTOS grupos receberam (gruposDestino): a
+// lista inteira de JIDs estouraria o shard do mes. Quem guarda QUAIS grupos
+// e o rastreio de links (links_rastreio_<dia>.json: ofertaId/execId -> grupos),
+// entao o cruzamento e feito aqui, na leitura. Envio sem link rastreado
+// (mensagem livre sem link, rastreio desligado) fica sem grupo e o painel
+// mostra a sobra como "sem grupo registrado". Dia ja fechado e imutavel: cache.
+const _divulgGruposCache = new Map(); // dia -> mapa
+async function _gruposDoDiaCacheado(dia) {
+  const hoje = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date());
+  if (dia < hoje && _divulgGruposCache.has(dia)) return _divulgGruposCache.get(dia);
+  const mapa = await gruposDosEnviosDoDia(dia);
+  if (dia < hoje) {
+    _divulgGruposCache.set(dia, mapa);
+    const ks = [..._divulgGruposCache.keys()].sort();
+    while (ks.length > 70) _divulgGruposCache.delete(ks.shift());
+  }
+  return mapa;
+}
+app.get('/operacao/divulgacoes-grupos', async (req, res) => {
+  try {
+    const mes = /^\d{4}-\d{2}$/.test(String(req.query.mes || ''))
+      ? String(req.query.mes)
+      : new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year:'numeric', month:'2-digit' }).format(new Date());
+    // Rastreio de links e da operacao padrao.
+    if (req.tenantId !== TENANT_PADRAO) return res.json({ ok:true, mes, grupos:[], porEnvio:{} });
+    const local = 'historico_envios_' + mes + '.json';
+    const regs = await _registrosDoShard(local);
+    const fmtDia = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP, year:'numeric', month:'2-digit', day:'2-digit' });
+    const dias = new Set();
+    for (const r of regs) { try { dias.add(fmtDia.format(new Date(r.enviadoEm))); } catch {} }
+    // O envio pode cruzar a meia-noite (lista longa): olha tambem o dia seguinte.
+    const mapas = {};
+    for (const d of [...dias].sort()) {
+      mapas[d] = await _gruposDoDiaCacheado(d);
+      const seg = fmtDia.format(new Date(new Date(d + 'T12:00:00-03:00').getTime() + 86400000));
+      if (seg.slice(0, 7) === mes && !mapas[seg]) mapas[seg] = await _gruposDoDiaCacheado(seg);
+    }
+    const idx = new Map(), grupos = [], porEnvio = {};
+    for (const r of regs) {
+      const chave = String(r.loteId || r.id);
+      if (porEnvio[chave]) continue;
+      let d; try { d = fmtDia.format(new Date(r.enviadoEm)); } catch { continue; }
+      const seg = fmtDia.format(new Date(new Date(d + 'T12:00:00-03:00').getTime() + 86400000));
+      const achado = (mapas[d] && mapas[d][chave]) || (mapas[seg] && mapas[seg][chave]);
+      if (!achado) continue;
+      porEnvio[chave] = Object.keys(achado).map(jid => {
+        if (!idx.has(jid)) {
+          idx.set(jid, grupos.length);
+          grupos.push({ jid, nome: NOMES_GRUPOS.get(jid) || achado[jid] || jid });
+        }
+        return idx.get(jid);
+      });
+    }
+    res.json({ ok:true, mes, grupos, porEnvio });
   } catch (e) { res.status(500).json({ ok:false, erro: e.message }); }
 });
 

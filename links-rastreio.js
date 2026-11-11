@@ -374,6 +374,39 @@ export async function resolverCodigo(base) {
   return reg ? { dia, base: b, ...reg } : null;
 }
 
+/**
+ * Grupos que receberam cada envio de um dia, lidos do shard de rastreio
+ * (aba Divulgacoes do painel: "foram 177 — para onde?"). Somente leitura:
+ * nao entra no cache _dias nem grava nada. Chave = ofertaId e o prefixo do
+ * execId (antes do "@"), que e o id do envio no historico duravel.
+ * @returns {Promise<Object<string, Object<string,string>>>} chave -> {jid: nome}
+ */
+export async function gruposDosEnviosDoDia(dia) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dia || ''))) return {};
+  let doc = _dias.get(dia) || null;
+  if (!doc) {
+    const local = SESSAO_DIR + '/' + nomeShard(dia);
+    if (!existsSync(local)) { try { await baixarArquivoDoGitHub(nomeShard(dia)); } catch { /* sem shard */ } }
+    try { doc = JSON.parse(readFileSync(local, 'utf-8')); } catch { doc = null; }
+  }
+  const out = {};
+  const links = (doc && doc.links) || {};
+  for (const v of Object.values(links)) {
+    const chaves = new Set();
+    if (v && v.ofertaId) chaves.add(String(v.ofertaId));
+    if (v && v.execId) chaves.add(String(v.execId).split('@')[0]);
+    if (!chaves.size) continue;
+    for (const g of Object.values(v.grupos || {})) {
+      if (!g || !g.jid) continue;
+      for (const k of chaves) {
+        const m = out[k] || (out[k] = {});
+        if (!m[g.jid]) m[g.jid] = g.nome || '';
+      }
+    }
+  }
+  return out;
+}
+
 export function estadoRastreio() {
   const hoje = diaSP();
   const doc = _dias.get(hoje);
