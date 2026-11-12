@@ -14411,7 +14411,16 @@ const GM_ACOES = new Set(['add', 'remove', 'promote', 'demote']);
 // principal nem camp-*/aviso-*; executor em rodizio (o tico que removeu menos
 // hoje primeiro) e teto diario por conta. Contagem em memoria (zera no deploy;
 // o proxy tem o proprio teto diario, gravado no repo de dados).
-const GM_REMOVE_TICO_MAX_DIA = Math.max(1, parseInt(process.env.GM_REMOVE_TICO_MAX_DIA || '8', 10) || 8);
+const GM_REMOVE_TICO_MAX_DIA_BASE = Math.max(1, parseInt(process.env.GM_REMOVE_TICO_MAX_DIA || '8', 10) || 8);
+// Teto TEMPORARIO (12/11/2026, pedido do Davi): o link dos grupos do CDV vazou
+// em canais do Telegram e muita gente sem direito esta entrando. Ate o fim de
+// 15/11/2026 (SP) cada tico pode remover ate GM_REMOVE_TICO_MAX_DIA_TEMP (25)
+// por dia; depois volta sozinho ao teto base, sem deploy.
+const GM_REMOVE_TICO_TEMP_MAX = Math.max(1, parseInt(process.env.GM_REMOVE_TICO_MAX_DIA_TEMP || '25', 10) || 25);
+const GM_REMOVE_TICO_TEMP_ATE = Date.parse(process.env.GM_REMOVE_TICO_TEMP_ATE || '2026-11-15T23:59:59-03:00');
+function gmRemoveTicoMaxDia() {
+  return Date.now() <= GM_REMOVE_TICO_TEMP_ATE ? Math.max(GM_REMOVE_TICO_MAX_DIA_BASE, GM_REMOVE_TICO_TEMP_MAX) : GM_REMOVE_TICO_MAX_DIA_BASE;
+}
 function _gmRemocoesTicoHoje(id) {
   const st = _gm();
   const dia = new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
@@ -15044,13 +15053,13 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
     } else if (soTico) {
       const ticos = retratos.filter(r => /^tico-/i.test(r.id) && _gmEuNoGrupo(r.sock, r.mapa[jid])?.admin
         && !_gmIdsParticipante(_gmEuNoGrupo(r.sock, r.mapa[jid])).some(n => idsAlvo.has(n)));
-      const livres = ticos.filter(r => _gmRemocoesTicoHoje(r.id) < GM_REMOVE_TICO_MAX_DIA)
+      const livres = ticos.filter(r => _gmRemocoesTicoHoje(r.id) < gmRemoveTicoMaxDia())
         .sort((a, b) => _gmRemocoesTicoHoje(a.id) - _gmRemocoesTicoHoje(b.id) || a.id.localeCompare(b.id));
       exec = livres[0] || null;
       if (!exec) {
         j.falhas++;
         push({ estado: 'bloqueado', detalhe: ticos.length
-          ? 'limite de ' + GM_REMOVE_TICO_MAX_DIA + ' remocoes hoje atingido nos ticos admin deste grupo'
+          ? 'limite de ' + gmRemoveTicoMaxDia() + ' remocoes hoje atingido nos ticos admin deste grupo'
           : 'nenhum tico conectado e admin deste grupo (a principal nao remove)' });
         continue;
       }
@@ -15584,7 +15593,7 @@ app.get('/grupos-gestao/grupos', async (req, res) => {
     }).sort((a, b) => String(a.nome || a.jid).localeCompare(String(b.nome || b.jid), 'pt-BR'));
     const st = _gm();
     res.json({ ok: true, operacao: op, contas: contas.map(c => ({ id: c.id, numero: c.numero })),
-      tarefaAtiva: st.ativo, limiteInclusoesDia: GM_ADD_MAX_DIA, remocaoSoTico: true, limiteRemocoesTicoDia: GM_REMOVE_TICO_MAX_DIA,
+      tarefaAtiva: st.ativo, limiteInclusoesDia: GM_ADD_MAX_DIA, remocaoSoTico: true, limiteRemocoesTicoDia: gmRemoveTicoMaxDia(), limiteRemocoesTicoTempAte: Date.now() <= GM_REMOVE_TICO_TEMP_ATE ? new Date(GM_REMOVE_TICO_TEMP_ATE).toISOString() : null,
       total: grupos.length, grupos });
   } catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
 });
