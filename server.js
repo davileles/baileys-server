@@ -1830,6 +1830,7 @@ async function conectarConta(id) {
         try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author, apelidoDaConta(id)); }
         catch (e) { console.error('[MEMBROS] Erro no handler (' + id + '):', e.message); }
         sgEventoParticipantes(apelidoDaConta(id), s, u);
+        avisarEntradaCdv(s, u);
       });
     }
     // Telemetria de "Aguardando mensagem" nos grupos desta conta. SO CONTA:
@@ -12862,6 +12863,7 @@ async function conectar() {
       try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author); }
       catch(e) { console.error('[MEMBROS] Erro no handler:', e.message); }
       sgEventoParticipantes('principal', sock, u);
+      avisarEntradaCdv(sock, u);
     });
     // Grupo novo (criado agora ou em que a conta acabou de entrar). Sem isto o
     // cache NOMES_GRUPOS so era preenchido em connection==='open', entao grupo
@@ -14914,7 +14916,10 @@ async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, 
   const digitos = String(telefone || '').replace(/\D/g, '');
   const partId = String(participante || '').trim();
   if (!digitos && !partId) return { status: 400, body: { ok: false, erro: 'informe o telefone' } };
-  if (digitos && (digitos.length < 12 || digitos.length > 15)) {
+  // Remocao aceita a partir de 10 digitos: o numero vem da lista de
+  // participantes (ja com DDI) e estrangeiro pode ser curto (+31 6… = 11).
+  // Inclusao continua exigindo 12+ (evita numero sem DDI digitado a mao).
+  if (digitos && (digitos.length < (acao === 'remove' ? 10 : 12) || digitos.length > 15)) {
     return { status: 400, body: { ok: false, erro: 'telefone invalido — informe com DDI e DDD (ex.: 5531999998888)' } };
   }
 
@@ -24731,6 +24736,42 @@ function _membrosJaVisto(grupo, ids, acao, agoraMs) {
 }
 
 // fonte: 'principal' | apelido da conta extra | 'wm:<conta>' (wa-envio).
+// Remocao imediata do invasor (12/11/2026): cada entrada (add) num grupo que nao
+// e do TSP e avisada ao proxy, que decide sozinho (grupo com regra, cadastro,
+// excecoes, modo on/sombra) e manda o Tico tirar na hora. Dedup por grupo+numero
+// (5 min) segura o mesmo evento vindo de varias contas. LID sem telefone e
+// resolvido pelo mapeamento da conta; sem telefone, a rodada de 20 min cobre.
+const _cdvEntradaVista = new Map();
+async function avisarEntradaCdv(sock, u) {
+  try {
+    const chave = process.env.CAMPANHAS_KEY || '';
+    const jid = String((u && u.id) || '');
+    if (!chave || !u || u.action !== 'add' || !jid.endsWith('@g.us') || ehGrupoTsp(jid)) return;
+    const agora = Date.now();
+    const tels = [];
+    for (const p of (u.participants || [])) {
+      const id = typeof p === 'string' ? p : String((p && (p.id || p.jid)) || '');
+      let tel = (p && typeof p === 'object') ? _soNumero(p.phoneNumber) : '';
+      if (!tel && /@s\.whatsapp\.net$/.test(id)) tel = _soNumero(id);
+      if (!tel && /@lid$/.test(id)) {
+        try { tel = _soNumero(await sock?.signalRepository?.lidMapping?.getPNForLID?.(id)); } catch (e) {}
+      }
+      if (!tel) continue;
+      const k = jid + '|' + tel;
+      if (agora - (_cdvEntradaVista.get(k) || 0) < 5 * 60e3) continue;
+      _cdvEntradaVista.set(k, agora);
+      tels.push(tel);
+    }
+    if (_cdvEntradaVista.size > 2000) for (const [k, t] of _cdvEntradaVista) if (agora - t > 5 * 60e3) _cdvEntradaVista.delete(k);
+    if (!tels.length) return;
+    const r = await fetch(CDV_PROXY_URL + '/hubla/grupos-remocao/entrada', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CDV-Op': chave },
+      body: JSON.stringify({ jid, telefones: tels }), signal: AbortSignal.timeout(15000),
+    });
+    if (r.status !== 202) console.warn('[INVASOR] proxy respondeu ' + r.status + ' para ' + (NOMES_GRUPOS.get(jid) || jid));
+  } catch (e) { console.warn('[INVASOR] aviso de entrada falhou:', e.message); }
+}
+
 function registrarMovimentoMembros(grupo, participantes, acao, autor, fonte = 'principal') {
   const destinos = new Set(censoAlvos());
   if (!destinos.has(grupo)) return;              // so grupos de destino
