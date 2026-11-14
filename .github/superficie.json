@@ -32,6 +32,7 @@
         "app.get('/cupons/ler-ml'",
         "app.get('/debug-fila'",
         "app.get('/debug-upserts'",
+        "app.get('/egress'",
         "app.get('/entrega/grupos'",
         "app.get('/fila-envio'",
         "app.get('/financeiro/mensal'",

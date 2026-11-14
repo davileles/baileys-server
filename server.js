@@ -1,3 +1,4 @@
+import { medirRespostas, estadoEgress } from './egress.js'; // PRIMEIRO import: mede o egress desde o boot
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -90,7 +91,7 @@ import {
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
   baixarDoGitHub, pushImediato, estadoSync, sincronizacaoAtiva, testarAcesso, agendarPush,
-  flushPushesPendentes, pushesPendentes, baixarArquivoDoGitHub,
+  flushPushesPendentes, pushesPendentes, baixarArquivoDoGitHub, enviosPorArquivo,
 } from './sync-github.js';
 
 // ── VITRINE PUBLICA (tudosobrepromos.com) ─────────────────────────────────────
@@ -1090,6 +1091,7 @@ async function _flushTodasSessoes(maxMs = 3000) {
 
 const app    = express();
 const upload = multer({ dest: UPLOAD_DIR });
+app.use(medirRespostas);
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
@@ -19449,6 +19451,12 @@ app.get('/tenants', (req, res) => {
 });
 
 // ── SINCRONIZACAO ────────────────────────────────────────────────────────────
+// Trafego de saida por destino desde o boot (egress.js) + PUTs do sync por
+// arquivo. Criado em 13/11/2026 para achar os 512 GB de egress do ciclo.
+app.get('/egress', (req, res) => {
+  res.json({ ok:true, ...estadoEgress({ syncGithubPorArquivo: enviosPorArquivo() }) });
+});
+
 app.get('/sync', async (req, res) => {
   const base = estadoSync();
   res.json({ ok:true, ...base, acesso: base.ativo ? await testarAcesso() : null });

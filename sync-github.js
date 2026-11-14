@@ -19,13 +19,20 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { createHash } from 'crypto';
 
 const SESSAO_DIR = './sessao';
 // Funcoes, nao constantes: o repositorio de dados pode ser trocado pelo painel
 // e precisa valer no proximo push, sem restart.
 function repoDados()  { return process.env.GITHUB_REPO_DADOS || 'davileles/cdv-tsp-dados'; }
 function pastaDados() { return process.env.GITHUB_PASTA_DADOS || 'tsp'; }
-const DEBOUNCE_MS = 10000;
+// 3 min (era 10 s ate 13/11/2026). Cada envio manda o ARQUIVO INTEIRO em
+// base64 para a Contents API (nao ha envio parcial), e arquivos de ~1 MB que
+// mudam a todo disparo (historico de envios, serie de precos, vitrine) subiam
+// varias vezes por minuto: o baileys-server fez 512 GB de egress num ciclo do
+// Railway (US$ 25,59). O flush do SIGTERM segue subindo o que estiver
+// pendente, entao deploy nao perde gravacao.
+const DEBOUNCE_MS = 3 * 60000;
 
 // Nomes de arquivo versionaveis. Na raiz de ./sessao pertencem ao tenant
 // padrao (operacao original — layout historico, sem migracao); em
@@ -135,6 +142,20 @@ function _idsTenantsDoDisco() {
 }
 
 const _shas = new Map();      // caminho no repo -> sha do ultimo commit conhecido
+// Hash do conteudo do ultimo envio bem-sucedido de cada arquivo, neste boot.
+const _ultimoHash = new Map();
+// Bytes enviados por arquivo desde o boot (corpo do PUT). Lido pelo GET /egress.
+const _enviosPorArquivo = new Map();   // local -> { envios, bytes, iguais }
+function _contarEnvio(local, bytes, igual) {
+  const r = _enviosPorArquivo.get(local) || { envios: 0, bytes: 0, iguais: 0 };
+  if (igual) r.iguais += 1; else { r.envios += 1; r.bytes += bytes; }
+  _enviosPorArquivo.set(local, r);
+}
+export function enviosPorArquivo() {
+  return [..._enviosPorArquivo.entries()]
+    .map(([arquivo, v]) => ({ arquivo, mb: Math.round(v.bytes / 1048576 * 10) / 10, envios: v.envios, semMudanca: v.iguais }))
+    .sort((a, b) => b.mb - a.mb);
+}
 const _timers = new Map();    // arquivo -> timer de debounce (ou de nova tentativa)
 let _ultimoErro = null;
 
@@ -259,6 +280,7 @@ export async function baixarDoGitHub() {
       const dir = destino.slice(0, destino.lastIndexOf('/'));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(destino, conteudo, 'utf-8');
+      _ultimoHash.set(local, createHash('sha1').update(conteudo).digest('hex'));
       baixados++;
     } catch (e) { erros.push(local + ': ' + e.message); }
   }
@@ -297,6 +319,7 @@ export async function baixarArquivoDoGitHub(local) {
     const dir = destino.slice(0, destino.lastIndexOf('/'));
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(destino, conteudo, 'utf-8');
+    _ultimoHash.set(local, createHash('sha1').update(conteudo).digest('hex'));
     return true;
   } catch { return false; }
 }
@@ -311,6 +334,36 @@ async function enviar(local) {
 
   try {
     const conteudo = readFileSync(caminhoLocal, 'utf-8');
+    const hash = createHash('sha1').update(conteudo).digest('hex');
+
+    // Igual ao ultimo envio deste boot: nada a fazer (nem o GET).
+    if (_ultimoHash.get(local) === hash) { _contarEnvio(local, 0, true); return true; }
+
+    // Atalho (13/11/2026): com o sha do ultimo commit conhecido, tenta o PUT
+    // direto, sem o GET que baixava o arquivo inteiro antes de cada envio —
+    // metade das chamadas e do tempo, o que importa no flush do SIGTERM (teto
+    // de 20 s). Sha velho (alguem escreveu no meio) = 409/422 e cai no caminho
+    // completo abaixo, que le o sha fresco.
+    const shaConhecido = _shas.get(remoto);
+    if (shaConhecido) {
+      const corpoJson = JSON.stringify({
+        message: 'chore(tsp): atualiza ' + local,
+        content: Buffer.from(conteudo, 'utf-8').toString('base64'),
+        sha: shaConhecido,
+      });
+      const r = await api(remoto, { method: 'PUT', body: corpoJson });
+      _contarEnvio(local, Buffer.byteLength(corpoJson), false);
+      if (r.ok) {
+        const d = await r.json();
+        _shas.set(remoto, d.content?.sha);
+        _ultimoHash.set(local, hash);
+        _ultimoErro = null;
+        console.log('[SYNC] ' + local + ' -> ' + repoDados() + '/' + remoto);
+        return true;
+      }
+      if (r.status !== 409 && r.status !== 422) throw new Error('PUT falhou: HTTP ' + r.status + ' ' + (await r.text()).slice(0, 160));
+      _shas.delete(remoto);
+    }
 
     // SHA sempre fresco antes do PUT: um push concorrente invalida o anterior.
     let sha = null;
@@ -319,7 +372,7 @@ async function enviar(local) {
       const d = await atual.json();
       sha = d.sha;
       // Conteudo identico: nao gera commit vazio.
-      if (Buffer.from(d.content, 'base64').toString('utf-8') === conteudo) { _shas.set(remoto, sha); return true; }
+      if (Buffer.from(d.content, 'base64').toString('utf-8') === conteudo) { _shas.set(remoto, sha); _ultimoHash.set(local, hash); _contarEnvio(local, 0, true); return true; }
     } else if (atual.status !== 404) {
       throw new Error('leitura falhou: HTTP ' + atual.status);
     }
@@ -329,11 +382,14 @@ async function enviar(local) {
       content: Buffer.from(conteudo, 'utf-8').toString('base64'),
       ...(sha ? { sha } : {}),
     };
-    const res = await api(remoto, { method: 'PUT', body: JSON.stringify(corpo) });
+    const corpoJson = JSON.stringify(corpo);
+    const res = await api(remoto, { method: 'PUT', body: corpoJson });
+    _contarEnvio(local, Buffer.byteLength(corpoJson), false);
     if (!res.ok) throw new Error('PUT falhou: HTTP ' + res.status + ' ' + (await res.text()).slice(0, 160));
 
     const d = await res.json();
     _shas.set(remoto, d.content?.sha);
+    _ultimoHash.set(local, hash);
     _ultimoErro = null;
     console.log('[SYNC] ' + local + ' -> ' + repoDados() + '/' + remoto);
     return true;
@@ -350,7 +406,12 @@ async function enviar(local) {
  */
 export function agendarPush(local) {
   if (!sincronizacaoAtiva() || !caminhoValido(local)) return;
-  if (_timers.has(local)) clearTimeout(_timers.get(local));
+  // Janela FIXA (desde 13/11/2026): a primeira gravacao agenda o envio e as
+  // seguintes pegam carona — o envio le o disco na hora e leva a versao mais
+  // nova. Antes cada gravacao reiniciava o timer; com 3 min, arquivo gravado a
+  // todo minuto nunca subiria. Timer de nova tentativa tambem conta como
+  // agendado.
+  if (_timers.has(local)) return;
   _timers.set(local, setTimeout(() => {
     _timers.delete(local);
     enviarComNovaTentativa(local).catch(e => console.error('[SYNC] Erro inesperado:', e.message));
