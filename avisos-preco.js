@@ -2330,6 +2330,16 @@ function pausarBuscaMl(motivo) {
   s.pausadaAte = new Date(Date.now() + BUSCA_ML_PAUSA_H * MS_H).toISOString(); s.motivoPausa = motivo;
   console.warn('[AVISOS] Busca no ML pausada por ' + BUSCA_ML_PAUSA_H + ' h: ' + motivo);
 }
+// Verificação resolvida na leitura de páginas (16/11/2026, decisão do Davi):
+// a pausa de 6 h da busca termina junto, sem esperar o prazo.
+export function retomarBuscaMlAposVerificacao() {
+  const s = estadoBuscaMl();
+  if (!s.pausadaAte || Date.parse(s.pausadaAte) <= Date.now()) return false;
+  s.pausadaAte = null; s.motivoPausa = null;
+  gravar();
+  console.log('[AVISOS] Busca no ML retomada: verificação resolvida na extensão.');
+  return true;
+}
 function buscaMlTravada() {
   if (process.env.AVISOS_BUSCA_ML === '0') return 'desligada';
   const s = estadoBuscaMl();

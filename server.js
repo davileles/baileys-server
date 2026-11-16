@@ -186,7 +186,7 @@ import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previa
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora, previaDisparoPedido,
          pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
          acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido,
-         enviarMensagemOperador, encerrarAtendimento, numeroDosAvisos } from './avisos-preco.js';
+         enviarMensagemOperador, encerrarAtendimento, numeroDosAvisos, retomarBuscaMlAposVerificacao } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio, gruposDosEnviosDoDia } from './links-rastreio.js';
 
@@ -752,8 +752,11 @@ configurarAvisosPaginasMl({
       + '2. Resolva o que o ML pedir (captcha ou confirmar a conta)\n'
       + '3. Na extensão, clique em *Já resolvi* — ou espere: ela testa sozinha a cada 15 min\n\n'
       + 'Enquanto isso, as ofertas do ML seguem pela API oficial.' }),
-  aoLiberar: () => registrarAlerta({ nivel: 'info', origem: 'ml', chave: 'ml:verificacao-pagina-ok', soRegistrar: true,
-    titulo: 'Leitura de páginas do ML voltou', corpo: 'A página de produto voltou a abrir pela extensão; leitura retomada.' }),
+  aoLiberar: () => {
+    try { retomarBuscaMlAposVerificacao(); } catch (e) { console.error('[AVISOS] Falha ao retomar busca no ML:', e.message); }
+    return registrarAlerta({ nivel: 'info', origem: 'ml', chave: 'ml:verificacao-pagina-ok', soRegistrar: true,
+      titulo: 'Leitura de páginas do ML voltou', corpo: 'A página de produto voltou a abrir pela extensão; leitura retomada.' });
+  },
 });
 const UPLOAD_DIR    = './tmp-uploads';
 
