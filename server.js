@@ -8408,6 +8408,14 @@ let _stub2Total = 0;
 // jid -> nome do grupo. Preenchido sob demanda para o painel mostrar de onde
 // veio cada oferta sem depender de uma chamada extra ao WhatsApp.
 const NOMES_GRUPOS = new Map();
+// jid -> data de criacao do grupo (ISO). Vem junto no groupFetchAllParticipating
+// (campo creation, em segundos); a rota /grupos devolve como criadoEm. O painel
+// do Travel Concierge usa para sugerir o inicio do contrato (17/11/2026).
+const CRIACAO_GRUPOS = new Map();
+function anotarCriacaoGrupo(g) {
+  const s = Number(g && g.creation);
+  if (g && g.id && s > 0) CRIACAO_GRUPOS.set(g.id, new Date(s * 1000).toISOString());
+}
 // As regras de afiliado por prefixo de nome (config_tsp.afiliados.regrasPorNome)
 // precisam do nome do grupo, que so existe aqui. Registrado uma vez: o mapa e
 // mutavel, entao a config sempre le o cache mais recente.
@@ -23991,7 +23999,7 @@ app.get('/grupos', async (req, res) => {
     try {
       const chats = await contasExtras.get(idConta).sock.groupFetchAllParticipating();
       const grupos = Object.values(chats)
-        .map(g => ({ id: g.id, nome: g.subject || '(sem nome)' }))
+        .map(g => { anotarCriacaoGrupo(g); return { id: g.id, nome: g.subject || '(sem nome)', criadoEm: CRIACAO_GRUPOS.get(g.id) || null }; })
         .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
       // Nomes tambem no cache global: paineis resolvem jid->nome por ele.
       for (const g of grupos) if (!NOMES_GRUPOS.has(g.id)) NOMES_GRUPOS.set(g.id, g.nome);
@@ -24004,11 +24012,13 @@ app.get('/grupos', async (req, res) => {
   // sem prazo, grupo criado ou renomeado depois do boot nunca aparecia.
   const _respCache = (aviso) => {
     const grupos = [...NOMES_GRUPOS.entries()]
-      .map(([id, nome]) => ({ id, nome }))
+      .map(([id, nome]) => ({ id, nome, criadoEm: CRIACAO_GRUPOS.get(id) || null }))
       .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
     return res.json({ ok:true, total:grupos.length, grupos, doCache:true, ...(aviso ? { aviso } : {}) });
   };
-  const _cacheFresco = NOMES_GRUPOS.size && (Date.now() - _gruposListaTs) < GRUPOS_LISTA_TTL_MS;
+  // Sem nenhuma data de criacao anotada (cache montado por outro caminho), le de
+  // novo uma vez: o concierge depende do criadoEm.
+  const _cacheFresco = NOMES_GRUPOS.size && CRIACAO_GRUPOS.size && (Date.now() - _gruposListaTs) < GRUPOS_LISTA_TTL_MS;
   if (_cacheFresco && req.query.refresh !== '1') return _respCache();
   // Principal fora do ar (bloqueio/logout): a lista sai das contas da casa que
   // estao conectadas (ticos). Antes ficava presa ao cache da principal — grupo
@@ -24020,12 +24030,12 @@ app.get('/grupos', async (req, res) => {
       const res2 = await Promise.allSettled(leitores.map(l => l.sock.groupFetchAllParticipating()));
       res2.forEach((r, i) => {
         if (r.status !== 'fulfilled') { console.warn('[GRUPOS] ' + leitores[i].id + ': ' + (r.reason?.message || r.reason)); return; }
-        for (const g of Object.values(r.value || {})) if (!mapa.has(g.id)) mapa.set(g.id, g.subject || '(sem nome)');
+        for (const g of Object.values(r.value || {})) { anotarCriacaoGrupo(g); if (!mapa.has(g.id)) mapa.set(g.id, g.subject || '(sem nome)'); }
       });
       if (mapa.size) {
         for (const [id, nome] of mapa) NOMES_GRUPOS.set(id, nome);
         _gruposListaTs = Date.now();
-        const grupos = [...mapa.entries()].map(([id, nome]) => ({ id, nome }))
+        const grupos = [...mapa.entries()].map(([id, nome]) => ({ id, nome, criadoEm: CRIACAO_GRUPOS.get(id) || null }))
           .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
         return res.json({ ok:true, total:grupos.length, grupos,
           viaContas: leitores.map(l => l.id), aviso:'Principal desconectada — lista lida de ' + leitores.map(l => l.id).join(', ') + '.' });
@@ -24049,9 +24059,9 @@ app.get('/grupos', async (req, res) => {
       if (r.status !== 'fulfilled') continue;
       for (const g of Object.values(r.value || {})) if (!chats[g.id]) chats[g.id] = g;
     }
-    for (const g of Object.values(chats)) NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)');
+    for (const g of Object.values(chats)) { NOMES_GRUPOS.set(g.id, g.subject || '(sem nome)'); anotarCriacaoGrupo(g); }
     _gruposListaTs = Date.now();
-    const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
+    const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)',criadoEm:CRIACAO_GRUPOS.get(g.id)||null})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
     res.json({ ok:true, total:grupos.length, grupos });
   } catch(err) {
     if (err.message?.includes('Connection Closed') || err.message?.includes('Connection Terminated')) {
@@ -24060,7 +24070,8 @@ app.get('/grupos', async (req, res) => {
       if (!ok) return res.status(503).json({ ok:false, erro:'WhatsApp reconectando, tente novamente.' });
       try {
         const chats  = await sock.groupFetchAllParticipating();
-        const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)'})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
+        for (const g of Object.values(chats)) anotarCriacaoGrupo(g);
+        const grupos = Object.values(chats).map(g=>({id:g.id,nome:g.subject||'(sem nome)',criadoEm:CRIACAO_GRUPOS.get(g.id)||null})).sort((a,b)=>a.nome.localeCompare(b.nome,'pt-BR'));
         return res.json({ ok:true, total:grupos.length, grupos });
       } catch(err2) { return res.status(500).json({ ok:false, erro:err2.message }); }
     }
