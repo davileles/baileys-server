@@ -248,7 +248,9 @@
         "async function _faGrupoSuspenso(",
         "function _faProximo(",
         "function _gmContarRemocaoTico(",
-        "remocaoSoTico: true"
+        "remocaoSoTico: true",
+        "app.get('/memoria'",
+        "function _gravarShardsMembros("
       ]
     },
     "radar-awin.js": {
@@ -450,7 +452,8 @@
         "export function agendarPush",
         "export function estadoSync",
         "export function sincronizacaoAtiva",
-        "const RE_NOME_LINKS"
+        "const RE_NOME_LINKS",
+        "function janelaDoArquivo("
       ]
     },
     "tenants.js": {
@@ -579,6 +582,13 @@
         "export async function trabalhoOutrasLojas(",
         "function melhorOferta(",
         "async function cardParaGrupos("
+      ]
+    },
+    "memoria.js": {
+      "minLinhas": 100,
+      "obrigatorio": [
+        "export function registrarMedidor(",
+        "export function estadoMemoria("
       ]
     }
   }

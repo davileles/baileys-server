@@ -1,4 +1,5 @@
 import { medirRespostas, estadoEgress } from './egress.js'; // PRIMEIRO import: mede o egress desde o boot
+import { registrarMedidor, estadoMemoria } from './memoria.js';
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -19469,6 +19470,62 @@ app.get('/egress', (req, res) => {
   res.json({ ok:true, ...estadoEgress({ syncGithubPorArquivo: enviosPorArquivo() }) });
 });
 
+// Memoria por parte do servidor (memoria.js, 17/11/2026): a RAM do
+// baileys-server sobe ~0,15 GB/h entre deploys e virou o maior custo no
+// Railway. GET /memoria mostra rss, heap, memoria fora do heap, tendencia em
+// MB/h e o tamanho das estruturas grandes; ?detalhe=1 estima os MB de cada uma.
+// Os medidores leem as estruturas so quando chamados (closure): a ordem de
+// declaracao no arquivo nao importa.
+{
+  const somaTamanhos = (mapa, f) => { let n = 0; for (const v of mapa.values()) n += f(v) || 0; return n; };
+  registrarMedidor('mensagensEnviadas (store de reenvio)', () => mensagensEnviadas);
+  registrarMedidor('_revogadas', () => _revogadas);
+  registrarMedidor('_retryPorMsg', () => _retryPorMsg);
+  registrarMedidor('_sombraLeitura', () => _sombraLeitura);
+  registrarMedidor('_histEnvioCache (registros)', () => ({ itens: somaTamanhos(_histEnvioCache, v => v?.length) }));
+  registrarMedidor('_idsVistos', () => _idsVistos);
+  registrarMedidor('_idsLidosEmReserva', () => _idsLidosEmReserva);
+  registrarMedidor('_membrosLog.eventos', () => _membrosLog.eventos);
+  registrarMedidor('_membrosVistos', () => _membrosVistos);
+  registrarMedidor('_campMidiaCache', () => ({ itens: _campMidiaCache.size,
+    mb: Math.round(somaTamanhos(_campMidiaCache, b => b?.length) / 1048576 * 10) / 10 }));
+  registrarMedidor('_campJids', () => _campJids);
+  registrarMedidor('_cacheEncurtador', () => _cacheEncurtador);
+  registrarMedidor('bufferAgrupamento', () => bufferAgrupamento);
+  registrarMedidor('bufferOfertaMilhas', () => bufferOfertaMilhas);
+  registrarMedidor('_esperandoPar', () => _esperandoPar);
+  registrarMedidor('_filaGrupo', () => _filaGrupo);
+  registrarMedidor('_bugHistorico (mensagens)', () => ({ itens: somaTamanhos(_bugHistorico, v => v?.length) }));
+  registrarMedidor('_redirVistos', () => _redirVistos);
+  registrarMedidor('_shieldVistos', () => _shieldVistos);
+  registrarMedidor('_cupomPagCat', () => _cupomPagCat);
+  registrarMedidor('_divulgGruposCache', () => _divulgGruposCache);
+  registrarMedidor('_ggMetaCache', () => _ggMetaCache);
+  registrarMedidor('_ggConviteCache', () => _ggConviteCache);
+  registrarMedidor('_tgEntidadesPorId', () => _tgEntidadesPorId);
+  registrarMedidor('NOMES_GRUPOS', () => NOMES_GRUPOS);
+  registrarMedidor('NOMES_GRUPOS_EXTRAS', () => NOMES_GRUPOS_EXTRAS);
+  registrarMedidor('ultimaCapturaPorGrupo', () => ultimaCapturaPorGrupo);
+  registrarMedidor('_retriesPorUser', () => _retriesPorUser);
+  registrarMedidor('_retriesPorGrupo', () => _retriesPorGrupo);
+  registrarMedidor('_cdvEntradaVista', () => _cdvEntradaVista);
+  registrarMedidor('_autoTransfRecentes', () => _autoTransfRecentes);
+  registrarMedidor('_aptidaoSubstituta', () => _aptidaoSubstituta);
+  registrarMedidor('_logSubstituicao', () => _logSubstituicao);
+  registrarMedidor('_ULTIMO_ALERTA', () => _ULTIMO_ALERTA);
+  registrarMedidor('_alertaAdminCache', () => _alertaAdminCache);
+  registrarMedidor('_indecifraveisPorGrupo', () => _indecifraveisPorGrupo);
+  registrarMedidor('_avisosEntrega', () => _avisosEntrega);
+  registrarMedidor('_autocuraEm', () => _autocuraEm);
+  registrarMedidor('_pulsoLeitores', () => _pulsoLeitores);
+  registrarMedidor('_ticksLista', () => _ticksLista);
+  registrarMedidor('_ultimaSelecaoLista', () => _ultimaSelecaoLista);
+  registrarMedidor('contasExtras (contas conectadas)', () => contasExtras);
+}
+app.get('/memoria', (req, res) => {
+  res.json({ ok:true, ...estadoMemoria({ detalhe: req.query.detalhe === '1' }) });
+});
+
 app.get('/sync', async (req, res) => {
   const base = estadoSync();
   res.json({ ok:true, ...base, acesso: base.ativo ? await testarAcesso() : null });
@@ -24720,9 +24777,39 @@ function salvarMembrosLog() {
       if (_membrosLog.eventos.length > MEMBROS_LOG_MAX)
         _membrosLog.eventos = _membrosLog.eventos.slice(-MEMBROS_LOG_MAX);
       escreverAtomico(MEMBROS_LOG_FILE, JSON.stringify(_membrosLog), 'utf-8');
-      agendarPush(MEMBROS_LOG_ARQ);
+      _gravarShardsMembros();
     } catch(e) { console.error('[MEMBROS] Falha ao gravar ledger:', e.message); }
   }, 5000);
+}
+
+// Copia no GitHub por mes (17/11/2026). O ledger inteiro (~9 MB) subia a cada
+// entrada/saida e sozinho gastava ~2 GB/dia de egress no Railway. O arquivo
+// local continua unico (todos os relatorios leem _membrosLog como antes); so a
+// copia de seguranca e dividida: grupos_membros_log_AAAA-MM.json (mes em UTC,
+// pelo ts do evento). Sobe o mes corrente e o mes da gravacao anterior (para
+// os eventos da virada nao ficarem de fora); os meses antigos sobem uma vez,
+// quando o shard ainda nao existe no disco.
+let _membrosShardMesAnterior = null;
+function _gravarShardsMembros() {
+  const mesAtual = new Date().toISOString().slice(0, 7);
+  const reescrever = new Set([mesAtual]);
+  if (_membrosShardMesAnterior && _membrosShardMesAnterior !== mesAtual) reescrever.add(_membrosShardMesAnterior);
+  const porMes = new Map();
+  for (const e of _membrosLog.eventos) {
+    const m = String(e.ts || '').slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(m)) continue;
+    let lista = porMes.get(m);
+    if (!lista) { lista = []; porMes.set(m, lista); }
+    lista.push(e);
+  }
+  for (const [m, eventos] of porMes) {
+    const arq = 'grupos_membros_log_' + m + '.json';
+    const caminho = SESSAO_DIR + '/' + arq;
+    if (!reescrever.has(m) && existsSync(caminho)) continue;
+    escreverAtomico(caminho, JSON.stringify({ mes: m, eventos }), 'utf-8');
+    agendarPush(arq);
+  }
+  _membrosShardMesAnterior = mesAtual;
 }
 
 // Aceita string (Baileys 6) ou objeto de participante (Baileys 7). O id e o que

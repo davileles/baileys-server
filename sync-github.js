@@ -18,7 +18,7 @@
 //   GITHUB_REPO_DADOS   ex: davileles/cdv-tsp-dados
 // ═══════════════════════════════════════════════════════════════════════════
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 
 const SESSAO_DIR = './sessao';
@@ -53,11 +53,10 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   'awin_config.json',
   'tenants.json',            // global: registro de operadores (so na raiz)
   'grupos_censo_hist.json',
-  // Ledger de entradas/saidas. O PUT aceita arquivo grande, mas a leitura via
-  // Contents API para de devolver o conteudo acima de ~1MB: passando disso o
-  // push continua, so a restauracao automatica no boot deixa de funcionar
-  // (o local e mantido, nao corrompido). Perto do limite, virar shard por ano.
-  'grupos_membros_log.json',
+  // Ledger de entradas/saidas: desde 17/11/2026 sobe em shards mensais
+  // (grupos_membros_log_AAAA-MM.json, RE_NOME_MEMBROS abaixo). O arquivo unico
+  // tinha ~9 MB e era reenviado inteiro a cada entrada/saida (1,5 GB em 16 h).
+  // O grupos_membros_log.json do repo fica congelado como estava em 17/11.
   // Ledger ref -> produto do rastreio de desempenho. Precisa sobreviver a
   // deploy: sem ele o relatorio da Amazon fica ilegivel, porque a tag
   // sozinha nao diz qual produto foi divulgado naquele dia.
@@ -111,9 +110,13 @@ const RE_NOME_PRECOS = /^precos_hist_\d{4}-\d{2}\.json$/;
 // esta fora: arquivo pequeno = fallback rapido. Sobem por agendarPush e sao
 // restaurados sob demanda por baixarArquivoDoGitHub (links-rastreio.js).
 const RE_NOME_LINKS = /^links_rastreio_\d{4}-\d{2}-\d{2}\.json$/;
+// Shards mensais do ledger de entradas/saidas de membros (17/11/2026). So o do
+// mes corrente muda; os antigos sobem uma vez. Copia de seguranca: a fonte da
+// verdade continua sendo sessao/grupos_membros_log.json no volume.
+const RE_NOME_MEMBROS = /^grupos_membros_log_\d{4}-\d{2}\.json$/;
 function nomeSincronizavel(nome) {
   return NOMES_SINCRONIZAVEIS.has(nome) || RE_NOME_HISTORICO.test(nome) || RE_NOME_PRECOS.test(nome)
-      || RE_NOME_LINKS.test(nome);
+      || RE_NOME_LINKS.test(nome) || RE_NOME_MEMBROS.test(nome);
 }
 
 // Caminho relativo valido: nome permitido na raiz, ou tenants/<id>/<nome>.
@@ -415,7 +418,24 @@ export function agendarPush(local) {
   _timers.set(local, setTimeout(() => {
     _timers.delete(local);
     enviarComNovaTentativa(local).catch(e => console.error('[SYNC] Erro inesperado:', e.message));
-  }, DEBOUNCE_MS));
+  }, janelaDoArquivo(local)));
+}
+
+// Janela por tamanho (17/11/2026): arquivo acima de 1 MB espera 3 min por MB,
+// ate 30 min (rastreio.json ~9 MB -> 27 min; serie de precos ~4 MB -> 12 min).
+// Cada envio manda o arquivo inteiro, entao sao esses que pesam no egress.
+// Seguro porque: (1) a fonte da verdade e o volume /app/sessao, o GitHub e
+// copia; (2) acima de 1 MB a Contents API nao devolve o conteudo, entao o boot
+// nunca restaura esses arquivos por cima do disco (nao ha versao velha
+// voltando); (3) o SIGTERM continua mandando o que estiver pendente.
+const MB = 1048576;
+const JANELA_GRANDE_TETO_MS = 30 * 60000;
+function janelaDoArquivo(local) {
+  try {
+    const bytes = statSync(SESSAO_DIR + '/' + local).size;
+    if (bytes <= MB) return DEBOUNCE_MS;
+    return Math.min(JANELA_GRANDE_TETO_MS, Math.ceil(bytes / MB) * DEBOUNCE_MS);
+  } catch { return DEBOUNCE_MS; }
 }
 
 /** Arquivos gravados no disco que ainda nao subiram (debounce, fila ou nova tentativa). */

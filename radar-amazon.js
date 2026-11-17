@@ -3731,7 +3731,7 @@ function salvarRastreio() {
   const limite = Date.now() - RASTREIO_RETENCAO_DIAS * 86400000;
   r.atribuicoes = (r.atribuicoes || []).filter(a => new Date(a.ts || a.data).getTime() >= limite);
   try {
-    writeFileSync(cT('rastreio.json'), JSON.stringify(r, null, 1), 'utf-8');
+    writeFileSync(cT('rastreio.json'), JSON.stringify(r), 'utf-8');   // compacto desde 17/11/2026: o arquivo (~9 MB) sobe inteiro ao GitHub
     agendarPush(pT('rastreio.json'));
   } catch (e) { console.log('[RASTREIO] Erro ao salvar:', e.message); }
 }
