@@ -2366,17 +2366,50 @@ export async function processarTextoMl(texto, opcoes = {}) {
   const legiveis = canonicas.filter(u => dadosPorUrl.has(u));
   if (!legiveis.length) return descartes;
 
+  // LINK FIXADO NA OFERTA (17/11/2026, mesma regra da vitrine de 24/10):
+  // catalogo /p/ compartilhado sem vendedor abre no vendedor que o ML escolher
+  // para quem clica — muitas vezes outro, com outro preco (ou so "Ver opcoes de
+  // compra"). Quando sabemos a oferta de onde saiu o preco, o link de afiliado
+  // e gerado para /p/{id}?pdp_filters=item_id:{item}. Se o painel recusar,
+  // segunda rodada com o link do catalogo, como antes.
+  const alvoDe = new Map();
+  for (const url of legiveis) alvoDe.set(url, urlOfertaCatalogoMl(url, dadosPorUrl.get(url)) || url);
+  const titulosAlvo = {};
+  for (const url of legiveis) if (titulos[url]) titulosAlvo[alvoDe.get(url)] = titulos[url];
+  const pegar = (mapa, alvo, url) => mapa.get(alvo) || mapa.get(url) || mapa.get(idDeUrl(alvo)) || mapa.get(idDeUrl(url));
+
   let links;
-  try { links = await gerarLinksAfiliadoMl(legiveis, { titulos }); }
+  try { links = await gerarLinksAfiliadoMl(legiveis.map(u => alvoDe.get(u)), { titulos: titulosAlvo }); }
   catch (e) {
     console.error('[ML] createLink falhou:', e.message);
     return [...descartes, ...legiveis.map(u => ({ produto: { loja: 'Mercado Livre', link: u },
                                                  descartadoPor: 'painel de afiliados: ' + e.message }))];
   }
+  const resultado = new Map();
+  const recusados = [];
+  for (const url of legiveis) {
+    const alvo = alvoDe.get(url);
+    const r = pegar(links, alvo, url);
+    if (alvo !== url && (!r || r.erro)) {
+      console.warn('[ML] ' + idProdutoMl(url) + ' — painel recusou o link fixado na oferta ('
+        + ((r && r.erro) || 'sem resposta') + '); usando o link do catalogo');
+      recusados.push(url);
+    } else resultado.set(url, r);
+  }
+  if (recusados.length) {
+    try {
+      const t2 = {};
+      for (const u of recusados) if (titulos[u]) t2[u] = titulos[u];
+      const l2 = await gerarLinksAfiliadoMl(recusados, { titulos: t2 });
+      for (const u of recusados) resultado.set(u, l2.get(u) || l2.get(idDeUrl(u)));
+    } catch (e) {
+      for (const u of recusados) resultado.set(u, { erro: 'painel de afiliados: ' + e.message });
+    }
+  }
 
   const saida = [...descartes];
   for (const url of legiveis) {
-    const r = links.get(url) || links.get(idDeUrl(url)) || { erro: 'sem resposta do painel' };
+    const r = resultado.get(url) || { erro: 'sem resposta do painel' };
     if (r.erro) {
       saida.push({ produto: { loja: 'Mercado Livre', titulo: url, link: url },
                    descartadoPor: r.erro });
