@@ -14420,9 +14420,10 @@ const GM_REMOVE_TICO_MAX_DIA_BASE = Math.max(1, parseInt(process.env.GM_REMOVE_T
 // Teto TEMPORARIO (12/11/2026, pedido do Davi): o link dos grupos do CDV vazou
 // em canais do Telegram e muita gente sem direito esta entrando. Ate o fim de
 // 15/11/2026 (SP) cada tico pode remover ate GM_REMOVE_TICO_MAX_DIA_TEMP (25)
-// por dia; depois volta sozinho ao teto base, sem deploy.
+// por dia; depois volta sozinho ao teto base, sem deploy. Religado em 17/11/2026
+// ate o fim de 20/11 para esvaziar a fila do grupo do Balcao (verificacao).
 const GM_REMOVE_TICO_TEMP_MAX = Math.max(1, parseInt(process.env.GM_REMOVE_TICO_MAX_DIA_TEMP || '25', 10) || 25);
-const GM_REMOVE_TICO_TEMP_ATE = Date.parse(process.env.GM_REMOVE_TICO_TEMP_ATE || '2026-11-15T23:59:59-03:00');
+const GM_REMOVE_TICO_TEMP_ATE = Date.parse(process.env.GM_REMOVE_TICO_TEMP_ATE || '2026-11-20T23:59:59-03:00');
 function gmRemoveTicoMaxDia() {
   return Date.now() <= GM_REMOVE_TICO_TEMP_ATE ? Math.max(GM_REMOVE_TICO_MAX_DIA_BASE, GM_REMOVE_TICO_TEMP_MAX) : GM_REMOVE_TICO_MAX_DIA_BASE;
 }
