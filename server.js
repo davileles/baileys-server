@@ -222,6 +222,9 @@ import {
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
   formatarOfertaMl, amostrasCardSocialMl, paginaMlBloqueadaHtml,
 } from './radar-ml.js';
+import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
+  salvarConfig as salvarConfigNotasShopee, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
+  marcarNota as marcarNotaShopee, baixarDanfse, previaDps } from './notas-shopee.js';
 import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -22869,6 +22872,91 @@ app.post('/ml/pagina/zerar', (req, res) => {
 app.get('/ml/pagina/estado', (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.json({ ok: true, ...estadoPaginasMl() });
+});
+
+// ── NOTAS SHOPEE (NFS-e Nacional das comissões extras de vendedores) ────────
+// notas-shopee.js. A extensão busca o relatório mensal da Shopee no Chrome do
+// operador (token da extensão); o painel (raiz logada) configura, cadastra o
+// certificado A1 e acompanha. Certificado e senha nunca saem do volume.
+iniciarNotasShopee(SESSAO_DIR, { avisar: (a) => registrarAlerta(a) });
+app.get('/notas-shopee/tarefa', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  res.json({ ok: true, tarefa: tarefaParaExtensao() });
+});
+app.post('/notas-shopee/relatorio', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  try { res.json(receberRelatorio(req.body || {})); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+function exigirRaizNotas(req, res) {
+  res.set('Cache-Control', 'no-store');
+  if (ehAdminRaiz(req)) return true;
+  res.status(403).json({ ok: false, erro: 'só o administrador logado' });
+  return false;
+}
+app.get('/notas-shopee', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  res.json(estadoNotasShopee());
+});
+app.post('/notas-shopee/config', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json({ ok: true, config: salvarConfigNotasShopee(req.body || {}) }); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.post('/notas-shopee/certificado', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json({ ok: true, certificado: salvarCertificado(req.body || {}) }); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.post('/notas-shopee/importar-xml', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json({ ok: true, ...importarXmlEmitente(String((req.body || {}).xml || '')) }); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.post('/notas-shopee/mes/:mes/buscar', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json({ ok: true, tarefa: pedirRelatorio(req.params.mes, 'painel') }); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+// Relatório importado à mão no painel (CSV da Shopee convertido no navegador):
+// mesmo caminho da extensão. Serve para meses atrasados ou extensão fora do ar.
+app.post('/notas-shopee/mes/:mes/importar', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json(receberRelatorio({ mes: req.params.mes, itens: (req.body || {}).itens, origem: 'arquivo' })); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.post('/notas-shopee/mes/:mes/emitir', async (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  // Lote grande leva minutos: responde em 2 s e a emissão segue em segundo plano
+  // (o painel acompanha por GET /notas-shopee, campo `emitindo`).
+  const p = emitirMesNotasShopee(req.params.mes, { origem: 'painel', so: Array.isArray((req.body || {}).so) ? req.body.so : null });
+  p.catch(e => console.error('[NFSE] emissão pelo painel:', e.message));
+  try {
+    const r = await Promise.race([p, new Promise(ok => setTimeout(() => ok(null), 2000))]);
+    res.json(r || { ok: true, emAndamento: true });
+  } catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.post('/notas-shopee/mes/:mes/teste', async (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json(await emitirTesteNotasShopee(req.params.mes, (req.body || {}).chave || null)); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.post('/notas-shopee/mes/:mes/nota/:chave/:acao', (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json({ ok: true, nota: marcarNotaShopee(req.params.mes, req.params.chave, req.params.acao) }); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.get('/notas-shopee/mes/:mes/previa/:chave', async (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.type('application/xml').send(await previaDps(req.params.mes, req.params.chave)); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+app.get('/notas-shopee/danfse/:chave', async (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try {
+    const pdf = await baixarDanfse(req.params.chave, req.query.ambiente === 'producaorestrita' ? 'producaorestrita' : 'producao');
+    res.type('application/pdf').set('Content-Disposition', 'inline; filename="NFSe-' + req.params.chave + '.pdf"').send(pdf);
+  } catch (e) { res.status(502).json({ ok: false, erro: e.message }); }
 });
 
 app.get('/cupons/auto/leitura', (req, res) => {
