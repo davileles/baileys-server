@@ -180,6 +180,10 @@ import { bootBotOfertas, tratarUpdateBotOfertas, BOT_OFERTAS_PATH,
 // Matching de desejos de compra x ofertas do radar. Controlado por MATCH_DESEJOS
 // (off | aviso | on). Em 'off' — o padrao — o modulo nao faz nada.
 import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
+// Inclusao de ex-alunos nos grupos do CDV pela conversa no WhatsApp (tico-02,
+// link wa.me com mensagem pronta). Ver cabecalho de inclusao-cdv.js.
+import { iniciarInclusaoCdv, observarInclusaoCdv, estadoInclusaoCdv, configurarInclusaoCdv, retomarInclusaoCdv,
+         pausarInclusaoCdv, removerDaFilaInclusaoCdv, reiniciarConversaInclusaoCdv } from './inclusao-cdv.js';
 // Avisos de preco no privado para clientes do Tica Promos (pagina /avisos/ do
 // tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
@@ -1901,7 +1905,9 @@ async function conectarConta(id) {
         if (ehContaCampanha(id)) campanhaMarcarResposta(msg).catch(() => {});
         if (tenantDaConta(id) === TENANT_PADRAO) registrarSombra('baileys:' + apelidoDaConta(id), msg);
         if (tenantDaConta(id) === TENANT_PADRAO) registrarContatoPrivado(apelidoDaConta(id), c.sock, msg);
-        if (tenantDaConta(id) === TENANT_PADRAO) observarMensagemAvisos(apelidoDaConta(id), msg);
+        // A conversa de inclusao nos grupos do CDV vem antes dos avisos de preco
+        // (dividem o tico-02): mensagem que e dela nao recebe resposta dos avisos.
+        if (tenantDaConta(id) === TENANT_PADRAO && !observarInclusaoCdv(apelidoDaConta(id), c.sock, msg)) observarMensagemAvisos(apelidoDaConta(id), msg);
         if (!msg.message) continue;
         if (tenantDaConta(id) === TENANT_PADRAO && String(msg.key?.remoteJid || '').endsWith('@g.us')) {
           shieldObservar(msg, apelidoDaConta(id), c.sock).catch(e => console.warn('[SHIELD] ' + e.message));
@@ -12922,7 +12928,7 @@ async function conectar() {
           if (_debugUpserts.length > 60) _debugUpserts.shift();
           registrarSombra('baileys:principal', mm);
           registrarContatoPrivado('principal', sock, mm);
-          observarMensagemAvisos('principal', mm);
+          if (!observarInclusaoCdv('principal', sock, mm)) observarMensagemAvisos('principal', mm);
           observarRevoke(mm, 'revoke visto pela principal');
           if (mm.messageStubType === 2) {
             _stub2Total++;
@@ -14928,7 +14934,7 @@ function _gmFimJob(j, erro) {
 
 // Cria (e dispara) a tarefa de participante. Devolve { status, body } para o
 // endpoint responder — a reentrada do CDV usa o mesmo caminho.
-async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, origem, soTico }) {
+async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, origem, soTico, pausaAdd }) {
   acao = String(acao || '').trim();
   if (!GM_ACOES.has(acao)) return { status: 400, body: { ok: false, erro: 'acao invalida — use add, remove, promote ou demote' } };
   soTico = soTico === true;
@@ -14987,8 +14993,13 @@ async function _gmCriarTarefaParticipante({ acao, telefone, participante, jids, 
     }
   }
 
+  // pausaAdd [min, max] ms (opcional; so inclusao e so mais lenta que o padrao):
+  // a inclusao pela conversa do WhatsApp (inclusao-cdv.js) usa ~3 min entre grupos.
+  const pausaPropria = acao === 'add' && Array.isArray(pausaAdd) && pausaAdd.length === 2
+    && Number(pausaAdd[0]) >= GM_PAUSA.add[0] && Number(pausaAdd[1]) >= Number(pausaAdd[0])
+    ? [Number(pausaAdd[0]), Number(pausaAdd[1])] : null;
   const j = _gmNovoJob({ tipo: 'participante', acao, alvo: digitos || partId, origem: origem || 'painel',
-    total: pedidos.length, executorFixo: contato ? contato.conta : null, soTico });
+    total: pedidos.length, executorFixo: contato ? contato.conta : null, soTico, pausaPropria });
   _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato, casa, soTico })
     .catch(e => _gmFimJob(j, e.message));
   return { status: 202, body: { ok: true, jobId: j.id, total: pedidos.length, executor: j.executorFixo,
@@ -15167,7 +15178,7 @@ async function _gmRodarParticipante(j, { acao, digitos, partId, pedidos, contato
       return _gmFimJob(j, 'a conta ' + exec.id + ' caiu logo depois de "' + nome + '" — parei aqui. Confira a conexao dela antes de tentar de novo.');
     }
 
-    if (i < pedidos.length - 1) await _gmPausa(j, GM_PAUSA[acao]);
+    if (i < pedidos.length - 1) await _gmPausa(j, j.pausaPropria || GM_PAUSA[acao]);
   }
   _gmFimJob(j);
 }
@@ -27300,6 +27311,98 @@ iniciarAvisosPreco({
   montarAmazon: montarOfertasVitrine,
   montarShopee: montarOfertasShopeeVitrine,
   montarMl: montarOfertasMlVitrine,
+});
+
+// ── INCLUSAO NOS GRUPOS DO CDV PELA CONVERSA (inclusao-cdv.js, 18/11/2026) ────
+// Telefone real de quem escreveu: o JID da conversa pode vir como LID.
+async function _inclTelefoneDe(s, msg) {
+  const k = msg?.key || {};
+  for (const v of [k.senderPn, k.remoteJidAlt, k.remoteJid]) {
+    if (String(v || '').endsWith('@s.whatsapp.net')) { const d = _gmDigitos(v); if (d) return d; }
+  }
+  for (const v of [k.remoteJid, k.remoteJidAlt]) {
+    if (!String(v || '').endsWith('@lid')) continue;
+    try { const d = _gmDigitos(await s?.signalRepository?.lidMapping?.getPNForLID?.(v)); if (d) return d; } catch (e) {}
+  }
+  return null;
+}
+// Em quais destes grupos o telefone ja esta (null = ninguem conseguiu ler).
+async function _inclJaEsta(telefone, jids) {
+  const retratos = await _gmRetratos(false);
+  if (!retratos.length) return null;
+  const ids = new Set(_reVariantes(telefone));
+  for (const v of [...ids]) {
+    try { const d = _gmDigitos(await retratos[0].sock?.signalRepository?.lidMapping?.getLIDForPN?.(v + '@s.whatsapp.net')); if (d) ids.add(d); }
+    catch (e) {}
+  }
+  const dentro = new Set();
+  for (const jid of jids) {
+    const md = _gmMeta(retratos, jid);
+    if (md && (md.participants || []).some(p => _gmIdsParticipante(p).some(n => ids.has(n)))) dentro.add(jid);
+  }
+  return dentro;
+}
+async function _inclProxy(caminho, corpo) {
+  if (!CAMPANHAS_KEY) throw new Error('CAMPANHAS_KEY nao definida');
+  const r = await fetch(CDV_PROXY_URL + caminho, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CDV-Op': CAMPANHAS_KEY },
+    body: JSON.stringify(corpo || {}), signal: AbortSignal.timeout(90000),
+  });
+  const d = await r.json().catch(() => null);
+  if (!d) throw new Error('proxy respondeu HTTP ' + r.status);
+  if (!r.ok && d.ok === false && d.erro) throw new Error(d.erro);
+  return d;
+}
+iniciarInclusaoCdv({
+  caminho: SESSAO_DIR + '/inclusao_cdv.json',
+  escreverAtomico,
+  enviar: (apelido, jid, texto) => _enviarDmAvisos(apelido, jid, texto),
+  telefoneDe: _inclTelefoneDe,
+  proxy: _inclProxy,
+  jaEsta: _inclJaEsta,
+  estadosCdv: () => { try { return estadosCdv(); } catch (e) { return []; } },
+  criarTarefa: (telefone, jids, pausaAdd) => _gmCriarTarefaParticipante({ acao: 'add', telefone, jids, origem: 'inclusao-cdv', pausaAdd }),
+  tarefa: (id) => _gm().jobs.get(id) || null,
+  avisarOperador: (texto) => enviarMensagem(GRUPOS.operador, { text: texto }),
+  ia: (system, texto) => chamarClaude(system, texto, 300, 'claude-haiku-4-5'),
+});
+function _inclAutorizado(req, res) {
+  if (ehAdminRaiz(req)) return true;
+  if (CAMPANHAS_KEY && (req.headers['x-cdv-op'] || '') === CAMPANHAS_KEY) return true;
+  res.status(401).json({ ok: false, erro: 'nao autorizado' });
+  return false;
+}
+// Estado da inclusao: config, fila, quem esta sendo incluido, conversas e o link wa.me.
+app.get('/cdv/inclusao', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  const est = estadoInclusaoCdv();
+  let numero = null;
+  try {
+    if (est.config.conta === 'principal') numero = telefoneDaConta(sock);
+    else { const c = contasExtras.get(contaIdDe(TENANT_PADRAO, est.config.conta)); numero = c?.sock ? telefoneDaConta(c.sock) : null; }
+  } catch (e) {}
+  const link = numero ? 'https://wa.me/' + String(numero).replace(/\D/g, '') + '?text=' + encodeURIComponent(est.mensagemGatilho) : null;
+  res.json({ ok: true, numero, link, ...est });
+});
+app.post('/cdv/inclusao/config', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  res.json({ ok: true, config: configurarInclusaoCdv(req.body || {}) });
+});
+app.post('/cdv/inclusao/retomar', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  retomarInclusaoCdv(); res.json({ ok: true });
+});
+app.post('/cdv/inclusao/pausar', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  pausarInclusaoCdv(req.body?.motivo); res.json({ ok: true });
+});
+app.post('/cdv/inclusao/fila/remover', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  res.json({ ok: removerDaFilaInclusaoCdv(String(req.body?.id || '')) });
+});
+app.post('/cdv/inclusao/conversa/reiniciar', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  res.json({ ok: true, removidas: reiniciarConversaInclusaoCdv(req.body?.telefone) });
 });
 
 function _ipDaReq(req) {
