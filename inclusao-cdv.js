@@ -501,7 +501,7 @@ async function processarBoasVindas() {
   const ufPorJid = new Map((_d.estadosCdv() || []).map(x => [x.jid, x.uf]));
   const links = [], adicionar = [];
   for (const g of faltam.filter(x => !ufPorJid.has(x.jid))) {
-    let removido = !!g.removidoPeloTico;
+    let removido = !!(g.removidoPeloTico || g.exAluno);
     if (!removido) { try { removido = await _d.removidoPorAdmin(b.telefone, g.jid); } catch (err) {} }
     let link = null;
     if (!removido) { try { link = await _d.linkConvite(g.jid); } catch (err) { link = null; } }
