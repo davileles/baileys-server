@@ -183,7 +183,8 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 // Inclusao de ex-alunos nos grupos do CDV pela conversa no WhatsApp (tico-02,
 // link wa.me com mensagem pronta). Ver cabecalho de inclusao-cdv.js.
 import { iniciarInclusaoCdv, observarInclusaoCdv, estadoInclusaoCdv, configurarInclusaoCdv, retomarInclusaoCdv,
-         pausarInclusaoCdv, removerDaFilaInclusaoCdv, reiniciarConversaInclusaoCdv } from './inclusao-cdv.js';
+         pausarInclusaoCdv, removerDaFilaInclusaoCdv, reiniciarConversaInclusaoCdv, configInclusaoCdv,
+         agendarBoasVindasCdv, textoBoasVindasCdv } from './inclusao-cdv.js';
 // Avisos de preco no privado para clientes do Tica Promos (pagina /avisos/ do
 // tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
@@ -1844,6 +1845,7 @@ async function conectarConta(id) {
         catch (e) { console.error('[MEMBROS] Erro no handler (' + id + '):', e.message); }
         sgEventoParticipantes(apelidoDaConta(id), s, u);
         avisarEntradaCdv(s, u);
+        registrarSaidaCdv(s, u);
       });
     }
     // Telemetria de "Aguardando mensagem" nos grupos desta conta. SO CONTA:
@@ -12887,6 +12889,7 @@ async function conectar() {
       catch(e) { console.error('[MEMBROS] Erro no handler:', e.message); }
       sgEventoParticipantes('principal', sock, u);
       avisarEntradaCdv(sock, u);
+      registrarSaidaCdv(sock, u);
     });
     // Grupo novo (criado agora ou em que a conta acabou de entrar). Sem isto o
     // cache NOMES_GRUPOS so era preenchido em connection==='open', entao grupo
@@ -25750,6 +25753,17 @@ app.post('/webhook/hubla', async (req, res) => {
     const telefone = extrairTelefone(payload);
     const nome = extrairNome(payload);
     if (!telefone) { console.warn('[Hubla] Telefone não encontrado'); return res.status(200).json({ status: 'sem_telefone' }); }
+    // Desde 18/11/2026 a boas-vindas sai do tico-02 pela inclusao-cdv.js: texto
+    // neutro + os grupos (link para quem nunca foi removido, inclusao com SIM para
+    // quem um admin removeu). O envio direto abaixo fica so se a inclusao estiver desligada.
+    if (configInclusaoCdv().ativo) {
+      const ev = payload.event || {};
+      const nomesOferta = [].concat(ev.products || [ev.product || {}]).flatMap(p => [p?.name, ...((p?.offers || []).map(o => o?.name))]);
+      const premium = nomesOferta.some(n => /premium/i.test(String(n || '')));
+      const r = agendarBoasVindasCdv({ telefone, nome, premium });
+      console.log(`[Hubla] Boas-vindas de ${nome} pela inclusao do CDV: ${r.agendada ? 'agendada' : r.repetida ? 'ja enviada nas ultimas 24 h' : r.jaNaFila ? 'ja na fila' : (r.erro || 'nao agendada')}`);
+      if (r.ok) return res.status(200).json({ status: r.agendada ? 'agendado' : 'ignorado', para: nome });
+    }
     const numeroFormatado = formatarNumero(telefone);
     console.log(`[Hubla] Enviando boas-vindas para ${nome} (${numeroFormatado})`);
     if (!conectado || !sock) { const ok = await aguardarSock(); if (!ok) return res.status(503).json({ error: 'WhatsApp não conectado' }); }
@@ -25758,7 +25772,7 @@ app.post('/webhook/hubla', async (req, res) => {
     const alvoHubla = await resolverJidWhatsApp(telefone, numeroFormatado);
     if (!alvoHubla.existe) console.warn(`[Hubla] ${numeroFormatado} nao confirmado no WhatsApp — tentando mesmo assim.`);
     if (alvoHubla.jid !== numeroFormatado) console.log(`[Hubla] JID corrigido: ${numeroFormatado} → ${alvoHubla.jid}`);
-    await enviarMensagem(alvoHubla.jid, { text: MENSAGEM_BOAS_VINDAS(nome) });
+    await enviarMensagem(alvoHubla.jid, { text: textoBoasVindasCdv(nome, false) });
     console.log(`[Hubla] ✅ Enviado para ${nome}`);
     return res.status(200).json({ status: 'enviado', para: nome });
   } catch (err) { console.error('[Hubla] Erro:', err); return res.status(500).json({ error: 'Erro interno' }); }
@@ -27342,6 +27356,64 @@ async function _inclJaEsta(telefone, jids) {
   }
   return dentro;
 }
+// Link de convite do grupo lido pela conta da inclusao (tico-02, admin dos grupos
+// do CDV). Cache de 12 h: a boas-vindas manda varios por pessoa.
+const _inclConvites = new Map();
+async function _inclLinkConvite(jid) {
+  const c = _inclConvites.get(jid);
+  if (c && Date.now() - c.em < 12 * 3600e3) return c.link;
+  const apelido = configInclusaoCdv().conta;
+  const s = apelido === 'principal' ? sock : contasExtras.get(contaIdDe(TENANT_PADRAO, apelido))?.sock;
+  if (!s) return null;
+  const codigo = await s.groupInviteCode(jid);
+  if (!codigo) return null;
+  const link = 'https://chat.whatsapp.com/' + codigo;
+  _inclConvites.set(jid, { link, em: Date.now() });
+  return link;
+}
+// Um admin tirou essa pessoa do grupo do CDV (e ela nao voltou depois)? Para
+// quem foi removido por admin o link de convite nao abre: precisa ser incluido.
+// O ledger de membros so cobre o Tica Promos, entao as saidas dos grupos do CDV
+// ficam aqui (registrarSaidaCdv, desde 18/11/2026; chave grupo|8 ultimos digitos).
+// As remocoes do Tico anteriores vem do historico do proxy (removidoPeloTico).
+const CDV_SAIDAS_FILE = SESSAO_DIR + '/cdv_saidas.json';
+let _cdvSaidas = {};
+try { if (existsSync(CDV_SAIDAS_FILE)) _cdvSaidas = JSON.parse(readFileSync(CDV_SAIDAS_FILE, 'utf-8')) || {}; } catch (e) { _cdvSaidas = {}; }
+let _cdvSaidasTimer = null;
+function _gravarCdvSaidas() {
+  if (_cdvSaidasTimer) return;
+  _cdvSaidasTimer = setTimeout(() => {
+    _cdvSaidasTimer = null;
+    const corte = Date.now() - 400 * 86400e3;
+    for (const [k, v] of Object.entries(_cdvSaidas)) if (!v || v.em < corte) delete _cdvSaidas[k];
+    try { escreverAtomico(CDV_SAIDAS_FILE, JSON.stringify(_cdvSaidas), 'utf-8'); } catch (e) { console.warn('[INCLUSAO] Falha ao gravar saidas do CDV:', e.message); }
+  }, 5000);
+}
+async function registrarSaidaCdv(s, u) {
+  try {
+    const jid = String((u && u.id) || '');
+    if (!u || (u.action !== 'remove' && u.action !== 'add') || !jid.endsWith('@g.us') || ehGrupoTsp(jid)) return;
+    const autor = _soNumero(u.author);
+    let mudou = false;
+    for (const p of (u.participants || [])) {
+      const id = typeof p === 'string' ? p : String((p && (p.id || p.jid)) || '');
+      let tel = (p && typeof p === 'object') ? _soNumero(p.phoneNumber) : '';
+      if (!tel && /@s\.whatsapp\.net$/.test(id)) tel = _soNumero(id);
+      if (!tel && /@lid$/.test(id)) { try { tel = _soNumero(await s?.signalRepository?.lidMapping?.getPNForLID?.(id)); } catch (e) {} }
+      if (!tel) continue;
+      const k = jid + '|' + tel.slice(-8);
+      const quem = _soNumero(id);
+      if (u.action === 'add') { if (_cdvSaidas[k]) { delete _cdvSaidas[k]; mudou = true; } continue; }
+      _cdvSaidas[k] = { em: Date.now(), admin: !!(autor && autor !== tel && autor !== quem) };
+      mudou = true;
+    }
+    if (mudou) _gravarCdvSaidas();
+  } catch (e) { console.warn('[INCLUSAO] Registro de saida do CDV falhou:', e.message); }
+}
+async function _inclRemovidoPorAdmin(telefone, jid) {
+  const r = _cdvSaidas[jid + '|' + String(telefone || '').replace(/\D/g, '').slice(-8)];
+  return !!(r && r.admin);
+}
 async function _inclProxy(caminho, corpo) {
   if (!CAMPANHAS_KEY) throw new Error('CAMPANHAS_KEY nao definida');
   const r = await fetch(CDV_PROXY_URL + caminho, {
@@ -27365,6 +27437,25 @@ iniciarInclusaoCdv({
   tarefa: (id) => _gm().jobs.get(id) || null,
   avisarOperador: (texto) => enviarMensagem(GRUPOS.operador, { text: texto }),
   ia: (system, texto) => chamarClaude(system, texto, 300, 'claude-haiku-4-5'),
+  // Boas-vindas (desde 18/11/2026)
+  contaConectada: (apelido) => apelido === 'principal' ? !!(conectado && sock)
+    : !!(contasExtras.get(contaIdDe(TENANT_PADRAO, apelido))?.conectado && contasExtras.get(contaIdDe(TENANT_PADRAO, apelido))?.sock),
+  numeroDaConta: (apelido) => {
+    try { const s = apelido === 'principal' ? sock : contasExtras.get(contaIdDe(TENANT_PADRAO, apelido))?.sock; return s ? telefoneDaConta(s) : null; }
+    catch (e) { return null; }
+  },
+  jidDoTelefone: async (tel) => {
+    const formatado = formatarNumero(tel);
+    try { const r = await resolverJidWhatsApp(tel, formatado); return r.jid || formatado; } catch (e) { return formatado; }
+  },
+  enviarPrincipal: async (tel, texto) => {
+    const formatado = formatarNumero(tel);
+    let jid = formatado;
+    try { jid = (await resolverJidWhatsApp(tel, formatado)).jid || formatado; } catch (e) {}
+    return enviarMensagem(jid, { text: texto });
+  },
+  linkConvite: _inclLinkConvite,
+  removidoPorAdmin: _inclRemovidoPorAdmin,
 });
 function _inclAutorizado(req, res) {
   if (ehAdminRaiz(req)) return true;

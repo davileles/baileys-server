@@ -71,6 +71,7 @@ function gravar() {
       const corte = Date.now() - CONVERSA_TTL;
       for (const [k, c] of Object.entries(e.conversas)) if ((c.atualizadoEm || 0) < corte && c.etapa !== 'na_fila') delete e.conversas[k];
       e.historico = (e.historico || []).slice(-200);
+      for (const [t, em] of Object.entries(e.bvEnviadas || {})) if (Date.now() - em > 7 * 24 * MS_H) delete e.bvEnviadas[t];
       _d.escreverAtomico(_d.caminho, JSON.stringify(e), 'utf-8');
     } catch (err) { console.warn('[INCLUSAO] Não gravei o estado: ' + err.message); }
   }, 1500);
@@ -109,7 +110,18 @@ export function observarInclusaoCdv(apelido, sock, msg) {
     const ts = Number(msg.messageTimestamp?.low ?? msg.messageTimestamp ?? 0) * 1000;
     if (ts && Date.now() - ts > 6 * MS_H) return false;   // histórico sincronizado na conexão
     const texto = textoDe(msg);
-    const conv = e.conversas[jid];
+    let conv = e.conversas[jid];
+    // A boas-vindas sai para o JID do telefone; a resposta pode chegar pelo LID.
+    // Acha a conversa pelo telefone que vem junto na chave e passa a usar o JID novo.
+    if (!conv) {
+      const tel = [k.senderPn, k.remoteJidAlt, k.remoteJid].map(v => String(v || ''))
+        .find(v => v.endsWith('@s.whatsapp.net'));
+      const d8 = tel ? tel.split('@')[0].replace(/\D/g, '').slice(-8) : '';
+      if (d8) {
+        const [k0, c0] = Object.entries(e.conversas).find(([, c]) => String(c.telefone || '').slice(-8) === d8) || [];
+        if (c0) { delete e.conversas[k0]; c0.jid = jid; e.conversas[jid] = c0; conv = c0; }
+      }
+    }
     const ativa = conv && conv.etapa !== 'fim' && Date.now() - (conv.atualizadoEm || 0) < CONVERSA_TTL;
     const gatilho = RE_GATILHO.test(norm(texto));
     if (!gatilho && !ativa) return false;
@@ -163,6 +175,10 @@ async function tratar(apelido, sock, msg, jid, texto, gatilho) {
         await responder(conv, pos >= 0 ? 'Seu pedido está na fila de inclusão (posição ' + (pos + 1) + '). Adicionamos com calma, um grupo de cada vez, para proteger os grupos. Te aviso aqui quando terminar.'
           : 'Estou te adicionando nos grupos agora, um de cada vez. Te aviso aqui quando terminar.');
       }
+    } else if (conv.etapa === 'boas_vindas') {
+      // Recebeu os links na boas-vindas. Falou de grupo/link/não conseguir →
+      // segue o fluxo normal de inclusão (só os grupos que ainda faltam).
+      if (/grupo|link|entrar|consegu|abr[eiu]|erro|\bnao\b|ajuda/.test(norm(texto))) await consultarPorTelefone(conv);
     } else if (conv.etapa === 'aguardando_equipe') {
       if (Date.now() - (conv.ultimaRespostaEm || 0) > 2 * MS_H) await responder(conv, 'A equipe já foi avisada e vai te responder por aqui. Se quiser tentar com outro e-mail, mande o e-mail da compra.');
       if (RE_EMAIL.test(texto)) { conv.etapa = 'email'; await etapaEmail(conv, texto); }
@@ -398,12 +414,130 @@ async function enfileirar(conv, ufs) {
   setTimeout(() => ciclo().catch(() => {}), 5000);
 }
 
+// ── Boas-vindas de quem acabou de assinar (desde 18/11/2026) ─────────────────
+// O webhook da Hubla (customer.member_added) agenda; 2 min depois (tempo de o
+// proxy gravar a assinatura) o tico-02 manda o texto de boas-vindas e, numa
+// segunda mensagem, os grupos: link de convite para quem nunca foi removido,
+// inclusão pela fila (com SIM depois de salvar o número) para quem um admin
+// removeu (o link não abre para essa pessoa), grupos por estado perguntados ao
+// Premium, Balcão só com o formulário. Sem direito a grupo ainda: tenta de novo
+// em 10 min e, se seguir sem, manda só a boas-vindas com a frase do fluxo.
+const BV_ATRASO_MS = 2 * MS_MIN;
+const BV_RETENTATIVA_MS = 10 * MS_MIN;
+const LINK_AREA_MEMBROS = 'https://app.hub.la/m/5aPVHUjfhTa79XR2bWqC';
+
+export function textoBoasVindasCdv(nome, premium) {
+  const n = primeiroNome(nome);
+  return 'Olá' + (n ? ', ' + n : '') + '! Que alegria ter você no *Clube do Viajante' + (premium ? ' Premium' : '') + '*! ✈️\n\n'
+    + 'A partir de agora você tem acesso aos nossos conteúdos, grupos e oportunidades para acumular e usar melhor seus pontos e milhas.\n\n'
+    + 'Meu conselho para o *primeiro passo*: entre na área de membros e *assista*, pelo menos, ao *módulo de boas-vindas*. '
+    + 'Lá eu explico como aproveitar os conteúdos, como funcionam os grupos, onde encontrar cada informação e quais são os próximos passos.\n\n'
+    + 'E tem mais: *você já está participando do desafio 100 em 3*. Quem assistir a todas as aulas em até 3 meses ganha um kit de viagens personalizado. '
+    + 'Os detalhes também estão no módulo de boas-vindas.\n\n'
+    + 'Que bom ter você aqui! 🚀\n\n'
+    + 'Área de membros: ' + LINK_AREA_MEMBROS + '\n\n'
+    + 'Davi Leles';
+}
+
+export function agendarBoasVindasCdv({ telefone, nome, premium }) {
+  const e = E();
+  let tel = String(telefone || '').replace(/\D/g, '');
+  if (tel.length <= 11) tel = '55' + tel;
+  if (tel.length < 12) return { ok: false, erro: 'telefone inválido' };
+  e.boasVindas = e.boasVindas || [];
+  e.bvEnviadas = e.bvEnviadas || {};
+  if (Date.now() - (e.bvEnviadas[tel] || 0) < 24 * MS_H) return { ok: true, repetida: true };
+  if (e.boasVindas.some(b => b.telefone === tel)) return { ok: true, jaNaFila: true };
+  e.boasVindas.push({ telefone: tel, nome: nome || '', premium: !!premium, quando: Date.now() + BV_ATRASO_MS, tentativas: 0 });
+  gravar();
+  return { ok: true, agendada: true };
+}
+
+async function processarBoasVindas() {
+  const e = E();
+  const fila = e.boasVindas || [];
+  const i = fila.findIndex(b => b.quando <= Date.now());
+  if (i < 0) return;
+  const b = fila[i];
+  const conta = e.config.conta;
+  if (!_d.contaConectada(conta)) {
+    b.tentativas++;
+    if (b.tentativas < 12) { b.quando = Date.now() + 5 * MS_MIN; gravar(); return; }
+    // conta fora do ar há 1 h: a boas-vindas sai pela principal, com a frase do fluxo
+    fila.splice(i, 1);
+    try {
+      await _d.enviarPrincipal(b.telefone, textoBoasVindasCdv(b.nome, b.premium) + '\n\nPara entrar nos grupos, chame o nosso número dos grupos'
+        + (_d.numeroDaConta(conta) ? ' (' + _d.numeroDaConta(conta) + ')' : '') + ' e mande: *Quero entrar nos grupos do Clube do Viajante*');
+    } catch (err) { console.warn('[INCLUSAO] Boas-vindas pela principal falhou: ' + err.message); }
+    (e.bvEnviadas || (e.bvEnviadas = {}))[b.telefone] = Date.now();
+    gravar();
+    return;
+  }
+  let d = null;
+  try { d = await _d.proxy('/cdv/inclusao/consultar', { telefone: b.telefone }); } catch (err) { console.warn('[INCLUSAO] Boas-vindas: consulta falhou: ' + err.message); }
+  const temDireito = !!(d && (d.grupos || []).some(g => g.direito));
+  if (!temDireito && b.tentativas === 0) { b.tentativas = 1; b.quando = Date.now() + BV_RETENTATIVA_MS; gravar(); return; }
+  fila.splice(i, 1);
+  (e.bvEnviadas || (e.bvEnviadas = {}))[b.telefone] = Date.now();
+  const jid = await _d.jidDoTelefone(b.telefone);
+  const conv = { jid, conta, telefone: b.telefone, nome: (d && d.nome) || b.nome || '', etapa: 'boas_vindas', tentativas: 0,
+    criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'boas-vindas' };
+  e.conversas[jid] = conv;
+  await responder(conv, textoBoasVindasCdv(b.nome || conv.nome, b.premium));
+  registrar(conv, 'boas_vindas');
+  if (!temDireito) {
+    await new Promise(r => setTimeout(r, 4000));
+    await responder(conv, 'Assim que o seu acesso aos grupos estiver liberado, é só me mandar aqui: *Quero entrar nos grupos do Clube do Viajante*');
+    conv.etapa = 'fim';
+    gravar();
+    return;
+  }
+  const comDireito = d.grupos.filter(g => g.direito);
+  const balcao = comDireito.find(g => g.balcao) || null;
+  const liberados = comDireito.filter(g => !g.balcao || g.verificado);
+  let presentes = null;
+  try { presentes = await _d.jaEsta(b.telefone, liberados.map(g => g.jid)); } catch (err) {}
+  const faltam = liberados.filter(g => !(presentes && presentes.has(g.jid)));
+  const ufPorJid = new Map((_d.estadosCdv() || []).map(x => [x.jid, x.uf]));
+  const links = [], adicionar = [];
+  for (const g of faltam.filter(x => !ufPorJid.has(x.jid))) {
+    let removido = !!g.removidoPeloTico;
+    if (!removido) { try { removido = await _d.removidoPorAdmin(b.telefone, g.jid); } catch (err) {} }
+    let link = null;
+    if (!removido) { try { link = await _d.linkConvite(g.jid); } catch (err) { link = null; } }
+    if (link) links.push({ nome: g.nome, link }); else adicionar.push({ jid: g.jid, nome: g.nome });
+  }
+  conv.fixos = adicionar;
+  conv.estadosDisp = faltam.filter(g => ufPorJid.has(g.jid)).map(g => ({ jid: g.jid, nome: g.nome, uf: ufPorJid.get(g.jid) }))
+    .sort((a, b2) => a.uf.localeCompare(b2.uf));
+  conv.balcao = balcao ? { verificado: !!balcao.verificado, pendente: !!balcao.verificacaoPendente, jaEsta: !!(presentes && presentes.has(balcao.jid)),
+    formulario: d.formularioBalcao || '' } : null;
+  const partes = [];
+  if (links.length) partes.push('*Seus grupos* — é só tocar para entrar:\n' + links.map(l => '• ' + l.nome + ': ' + l.link).join('\n'));
+  if (adicionar.length || conv.estadosDisp.length) {
+    const quais = [];
+    if (adicionar.length) quais.push('Eu mesmo te adiciono em:\n' + lista(adicionar.map(g => g.nome)));
+    if (conv.estadosDisp.length) quais.push((adicionar.length ? 'E você' : 'Você') + ' também pode entrar nos grupos de emissões por estado (pergunto quais logo depois).');
+    partes.push(quais.join('\n\n') + '\n\n⚠️ *Só conseguimos te adicionar depois que você salvar este número na sua agenda.* Salvou? Responda *SIM*.');
+    conv.etapa = 'salvo';
+  }
+  const nota = balcaoNota(conv);
+  if (nota) partes.push(nota);
+  if (links.length) partes.push('Se algum link não abrir, me responda aqui que eu te ajudo.');
+  if (!partes.length) partes.push('Você já está nos grupos a que tem direito 👍');
+  await new Promise(r => setTimeout(r, 4000));
+  await responder(conv, partes.join('\n\n'));
+  registrar(conv, 'boas_vindas_grupos', 'links ' + links.length + ', adicionar ' + adicionar.length + ', estados ' + conv.estadosDisp.length);
+  gravar();
+}
+
 // ── Fila lenta ───────────────────────────────────────────────────────────────
 async function ciclo() {
   if (_rodando) return;
   _rodando = true;
   try {
     const e = E();
+    try { await processarBoasVindas(); } catch (err) { console.warn('[INCLUSAO] Boas-vindas: ' + err.message); }
     if (e.atual) { await acompanhar(); return; }
     if (!e.config.ativo || e.pausado || !e.fila.length) return;
     const h = horaSP();
@@ -482,6 +616,8 @@ export function estadoInclusaoCdv() {
     .map(c => ({ telefone: c.telefone, nome: c.nome || c.pushName || '', etapa: c.etapa, email: c.email || null,
       atualizadoEm: c.atualizadoEm ? new Date(c.atualizadoEm).toISOString() : null }));
   return { config: { ...e.config }, pausado: e.pausado, atual: e.atual, fila: e.fila, hoje: hojeE(), conversas,
+    boasVindasAgendadas: (e.boasVindas || []).map(b => ({ telefone: b.telefone, nome: b.nome, premium: b.premium,
+      quando: new Date(b.quando).toISOString(), tentativas: b.tentativas })),
     historico: (e.historico || []).slice(-50).reverse(), mensagemGatilho: 'Quero entrar nos grupos do Clube do Viajante' };
 }
 export function configurarInclusaoCdv(p) {
