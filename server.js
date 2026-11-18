@@ -48,7 +48,7 @@ import {
   templateAwin, templateProprioDaLoja,
   renderTemplate, varsDoProduto, VARIAVEIS_TEMPLATE, VARIAVEIS_CUPOM,
   resolverLinhaVitrine, listarVitrine, salvarItemVitrine, removerItemVitrine,
-  buscarProdutos, normalizar,
+  buscarProdutos, normalizar, buscarAmazonPorTermo,
   itemVitrine, marcarDisparo, montarOfertasVitrine,
   listarPoolRastreio, salvarPoolRastreio, listarAtribuicoes,
   repararAsinAtribuicoes, urlsNoAsinDeAtribuicoes,
@@ -230,7 +230,7 @@ import {
 import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
   salvarConfig as salvarConfigNotasShopee, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
   marcarNota as marcarNotaShopee, baixarDanfse, previaDps } from './notas-shopee.js';
-import { iniciarPaginasMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
+import { iniciarPaginasMl, pedirPaginaMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
 // variavel porque o endpoint interno pode mudar sem aviso.
@@ -9519,14 +9519,121 @@ async function _expandirDesconhecidos(texto, jid) {
   const alvos = [...new Set(urls.map(u => u.replace(/[.,;:!?]+$/, '')).filter(ehLinkDesconhecido))].slice(0, ENCURT_MAX_POR_MSG);
   for (const curta of alvos) {
     const info = _hostsDesconhecidos.get(_hostSemWww(curta));
-    if (info?.pausaAte > Date.now()) { _notaHostDesconhecido(curta, jid); continue; }
-    const destino = await resolverLinkDesconhecido(curta);
+    // Dominio em descanso so poupa a tentativa pelo Railway; a extensao e a
+    // busca pelo titulo seguem valendo (o descanso existe por causa do 403).
+    const pausado = info?.pausaAte > Date.now();
+    let destino = pausado ? null : await resolverLinkDesconhecido(curta);
+    let via = 'servidor';
+    if (!destino) {
+      const ext = await resolverDesconhecidoPelaExtensao(curta);
+      if (ext.destino) { destino = ext.destino; via = 'extensao'; }
+      else if (ext.motivo) console.log('[ENCURTADOR] (extensao) ' + curta + ' — ' + ext.motivo);
+    }
+    if (!destino) {
+      const tit = await resolverDesconhecidoPorTitulo(curta, texto);
+      if (tit.destino) { destino = tit.destino; via = 'titulo'; }
+      else if (tit.motivo) console.log('[ENCURTADOR] (titulo) ' + curta + ' — ' + tit.motivo);
+    }
+    if (pausado && !destino) { _notaHostDesconhecido(curta, jid); continue; }
     _notaHostDesconhecido(curta, jid, destino);
     if (!destino) continue;
-    console.log('[ENCURTADOR] (desconhecido) ' + curta + ' -> ' + destino.slice(0, 140));
+    console.log('[ENCURTADOR] (desconhecido' + (via === 'servidor' ? '' : ', via ' + via) + ') ' + curta + ' -> ' + destino.slice(0, 140));
     saida = saida.split(curta).join(destino);
   }
   return saida;
+}
+
+// ── ENCURTADOR BARRADO NO RAILWAY: EXTENSAO E BUSCA PELO TITULO (18/11/2026) ──
+// amzn.promos.link (grupo-fonte de bebidas) responde 403 "Attention Required"
+// do Cloudflare ao IP do Railway. Ordem quando o servidor nao chega na loja:
+// (1) a extensao Captura Tica abre o link na janela minimizada dela, no Chrome
+// do operador (navegador de verdade passa pelo Cloudflare), pela mesma fila
+// das paginas do ML (paginas-ml.js, motivo 'encurtador' — nao pesa no teto do
+// monitor, nao para na verificacao do ML e nao a dispara); (2) sem extensao,
+// so para encurtador da Amazon: busca o titulo do post na Creators API e so
+// aceita resultado inequivoco (todas as medidas/numeros do titulo, 80%+ das
+// palavras e preco ate 25% do post; dois candidatos = desiste).
+// ENCURT_EXTENSAO=0 / ENCURT_BUSCA_TITULO=0 desligam cada camada.
+const ENCURT_EXTENSAO      = String(process.env.ENCURT_EXTENSAO ?? '1') !== '0';
+const ENCURT_EXTENSAO_MS   = Number(process.env.ENCURT_EXTENSAO_ESPERA_MS || 45000);
+const ENCURT_BUSCA_TITULO  = String(process.env.ENCURT_BUSCA_TITULO ?? '1') !== '0';
+const _HOST_ENCURT_AMAZON  = /(?:^|[.-])(?:amzn|amazon|amz)(?:[.-]|$)/i;
+
+async function resolverDesconhecidoPelaExtensao(url) {
+  if (!ENCURT_EXTENSAO) return { destino: null, motivo: null };
+  const chave = 'ext:' + url;
+  const emCache = _cacheEncurtador.get(chave);
+  if (emCache?.destino && Date.now() - emCache.em < ENCURTADOR_TTL_MS) return { destino: emCache.destino };
+  let r = null;
+  try { r = await pedirPaginaMl(url, { motivo: 'encurtador', esperaMs: ENCURT_EXTENSAO_MS }); } catch (e) { r = null; }
+  if (!r) return { destino: null, motivo: 'extensao offline, fora da janela ou sem resposta no prazo' };
+  const final = String(r.url || '');
+  let destino = linkDePipeline(final) ? final : null;
+  if (!destino) {
+    const m = String(r.html || '').match(RE_URL_LOJA_NO_HTML);
+    if (m) destino = m[0].replace(/&amp;/g, '&');
+  }
+  if (destino && !linkDePipeline(destino)) destino = null;
+  if (!destino) {
+    const tit = (String(r.html || '').match(/<title[^>]*>([^<]{0,120})/i) || [])[1] || '';
+    return { destino: null, motivo: 'pagina aberta sem loja (final ' + final.slice(0, 120) + (tit ? ', "' + tit.trim() + '"' : '') + ')' };
+  }
+  destino = _limparTagAmazon(destino);
+  if (_cacheEncurtador.size >= ENCURTADOR_CACHE_MAX) _cacheEncurtador.delete(_cacheEncurtador.keys().next().value);
+  _cacheEncurtador.set(chave, { destino, em: Date.now() });
+  return { destino };
+}
+
+function _palavrasTitulo(s) {
+  return String(s || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase()
+    .replace(/(\d+(?:[.,]\d+)?)\s*(ml|l|lt|litros?|g|kg|un|unid(?:ades)?|anos?|x)\b/g,
+      (_, n, u) => n.replace(',', '.') + u.replace(/^lt$|^litros?$/, 'l').replace(/^unid(?:ades)?$/, 'un').replace(/^anos?$/, 'anos'))
+    .split(/[^a-z0-9.]+/).map(w => w.replace(/^\.+|\.+$/g, ''))
+    .filter(w => w.length >= 2 && !/^(de|da|do|das|dos|com|e|em|para|por|o|a|os|as|no|na|kit)$/.test(w));
+}
+
+function _tituloDoPost(texto) {
+  for (const linha of String(texto || '').split(/\n+/)) {
+    const l = linha.replace(/https?:\/\/\S+/g, ' ').replace(/[*_~]/g, ' ')
+      .replace(/[^\p{L}\p{N}\s.,\-]/gu, ' ').replace(/\s+/g, ' ').trim();
+    if (/R\$|^\s*(?:de|por)\b/i.test(linha) || !/\p{L}{3}/u.test(l)) continue;
+    if (_palavrasTitulo(l).length >= 2) return l.slice(0, 160);
+  }
+  return '';
+}
+
+async function resolverDesconhecidoPorTitulo(url, texto) {
+  if (!ENCURT_BUSCA_TITULO || !_HOST_ENCURT_AMAZON.test(_hostSemWww(url))) return { destino: null, motivo: null };
+  // Mensagem com varios links: o titulo nao diz de qual produto e.
+  if ((String(texto || '').match(/https?:\/\//g) || []).length > 2) return { destino: null, motivo: 'post com varios links' };
+  const titulo = _tituloDoPost(texto);
+  if (!titulo) return { destino: null, motivo: 'post sem titulo legivel' };
+  const pPost = _palavrasTitulo(titulo);
+  const numPost = pPost.filter(w => /\d/.test(w));
+  const precos = (String(texto).match(/R\$\s*([\d.]+,\d{2})/g) || [])
+    .map(s => Number(s.replace(/[^\d,]/g, '').replace(',', '.'))).filter(n => n > 0);
+  const precoPost = precos.length ? Math.min(...precos) : null;
+  let itens = [];
+  try { itens = (await buscarAmazonPorTermo(titulo, 10)).map(normalizar).filter(i => i?.asin); }
+  catch (e) { return { destino: null, motivo: 'busca na Amazon falhou: ' + e.message }; }
+  const aprovados = new Map();
+  for (const it of itens) {
+    const pIt = new Set(_palavrasTitulo(it.titulo));
+    if (!numPost.every(w => pIt.has(w))) continue;
+    const cobre = pPost.filter(w => pIt.has(w)).length / pPost.length;
+    if (cobre < 0.8) continue;
+    if (precoPost && !it.preco) continue;
+    if (precoPost && Math.abs(it.preco - precoPost) / precoPost > 0.25) continue;
+    if (!aprovados.has(it.asin)) aprovados.set(it.asin, it);
+  }
+  if (aprovados.size !== 1) {
+    return { destino: null, motivo: (aprovados.size ? aprovados.size + ' candidatos — ambiguo' : 'nenhum resultado confere')
+      + ' ("' + titulo.slice(0, 60) + '", ' + itens.length + ' resultado(s))' };
+  }
+  const [asin, it] = [...aprovados][0];
+  console.log('[ENCURTADOR] (titulo) "' + titulo.slice(0, 60) + '" -> ' + asin + ' "' + String(it.titulo).slice(0, 60) + '"'
+    + (it.preco ? ' R$ ' + it.preco : ''));
+  return { destino: 'https://www.amazon.com.br/dp/' + asin };
 }
 
 async function expandirEncurtadores(texto, jid = null) {

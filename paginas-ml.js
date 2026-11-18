@@ -140,7 +140,9 @@ export function extensaoPaginasOnline() {
 export function motivoIndisponivelPaginasMl(motivo = null) {
   if (!LIGADO) return 'desligada';
   if (!extensaoPaginasOnline()) return 'extensao_offline';
-  if (_estado.verificacao) return 'aguardando_verificacao';
+  // Encurtador de grupo-fonte (server.js, 18/11/2026): pagina de outro site,
+  // nao do ML — a verificacao pendente do ML nao a segura.
+  if (_estado.verificacao && motivo !== 'encurtador') return 'aguardando_verificacao';
   if (!naJanela()) return 'fora_da_janela';
   zerarDia();
   if (motivo === 'monitor' && (_estado.porMotivo.monitor || 0) >= TETO_MONITOR) return 'teto_monitor';
@@ -253,8 +255,13 @@ export function registrarResultadoPaginaMl(corpo, bloqueadaFn) {
     acordarExtensao();
     return { ok: true, veredito: 'erro' };
   }
-  const bloqueada = !!bloqueadaFn(urlFinal, html, status);
-  if (bloqueada) {
+  // Encurtador abre pagina de qualquer loja: nunca vira tela antibot do ML,
+  // nem libera uma verificacao do ML pendente.
+  const ehEncurtador = p.motivo === 'encurtador';
+  const bloqueada = ehEncurtador ? false : !!bloqueadaFn(urlFinal, html, status);
+  if (ehEncurtador) {
+    // so devolve a pagina
+  } else if (bloqueada) {
     _estado.walls++;
     if (!_estado.verificacao) {
       // Primeira tela de verificacao: para na hora e chama o operador.
