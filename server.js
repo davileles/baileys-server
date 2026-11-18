@@ -36,7 +36,7 @@ import {
   registrarCupomBase, listarCuponsBase, atualizarCupomBase, removerCupomBase, definirAtivoPorLoja,
   cupomPorCodigo, cupomVigente, calcularDesconto, melhorCupomAplicavel,
   cupomExpirado, cupomRestrito, cupomGeralDisponivel, desativarExpirados,
-  cupomCitadoDesconhecido,
+  cupomCitadoDesconhecido, extrairCuponsPaginaAmazon, lerCuponsPaginaAmazon,
   janelaCupom, salvarJanelaCupom, dentroDaJanelaCupom,
   espacamentoGrupos, salvarEspacamentoGrupos, msEntreGrupos,
   intervaloPublicacoes, salvarIntervaloPublicacoes, msEntrePublicacoes,
@@ -230,6 +230,7 @@ import {
 import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
   salvarConfig as salvarConfigNotasShopee, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
   marcarNota as marcarNotaShopee, baixarDanfse, previaDps } from './notas-shopee.js';
+import { atenderLongPollPaginasAmazon, registrarResultadoPaginaAmazon, estadoPaginasAmazon } from './paginas-amazon.js';
 import { iniciarPaginasMl, pedirPaginaMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
 
 // URL usada para testar a validade do token do painel de afiliados. Fica em
@@ -9886,7 +9887,10 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // Cupom citado no post original que nao existe na base: sem a regra
     // (percentual, minimo, teto) o radar nao calcula o desconto e a oferta sai
     // pelo preco cheio. Aviso ao operador, sem travar o envio.
-    const _cupSemBase = cupomCitadoDesconhecido(p.loja, texto);
+    // Codigo que a pagina do produto confirmou (cupom do anuncio da Amazon,
+    // 18/11/2026) nao e "cupom fora da base": ja entrou no preco.
+    const _cupSemBase = cupomCitadoDesconhecido(p.loja, texto)
+      .filter(x => !(r.cupom?.pagina && String(r.cupom.codigo || '').toUpperCase() === x));
     // Regra da operacao: oferta com cupom nao rastreado (citado no post ou
     // declarado no anuncio) que sairia pelo PRECO CHEIO nunca e auto-enviada.
     // No ML a incorporacao automatica ja tentou resolver antes do pipeline; se
@@ -9953,6 +9957,9 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         vendas: p.vendas || '',
         codigoBusca: p.codigoBusca || null,
         cupom: r.cupom || null,
+        // Linha IMPORTANTE que a captura ja trouxe (ex.: "Válido só no app da
+        // Amazon" do cupom do anuncio) — a remontagem le daqui.
+        ...(String(p.importante || '').trim() ? { importante: String(p.importante).trim() } : {}),
         precoFinal: r.precoFinal ?? p.preco,
         // Magalu nao tem fonte verificavel de preco: o painel precisa avisar
         // antes da aprovacao que aquele valor veio do texto do grupo.
@@ -10092,6 +10099,9 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // nosso (valor ilegivel, preco abaixo do minimo, link nao gerado): sairia
     // pelo preco cheio enquanto o post promete o cupom. Segura na fila.
     if (!r.cupom && r.cupomResgatePendente) oferta.cupomResgatePendente = r.cupomResgatePendente;
+    // Post cita um codigo que a pagina do produto (Amazon) nao tem mais: cupom
+    // acabou ou nao vale para o vendedor do link. Segura na fila.
+    if (!r.cupom && r.cupomPaginaAusente?.length) oferta.cupomPaginaAusente = r.cupomPaginaAusente;
     // Procedencia do produto quando o link veio de perfil de afiliado.
     // 'vitrine' = o item saiu do casamento por og:title numa pagina SEM CTA de
     // produto, isto e, pode ser um card qualquer de uma lista de cupons. Nesta
@@ -10160,7 +10170,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     }
     if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
         && !_filtro?.bloqueia
-        && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente
+        && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente && !oferta.cupomPaginaAusente
         && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
       try {
         // Passou so pelo rigor do nicho (ex.: Bebidas no moderado): sai so nos
@@ -10212,6 +10222,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       : oferta.cupomAmbiguo    ? 'post cita ' + oferta.cupomAmbiguo.codigos.length
           + ' cupons e nenhum e do bloco deste link'
       : oferta.cupomResgatePendente ? 'cupom de resgate: ' + oferta.cupomResgatePendente.motivo
+      : oferta.cupomPaginaAusente ? 'post cita o cupom ' + oferta.cupomPaginaAusente.join(', ')
+          + ' e a página do produto não tem mais (acabou ou é de outro vendedor)'
       : oferta.precoDivergente ? 'post anuncia R$ ' + oferta.precoDivergente.declarado
           + ' e calculamos R$ ' + oferta.precoDivergente.calculado
       : oferta.precoDoPost?.retem ? (oferta.precoDoPost.aplicado
@@ -23401,6 +23413,30 @@ app.get('/ml/pagina/estado', (req, res) => {
   res.json({ ok: true, ...estadoPaginasMl() });
 });
 
+// ── LEITURA DE PAGINA DA AMAZON PELA EXTENSAO (paginas-amazon.js, 18/11/2026) ─
+// Pagina do produto para os cupons do anuncio quando a Amazon barra o Railway.
+// Mesmo token da extensao (X-Extensao-Token). Extensao 2.15.0+.
+app.get('/amazon/pagina/proximo', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  atenderLongPollPaginasAmazon(req, res);
+});
+app.post('/amazon/pagina/resultado', (req, res) => {
+  if (!exigirExtensaoMl(req, res)) return;
+  res.json(registrarResultadoPaginaAmazon(req.body || {}, html => {
+    const cs = extrairCuponsPaginaAmazon(html);
+    return cs ? cs.length : null;
+  }));
+});
+app.get('/amazon/pagina/estado', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, ...estadoPaginasAmazon() });
+});
+// Diagnostico: cupons que a pagina do produto declara agora.
+app.get('/amazon/cupons-pagina/:asin', async (req, res) => {
+  try { res.json(await lerCuponsPaginaAmazon(String(req.params.asin || '').toUpperCase(), { forcar: req.query.forcar === '1' })); }
+  catch (e) { res.status(500).json({ ok: false, erro: e.message }); }
+});
+
 // ── NOTAS SHOPEE (NFS-e Nacional das comissões extras de vendedores) ────────
 // notas-shopee.js. A extensão busca o relatório mensal da Shopee no Chrome do
 // operador (token da extensão); o painel (raiz logada) configura, cadastra o
@@ -24242,6 +24278,11 @@ function cupomVigenteDaOferta(o, p, opc = {}) {
   // Cupom de resgate por link (Shopee): a regra (valor, %, minimo, teto) viaja
   // com ele, entao o desconto e recalculado sobre o preco novo.
   if (c.resgate?.link) return { ...c, desconto: descontoCupomResgate(c.resgate, p.preco) };
+  // Cupom do anuncio da Amazon (18/11/2026): a regra (% ou R$) viaja com ele.
+  if (c.pagina && Number(c.valor) > 0 && p.preco > 0) {
+    const dc = c.tipo === 'pct' ? Math.round(p.preco * Number(c.valor)) / 100 : Math.min(Number(c.valor), p.preco);
+    return { ...c, desconto: dc };
+  }
   return { ...c, desconto: Number(c.desconto) || 0 };
 }
 
@@ -24323,7 +24364,9 @@ function remontarOfertaFila(oferta, ov = {}) {
   d.precoDe  = p.precoDe ?? null;
   d.desconto = p.desconto;
   d.cupom      = cupom ? { codigo: cupom.codigo || cupom.reg?.codigo || '', desconto: cupom.desconto,
-                           ...(cupom.resgate ? { resgate: cupom.resgate } : {}) } : null;
+                           ...(cupom.resgate ? { resgate: cupom.resgate } : {}),
+                           ...(cupom.pagina ? { pagina: true, soApp: !!cupom.soApp, salvar: !!cupom.salvar,
+                                                tipo: cupom.tipo, valor: cupom.valor } : {}) } : null;
   d.precoFinal = cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco;
   oferta.ajustes = { ...(oferta.ajustes || {}) };
   for (const k of Object.keys(ov)) oferta.ajustes[k] = true;

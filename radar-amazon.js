@@ -21,6 +21,7 @@ import { comContextoTenant, tenantContexto } from './tenants.js';
 import { agendarPush } from './sync-github.js';
 import { rodapeOferta, rodapeCupom, rodapesRegras, credencialTsp, tagAmazonDoGrupo, trocasDeLinkDoGrupo } from './config-tsp.js';
 import { resolverPrecoDe, FONTE_TEXTO } from './preco-de.js';
+import { pedirPaginaAmazon } from './paginas-amazon.js';
 
 const SESSAO_DIR      = './sessao';
 
@@ -1761,11 +1762,10 @@ const PALAVRAS_NAO_CODIGO = new Set([
 export function cupomCitadoDesconhecido(loja, textoOriginal) {
   const texto = String(textoOriginal || '');
   const achados = new Set();
-  for (const m of texto.matchAll(REGEX_CODIGO_CITADO)) {
-    const bruto = m[1];
-    const codigo = bruto.toUpperCase();
-    if (PALAVRAS_NAO_CODIGO.has(codigo)) continue;
-    if (bruto !== codigo && !/\d/.test(codigo)) continue;   // nao parece codigo
+  // Desde 18/11/2026 tambem "codigo: `X`", "cod. X" e codigo entre crases
+  // (codigosCitadosNoPost) — antes so "cupom X", e o "Utilize o codigo:
+  // `REFORMA50`" da Loucos por Promos passava sem aviso nenhum.
+  for (const codigo of codigosCitadosNoPost(texto)) {
     if (cupomPorCodigo(loja, codigo)) continue;              // ja esta na base
     achados.add(codigo);
   }
@@ -2202,7 +2202,11 @@ async function baixarPaginaProduto(asin) {
       bytes += value.length;
       html += dec.decode(value, { stream: true });
       if (bytes >= AVISTA_CORTE_BYTES) break;
-      if (RE_AVISTA_VALOR.test(html) && RE_AVISTA_MSG.test(html)) break;
+      // Desde 18/11/2026 a mesma leitura serve aos cupons do anuncio: o bloco
+      // promoPriceBlockMessage fica DEPOIS do preco (~430-490 KB). Para so
+      // quando os marcadores do a vista apareceram E o bloco de cupons ja
+      // passou; sem bloco de cupons, segue ate o corte (700 KB).
+      if (RE_AVISTA_VALOR.test(html) && RE_AVISTA_MSG.test(html) && blocoCuponsAmazonLido(html)) break;
     }
   } finally {
     try { await leitor.cancel(); } catch (_) {}
@@ -2211,6 +2215,8 @@ async function baixarPaginaProduto(asin) {
   // Pagina barrada: curta demais para ser uma PDP. Devolve vazio para o
   // chamador tratar como falha de rede, nao como "produto sem a vista".
   if (html.length < AVISTA_MIN_BYTES && !RE_AVISTA_VALOR.test(html)) return '';
+  _pdpRecente.set(asin, { em: Date.now(), html });
+  if (_pdpRecente.size > 30) _pdpRecente.delete(_pdpRecente.keys().next().value);
   return html;
 }
 
@@ -2540,6 +2546,206 @@ export async function comPrecoAVista(p, texto = '') {
     console.log('[AVISTA] ' + p.asin + ' R$ ' + a.preco + ' (' + a.percentual + '%) deduzido do post');
   }
   return p;
+}
+
+// ── CUPONS DO ANUNCIO DA AMAZON (18/11/2026) ─────────────────────────────
+// A pagina do produto traz os cupons vigentes no bloco promoPriceBlockMessage
+// — um item por cupom, cada um com um selo (label id="greenBadge<k>", ex.:
+// "Só no app: 50%", "Salve o cupom R$20", "Promoção") e uma mensagem
+// (span id="promoMessageCXCW<k>" ou "promoMessage<k>", ex.: "off em
+// Construção. Insira o código REFORMA50 na finalização da compra", ": BF40").
+// Serve para tres coisas na captura dos grupos-fonte:
+//   1. o post cita o codigo e a pagina tambem: o cupom vale, a oferta sai com
+//      o preco com cupom e a mensagem leva o codigo;
+//   2. o post cita um codigo que NAO esta mais na pagina: cupom acabou, a
+//      oferta vai para revisao (cupomPaginaAusente);
+//   3. o post fala em cupom/desconto no carrinho sem dar o codigo, ou nem fala:
+//      o codigo da pagina entra (e a loja declarando, nao inferencia — mesmo
+//      criterio do cupom da pagina do ML).
+// Ficam de fora cupom de primeira compra, exclusivo Prime e promocao sem
+// codigo nem valor ("Compre agora e economize mais 15%"). "Só no app" vira a
+// linha IMPORTANTE. A pagina lida e a de /dp/ASIN sem vendedor fixo — a mesma
+// que o nosso link abre: se o buy box for outro vendedor sem o cupom, o cupom
+// nao aparece e a oferta nao sai com ele.
+// Leitura: pela mesma visita a pagina do preco a vista (cache de 2 min) ou,
+// quando a Amazon barra o Railway, pela extensao Captura Tica no Chrome do
+// operador (paginas-amazon.js). Sem pagina = nada muda (fluxo antigo).
+const _pdpRecente = new Map();             // asin -> { em, html } (ultima leitura de PDP)
+const PDP_RECENTE_MS = 2 * 60000;
+const _cuponsPaginaCache = new Map();      // asin -> { em, r }
+const CUPONS_PAGINA_TTL_MS = 15 * 60000;
+const RE_MARCA_CUPONS = 'id="promoPriceBlockMessage_feature_div"';
+
+function blocoCuponsAmazonLido(html) {
+  const i = html.indexOf(RE_MARCA_CUPONS);
+  return i >= 0 && html.length > i + 40000;
+}
+
+const _ENT = { nbsp: ' ', amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', aacute: 'á', eacute: 'é', iacute: 'í',
+  oacute: 'ó', uacute: 'ú', atilde: 'ã', otilde: 'õ', acirc: 'â', ecirc: 'ê', ocirc: 'ô', agrave: 'à', ccedil: 'ç',
+  Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Atilde: 'Ã', Otilde: 'Õ', Ccedil: 'Ç', uuml: 'ü' };
+function textoDeHtml(s) {
+  return String(s || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ').replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&([a-zA-Z]+);/g, (m, n) => _ENT[n] ?? m)
+    .replace(/\s+/g, ' ').trim();
+}
+const numBrl = s => Number(String(s).replace(/\./g, '').replace(',', '.'));
+
+/**
+ * Cupons do bloco promoPriceBlockMessage. Devolve [] quando a pagina tem o
+ * produto e nao tem cupom; null quando nem e a pagina do produto.
+ */
+export function extrairCuponsPaginaAmazon(html) {
+  const s = String(html || '');
+  if (!s.includes('id="productTitle"') && !s.includes(RE_MARCA_CUPONS)) return null;
+  const i0 = s.indexOf(RE_MARCA_CUPONS);
+  if (i0 < 0) return [];
+  // O bloco termina no proximo widget (feature_div) que nao e ele.
+  const resto = s.slice(i0, i0 + 80000);
+  const fimRel = resto.slice(40).search(/<div id="[a-zA-Z0-9]+_feature_div"/);
+  const bloco = fimRel >= 0 ? resto.slice(0, fimRel + 40) : resto;
+  const saida = [];
+  const vistos = new Set();
+  for (const m of bloco.matchAll(/id="greenBadge([A-Za-z0-9_]+)"/g)) {
+    const k = m[1];
+    const ini = m.index;
+    const fimDone = bloco.indexOf('id="doneMessage' + k + '"', ini);
+    const fimProx = bloco.indexOf('id="greenBadge', ini + 20);
+    const corte = [fimDone, fimProx].filter(x => x > ini).sort((a, b) => a - b)[0];
+    // Corta no '<' da tag do marcador seguinte, para nao sobrar "<span" solto.
+    const fim = corte != null ? bloco.lastIndexOf('<', corte) : Math.min(bloco.length, ini + 4000);
+    // O selo comeca no '>' do proprio label.
+    const trecho = bloco.slice(bloco.indexOf('>', ini) + 1, fim);
+    const texto = textoDeHtml(trecho).replace(/\b(Ver itens participantes|Comprar itens eleg[ií]veis|Termos)\b/gi, '').replace(/\s+/g, ' ').trim();
+    if (!texto) continue;
+    const codigo = (texto.match(/c[oó]digo\s+(?:promocional\s+)?([A-Z0-9][A-Z0-9_-]{3,24})\b/) || texto.match(/:\s*([A-Z0-9][A-Z0-9_-]{3,24})\b/) || [])[1] || null;
+    const pct = (texto.match(/(\d{1,2})\s*%/) || [])[1];
+    const valorM = texto.match(/(?:cupom|economize|desconto de)\s*(?:de\s*)?R\$\s*([\d.]+(?:,\d{2})?)/i) || texto.match(/^R\$\s*([\d.]+(?:,\d{2})?)/);
+    const minimoM = texto.match(/(?:acima de|a partir de|m[ií]nimo de|compras? de)\s*R\$\s*([\d.]+(?:,\d{2})?)/i);
+    const c = {
+      codigo,
+      tipo: pct ? 'pct' : (valorM ? 'valor' : null),
+      valor: pct ? Number(pct) : (valorM ? numBrl(valorM[1]) : null),
+      minimo: minimoM ? numBrl(minimoM[1]) : null,
+      soApp: /s[oó]\s+no\s+app/i.test(texto),
+      primeiraCompra: /primeira compra/i.test(texto),
+      prime: /exclusivo\s+prime/i.test(texto),
+      salvar: /salve o cupom/i.test(texto),
+      texto: texto.slice(0, 200),
+    };
+    const chave = (c.codigo || '') + '|' + c.texto;
+    if (vistos.has(chave)) continue;
+    vistos.add(chave);
+    saida.push(c);
+  }
+  return saida;
+}
+
+/** Cupom que vale para qualquer cliente: tem codigo e desconto, nao e 1a compra nem Prime. */
+function cupomPaginaUtil(c) {
+  return !!(c && c.codigo && c.tipo && c.valor > 0 && !c.primeiraCompra && !c.prime);
+}
+
+/**
+ * Le os cupons da pagina do produto. { ok:true, cupons, fonte } com a pagina
+ * lida (cupons pode ser []), { ok:false, motivo } sem pagina. Cache de 15 min.
+ */
+export async function lerCuponsPaginaAmazon(asin, { forcar = false } = {}) {
+  if (!/^[A-Z0-9]{10}$/.test(String(asin || ''))) return { ok: false, motivo: 'asin inválido' };
+  if (E().cfg.lerCuponsPaginaAmazon === false) return { ok: false, motivo: 'desligado na config' };
+  const c = _cuponsPaginaCache.get(asin);
+  if (!forcar && c && Date.now() - c.em < CUPONS_PAGINA_TTL_MS) return c.r;
+  let r = null;
+  // 1. A pagina que a leitura do a vista acabou de baixar.
+  const rec = _pdpRecente.get(asin);
+  if (rec && Date.now() - rec.em < PDP_RECENTE_MS) {
+    const cs = extrairCuponsPaginaAmazon(rec.html);
+    if (cs) r = { ok: true, cupons: cs, fonte: 'pdp' };
+  }
+  // 2. Baixa agora pelo Railway (fora da pausa de bloqueio do a vista).
+  if (!r && Date.now() >= _avistaPausaAte) {
+    try {
+      const html = await baixarPaginaProduto(asin);
+      const cs = html ? extrairCuponsPaginaAmazon(html) : null;
+      if (cs) r = { ok: true, cupons: cs, fonte: 'railway' };
+    } catch (e) { /* cai na extensao */ }
+  }
+  // 3. Extensao no Chrome do operador.
+  if (!r) {
+    const pg = await pedirPaginaAmazon('https://www.amazon.com.br/dp/' + asin, { motivo: 'cupons' });
+    const cs = pg && !pg.semProduto ? extrairCuponsPaginaAmazon(pg.html) : null;
+    if (cs) r = { ok: true, cupons: cs, fonte: 'extensao' };
+  }
+  if (!r) r = { ok: false, motivo: 'página indisponível' };
+  _cuponsPaginaCache.set(asin, { em: r.ok ? Date.now() : Date.now() - CUPONS_PAGINA_TTL_MS + 3 * 60000, r });
+  if (_cuponsPaginaCache.size > 500) _cuponsPaginaCache.delete(_cuponsPaginaCache.keys().next().value);
+  if (r.ok) console.log('[CUPOM-AMZ] ' + asin + ' (' + r.fonte + '): '
+    + (r.cupons.length ? r.cupons.map(x => (x.codigo || '?') + ' ' + (x.valor ?? '?') + (x.tipo === 'pct' ? '%' : '') + (x.soApp ? ' app' : '') + (x.primeiraCompra ? ' 1a' : '') + (x.prime ? ' prime' : '')).join(', ') : 'sem cupom'));
+  return r;
+}
+
+// Codigos que o post cita como cupom: "cupom X", "cupom: X", "código: `X`",
+// "use o código X", "cód. X" e qualquer token em caixa alta entre crases.
+const RE_CODIGO_POST = /(?:\bcupo(?:m|ns)|\bc[oó]d(?:igo|\.)?(?:\s+promocional)?)\s*(?:de\s+desconto\s*)?[:\-]?\s*(?:e|eh|é|de|do|da)?\s*[`*_"'“”]*([A-Z0-9][A-Z0-9._-]{3,29})\b/gi;
+export function codigosCitadosNoPost(texto) {
+  const t = String(texto || '');
+  const achados = new Set();
+  for (const m of t.matchAll(RE_CODIGO_POST)) {
+    const bruto = m[1], codigo = bruto.toUpperCase();
+    if (PALAVRAS_NAO_CODIGO.has(codigo)) continue;
+    if (bruto !== codigo && !/\d/.test(codigo)) continue;
+    achados.add(codigo);
+  }
+  for (const m of t.matchAll(/`([A-Z0-9][A-Z0-9._-]{3,29})`/g)) {
+    if (!PALAVRAS_NAO_CODIGO.has(m[1])) achados.add(m[1]);
+  }
+  return [...achados];
+}
+
+/**
+ * Cupom da pagina para uma oferta capturada. Devolve
+ *   { cupom:{codigo, desconto, citado, pagina:true, soApp, salvar}, importante }
+ *   { ausente:[codigos] }  o post cita codigo(s) que a pagina lida nao tem
+ *   null                   sem pagina, sem cupom util ou nada a fazer
+ */
+export async function cupomDaPaginaAmazon(p, texto) {
+  if (!p || p.loja !== 'Amazon' || !p.asin || !(p.preco > 0)) return null;
+  const lido = await lerCuponsPaginaAmazon(p.asin);
+  if (!lido?.ok) return null;
+  const citados = codigosCitadosNoPost(texto);
+  const uteis = lido.cupons.filter(cupomPaginaUtil)
+    .filter(c => !(c.minimo > 0) || p.preco >= c.minimo);
+  const descontoDe = c => c.tipo === 'pct' ? Math.round(p.preco * c.valor) / 100 : Math.min(c.valor, p.preco);
+  let escolhido = null;
+  if (citados.length) {
+    escolhido = uteis.find(c => citados.includes(String(c.codigo).toUpperCase())) || null;
+    if (!escolhido) {
+      // Codigo citado que a pagina nao tem. So conta como "acabou" se nenhum
+      // cupom da pagina (nem de 1a compra/Prime) tem esse codigo.
+      const naPagina = new Set(lido.cupons.map(c => String(c.codigo || '').toUpperCase()));
+      const ausentes = citados.filter(x => !naPagina.has(x));
+      if (ausentes.length === citados.length) return { ausente: ausentes, fonte: lido.fonte };
+      return null;
+    }
+  } else {
+    escolhido = uteis.map(c => ({ c, d: descontoDe(c) })).sort((a, b) => b.d - a.d)[0]?.c || null;
+  }
+  if (!escolhido) return null;
+  const desconto = descontoDe(escolhido);
+  if (!(desconto > 0)) return null;
+  const importante = escolhido.soApp
+    ? 'Válido só no app da Amazon — insira o código na finalização da compra'
+    : escolhido.salvar ? 'Salve o cupom na página do produto antes de finalizar' : '';
+  return {
+    cupom: { codigo: escolhido.codigo, desconto, citado: citados.length > 0, generico: false,
+             pagina: true, soApp: escolhido.soApp, salvar: escolhido.salvar,
+             tipo: escolhido.tipo, valor: escolhido.valor },
+    importante, fonte: lido.fonte,
+  };
 }
 
 // ── FORMATACAO ────────────────────────────────────────────────────────────
@@ -3404,16 +3610,35 @@ export async function processarTextoAmazon(texto, opcoes = {}) {
 
     // A API devolve sempre o preco de tabela; o cupom vem da base alimentada
     // pelo pipeline de cupons e e aplicado aqui sobre esse preco cheio.
-    const cupom = melhorCupom(p.loja, p.preco, texto);
+    let cupom = melhorCupom(p.loja, p.preco, texto);
     if (cupom) {
       console.log('[MKT] ' + p.asin + ' + cupom ' + cupom.reg.codigo +
         ' (-R$ ' + cupom.desconto.toFixed(2) + ')' +
         (cupom.citado ? ' [citado no texto]' : ' [ultimo da loja — texto cita cupom sem codigo]'));
     }
+    // Sem cupom da base: o cupom que a propria pagina do produto declara
+    // (18/11/2026). Codigo citado no post que sumiu da pagina = cupom acabou.
+    let cupomPaginaAusente = null;
+    if (!cupom && !opcoes.semCupomPagina) {
+      try {
+        const cp = await cupomDaPaginaAmazon(p, texto);
+        if (cp?.cupom) {
+          cupom = cp.cupom;
+          if (cp.importante && !String(p.importante || '').trim()) p.importante = cp.importante;
+          console.log('[MKT] ' + p.asin + ' + cupom da pagina ' + cupom.codigo + ' (-R$ ' + cupom.desconto.toFixed(2) + ')'
+            + (cupom.soApp ? ' [so no app]' : '') + (cupom.citado ? ' [citado no texto]' : ' [nao citado no post]') + ' via ' + cp.fonte);
+        } else if (cp?.ausente) {
+          cupomPaginaAusente = cp.ausente;
+          console.log('[MKT] ' + p.asin + ' post cita ' + cp.ausente.join(', ') + ' e a pagina nao tem o cupom (via ' + cp.fonte + ')');
+        }
+      } catch (e) { console.warn('[CUPOM-AMZ] ' + p.asin + ': ' + e.message); }
+    }
     saida.push({
       produto: p,
-      cupom: cupom ? { codigo: cupom.reg.codigo, desconto: cupom.desconto, citado: cupom.citado,
-                       generico: !!cupom.generico } : null,
+      cupom: cupom ? { codigo: cupom.codigo || cupom.reg?.codigo, desconto: cupom.desconto, citado: cupom.citado,
+                       generico: !!cupom.generico,
+                       ...(cupom.pagina ? { pagina: true, soApp: !!cupom.soApp, salvar: !!cupom.salvar, tipo: cupom.tipo, valor: cupom.valor } : {}) } : null,
+      ...(cupomPaginaAusente ? { cupomPaginaAusente } : {}),
       precoFinal: cupom ? Math.max(0, p.preco - cupom.desconto) : p.preco,
       // Preco que a mensagem realmente anuncia. Quem le isto para comparar com
       // o preco declarado no post precisa do numero publicado, nao do a prazo.
