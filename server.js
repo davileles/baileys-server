@@ -10260,6 +10260,7 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
             + ' imagem(ns) acima — leia os valores, percentuais e prazos direto delas.\n\n'
           : 'Conteúdo publicado em um grupo de plantão de milhas.\n\n')
         + (textoBruto ? 'Texto da(s) mensagem(ns):\n"""\n' + textoBruto + '\n"""' : '(as mensagens vieram sem texto)')
+        + '\n\n' + textoDataHojeOferta()
     },
   ];
 
@@ -10298,8 +10299,14 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
   }
   // Link de convite de grupo e encurtador de afiliado nunca entram: o card vai
   // para o radar publico e para o WhatsApp dos assinantes.
-  const link = /^https?:\/\//i.test(ia.link || '') && !/chat\.whatsapp\.com/i.test(ia.link)
+  let link = /^https?:\/\//i.test(ia.link || '') && !/chat\.whatsapp\.com/i.test(ia.link)
     ? ia.link : '';
+  // Experiencia Accor Limitless: o link e a propria oferta. Se a IA nao o
+  // devolveu, pega do texto (e ele que decide o envio automatico abaixo).
+  if (!ehLinkLimitless(link)) {
+    const m = textoBruto.match(LIMITLESS_LINK_RE);
+    if (m) link = m[0].replace(/[).,;]+$/, '');
+  }
 
   const item = {
     titulo:            String(ia.titulo || '').trim(),
@@ -10307,7 +10314,7 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
     resumo:            String(ia.resumo || '').trim(),
     programa:          String(ia.programa || '').trim(),
     bonus:             String(ia.bonus || '').trim(),
-    prazo:             String(ia.prazo || '').trim(),
+    prazo:             corrigirAnoPrazoOferta(String(ia.prazo || '').trim(), textoBruto + ' ' + String(ia.titulo || '')),
     categoria,
     loja:              categoria === 'compra_bonificada' ? String(ia.loja || '').trim() : '',
     cupom:             String(ia.cupom || '').trim(),
@@ -10346,6 +10353,9 @@ async function processarBufferOfertaMilhas(jid, opts = {}) {
     if (!d.duplicada && !opts.fonte && categoria === 'transferencia' && autoTransferenciaLigada()) {
       reservarOfertaAutomatica(d.id);
       agendarDecisaoTransferencia({ id: d.id, item, jid, nomeGrupo, textoBruto });
+    } else if (!d.duplicada && !opts.fonte && ehLinkLimitless(item.link) && autoLimitlessLigada()) {
+      reservarOfertaAutomatica(d.id);
+      agendarDecisaoLimitless({ id: d.id, item, jid, nomeGrupo, textoBruto });
     }
     return { ok:true, id: d.id, duplicada: !!d.duplicada, titulo: item.titulo };
   } catch (e) {
@@ -10419,6 +10429,12 @@ function agendarDecisaoTransferencia(ctx) {
 // card). Captura de grupo tem fonte 'whatsapp' e ja decidiu no envio a fila;
 // criacao manual (fonte 'manual') segue sempre para aprovacao.
 function decidirTransferenciaRadar(o) {
+  if (o && o.id && !o.fonte && ehLinkLimitless(o.link) && autoLimitlessLigada()) {
+    reservarOfertaAutomatica(o.id);
+    agendarDecisaoLimitless({ id: o.id, item: o, jid: null, nomeGrupo: 'radar de blogs',
+      textoBruto: [o.titulo, o.prazo].filter(Boolean).join(' — ') });
+    return true;
+  }
   if (!o || !o.id || o.categoria !== 'transferencia' || o.fonte) return false;
   if (!autoTransferenciaLigada()) return false;
   reservarOfertaAutomatica(o.id);
@@ -10478,6 +10494,127 @@ async function decidirTransferenciaAutomatica({ id, item, jid, nomeGrupo, textoB
     return;
   }
   return manual('situacao "' + tipo + '" sem regra automatica');
+}
+
+// ══ ANO DO PRAZO DAS OFERTAS ═════════════════════════════════════════════════
+// A IA nao sabe a data de hoje: com "02 de dezembro" na origem ela completava
+// o ano com um chute (2025 em nov/2026) e a oferta saia com prazo no passado.
+// Duas travas: a data de hoje vai no prompt, e depois da IA toda data
+// dd/mm/aaaa vencida ha mais de 60 dias cujo ano NAO esta escrito na origem
+// ganha o primeiro ano em que ainda nao passou. Copia espelhada em
+// painel-cdv/prazo-ano.js (o proxy aplica de novo ao enfileirar). Mudou uma,
+// muda a outra.
+function _hojeSPOferta(agora) {
+  const d = new Date((agora || Date.now()) - 3 * 3600e3);
+  return { dia: d.getUTCDate(), mes: d.getUTCMonth() + 1, ano: d.getUTCFullYear() };
+}
+function textoDataHojeOferta() {
+  const h = _hojeSPOferta();
+  const p = (n) => String(n).padStart(2, '0');
+  return 'Data de hoje: ' + p(h.dia) + '/' + p(h.mes) + '/' + h.ano
+    + '. Quando a origem trouxer data sem ano (ex.: "02 de dezembro"), use o ano em que essa data ainda não passou.';
+}
+function corrigirAnoPrazoOferta(prazo, textoOrigem) {
+  const s = String(prazo || '');
+  if (!s) return s;
+  const h = _hojeSPOferta();
+  const hojeNum = h.ano * 10000 + h.mes * 100 + h.dia;
+  const origem = String(textoOrigem || '');
+  return s.replace(/\b(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})\b/g, (tudo, dd, mm, aa) => {
+    const dia = Number(dd), mes = Number(mm);
+    let ano = Number(aa);
+    if (aa.length === 2) ano += 2000;
+    if (!dia || !mes || dia > 31 || mes > 12) return tudo;
+    if (ano * 10000 + mes * 100 + dia >= hojeNum) return tudo;
+    const diasPassados = (Date.UTC(h.ano, h.mes - 1, h.dia) - Date.UTC(ano, mes - 1, dia)) / 864e5;
+    if (diasPassados <= 60) return tudo;
+    if (new RegExp('\\b' + ano + '\\b').test(origem)) return tudo;
+    let novo = h.ano;
+    if (novo * 10000 + mes * 100 + dia < hojeNum) novo += 1;
+    return dd + '/' + mm + '/' + novo;
+  });
+}
+// Ultima data dd/mm/aaaa do prazo ja passou (o dia de hoje ainda vale)?
+function prazoOfertaVencido(prazo) {
+  const ds = [...String(prazo || '').matchAll(/\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/g)];
+  if (!ds.length) return false;
+  const h = _hojeSPOferta();
+  const hojeNum = h.ano * 10000 + h.mes * 100 + h.dia;
+  const ultima = Math.max(...ds.map(m => Number(m[3]) * 10000 + Number(m[2]) * 100 + Number(m[1])));
+  return ultima < hojeNum;
+}
+
+// ══ DISPARO AUTOMATICO — EXPERIENCIAS ACCOR LIMITLESS ════════════════════════
+// Oferta capturada (grupo monitorado ou radar de blogs) com link de
+// limitlessexperiences.accor.com nao espera aprovacao (pedido do Davi em
+// 18/11/2026): sai direto para o grupo de ofertas com o que veio na captura.
+// Fica manual so quando o prazo ja passou ou o envio falhou. O mesmo link ja
+// enviado (memoria em disco, 120 dias) e rejeitado em silencio. Criacao manual
+// (opts.fonte) segue para aprovacao como sempre.
+// Kill switch: AUTO_LIMITLESS=off. Sem CAMPANHAS_KEY tudo fica manual.
+const LIMITLESS_LINK_RE = /https?:\/\/(?:www\.)?limitlessexperiences\.accor\.com\/[^\s"'<>]+/i;
+const AUTO_LIMITLESS_ARQ = SESSAO_DIR + '/limitless-enviados.json';
+const AUTO_LIMITLESS_MEMORIA_MS = 120 * 24 * 3600e3;
+let _autoLimitlessFila = Promise.resolve();
+
+function ehLinkLimitless(link) {
+  return /^https?:\/\/(?:www\.)?limitlessexperiences\.accor\.com\//i.test(String(link || ''));
+}
+function autoLimitlessLigada() {
+  return !/^(0|off|false|nao|não)$/i.test(String(process.env.AUTO_LIMITLESS || '').trim())
+    && !!process.env.CAMPANHAS_KEY;
+}
+function _chaveLinkLimitless(link) {
+  return String(link || '').toLowerCase().replace(/^https?:\/\/(?:www\.)?/, '').split(/[?#]/)[0].replace(/\/+$/, '');
+}
+function _lerLimitlessEnviados() {
+  try { return JSON.parse(readFileSync(AUTO_LIMITLESS_ARQ, 'utf8')) || {}; } catch { return {}; }
+}
+function _gravarLimitlessEnviados(m) {
+  try {
+    const corte = Date.now() - AUTO_LIMITLESS_MEMORIA_MS;
+    for (const k of Object.keys(m)) if (!(m[k] && m[k].em >= corte)) delete m[k];
+    writeFileSync(AUTO_LIMITLESS_ARQ, JSON.stringify(m));
+  } catch (e) { console.warn('[AUTO-LIMITLESS] Nao gravei a memoria: ' + e.message); }
+}
+
+function agendarDecisaoLimitless(ctx) {
+  _autoLimitlessFila = _autoLimitlessFila
+    .then(() => decidirLimitlessAutomatica(ctx))
+    .catch((e) => {
+      console.warn('[AUTO-LIMITLESS] Decisao de #' + ctx.id + ' falhou: ' + e.message + ' — fica manual.');
+      liberarOfertaParaCard(ctx.id).catch(() => {});
+    });
+  return _autoLimitlessFila;
+}
+
+async function decidirLimitlessAutomatica({ id, item, jid, nomeGrupo, textoBruto }) {
+  const manual = (motivo) => {
+    console.log('[AUTO-LIMITLESS] #' + id + ' fica para aprovacao manual — ' + motivo);
+    return liberarOfertaParaCard(id).catch(() => {});
+  };
+  if (prazoOfertaVencido(item.prazo)) return manual('prazo ja passou (' + item.prazo + ')');
+
+  const chave = _chaveLinkLimitless(item.link);
+  const enviados = _lerLimitlessEnviados();
+  if (chave && enviados[chave]) {
+    const r = await proxyOperadorCdv('POST', '/ofertas/rejeitar', { id });
+    if (!r.ok) return manual('rejeicao automatica falhou (' + (r.erro || r.http) + ')');
+    console.log('[AUTO-LIMITLESS] #' + id + ' repetida (ja saiu como #' + enviados[chave].id + ') — ' + item.titulo);
+    registrarDescarteCdv({ jid, motivo: 'experiência Limitless repetida',
+      detalhe: 'mesmo link já enviado (#' + enviados[chave].id + ')', texto: textoBruto });
+    return;
+  }
+
+  const r = await proxyOperadorCdv('POST', '/ofertas/aprovar-e-enviar', { id });
+  if (!r.ok) return manual('envio automatico falhou (' + (r.erro || r.http) + ')');
+  if (chave) { enviados[chave] = { id, em: Date.now() }; _gravarLimitlessEnviados(enviados); }
+  const como = r.enviada === false
+    ? 'aprovada, mas o envio ao WhatsApp falhou (' + (r.erroEnvio || r.erro || 'sem detalhe') + ') — reenvie pela tela'
+    : 'enviada ao grupo de ofertas';
+  console.log('[AUTO-LIMITLESS] #' + id + ' ' + como + ' — ' + item.titulo);
+  avisarOfertaAutomatica(id, '🤖 Experiência Accor Limitless ' + como + ': ' + item.titulo
+    + (item.prazo ? ' — prazo ' + item.prazo : '') + ' (#' + id + ') — capturada em ' + (nomeGrupo || 'grupo') + '.').catch(() => {});
 }
 
 // ── CRIAR OFERTA DE PONTOS SOB DEMANDA (link / texto / arquivo) ──────────────
