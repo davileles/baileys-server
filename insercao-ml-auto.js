@@ -63,6 +63,10 @@ const LOTE_MAX = 40;
 const LOTE = [1, LOTE_MAX];
 const PAUSA_MIN = [1, 1];        // so um respiro entre uma visita e a proxima
 const FOLGA_PCT = 0;
+// 18/11/2026: o modo da extensao e decidido aqui (a decisao da operacao e
+// inserir sozinho). 'auto' vale mais que o "perguntar antes" do popup, que
+// voltava sozinho quando a extensao era reinstalada. 'aprovar' respeita o popup.
+const MODO_EXTENSAO = String(process.env.CUPONS_ML_AUTO_MODO || 'auto').trim().toLowerCase() === 'aprovar' ? 'aprovar' : 'auto';
 const ESPERA_MAX_MS = Math.max(30, Number(process.env.CUPONS_ML_AUTO_ESPERA_MAX_MIN) || 180) * 60000;
 
 // Seletores da pagina de cupons do ML (lidos em 27/09/2026). Vao para a
@@ -413,8 +417,9 @@ export function proximoLoteInsercaoMl(opts = {}) {
     let chave = null, txt = null;
     if (r && r.espiar && r.lote && r.lote.length) {
       chave = 'espiar';
-      txt = 'Extensão no modo "perguntar antes": ' + r.lote.length + ' cupom(ns) esperando o clique em "Inserir agora" no Chrome ('
-        + r.lote.map(x => x.codigo).slice(0, 8).join(', ') + '). Para inserir sozinho, mude o modo para automático no popup.';
+      txt = 'Extensão no modo "perguntar antes" (' + r.lote.length + ' cupom(ns): '
+        + r.lote.map(x => x.codigo).slice(0, 8).join(', ') + ') — '
+        + (MODO_EXTENSAO === 'auto' ? 'a 2.15.2+ insere sozinha porque o servidor manda modo auto; se continuar parado, a extensão está desatualizada.' : 'esperando o clique em "Inserir agora" no Chrome.');
     } else if (fila && (!r.lote || !r.lote.length)) {
       chave = 'sem_lote:' + (r.motivo || '?');
       txt = 'Fila com ' + fila + ' cupom(ns) e nenhum lote entregue — motivo: ' + (r.motivo || '?')
@@ -431,7 +436,7 @@ function _proximoLoteInsercaoMl({ espiar = false } = {}) {
   const agora = Date.now();
   estado.ultimoContatoExt = agora;
   // "agora" muda a cada resposta: o navegador nunca recebe 304 com um lote velho.
-  const base = { ok: true, lote: [], visitaId: null, seletores: seletores(), tempos: TEMPOS, agora };
+  const base = { ok: true, lote: [], visitaId: null, seletores: seletores(), tempos: TEMPOS, agora, modo: MODO_EXTENSAO };
   if (!LIGADA) { salvar(); return { ...base, ok: false, motivo: 'desligada', aguardar: 30 * 60000 }; }
   if (estado.disjuntor) { salvar(); return { ...base, ok: false, motivo: 'disjuntor', disjuntor: estado.disjuntor, aguardar: 30 * 60000 }; }
   virarDia();
