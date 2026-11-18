@@ -4,6 +4,8 @@
     "server.js": {
       "minLinhas": 7880,
       "obrigatorio": [
+        "app.get('/mkt/notas'",
+        "app.post('/mkt/notas/config'",
         "app.delete('/agendamentos/:id'",
         "app.delete('/contas/:id'",
         "app.delete('/cupons/base/:chave'",
@@ -589,6 +591,14 @@
       "obrigatorio": [
         "export function registrarMedidor(",
         "export function estadoMemoria("
+      ]
+    },
+    "nota-oferta.js": {
+      "minLinhas": 200,
+      "obrigatorio": [
+        "export function avaliarNotaOferta(",
+        "export function relatorioNotas(",
+        "export function registrarCapturaFonte("
       ]
     }
   }

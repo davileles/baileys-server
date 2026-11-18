@@ -1252,6 +1252,22 @@ export function epcDe(asin) {
            ticket: p.ticket ?? 0, nome: p.nome || '', categoria: p.categoria || '' };
 }
 
+// Sinais de preco para a NOTA DA OFERTA (nota-oferta.js). So leitura: serie,
+// mediana de 30 dias, recorde estrito (mesma regra do selo) e EPC do ledger.
+export function sinaisParaNota(asin, preco) {
+  const p = Number(preco);
+  const st = asin ? estatisticas(asin) : null;
+  const d = asin ? epcDe(asin) : null;
+  return {
+    dias: st?.dias ?? 0,
+    mediana30: st?.mediana30 ?? null,
+    min90: st?.min90 ?? null,
+    recorde: !!(st && Number.isFinite(p) && p > 0 && ehRecordeEstrito(st.serie90, p)),
+    epc: d ? d.epc : null,
+    cliquesEpc: d ? d.cliques : 0,
+  };
+}
+
 /** Estado do ledger para o painel (e para saber se o coletor ja rodou). */
 export function estadoEpc() {
   const prods = Object.values(_epc?.produtos || {}).filter(p => p.cliques > 0);

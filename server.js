@@ -88,6 +88,11 @@ import {
   recusarCandidato, curadoriaEstado, curadoriaRemover,
   conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie,
 } from './monitor-precos.js';
+import {
+  carregarNotaOferta, configNotaOferta, salvarConfigNotaOferta, registrarCapturaFonte,
+  avaliarNotaOferta, relatorioNotas,
+} from './nota-oferta.js';
+try { carregarNotaOferta(); } catch (e) { console.warn('[NOTA] Falha ao carregar:', e.message); }
 
 // ── SINCRONIZACAO COM O GITHUB ────────────────────────────────────────────────
 import {
@@ -5932,6 +5937,20 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' roteamento: ' + explicarRoteamento(_rota)
     + ' -> ' + alvos.length + ' grupo(s).');
   }
+  // Nota da oferta em modo ativo: so no auto-envio da captura (aplicarNota).
+  // Grupo que tambem e destino de uma trilha aprovada continua recebendo.
+  const _barradasNota = (!_manuais && opcoes.aplicarNota)
+    ? (oferta?.dadosExtraidos?.notaOferta?.trilhasBarradas || []) : [];
+  if (_barradasNota.length) {
+    const _barr = new Set(_barradasNota.map(String));
+    const _okIds = detalharRoteamento(_rota).filter(t => t.entrega && !_barr.has(String(t.id))).map(t => t.id);
+    const _permitidos = new Set(destinosDasTrilhas(_okIds));
+    const antes = alvos.length;
+    alvos = alvos.filter(j => _permitidos.has(j));
+    console.log('[NOTA] Oferta #' + (oferta?.id || '?') + ' fora das trilhas ' + _barradasNota.join(', ')
+      + ' pela nota — ' + alvos.length + ' de ' + antes + ' grupo(s).');
+    if (!alvos.length) throw new Error('Nota da oferta abaixo da minima em todas as trilhas.');
+  }
 
   // ── RECORTE POR TIPO DE DESTINO ──
   // Usado pelo monitor de precos quando o produto e curado e o desconto nao foi
@@ -7327,7 +7346,7 @@ async function iniciarTelegram() {
           registrarCapturaBruta(tgFonte, { key: { id: 'tg-' + msg.id },
             message: { telegram: { msgId: msg.id, temMidia: !!msg.media } } },
             msg.message, 'telegram-polling', false);
-          await processarRadarMarketplace(tgFonte, msg.message, {});
+          await processarRadarMarketplace(tgFonte, msg.message, { postadoEm: msg.date ? msg.date * 1000 : null });
         }
       } catch(e) { /* silencioso — canal pode estar temporariamente inacessivel */ }
     }
@@ -7390,7 +7409,7 @@ async function iniciarTelegram() {
         registrarCapturaBruta(tgFonte, { key: { id: 'tg-' + msg.id },
           message: { telegram: { msgId: msg.id, temMidia: !!msg.media } } },
           texto, 'telegram', false);
-        processarRadarMarketplace(tgFonte, texto, {})
+        processarRadarMarketplace(tgFonte, texto, { postadoEm: msg.date ? msg.date * 1000 : null })
           .catch(e => console.error('[TG-RADAR] Falha no pipeline:', e.message));
       }
 
@@ -9854,6 +9873,9 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // justamente a que traz o cupom/preco que faltava, e jaDivulgado() compara
     // preco BRUTO — cupom novo nao muda o preco de tabela, entao a correcao
     // seria descartada em silencio. Ela nunca auto-envia: vai para aprovacao.
+    // Nota da oferta: conta a captura ANTES do dedup, para "varias fontes
+    // postaram o mesmo produto" enxergar tambem o repost de outra fonte.
+    try { registrarCapturaFonte(p, jid); } catch (e) { /* nota nunca segura o pipeline */ }
     if (jaDivulgado(p) && !opcoes.edicao) {
       console.log('[MKT] ' + (p.asin || '?') + ' descartado — ja divulgado nas ultimas '
         + horasDedup() + 'h (' + (p.titulo || '').slice(0, 50) + ')');
@@ -10168,10 +10190,40 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       console.log('[FILTRO] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA — ' + oferta.motivoFila);
       continue;
     }
-    if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
+    const _elegivelAuto = autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
         && !_filtro?.bloqueia
         && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente && !oferta.cupomPaginaAusente
-        && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
+        && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao;
+    // ── NOTA DA OFERTA (18/11/2026, nota-oferta.js) ──
+    // Nota de 0 a 100 na hora da captura, sem fila e sem teto por hora. Em
+    // 'sombra' so registra (GET /mkt/notas). Em 'ativo', oferta que sairia
+    // sozinha so vai as trilhas em que passou na nota minima; sem nenhuma, e
+    // descartada como no filtro de preco. Card/aprovacao manual nunca e barrado.
+    let _nota = null;
+    try {
+      const _rotaNota = rotaDeRoteamento(oferta);
+      _nota = avaliarNotaOferta({ oferta, p, precoFinal: _precoGate, descontoPct: _descGate, fonte: jid,
+        postadoEm: opcoes.postadoEm || null, rota: detalharRoteamento(_rotaNota),
+        categoria: _rotaNota.categoria, categoriaConfiavel: _rotaNota.categoriaConfiavel, elegivel: _elegivelAuto });
+      if (_nota) {
+        oferta.dadosExtraidos.notaOferta = { nota: _nota.nota, partes: _nota.partes, modo: _nota.modo,
+          trilhas: _nota.trilhas, trilhasBarradas: _nota.trilhasBarradas };
+        console.log('[NOTA] #' + oferta.id + ' ' + (p.asin || '?') + ' nota ' + _nota.nota + ' ('
+          + (_nota.partes.map(x => x.rotulo + ' ' + (x.pontos > 0 ? '+' : '') + x.pontos).join(', ') || 'base') + ')'
+          + (_nota.trilhas.length ? ' · ' + _nota.trilhas.map(t => t.nome + (t.passa ? ' ✓' : ' ✗') + t.min).join(', ') : '')
+          + (_nota.modo === 'sombra' ? ' [sombra]' : ''));
+      }
+    } catch (e) { /* nota nunca segura o pipeline */ }
+    if (_elegivelAuto && _nota?.descartar) {
+      oferta.status = 'rejeitado';
+      oferta.motivoFila = 'nota da oferta: ' + _nota.motivo;
+      oferta.descartadaPorNota = true;
+      filaPendentes.unshift(oferta);
+      salvarFila();
+      console.log('[NOTA] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA — ' + _nota.motivo);
+      continue;
+    }
+    if (_elegivelAuto) {
       try {
         // Passou so pelo rigor do nicho (ex.: Bebidas no moderado): sai so nos
         // grupos do nicho; os gerais seguem com o rigor total (18/11/2026).
@@ -10179,7 +10231,8 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
           ? { categoriaNicho: _filtro.nicho, somenteNicho: true } : {};
         if (_soNicho.somenteNicho) console.log('[FILTRO] #' + oferta.id + ' ' + (p.asin || '?') + ' — passou no rigor do nicho '
           + _filtro.nicho + ' (' + _filtro.vetarNicho + '): so nos grupos do nicho — ' + (_filtro.motivo || ''));
-        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta, { revalidarPreco: true, ..._soNicho });
+        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta,
+          { revalidarPreco: true, ..._soNicho, aplicarNota: !!_nota?.trilhasBarradas?.length });
         oferta.status = 'enviado';
         oferta.enviadoEm = new Date().toISOString();
         oferta.gruposEnviados = r.enviados;
@@ -11208,7 +11261,10 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
     // pipeline de emissoes CDV e nao sabe lidar com link de produto.
     if (_ehRadar) {
       registrarCapturaBruta(jid, msg, texto, tipo, _ehEdicao);
-      await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao, thumbFonte: _thumbFonte });
+      const _tsMsg = msg?.messageTimestamp;
+      const _postadoEm = _tsMsg ? Number(typeof _tsMsg?.toNumber === 'function' ? _tsMsg.toNumber() : _tsMsg) * 1000 : null;
+      await processarRadarMarketplace(jid, texto, { edicao: _ehEdicao, thumbFonte: _thumbFonte,
+        postadoEm: Number.isFinite(_postadoEm) && _postadoEm > 0 ? _postadoEm : null });
       if (!ehMonitoradoCdv(jid)) return;
     }
 
@@ -22774,6 +22830,21 @@ app.get('/monitor-precos', (req, res) => {
 app.get('/monitor-precos/config', (req, res) => {
   res.json({ ok:true, config: configMonitorPrecos(), lojas: LOJAS_MONITORAVEIS_PRECO });
 });
+
+// ── NOTA DA OFERTA (nota-oferta.js) ──
+// Relatorio da nota em sombra/ativo: distribuicao, quantas passariam em cada
+// corte por trilha e exemplos dos dois lados. ?dias=1..8 (padrao 7).
+app.get('/mkt/notas', (req, res) => {
+  try { res.json({ ok:true, ...relatorioNotas({ dias: Number(req.query.dias) || 7 }) }); }
+  catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
+});
+// body: { modo:'off'|'sombra'|'ativo', minGeral, minGeralProdutoNicho,
+//         minNichoPadrao, minNicho:{<categoria>: nota|null}, janelaFontesH }
+app.post('/mkt/notas/config', (req, res) => {
+  try { res.json({ ok:true, config: salvarConfigNotaOferta(req.body || {}) }); }
+  catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+app.get('/mkt/notas/config', (req, res) => res.json({ ok:true, config: configNotaOferta() }));
 
 app.post('/monitor-precos/config', (req, res) => {
   try { res.json({ ok:true, config: salvarConfigMonitorPrecos(req.body || {}) }); }
