@@ -9364,7 +9364,145 @@ async function resolverPechinchou(url) {
   return destino;
 }
 
-async function expandirEncurtadores(texto) {
+// ── ENCURTADOR DESCONHECIDO (QUALQUER DOMINIO) ──────────────────────────────
+// 18/11/2026, regra do Davi: encurtador de grupo-fonte tem de ser resolvido "em
+// qualquer caso". Os dois detectores acima pedem um sinal no formato (lista fixa
+// de encurtadores genericos ou subdominio/slug com cara de hash) e deixavam de
+// fora amzn.promos.link / shpee.promos.link (Leandro Indica: ~25 ofertas/dia,
+// zero aproveitadas), amaznlink.com, x.gd e o que vier depois. Agora todo link
+// cujo host nenhum pipeline de loja reconhece e que nao e rede social/bio e
+// seguido salto a salto; se a cadeia nao redireciona, le ate 128 KB do HTML
+// procurando o link da loja (meta refresh, JS ou link na pagina). So substitui o
+// texto quando o destino cai em loja que algum pipeline atende — o pipeline gera
+// o NOSSO link de afiliado, e a tag de quem postou sai da URL da Amazon.
+const HOSTS_PIPELINE = /(?:^|\.)(?:amazon\.com\.br|amzn\.to|amzn\.eu|a\.co|link\.amazon(?:\.com)?|mercadolivre\.com\.br|mercadolibre\.com|mercadolivre\.com|meli\.la|shopee\.com\.br|shope\.ee|magazineluiza\.com\.br|magazinevoce\.com\.br|magalu\.com|ofertou\.ai|onelink\.me|pechin\.co|pechinchou\.com\.br)$/i;
+// Bio/agregador e lojas que nao atendemos: nem tenta.
+const HOSTS_NUNCA_RESOLVER = /(?:^|\.)(?:taplink\.cc|taplink\.at|beacons\.ai|bio\.link|linkbio\.co|campsite\.bio|aliexpress\.com|pichau\.com\.br|kabum\.com\.br)$/i;
+const RE_URL_LOJA_NO_HTML = /https?:\/\/(?:[\w-]+\.)*(?:amazon\.com\.br|amzn\.to|a\.co|mercadolivre\.com(?:\.br)?|meli\.la|shopee\.com\.br|shope\.ee|magazineluiza\.com\.br|magazinevoce\.com\.br)\/[^\s"'<>\\]+/i;
+const _hostsDesconhecidos = new Map(); // host -> { n, resolvidos, falhas, falhasSeguidas, grupos:Set, exemplo, ultimoDestino, em, pausaAte }
+const ENCURT_MAX_POR_MSG = 4;
+
+function linkDePipeline(url) {
+  if (HOSTS_PIPELINE.test(_hostSemWww(url))) return true;
+  try { return ehLinkAwin(url); } catch (e) { return false; }
+}
+
+function ehLinkDesconhecido(url) {
+  const h = _hostSemWww(url);
+  if (!h || !h.includes('.')) return false;
+  if (linkDePipeline(url)) return false;
+  if (HOSTS_NAO_ENCURTADOR.test(h) || HOSTS_NUNCA_RESOLVER.test(h)) return false;
+  if (ENCURTADORES_GENERICOS.test(h)) return false;   // ja tem resolvedor proprio
+  return true;
+}
+
+function _limparTagAmazon(url) {
+  if (!/amazon\.com\.br|amzn\.|a\.co\//i.test(url)) return url;
+  try {
+    const u = new URL(url);
+    for (const k of ['tag', 'ascsubtag', 'linkCode', 'linkId', 'ref_', 'creative', 'creativeASIN', 'camp']) u.searchParams.delete(k);
+    return u.toString();
+  } catch (e) { return url; }
+}
+
+function _notaHostDesconhecido(url, jid, destino) {
+  const h = _hostSemWww(url);
+  let e = _hostsDesconhecidos.get(h);
+  if (!e) {
+    if (_hostsDesconhecidos.size >= 300) _hostsDesconhecidos.delete(_hostsDesconhecidos.keys().next().value);
+    e = { n: 0, resolvidos: 0, falhas: 0, falhasSeguidas: 0, grupos: new Set(), exemplo: url, ultimoDestino: null, em: null, pausaAte: 0 };
+    _hostsDesconhecidos.set(h, e);
+  }
+  e.n++; e.em = new Date().toISOString(); e.exemplo = url;
+  if (jid) e.grupos.add(String(jid).split('@')[0]);
+  if (destino === undefined) return e;
+  if (destino) { e.resolvidos++; e.falhasSeguidas = 0; e.ultimoDestino = destino.slice(0, 200); }
+  else {
+    e.falhas++; e.falhasSeguidas++;
+    // Dominio que falha sempre nao merece uma requisicao por mensagem:
+    // descansa 6 h a cada 15 falhas seguidas.
+    if (e.falhasSeguidas >= 15) { e.pausaAte = Date.now() + 6 * 3600e3; e.falhasSeguidas = 0; }
+  }
+  return e;
+}
+
+async function resolverLinkDesconhecido(url, saltos = 5) {
+  const emCache = _cacheEncurtador.get(url);
+  if (emCache && Date.now() - emCache.em < ENCURTADOR_TTL_MS) return emCache.destino;
+  const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+  let destino = null;
+  let atual = url;
+  try {
+    for (let i = 0; i < saltos; i++) {
+      const res = await fetch(atual, {
+        method: 'GET', redirect: 'manual',
+        headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', 'Accept': 'text/html,*/*' },
+        signal: AbortSignal.timeout(8000),
+      });
+      const loc = res.headers.get('location');
+      if (loc) {
+        try { await res.body?.cancel?.(); } catch (e) {}
+        atual = new URL(loc, atual).href;
+        if (linkDePipeline(atual)) { destino = atual; break; }
+        continue;
+      }
+      // Sem redirect: pagina intermediaria. Le so o comeco do HTML.
+      let html = '';
+      try {
+        const leitor = res.body?.getReader?.();
+        if (leitor) {
+          const dec = new TextDecoder();
+          while (html.length < 131072) {
+            const { value, done } = await leitor.read();
+            if (done) break;
+            html += dec.decode(value, { stream: true });
+          }
+          try { await leitor.cancel(); } catch (e) {}
+        }
+      } catch (e) { /* corpo ilegivel: segue sem */ }
+      const refresh = html.match(/http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=([^"'>\s]+)/i)
+                   || html.match(/(?:window\.)?location(?:\.href)?\s*(?:=|\.replace\()\s*["'](https?:\/\/[^"']+)/i);
+      let proximo = null;
+      try { proximo = refresh ? new URL(refresh[1].replace(/&amp;/g, '&'), atual).href : null; } catch (e) {}
+      if (proximo && proximo !== atual) {
+        atual = proximo;
+        if (linkDePipeline(atual)) { destino = atual; break; }
+        continue;
+      }
+      const m = html.match(RE_URL_LOJA_NO_HTML);
+      if (m) destino = m[0].replace(/&amp;/g, '&');
+      break;
+    }
+  } catch (e) {
+    console.warn('[ENCURTADOR] Link desconhecido nao resolveu ' + url + ': ' + e.message);
+  }
+  if (destino && !linkDePipeline(destino)) destino = null;
+  if (destino) destino = _limparTagAmazon(destino);
+  if (_cacheEncurtador.size >= ENCURTADOR_CACHE_MAX) {
+    _cacheEncurtador.delete(_cacheEncurtador.keys().next().value);
+  }
+  _cacheEncurtador.set(url, { destino, em: Date.now() });
+  return destino;
+}
+
+// Passada final: o que sobrou de link com host desconhecido.
+async function _expandirDesconhecidos(texto, jid) {
+  const urls = String(texto || '').match(/https?:\/\/[^\s<>"')*]+/g) || [];
+  let saida = texto;
+  const alvos = [...new Set(urls.map(u => u.replace(/[.,;:!?]+$/, '')).filter(ehLinkDesconhecido))].slice(0, ENCURT_MAX_POR_MSG);
+  for (const curta of alvos) {
+    const info = _hostsDesconhecidos.get(_hostSemWww(curta));
+    if (info?.pausaAte > Date.now()) { _notaHostDesconhecido(curta, jid); continue; }
+    const destino = await resolverLinkDesconhecido(curta);
+    _notaHostDesconhecido(curta, jid, destino);
+    if (!destino) continue;
+    console.log('[ENCURTADOR] (desconhecido) ' + curta + ' -> ' + destino.slice(0, 140));
+    saida = saida.split(curta).join(destino);
+  }
+  return saida;
+}
+
+async function expandirEncurtadores(texto, jid = null) {
   const urls = String(texto || '').match(/https?:\/\/[^\s<>"')]+/g) || [];
   let saida = texto;
   for (const curta of [...new Set(urls.filter(ehLinkPechinchou))]) {
@@ -9375,7 +9513,6 @@ async function expandirEncurtadores(texto) {
   }
   const alvos = [...new Set(urls.filter(u => !ehLinkPechinchou(u) && (
     ENCURTADORES_GENERICOS.test(_hostSemWww(u)) || ehEncurtadorCustom(u))))];
-  if (!alvos.length) return saida;
   for (const curta of alvos) {
     const generico = ENCURTADORES_GENERICOS.test(_hostSemWww(curta));
     const destino = generico
@@ -9386,14 +9523,14 @@ async function expandirEncurtadores(texto) {
       + curta + ' -> ' + destino.slice(0, 140));
     saida = saida.split(curta).join(destino);
   }
-  return saida;
+  return await _expandirDesconhecidos(saida, jid);
 }
 
 async function processarRadarMarketplace(jid, texto, opcoes = {}) {
   if (!texto) return;
 
   // Encurtador generico esconde a loja de destino de todos os gates abaixo.
-  texto = await expandirEncurtadores(texto);
+  texto = await expandirEncurtadores(texto, jid);
 
   // Uma mensagem pode trazer link de mais de uma loja; cada pipeline cuida dos
   // links que reconhece e ignora o resto.
@@ -9498,7 +9635,17 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     const _doms = [...new Set((String(texto).match(/https?:\/\/[^\/\s]+/g) || [])
       .map(u => u.replace(/^https?:\/\//i, '')))];
     if (_doms.length) {
-      console.log('[MKT] ' + String(jid).split('@')[0] + ' — nenhum pipeline reconheceu o link: ' + _doms.join(', '));
+      // Separa loja atendida (o pipeline leu e descartou: dedup, nicho, preco,
+      // janela) de dominio que ninguem atende — so o segundo e buraco de captura.
+      const _desc = _doms.filter(d => ehLinkDesconhecido('https://' + d + '/x'));
+      const _lojas = _doms.filter(d => linkDePipeline('https://' + d + '/x'));
+      if (_desc.length) {
+        console.log('[MKT] ' + String(jid).split('@')[0] + ' — nenhum pipeline reconheceu o link: ' + _desc.join(', '));
+      } else if (_lojas.length) {
+        console.log('[MKT] ' + String(jid).split('@')[0] + ' — loja reconhecida, nada aproveitado (descarte do pipeline): ' + _lojas.join(', '));
+      } else {
+        console.log('[MKT] ' + String(jid).split('@')[0] + ' — so links fora de loja: ' + _doms.join(', '));
+      }
     }
     return;
   }
@@ -19121,6 +19268,18 @@ app.post('/enviar-audio', upload.single('audio'), async (req, res) => {
 
 // ── RADAR DE MARKETPLACE (TSP) ───────────────────────────────────────────────
 // Nao confundir com /radar/* e filaRadar acima, que sao do Radar de Ofertas CDV.
+
+// Dominios desconhecidos vistos nos grupos-fonte desde o boot (18/11/2026):
+// quantas vezes, em quais grupos e quantos viraram link de loja.
+app.get('/mkt/encurtadores', (req, res) => {
+  const lista = [..._hostsDesconhecidos.entries()].map(([host, e]) => ({
+    host, vistos: e.n, resolvidos: e.resolvidos, falhas: e.falhas,
+    grupos: [...e.grupos].map(g => ({ id: g, nome: NOMES_GRUPOS.get(g + '@g.us') || null })),
+    exemplo: e.exemplo, ultimoDestino: e.ultimoDestino, em: e.em,
+    pausadoAte: e.pausaAte > Date.now() ? new Date(e.pausaAte).toISOString() : null,
+  })).sort((a, b) => b.vistos - a.vistos);
+  res.json({ ok: true, total: lista.length, lista });
+});
 
 // Config do radar de marketplace — a aba Grupos do painel Gestao TSP grava aqui.
 app.get('/mkt/config', (req, res) => {
