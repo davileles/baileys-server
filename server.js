@@ -10984,6 +10984,25 @@ async function processarMensagem(msg, ctx = CTX_PRINCIPAL) {
     else if (tipo === 'extendedTextMessage') {
       texto = m.extendedTextMessage.text;
       _thumbFonte = miniaturaDaMensagem(m);
+      // Card de link: quem postou ja abriu o link no celular para gerar a
+      // previa, e o canonicalUrl costuma ser a pagina FINAL da loja. Encurtador
+      // atras de Cloudflare (amzn.promos.link do Leandro Indica: 403 "Attention
+      // Required" para o IP do Railway) so se resolve assim — troca o link
+      // curto pelo da loja antes do radar (18/11/2026).
+      try {
+        const _ext = m.extendedTextMessage;
+        const _curto = String(_ext.matchedText || '').trim();
+        const _canon = String(_ext.canonicalUrl || '').trim();
+        if (_ehRadar && _curto && ehLinkDesconhecido(_curto)) {
+          console.log('[ENCURTADOR] (previa) ' + String(jid).split('@')[0] + ' matched=' + _curto.slice(0, 120)
+            + ' canonical=' + _canon.slice(0, 160));
+        }
+        if (_curto && _canon && _curto !== _canon && /^https?:\/\//i.test(_canon)
+            && linkDePipeline(_canon) && !linkDePipeline(_curto) && texto.includes(_curto)) {
+          texto = texto.split(_curto).join(_limparTagAmazon(_canon));
+          console.log('[ENCURTADOR] (previa) ' + _curto + ' -> ' + _canon.slice(0, 140));
+        }
+      } catch (e) { /* previa e so atalho */ }
     }
     else if (tipo === 'imageMessage') {
       texto = m.imageMessage.caption || '';
