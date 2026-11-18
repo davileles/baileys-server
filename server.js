@@ -9837,6 +9837,19 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         }
       } catch (e) { /* filtro nunca segura o pipeline por erro */ }
     }
+    // Vetada pela serie em modo 'ativo' (18/11/2026, decisao do Davi): a oferta
+    // do grupo-fonte e DESCARTADA — nao vira card no bot nem espera no painel.
+    // Fica no historico da fila como 'rejeitado' com o motivo. A trava de queda
+    // anormal continua indo para revisao (preco provavelmente lido errado).
+    if (_filtro?.bloqueia && !_filtro.quedaAnormal) {
+      oferta.status = 'rejeitado';
+      oferta.motivoFila = 'filtro de preco: ' + (_filtro.nivel || '') + ' — ' + (_filtro.motivo || 'serie de precos');
+      oferta.descartadaPorFiltro = true;
+      filaPendentes.unshift(oferta);
+      salvarFila();
+      console.log('[FILTRO] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA — ' + oferta.motivoFila);
+      continue;
+    }
     if (autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
         && !_filtro?.bloqueia
         && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente
@@ -20551,9 +20564,10 @@ async function _dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', 
           return { ok:false, motivo: _f.motivo + _card };
         }
       } else {
-        if (_f?.veto) console.log('[FILTRO] Lista ' + asin + ' — ' + (_f.bloqueia ? 'PULADO' : 'vetaria (sombra)')
+        if (_f?.veto) console.log('[FILTRO] Lista ' + asin + ' — ' + (_f.bloqueia && configMonitorPrecos()?.filtroDisparo?.listas === true ? 'PULADO' : 'vetaria (lista fora do filtro / sombra)')
           + ': ' + _f.nivel + ' — ' + _f.motivo);
-        if (_f?.bloqueia) return { ok:false, motivo:'filtro de preco: ' + _f.motivo + ' (serie ' + _f.diasSerie + 'd)' };
+        if (_f?.bloqueia && configMonitorPrecos()?.filtroDisparo?.listas === true)
+          return { ok:false, motivo:'filtro de preco: ' + _f.motivo + ' (serie ' + _f.diasSerie + 'd)' };
       }
     } catch (e) { /* filtro nunca derruba a lista */ }
   }

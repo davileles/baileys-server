@@ -279,9 +279,13 @@ const CFG_PADRAO = {
   //         'semQuedaReal'  tambem queda abaixo do minimo do nicho / fora do
   //                          menor patamar de 90 dias
   // Disparo manual (painel, vitrine, bot) nunca e segurado: e decisao do operador.
+  // listas: false (18/11/2026, decisao do Davi) — itens de LISTA nunca sao
+  // pulados pelo filtro: listas sao produtos repetidos de proposito (campanha,
+  // bonus de comissao). O filtro so peneira o que chega dos grupos-fonte.
   filtroDisparo: {
     modo: 'sombra',
     vetar: 'semQuedaReal',
+    listas: false,
   },
 
   // TRAVA DE QUEDA ANORMAL (08/10/2026): queda de 'pct'% ou mais contra a
@@ -613,6 +617,7 @@ function estruturarCfg(bruto) {
   const fd = b.filtroDisparo || {};
   out.filtroDisparo.modo  = ['off', 'sombra', 'ativo'].includes(fd.modo) ? fd.modo : CFG_PADRAO.filtroDisparo.modo;
   out.filtroDisparo.vetar = ['falsoDesconto', 'semQuedaReal'].includes(fd.vetar) ? fd.vetar : CFG_PADRAO.filtroDisparo.vetar;
+  out.filtroDisparo.listas = typeof fd.listas === 'boolean' ? fd.listas : CFG_PADRAO.filtroDisparo.listas;
 
   const tq = b.travaQueda || {};
   out.travaQueda.ativo   = tq.ativo !== false;
