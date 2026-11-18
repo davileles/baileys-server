@@ -531,6 +531,142 @@ async function processarBoasVindas() {
   gravar();
 }
 
+// ── Balcão: aviso de aprovação e de retirada (desde 18/11/2026) ──────────────
+// O proxy chama quando o Davi aprova uma verificação no gestor (balcao.js) e
+// quando o Tico tira alguém do grupo do Balcão por falta de verificação
+// (index.js do painel-cdv). Mensagens saem da conta da inclusão (tico-02).
+// Aprovado: já está no grupo → só a confirmação; nunca saiu → link de convite;
+// saiu/foi removido (o link não abre) → "salve o número e responda SIM" e a
+// inclusão segue pela fila lenta, como no fluxo normal.
+const _balcaoAvisados = new Map();   // tipo|telefone → ms (contra clique duplo / rodada repetida)
+
+function _balcaoRepetido(tipo, tel, janelaMs) {
+  const k = tipo + '|' + String(tel).slice(-8);
+  if (Date.now() - (_balcaoAvisados.get(k) || 0) < janelaMs) return true;
+  _balcaoAvisados.set(k, Date.now());
+  return false;
+}
+function _telNorm(t) { let d = String(t || '').replace(/\D/g, ''); if (d.length === 10 || d.length === 11) d = '55' + d; return d.length >= 12 ? d : ''; }
+
+export function avisarBalcaoAprovadoCdv({ telefones, nome }) {
+  const e = E();
+  const tels = [...new Set((telefones || []).map(_telNorm).filter(Boolean))];
+  if (!tels.length) return { ok: false, erro: 'telefone inválido' };
+  const conta = e.config.conta;
+  if (!e.config.ativo) return { ok: false, erro: 'inclusão pelo WhatsApp desligada (/cdv/inclusao/config)' };
+  if (!_d.contaConectada || !_d.contaConectada(conta)) {
+    avisarOperador('*Balcão — aprovação sem aviso* ⚠️\n\n' + (nome || '+' + tels[0]) + ' foi aprovado(a) no Balcão, mas o ' + conta
+      + ' está desconectado. Avise a pessoa e inclua no grupo manualmente.');
+    return { ok: false, erro: conta + ' desconectado: avisei o grupo do operador' };
+  }
+  if (_balcaoRepetido('aprovado', tels[0], 10 * MS_MIN)) return { ok: true, repetido: true };
+  _avisarAprovado(tels, nome || '').catch(err => {
+    console.warn('[INCLUSAO] Balcão aprovado: ' + err.message);
+    avisarOperador('*Balcão — aprovação sem aviso* ⚠️\n\n' + (nome || '+' + tels[0]) + ': ' + err.message);
+  });
+  return { ok: true, agendado: true, conta, telefone: tels[0] };
+}
+
+async function _avisarAprovado(tels, nome) {
+  const e = E();
+  // Primeiro telefone com direito ao grupo do Balcão; senão, o primeiro que respondeu.
+  let escolhido = null, primeiro = null, ultimoErro = null;
+  for (const tel of tels) {
+    let d;
+    try { d = await _d.proxy('/cdv/inclusao/consultar', { telefone: tel }); } catch (err) { ultimoErro = err; continue; }
+    const g = (d.grupos || []).find(x => x.balcao) || null;
+    if (!primeiro) primeiro = { tel, d, g };
+    if (g && g.direito) { escolhido = { tel, d, g }; break; }
+  }
+  if (!primeiro) throw new Error('consulta ao proxy falhou' + (ultimoErro ? ': ' + ultimoErro.message : ''));
+  const { tel, d, g } = escolhido || primeiro;
+  const pn = primeiroNome(d.nome || nome);
+  const jid = await _d.jidDoTelefone(tel);
+  const abertura = 'Oi' + (pn ? ', ' + pn : '') + '! Sua verificação do *Balcão do Clube do Viajante* foi aprovada ✅';
+  const existente = e.conversas[jid];
+  const conv = (existente && existente.etapa !== 'fim') ? existente
+    : { jid, conta: e.config.conta, telefone: tel, nome: d.nome || nome, etapa: 'fim', tentativas: 0, criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'balcao-aprovado' };
+  conv.atualizadoEm = Date.now();
+  if (!g || !g.direito) {
+    conv.etapa = 'fim';
+    e.conversas[jid] = conv;
+    await responder(conv, abertura + '\n\nPara entrar no grupo do Balcão você precisa estar com a assinatura do Clube ativa. Assim que estiver, é só me mandar aqui: *Quero entrar nos grupos do Clube do Viajante*');
+    registrar(conv, 'balcao_aprovado_sem_direito', d.situacao || null);
+    await avisarOperador('*Balcão — aprovado sem assinatura que dá o grupo* ⚠️\n\n' + rotuloPessoa(conv) + ' teve a verificação aprovada, mas hoje não tem direito ao grupo do Balcão (situação: '
+      + ((g && g.situacao) || d.situacao || '?') + '). Mandei a aprovação e pedi para chamar quando a assinatura estiver ativa.');
+    gravar();
+    return;
+  }
+  let presentes = null;
+  try { presentes = await _d.jaEsta(tel, [g.jid]); } catch (err) { presentes = null; }
+  if (presentes && presentes.has(g.jid)) {
+    if (conv.etapa === 'fim') e.conversas[jid] = conv;
+    await responder(conv, abertura + '\n\nVocê já está no grupo do Balcão, então está tudo certo 👍');
+    registrar(conv, 'balcao_aprovado_ja_esta');
+    gravar();
+    return;
+  }
+  // Já está na fila de inclusão por outro pedido: o Balcão entra junto.
+  const naFila = e.fila.find(f => f.jid === jid);
+  if (naFila) {
+    if (!naFila.grupos.some(x => x.jid === g.jid)) naFila.grupos.push({ jid: g.jid, nome: g.nome });
+    await responder(conv, abertura + '\n\nVocê já está na fila de inclusão; coloquei o grupo do Balcão junto. Te aviso aqui quando terminar.');
+    registrar(conv, 'balcao_aprovado_na_fila');
+    gravar();
+    return;
+  }
+  let removido = !!(g.removidoPeloTico || g.exAluno);
+  if (!removido) { try { removido = await _d.removidoPorAdmin(tel, g.jid); } catch (err) {} }
+  let link = null;
+  if (!removido) { try { link = await _d.linkConvite(g.jid); } catch (err) { link = null; } }
+  if (link) {
+    conv.etapa = 'boas_vindas';   // "o link não abre" → segue para a inclusão normal
+    e.conversas[jid] = conv;
+    await responder(conv, abertura + '\n\nAgora é só tocar no link para entrar no grupo do Balcão:\n' + link + '\n\nSe o link não abrir, me responda aqui que eu te ajudo.');
+    registrar(conv, 'balcao_aprovado_link');
+    gravar();
+    return;
+  }
+  conv.etapa = 'salvo';
+  conv.tentativas = 0;
+  conv.fixos = [{ jid: g.jid, nome: g.nome }];
+  conv.estadosDisp = [];
+  conv.balcao = { verificado: true, pendente: false, jaEsta: false, formulario: '' };
+  e.conversas[jid] = conv;
+  await responder(conv, abertura + '\n\n' + (removido
+      ? 'Como você já tinha saído do grupo do Balcão antes, o WhatsApp não deixa voltar pelo link, então eu mesmo te adiciono.'
+      : 'Eu mesmo te adiciono no grupo do Balcão.')
+    + '\n\n⚠️ *Só conseguimos te adicionar depois que você salvar este número na sua agenda.*\n\nSalvou? Responda *SIM*.');
+  registrar(conv, 'balcao_aprovado_inclusao', removido ? 'removido antes' : 'sem link');
+  gravar();
+}
+
+export function avisarBalcaoRemovidoCdv({ telefone, nome, grupo, formulario }) {
+  const e = E();
+  const tel = _telNorm(telefone);
+  if (!tel) return { ok: false, erro: 'telefone inválido' };
+  const conta = e.config.conta;
+  if (!_d.contaConectada || !_d.contaConectada(conta)) return { ok: false, erro: conta + ' desconectado' };
+  if (_balcaoRepetido('removido', tel, 24 * MS_H)) return { ok: true, repetido: true };
+  (async () => {
+    const jid = await _d.jidDoTelefone(tel);
+    const pn = primeiroNome(nome);
+    const conv = e.conversas[jid] && e.conversas[jid].etapa !== 'fim' ? e.conversas[jid]
+      : { jid, conta, telefone: tel, nome: nome || '', etapa: 'fim', tentativas: 0, criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'balcao-removido' };
+    await responder(conv, 'Oi' + (pn ? ', ' + pn : '') + '! Você foi retirado(a) do grupo ' + (grupo ? '*' + grupo + '*' : 'do *Balcão*')
+      + ' porque ainda não encontramos a sua verificação do Balcão aprovada. O Balcão é só para membros verificados, para a segurança de todos nas negociações.\n\n'
+      + '*Para voltar:*\n'
+      + '1️⃣ Preencha o formulário de verificação' + (formulario ? ': ' + formulario : ' (me peça o link por aqui)') + '\n'
+      + '2️⃣ Aguarde a análise (até 5 dias úteis)\n'
+      + '3️⃣ Assim que for aprovada, eu te aviso aqui e te coloco de volta no grupo\n\n'
+      + '⚠️ Já deixe este número salvo na sua agenda: sem isso o WhatsApp não deixa eu te adicionar.\n\n'
+      + 'Se você já preencheu o formulário, é só aguardar a análise.');
+    registrar(conv, 'balcao_removido_aviso', grupo || null);
+    gravar();
+  })().catch(err => console.warn('[INCLUSAO] Aviso de retirada do Balcão: ' + err.message));
+  return { ok: true, agendado: true };
+}
+
 // ── Fila lenta ───────────────────────────────────────────────────────────────
 async function ciclo() {
   if (_rodando) return;

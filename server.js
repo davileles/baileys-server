@@ -184,7 +184,7 @@ import { casarDesejosComOferta, MODO_DESEJOS } from './matching-desejos.js';
 // link wa.me com mensagem pronta). Ver cabecalho de inclusao-cdv.js.
 import { iniciarInclusaoCdv, observarInclusaoCdv, estadoInclusaoCdv, configurarInclusaoCdv, retomarInclusaoCdv,
          pausarInclusaoCdv, removerDaFilaInclusaoCdv, reiniciarConversaInclusaoCdv, configInclusaoCdv,
-         agendarBoasVindasCdv, textoBoasVindasCdv } from './inclusao-cdv.js';
+         agendarBoasVindasCdv, textoBoasVindasCdv, avisarBalcaoAprovadoCdv, avisarBalcaoRemovidoCdv } from './inclusao-cdv.js';
 // Avisos de preco no privado para clientes do Tica Promos (pagina /avisos/ do
 // tica-site). Numero exclusivo aviso-*; ver cabecalho de avisos-preco.js.
 import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previaDoLink as avisosPrevia,
@@ -27663,6 +27663,17 @@ app.post('/cdv/inclusao/pausar', (req, res) => {
 app.post('/cdv/inclusao/fila/remover', (req, res) => {
   if (!_inclAutorizado(req, res)) return;
   res.json({ ok: removerDaFilaInclusaoCdv(String(req.body?.id || '')) });
+});
+// Balcão (18/11/2026): o proxy avisa aprovação da verificação e retirada do grupo.
+app.post('/cdv/balcao/aviso-aprovado', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  const b = req.body || {};
+  res.json(avisarBalcaoAprovadoCdv({ telefones: Array.isArray(b.telefones) ? b.telefones : [b.telefone], nome: b.nome }));
+});
+app.post('/cdv/balcao/aviso-removido', (req, res) => {
+  if (!_inclAutorizado(req, res)) return;
+  const b = req.body || {};
+  res.json(avisarBalcaoRemovidoCdv({ telefone: b.telefone, nome: b.nome, grupo: b.grupo, formulario: b.formulario }));
 });
 app.post('/cdv/inclusao/conversa/reiniciar', (req, res) => {
   if (!_inclAutorizado(req, res)) return;
