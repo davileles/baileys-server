@@ -401,7 +401,33 @@ export function extensaoMlConfigurada() { return !!String(process.env.CUPONS_ML_
  * lote vazio + aguardar = volte depois. Com espiar=true nao reserva nada (para a
  * notificacao "3 cupons na fila — inserir agora?" do modo com aprovacao).
  */
-export function proximoLoteInsercaoMl({ espiar = false } = {}) {
+// 18/11/2026: cupons ficaram parados na fila a tarde inteira com a extensao
+// consultando a cada minuto, sem nenhum rastro do motivo. Quando ha cupom na
+// fila e a resposta nao entrega lote, registra o motivo (no maximo 1x a cada
+// 15 min por motivo) — e o modo "perguntar antes" da extensao (espiar) tambem.
+const _diagProximo = {};
+export function proximoLoteInsercaoMl(opts = {}) {
+  const r = _proximoLoteInsercaoMl(opts);
+  try {
+    const fila = r && !r.visitaId ? naFila().length : 0;
+    let chave = null, txt = null;
+    if (r && r.espiar && r.lote && r.lote.length) {
+      chave = 'espiar';
+      txt = 'Extensão no modo "perguntar antes": ' + r.lote.length + ' cupom(ns) esperando o clique em "Inserir agora" no Chrome ('
+        + r.lote.map(x => x.codigo).slice(0, 8).join(', ') + '). Para inserir sozinho, mude o modo para automático no popup.';
+    } else if (fila && (!r.lote || !r.lote.length)) {
+      chave = 'sem_lote:' + (r.motivo || '?');
+      txt = 'Fila com ' + fila + ' cupom(ns) e nenhum lote entregue — motivo: ' + (r.motivo || '?')
+        + (r.aguardar ? ' (aguardar ' + Math.round(r.aguardar / 60000) + ' min)' : '');
+    }
+    if (chave && Date.now() - (_diagProximo[chave] || 0) > 15 * 60000) {
+      _diagProximo[chave] = Date.now();
+      console.warn('[CUPONS-ML-AUTO] ' + txt);
+    }
+  } catch (e) {}
+  return r;
+}
+function _proximoLoteInsercaoMl({ espiar = false } = {}) {
   const agora = Date.now();
   estado.ultimoContatoExt = agora;
   // "agora" muda a cada resposta: o navegador nunca recebe 304 com um lote velho.
