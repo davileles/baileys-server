@@ -9381,6 +9381,7 @@ const HOSTS_NUNCA_RESOLVER = /(?:^|\.)(?:taplink\.cc|taplink\.at|beacons\.ai|bio
 const RE_URL_LOJA_NO_HTML = /https?:\/\/(?:[\w-]+\.)*(?:amazon\.com\.br|amzn\.to|a\.co|mercadolivre\.com(?:\.br)?|meli\.la|shopee\.com\.br|shope\.ee|magazineluiza\.com\.br|magazinevoce\.com\.br)\/[^\s"'<>\\]+/i;
 const _hostsDesconhecidos = new Map(); // host -> { n, resolvidos, falhas, falhasSeguidas, grupos:Set, exemplo, ultimoDestino, em, pausaAte }
 const ENCURT_MAX_POR_MSG = 4;
+const _trilhasDesconhecidos = new Map(); // host -> ultima tentativa { url, em, destino, passos[] } (diagnostico)
 
 function linkDePipeline(url) {
   if (HOSTS_PIPELINE.test(_hostSemWww(url))) return true;
@@ -9426,20 +9427,27 @@ function _notaHostDesconhecido(url, jid, destino) {
   return e;
 }
 
-async function resolverLinkDesconhecido(url, saltos = 5) {
-  const emCache = _cacheEncurtador.get(url);
+// Chave propria no cache: o detector de dominio proprio (resolverEncurtadorCustom,
+// que nao le corpo) pode ter gravado null para a MESMA url logo antes — com a
+// chave compartilhada esta passada devolvia esse null sem tentar (18/11/2026,
+// amzn.promos.link do Leandro Indica continuou sem resolver por isso).
+async function resolverLinkDesconhecido(url, saltos = 5, trilha = null) {
+  const chave = 'desc:' + url;
+  const emCache = trilha ? null : _cacheEncurtador.get(chave);
   if (emCache && Date.now() - emCache.em < ENCURTADOR_TTL_MS) return emCache.destino;
   const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
   let destino = null;
   let atual = url;
+  const passos = [];
   try {
     for (let i = 0; i < saltos; i++) {
       const res = await fetch(atual, {
         method: 'GET', redirect: 'manual',
-        headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', 'Accept': 'text/html,*/*' },
+        headers: { 'User-Agent': UA, 'Accept-Language': 'pt-BR,pt;q=0.9', 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8' },
         signal: AbortSignal.timeout(8000),
       });
       const loc = res.headers.get('location');
+      passos.push({ url: atual.slice(0, 200), status: res.status, location: loc ? loc.slice(0, 200) : null });
       if (loc) {
         try { await res.body?.cancel?.(); } catch (e) {}
         atual = new URL(loc, atual).href;
@@ -9460,10 +9468,20 @@ async function resolverLinkDesconhecido(url, saltos = 5) {
           try { await leitor.cancel(); } catch (e) {}
         }
       } catch (e) { /* corpo ilegivel: segue sem */ }
+      if (passos.length) {
+        const ult = passos[passos.length - 1];
+        ult.bytes = html.length;
+        ult.titulo = (html.match(/<title[^>]*>([^<]{0,120})/i) || [])[1] || null;
+        ult.trecho = html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 240);
+        ult.links = [...new Set((html.match(/https?:\/\/[^\s"'<>\\]+/g) || [])
+          .filter(u => !/\.(?:js|css|png|jpe?g|svg|webp|woff2?|ico)(?:\?|$)/i.test(u)))].slice(0, 8).map(u => u.slice(0, 160));
+      }
       const refresh = html.match(/http-equiv=["']?refresh["']?[^>]*content=["'][^"']*url=([^"'>\s]+)/i)
-                   || html.match(/(?:window\.)?location(?:\.href)?\s*(?:=|\.replace\()\s*["'](https?:\/\/[^"']+)/i);
+                   || html.match(/(?:window\.)?location(?:\.href)?\s*(?:=|\.replace\()\s*["'](https?:\/\/[^"']+)/i)
+                   || html.match(/["'](?:url|href|redirect(?:Url|_url)?|destino|target)["']\s*:\s*["'](https?:\\?\/\\?\/[^"']+)/i);
       let proximo = null;
-      try { proximo = refresh ? new URL(refresh[1].replace(/&amp;/g, '&'), atual).href : null; } catch (e) {}
+      try { proximo = refresh ? new URL(refresh[1].replace(/\\\//g, '/').replace(/&amp;/g, '&'), atual).href : null; } catch (e) {}
       if (proximo && proximo !== atual) {
         atual = proximo;
         if (linkDePipeline(atual)) { destino = atual; break; }
@@ -9474,14 +9492,23 @@ async function resolverLinkDesconhecido(url, saltos = 5) {
       break;
     }
   } catch (e) {
+    passos.push({ url: atual.slice(0, 200), erro: e.message });
     console.warn('[ENCURTADOR] Link desconhecido nao resolveu ' + url + ': ' + e.message);
   }
   if (destino && !linkDePipeline(destino)) destino = null;
   if (destino) destino = _limparTagAmazon(destino);
+  if (!destino) {
+    const ult = passos[passos.length - 1] || {};
+    console.log('[ENCURTADOR] (desconhecido) sem loja em ' + url + ' — ' + passos.length + ' passo(s), ultimo HTTP '
+      + (ult.status ?? '?') + (ult.titulo ? ' "' + ult.titulo + '"' : '') + (ult.erro ? ' erro ' + ult.erro : ''));
+  }
+  if (_trilhasDesconhecidos.size >= 300) _trilhasDesconhecidos.delete(_trilhasDesconhecidos.keys().next().value);
+  _trilhasDesconhecidos.set(_hostSemWww(url), { url, em: new Date().toISOString(), destino, passos });
+  if (trilha) trilha.passos = passos;
   if (_cacheEncurtador.size >= ENCURTADOR_CACHE_MAX) {
     _cacheEncurtador.delete(_cacheEncurtador.keys().next().value);
   }
-  _cacheEncurtador.set(url, { destino, em: Date.now() });
+  _cacheEncurtador.set(chave, { destino, em: Date.now() });
   return destino;
 }
 
@@ -19277,8 +19304,25 @@ app.get('/mkt/encurtadores', (req, res) => {
     grupos: [...e.grupos].map(g => ({ id: g, nome: NOMES_GRUPOS.get(g + '@g.us') || null })),
     exemplo: e.exemplo, ultimoDestino: e.ultimoDestino, em: e.em,
     pausadoAte: e.pausaAte > Date.now() ? new Date(e.pausaAte).toISOString() : null,
+    ultimaTentativa: _trilhasDesconhecidos.get(host) || null,
   })).sort((a, b) => b.vistos - a.vistos);
   res.json({ ok: true, total: lista.length, lista });
+});
+
+// Testa um link desconhecido na hora, sem cache, e devolve cada salto (status,
+// location, titulo, trecho e links da pagina). So host publico com ponto.
+app.get('/mkt/encurtadores/testar', async (req, res) => {
+  const url = String(req.query.url || '').trim();
+  let u;
+  try { u = new URL(url); } catch (e) { return res.status(400).json({ ok: false, erro: 'url invalida' }); }
+  const h = u.hostname.toLowerCase();
+  if (!/^https?:$/.test(u.protocol) || !h.includes('.') || /(?:^|\.)(?:internal|local|localhost)$/.test(h)
+      || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(h) || h.includes(':')) {
+    return res.status(400).json({ ok: false, erro: 'host nao permitido' });
+  }
+  const trilha = {};
+  const destino = await resolverLinkDesconhecido(url, 5, trilha);
+  res.json({ ok: true, url, desconhecido: ehLinkDesconhecido(url), destino, passos: trilha.passos || [] });
 });
 
 // Config do radar de marketplace — a aba Grupos do painel Gestao TSP grava aqui.
