@@ -10136,7 +10136,13 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente
         && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao) {
       try {
-        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta, { revalidarPreco: true });
+        // Passou so pelo rigor do nicho (ex.: Bebidas no moderado): sai so nos
+        // grupos do nicho; os gerais seguem com o rigor total (18/11/2026).
+        const _soNicho = _filtro?.soNicho && _filtro.nicho
+          ? { categoriaNicho: _filtro.nicho, somenteNicho: true } : {};
+        if (_soNicho.somenteNicho) console.log('[FILTRO] #' + oferta.id + ' ' + (p.asin || '?') + ' — passou no rigor do nicho '
+          + _filtro.nicho + ' (' + _filtro.vetarNicho + '): so nos grupos do nicho — ' + (_filtro.motivo || ''));
+        const r = await enviarOfertaParaDestinos(oferta.mensagemFormatada, null, oferta, { revalidarPreco: true, ..._soNicho });
         oferta.status = 'enviado';
         oferta.enviadoEm = new Date().toISOString();
         oferta.gruposEnviados = r.enviados;

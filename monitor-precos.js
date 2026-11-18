@@ -286,6 +286,10 @@ const CFG_PADRAO = {
     modo: 'sombra',
     vetar: 'semQuedaReal',
     listas: false,
+    // Rigor por nicho (18/11/2026, decisao do Davi): Bebidas no moderado (so
+    // barra falso desconto); o resto segue no 'vetar' geral. Oferta que so
+    // passa pelo moderado do nicho sai SO nos grupos do nicho (soNicho).
+    vetarPorNicho: { bebidas: 'falsoDesconto' },
   },
 
   // TRAVA DE QUEDA ANORMAL (08/10/2026): queda de 'pct'% ou mais contra a
@@ -618,6 +622,11 @@ function estruturarCfg(bruto) {
   out.filtroDisparo.modo  = ['off', 'sombra', 'ativo'].includes(fd.modo) ? fd.modo : CFG_PADRAO.filtroDisparo.modo;
   out.filtroDisparo.vetar = ['falsoDesconto', 'semQuedaReal'].includes(fd.vetar) ? fd.vetar : CFG_PADRAO.filtroDisparo.vetar;
   out.filtroDisparo.listas = typeof fd.listas === 'boolean' ? fd.listas : CFG_PADRAO.filtroDisparo.listas;
+  const vpn = (fd.vetarPorNicho && typeof fd.vetarPorNicho === 'object') ? fd.vetarPorNicho : CFG_PADRAO.filtroDisparo.vetarPorNicho;
+  out.filtroDisparo.vetarPorNicho = {};
+  for (const [n, v] of Object.entries(vpn || {})) {
+    if (String(n).trim() && ['falsoDesconto', 'semQuedaReal'].includes(v)) out.filtroDisparo.vetarPorNicho[String(n).trim()] = v;
+  }
 
   const tq = b.travaQueda || {};
   out.travaQueda.ativo   = tq.ativo !== false;
@@ -1647,8 +1656,14 @@ export function filtroDisparo({ asin, loja, nome, preco, precoDe, cupom = null }
     const { nicho } = nichoDoProduto(item, nome || _hist[asin]?.n || item.nome);
     const av = avaliar(item, { preco: Number(preco), precoDe: Number(precoDe), disponivel: true }, stats, nicho);
     const c = classificarFiltro(av, stats, nicho);
-    const veto = !!c.nivel && (cfg.vetar === 'semQuedaReal' || c.nivel === 'falsoDesconto');
-    return { ...base, ...c, nicho, veto, bloqueia: veto && cfg.modo === 'ativo',
+    // Rigor do nicho (vetarPorNicho) vale para os grupos do nicho; o geral
+    // segue com cfg.vetar. Passou so pelo do nicho -> soNicho (o chamador
+    // restringe o envio aos grupos do nicho).
+    const vetarNicho = (cfg.vetarPorNicho || {})[nicho] || cfg.vetar;
+    const vetoGeral = !!c.nivel && (cfg.vetar === 'semQuedaReal' || c.nivel === 'falsoDesconto');
+    const veto = !!c.nivel && (vetarNicho === 'semQuedaReal' || c.nivel === 'falsoDesconto');
+    const soNicho = !veto && vetoGeral && vetarNicho !== cfg.vetar;
+    return { ...base, ...c, nicho, veto, soNicho, vetarNicho, bloqueia: veto && cfg.modo === 'ativo',
              diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null };
   } catch (e) {
     // Filtro nunca derruba envio: erro = nao julgavel.
