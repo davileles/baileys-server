@@ -673,9 +673,19 @@ export async function baixarDanfse(chave, ambiente = 'producao') {
   const cert = certificado();
   if (!cert) throw new Error('certificado não cadastrado');
   if (!/^\d{50}$/.test(String(chave))) throw new Error('chave inválida');
-  const r = await chamar(URLS[ambiente].adn + '/danfse/' + chave, { cert, binario: true, timeoutMs: 45000 });
-  if (r.status !== 200 || !/pdf/i.test(r.tipo)) throw new Error('ADN respondeu ' + r.status);
-  return r.buf;
+  // O ADN fica instável (503/504) com frequência: tenta de novo antes de desistir.
+  const esperas = [0, 3000, 8000];
+  let ultimo = '';
+  for (const ms of esperas) {
+    if (ms) await new Promise(res => setTimeout(res, ms));
+    let r;
+    try { r = await chamar(URLS[ambiente].adn + '/danfse/' + chave, { cert, binario: true, timeoutMs: 45000 }); }
+    catch (e) { ultimo = e.message; continue; }
+    if (r.status === 200 && /pdf/i.test(r.tipo)) return r.buf;
+    ultimo = 'ADN respondeu ' + r.status;
+    if (r.status < 500 && r.status !== 429) break;   // erro definitivo: não adianta repetir
+  }
+  throw new Error(ultimo + ' (o ADN da NFS-e Nacional está fora do ar agora; a nota segue emitida, tente de novo mais tarde ou baixe pela Consulta Pública do Portal Nacional com a chave de acesso)');
 }
 
 // ── Configuração ─────────────────────────────────────────────────────────────
