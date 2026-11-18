@@ -4326,6 +4326,23 @@ function ehZeDelivery(loja) {
   return n.includes('zedelivery') || n === 'ze';
 }
 
+// iFood (18/11/2026): nao tem programa de afiliado, mas os cupons que chegam
+// pelos canais-fonte do Telegram (Fada, Juao...) valem a divulgacao. Sai SEM
+// link (a linha "RESGATE O CUPOM AQUI" some sozinha no template, porque a
+// variavel fica vazia), so com codigo, e SO no grupo "So cupons": cupom sem
+// comissao nao ocupa os gerais nem os nichos.
+function ehIfood(loja) {
+  const n = String(loja || '').toLowerCase()
+    .replace(/^outro:\s*/, '').replace(/[^a-z]/g, '');
+  return n.startsWith('ifood');
+}
+// Lojas divulgadas sem afiliado: entram no auto-envio com codigo e saem so no
+// grupo So cupons.
+function lojaSemAfiliadoSoCupons(loja) { return ehIfood(loja); }
+// Cupom do iFood restrito a primeiro pedido ou a usuarios selecionados frustra
+// quem tenta usar: nao sai sozinho (vai para aprovacao manual).
+const RE_IFOOD_RESTRITO = /primeir[oa]\s+(pedido|compra)|novos?\s+(usu[aá]rios?|clientes?)|(usu[aá]rios?|clientes?|contas?)\s+selecionad[oa]s?|s[oó]\s+para\s+(alguns|algumas)/i;
+
 // A IA devolve lojas fora das quatro principais como "Outro: Casas Bahia".
 // O prefixo e um rotulo interno de classificacao — nunca deve vazar para a
 // mensagem enviada ao grupo, onde so o nome da loja faz sentido.
@@ -4725,6 +4742,8 @@ function lojaComLink(loja, codigo) {
   if (loja === 'Shopee')        return !!codigo && !!LINKS_TSP['Shopee_com'];
   if (/magazine\s*luiza|magalu/.test(norm)) return !!LINKS_TSP['Magazine Luiza'];
   if (ehZeDelivery(loja))       return !!LINKS_TSP['Zé Delivery'];
+  // Sem afiliado de proposito (iFood): basta ter codigo.
+  if (lojaSemAfiliadoSoCupons(loja)) return !!codigo;
   // Loja da rede Awin: o link sai do proprio catalogo de programas afiliados.
   return !!linkAwinDaLoja(loja);
 }
@@ -4827,6 +4846,8 @@ function avaliarAutoEnvio(cupom, textoOriginal, tinhaMultiplos, codigosIrmaos = 
     return { auto:false, motivo:'maximo nao confere '+ondeStr };
   if (!t.toLowerCase().includes(String(cupom.codigo).toLowerCase()))
     return { auto:false, motivo:'codigo nao aparece '+ondeStr };
+  if (ehIfood(cupom.loja) && RE_IFOOD_RESTRITO.test(t))
+    return { auto:false, motivo:'iFood: cupom so para primeiro pedido ou usuarios selecionados' };
 
   // Janela de publicacao (nada de cupom as 3h) e anti-flood. Quem monta lote
   // pede para pular esta parte e avalia uma vez so para a mensagem inteira.
@@ -5071,8 +5092,14 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   const destinos = destinosGerais();
   const soCupons = GRUPOS['tsp_cupons'];
   const _nicho = rotaNichoDoCupom(mensagem, oferta);
-  const alvos = [...new Set([...destinos, ...soCupons, ..._nicho.destinos])];
-  console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' nicho: ' + _nicho.motivo
+  // Loja sem afiliado (iFood): so o grupo So cupons.
+  const _soGrupoCupons = lojaSemAfiliadoSoCupons(oferta?.dadosExtraidos?.loja);
+  const alvos = _soGrupoCupons
+    ? [...new Set(soCupons || [])]
+    : [...new Set([...destinos, ...soCupons, ..._nicho.destinos])];
+  if (_soGrupoCupons) console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' de loja sem afiliado ('
+    + nomeLojaExibicao(oferta?.dadosExtraidos?.loja) + ') -> so grupo So cupons (' + alvos.length + ').');
+  else console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' nicho: ' + _nicho.motivo
     + ' -> ' + _nicho.destinos.length + ' grupo(s) de nicho, ' + alvos.length + ' no total.');
   const jaRecebeu = new Set(Array.isArray(oferta?.enviadosParciais) ? oferta.enviadosParciais : []);
   const enviados = [], falhas = [], pulados = [];
