@@ -642,6 +642,28 @@ function encurtar(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, 
 // ── Mensagens recebidas no número dos avisos ────────────────────────────────
 // Chamado do messages.upsert de TODA conta (principal e extras). Só age quando
 // a conta é a configurada para os avisos e a conversa é privada.
+// Última vez que a pessoa teve relação de verdade com os alertas de preço
+// (pedido criado/ativado, aviso enviado, pergunta de compra, alerta em criação).
+// Conversa solta não conta. Usado pela inclusão do CDV (inclusao-cdv.js), que
+// divide o tico-02 com os avisos: depois de entrar nos grupos, o "obrigada" da
+// pessoa é do CDV, a não ser que o contato mais recente dela seja um alerta.
+export function ultimaRelacaoAvisos(jids = [], telefone = '') {
+  try {
+    const js = new Set((jids || []).map(String).filter(Boolean));
+    for (const j of js) if (pendenteDe(j)) return Date.now();
+    const vs = new Set([...(jids || []).map(digitosDeJid), telefone].filter(Boolean).flatMap(n => [...variantesTelefone(n)]));
+    let ult = 0;
+    for (const p of E().pedidos) {
+      if (!(js.has(p.jid) || [...variantesTelefone(p.telefone)].some(v => vs.has(v)))) continue;
+      for (const t of [p.criadoEm, p.ativadoEm, p.ultimoAvisoEm, p.perguntaCompra && p.perguntaCompra.em]) {
+        const ms = Date.parse(t || '');
+        if (ms > ult) ult = ms;
+      }
+    }
+    return ult;
+  } catch (e) { return 0; }
+}
+
 export function observarMensagemAvisos(apelido, msg) {
   try {
     const c = E().config;

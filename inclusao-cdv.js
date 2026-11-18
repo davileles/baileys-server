@@ -26,9 +26,20 @@
 // extenso); quem decide e escreve as mensagens é o código.
 
 import { existsSync, readFileSync } from 'fs';
+import { ultimaRelacaoAvisos } from './avisos-preco.js';
 
 const MS_MIN = 60e3, MS_H = 3600e3;
 const CONVERSA_TTL = 48 * MS_H;
+// Depois que a conversa termina, a pessoa continua sendo "do CDV" no tico-02
+// por 30 dias para agradecimento (7 dias) e problema com grupo/link; o resto
+// segue para os avisos de preço (18/11/2026 —
+// uma ex-aluna respondeu "muito obrigada" à inclusão e o Tico respondeu
+// falando de alerta de preço). Conversa solta (ex.: falar de uma oferta dias
+// depois) continua indo para o Tico dos alertas.
+const POS_CONVERSA_MS = 30 * 24 * MS_H;
+const POS_AGRADECE_MS = 7 * 24 * MS_H;
+const RE_INTENCAO_AVISOS = /(amazon|amzn|mercadoli|meli\.la|shopee|shope\.ee|magalu|magazineluiza)|\balertas?\b|\bavisos? de preco|^\s*(sair|parar|cancelar)\b|\bcomprei\b|\bpedido\s*n?\W*\d{4}/;
+const RE_AGRADECE = /^(muit[oa]\s+)?(obrigad|obg|brigad|valeu|vlw|grat[oa]|gratidao|show|top|perfeito|otimo|maravilh|beleza|blz|ok\b|okay|certo|combinado|amem|deus\s+(te\s+)?abenc|tmj|joia|legal|massa|entendi|ta\s+bom|tudo\s+certo|consegui|deu\s+certo|que\s+bom|oba)/;
 const RE_GATILHO = /\bentrar\b.{0,20}\bgrupos?\b.{0,40}\bclube\s+do\s+viajante\b/;
 const RE_SIM = /^\s*(sim|s|salvei|ja salvei|já salvei|pronto|ok|okay|feito|salvo|isso|claro|positivo)\b/i;
 const RE_EMAIL = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
@@ -72,6 +83,7 @@ function gravar() {
       for (const [k, c] of Object.entries(e.conversas)) if ((c.atualizadoEm || 0) < corte && c.etapa !== 'na_fila') delete e.conversas[k];
       e.historico = (e.historico || []).slice(-200);
       for (const [t, em] of Object.entries(e.bvEnviadas || {})) if (Date.now() - em > 7 * 24 * MS_H) delete e.bvEnviadas[t];
+      for (const [t, em] of Object.entries(e.posCdv || {})) if (Date.now() - em > POS_CONVERSA_MS) delete e.posCdv[t];
       _d.escreverAtomico(_d.caminho, JSON.stringify(e), 'utf-8');
     } catch (err) { console.warn('[INCLUSAO] Não gravei o estado: ' + err.message); }
   }, 1500);
@@ -124,14 +136,38 @@ export function observarInclusaoCdv(apelido, sock, msg) {
     }
     const ativa = conv && conv.etapa !== 'fim' && Date.now() - (conv.atualizadoEm || 0) < CONVERSA_TTL;
     const gatilho = RE_GATILHO.test(norm(texto));
-    if (!gatilho && !ativa) return false;
+    if (!gatilho && !ativa) {
+      // Conversa já encerrada (ou de até 30 dias atrás): segue sendo do CDV,
+      // salvo pedido claro de alerta de preço ou alerta mais recente que o CDV.
+      const telJid = [k.senderPn, k.remoteJidAlt, k.remoteJid].map(v => String(v || '')).find(v => v.endsWith('@s.whatsapp.net'));
+      const d8 = telJid ? telJid.split('@')[0].replace(/\D/g, '').slice(-8) : String((conv && conv.telefone) || '').slice(-8);
+      const pc = e.posCdv || {};
+      const desde = Math.max(conv ? (conv.ultimaRespostaEm || conv.atualizadoEm || 0) : 0, pc['j:' + jid] || 0, d8 ? (pc['t:' + d8] || 0) : 0);
+      if (!desde || Date.now() - desde > POS_CONVERSA_MS) return false;
+      if (RE_INTENCAO_AVISOS.test(norm(texto))) return false;
+      const jids = [k.remoteJid, k.remoteJidAlt, k.senderPn].map(v => String(v || '')).filter(Boolean);
+      if (ultimaRelacaoAvisos(jids, telJid ? telJid.split('@')[0] : '') > desde) return false;
+      // Só fica com o CDV o que é claramente dele: agradecimento/emoji (7 dias)
+      // ou problema com grupo/link (30 dias). O resto volta para o Tico.
+      const tipo = tipoPosConversa(texto);
+      if (!tipo || (tipo === 'agradece' && Date.now() - desde > POS_AGRADECE_MS)) return false;
+      posConversa(apelido, sock, msg, jid, texto, conv).catch(err => console.warn('[INCLUSAO] Pós-conversa: ' + err.message));
+      return true;
+    }
     tratar(apelido, sock, msg, jid, texto, gatilho).catch(err => console.warn('[INCLUSAO] Conversa: ' + err.message));
     return true;
   } catch (err) { console.warn('[INCLUSAO] ' + err.message); return false; }
 }
 
+function marcarPosCdv(conv) {
+  const e = E();
+  e.posCdv = e.posCdv || {};
+  if (conv.jid) e.posCdv['j:' + conv.jid] = Date.now();
+  const d8 = String(conv.telefone || '').slice(-8);
+  if (d8) e.posCdv['t:' + d8] = Date.now();
+}
 async function responder(conv, texto) {
-  try { await _d.enviar(conv.conta, conv.jid, texto); conv.ultimaRespostaEm = Date.now(); }
+  try { await _d.enviar(conv.conta, conv.jid, texto); conv.ultimaRespostaEm = Date.now(); marcarPosCdv(conv); gravar(); }
   catch (e) { console.warn('[INCLUSAO] Resposta não saiu para ' + conv.telefone + ': ' + e.message); }
 }
 async function avisarOperador(texto) {
@@ -184,6 +220,32 @@ async function tratar(apelido, sock, msg, jid, texto, gatilho) {
       if (RE_EMAIL.test(texto)) { conv.etapa = 'email'; await etapaEmail(conv, texto); }
     }
   } finally { gravar(); }
+}
+
+// Mensagem de quem já passou pela inclusão (conversa encerrada). Só dois tipos
+// ficam com o CDV; o resto segue para os avisos de preço, como antes:
+//  - 'agradece': agradecimento/emoji (até 7 dias) → resposta curta do CDV, 1×/24 h;
+//  - 'problema': problema com grupo/link (até 30 dias) → reabre a inclusão.
+function tipoPosConversa(texto) {
+  const t = norm(texto);
+  if (!t) return null;
+  const problema = /\bnao\b|erro|problema|ajuda|\bsai\b|saiu|removid|nao abre|nao consig/.test(t);
+  if (problema) return /grupo|link|convite|entrar|adicion/.test(t) ? 'problema' : null;
+  const soEmoji = !t.replace(/[^a-z0-9]/g, '');
+  return (RE_AGRADECE.test(t) || soEmoji) ? 'agradece' : null;
+}
+async function posConversa(apelido, sock, msg, jid, texto, conv) {
+  const e = E();
+  if (tipoPosConversa(texto) === 'problema') { await tratar(apelido, sock, msg, jid, texto, true); return; }
+  e.posResp = e.posResp || {};
+  if (Date.now() - (e.posResp[jid] || 0) < 24 * MS_H) return;
+  e.posResp[jid] = Date.now();
+  for (const [j, em] of Object.entries(e.posResp)) if (Date.now() - em > 7 * 24 * MS_H) delete e.posResp[j];
+  const telefone = (conv && conv.telefone) || await _d.telefoneDe(sock, msg);
+  if (!telefone) return;
+  const c = conv || { jid, conta: apelido, telefone };
+  c.jid = jid; c.conta = c.conta || apelido;
+  await responder(c, 'Por nada! 😊 Aproveite os grupos do Clube do Viajante. Boas viagens! ✈️');
 }
 
 async function consultarPorTelefone(conv) {
