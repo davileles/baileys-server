@@ -518,7 +518,8 @@ async function montarInfDps(n, mesId, ambiente, nDPS, s = produtoDoPrograma('sho
     + tag('verAplic', VER_APLIC)
     + tag('serie', String(cfg.serie))
     + tag('nDPS', String(nDPS))
-    + tag('dCompet', cfg.competencia === 'mes' ? ultimoDiaDoMes(mesId) : dhEmiSp().slice(0, 10))
+    // Competência do produto fiscal (19/11/2026); vazio = a padrão da Emissão.
+    + tag('dCompet', ((s.competencia || cfg.competencia) === 'mes') ? ultimoDiaDoMes(mesId) : dhEmiSp().slice(0, 10))
     + tag('tpEmit', '1')
     + tag('cLocEmi', em.cLocEmi)
     + '<prest>' + tag('CNPJ', digitos(em.cnpj)) + tag('IM', digitos(em.im)) + tag('fone', digitos(em.fone)) + tag('email', em.email)
@@ -860,6 +861,7 @@ function validarProdutos(lista) {
       cstPisCofins: digitos(p.cstPisCofins), tpRetPisCofins: digitos(p.tpRetPisCofins) || '0',
       pTotTribSN: String(p.pTotTribSN == null ? '' : p.pTotTribSN).trim().replace(',', '.'),
       codigosConfirmados: p.codigosConfirmados === true,
+      competencia: p.competencia === 'mes' || p.competencia === 'emissao' ? p.competencia : '',
     });
     if (!x.nome) throw new Error('produto fiscal sem nome');
     if (x.cTribNac.length !== 6) throw new Error(x.nome + ': código de tributação nacional precisa de 6 dígitos');
