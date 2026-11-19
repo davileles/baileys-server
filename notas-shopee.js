@@ -52,6 +52,19 @@ const NS_NFSE = 'http://www.sped.fazenda.gov.br/nfse';
 const NS_DSIG = 'http://www.w3.org/2000/09/xmldsig#';
 const VER_APLIC = 'TicaPromos_1.0';
 
+// 17.06 propaganda/promoção de vendas (escolha do Davi em 18/11/2026; BH 001,
+// NBS 1.1406.19.00). Mesmo assim só vale em produção depois de confirmado no painel.
+function PRODUTO_SHOPEE_PADRAO() {
+  return { id: 'shopee-comissao', nome: 'Comissão extra de vendedores Shopee', ativo: true,
+           cTribNac: '170601', cTribMun: '001', cNBS: '114061900',
+           xDescServ: 'Promoção de vendas de produtos do vendedor por programa de afiliados Shopee (comissão extra) - competência {mes} - loja(s): {lojas}',
+           xInfComp: '', tribISSQN: '1', tpRetISSQN: '1', cstPisCofins: '00',
+           tpRetPisCofins: '0', pTotTribSN: '', codigosConfirmados: false };
+}
+// Programas de afiliados que geram nota por aqui. Só a Shopee tem relatório
+// automático hoje; os outros entram aqui quando ganharem a sua fonte.
+export const PROGRAMAS_NOTA = { shopee: 'Shopee · comissão extra de vendedores' };
+
 const CONFIG_PADRAO = {
   ativo: false,                 // emissão automática no mês (produção)
   ambiente: 'producao',         // 'producao' | 'producaorestrita'
@@ -62,18 +75,17 @@ const CONFIG_PADRAO = {
   estrangeiros: false,          // vendedor de fora do Brasil fica de fora (sem documento brasileiro)
   minimo: 0,                    // valor mínimo por nota (R$); 0 = todas
   serie: '70',                  // série das DPS deste módulo (o eNotas usa a série 1)
-  emitente: { cnpj: '', im: '', fone: '', email: '', cLocEmi: '3106200',
+  // Dados da empresa: cadastro ÚNICO com o Gestão CDV (proxy, notas-fiscais.json).
+  // Salvou aqui, vai para lá; salvou lá, chega aqui (ver EMPRESA COMPARTILHADA).
+  emitente: { cnpj: '', im: '', razao: '', fone: '', email: '', cLocEmi: '3106200',
               opSimpNac: '3', regApTribSN: '1', regEspTrib: '0' },
-  // 17.06 propaganda/promoção de vendas (escolha do Davi em 18/11/2026; BH 001,
-  // NBS 1.1406.19.00). Mesmo assim só vale em produção depois de confirmado no painel.
-  servico: { cTribNac: '170601', cTribMun: '001', cNBS: '114061900',
-             xDescServ: 'Promoção de vendas de produtos do vendedor por programa de afiliados Shopee (comissão extra) - competência {mes} - loja(s): {lojas}',
-             xInfComp: '', tribISSQN: '1', tpRetISSQN: '1', cstPisCofins: '00',
-             tpRetPisCofins: '0', pTotTribSN: '' },
-  codigosConfirmados: false,
+  // Produtos fiscais (19/11/2026): cada um define como a nota sai (códigos,
+  // tributos e texto). Cada programa de afiliados aponta para um produto.
+  produtos: [PRODUTO_SHOPEE_PADRAO()],
+  programas: { shopee: 'shopee-comissao' },
 };
 
-let E = { config: JSON.parse(JSON.stringify(CONFIG_PADRAO)), proxNDPS: {}, meses: {}, tarefa: null, cepIbge: {}, log: [] };
+let E = { config: JSON.parse(JSON.stringify(CONFIG_PADRAO)), proxNDPS: {}, meses: {}, tarefa: null, cepIbge: {}, log: [], empresaSync: {} };
 
 function escreverAtomico(caminho, dados) {
   const tmp = caminho + '.tmp';
@@ -101,12 +113,14 @@ export function iniciarNotasShopee(sessaoDir, opcoes = {}) {
   ESTADO_PATH = DIR + '/nfse_shopee.json';
   CERT_DIR = DIR + '/nfse';
   _avisar = opcoes.avisar || null;
+  _proxy = { url: opcoes.proxyUrl || '', chave: opcoes.chaveOp || '' };
   try { if (!existsSync(CERT_DIR)) mkdirSync(CERT_DIR, { recursive: true }); } catch (_) {}
   try {
     if (existsSync(ESTADO_PATH)) {
       const lido = JSON.parse(readFileSync(ESTADO_PATH, 'utf-8')) || {};
       E = Object.assign(E, lido);
       E.config = mesclar(CONFIG_PADRAO, lido.config || {});
+      migrarProdutos(lido.config || {});
     }
   } catch (e) { console.error('[NFSE] Estado ilegível, começando vazio:', e.message); }
   // Nota que estava "emitindo" quando o processo caiu: resultado incerto.
@@ -114,6 +128,98 @@ export function iniciarNotasShopee(sessaoDir, opcoes = {}) {
   gravar();
   setTimeout(() => { trabalho().catch(e => console.error('[NFSE] trabalho:', e.message)); }, 4 * 60000).unref();
   setInterval(() => { trabalho().catch(e => console.error('[NFSE] trabalho:', e.message)); }, 10 * 60000).unref();
+  // Empresa compartilhada com o Gestão CDV: confere 40 s após o boot e a cada 10 min.
+  setTimeout(() => { sincronizarEmpresa().catch(() => {}); }, 40000).unref();
+  setInterval(() => { sincronizarEmpresa().catch(() => {}); }, 10 * 60000).unref();
+}
+
+// Antes de 19/11/2026 havia um só "serviço" (config.servico) e uma só
+// confirmação de códigos: vira o produto fiscal da Shopee.
+function migrarProdutos(lidoCfg) {
+  const c = E.config;
+  if (lidoCfg.servico && !Array.isArray(lidoCfg.produtos)) {
+    const p = Object.assign(PRODUTO_SHOPEE_PADRAO(), lidoCfg.servico, { codigosConfirmados: !!lidoCfg.codigosConfirmados });
+    c.produtos = [p];
+    c.programas = { shopee: p.id };
+    registrarLog('Serviço antigo convertido no produto fiscal "' + p.nome + '"');
+  }
+  delete c.servico; delete c.codigosConfirmados;
+  if (!Array.isArray(c.produtos) || !c.produtos.length) c.produtos = [PRODUTO_SHOPEE_PADRAO()];
+  if (!c.programas || typeof c.programas !== 'object') c.programas = {};
+  if (!c.programas.shopee || !c.produtos.some(p => p.id === c.programas.shopee)) c.programas.shopee = c.produtos[0].id;
+}
+
+// ── Produtos fiscais ──────────────────────────────────────────────────────────
+function produtoPorId(id) { return (E.config.produtos || []).find(p => p.id === id) || null; }
+export function produtoDoPrograma(programa = 'shopee') { return produtoPorId((E.config.programas || {})[programa]); }
+
+// ── EMPRESA COMPARTILHADA com o Gestão CDV ───────────────────────────────────
+// A fonte é o proxy (painel-cdv, notas-fiscais.json → empresa), que o gestor-cdv
+// edita. Daqui: GET/POST /notas/empresa com a chave de operador (CAMPANHAS_KEY).
+// Campo preenchido lá vale aqui; campo vazio lá e preenchido aqui sobe para lá.
+// Salvar aqui sem conseguir falar com o proxy fica "pendente" e sobe na próxima.
+// A alíquota do Simples (pTotTribSN) NÃO é compartilhada: fica em cada produto.
+let _proxy = { url: '', chave: '' };
+const CAMPOS_EMPRESA = [['cnpj', 'cnpj'], ['im', 'im'], ['razao', 'razao'], ['cLocEmi', 'cMun'], ['fone', 'fone'], ['email', 'email'],
+                        ['opSimpNac', 'opSimpNac'], ['regApTribSN', 'regApTribSN'], ['regEspTrib', 'regEspTrib']];
+const CAMPOS_NUMERICOS = new Set(['opSimpNac', 'regApTribSN', 'regEspTrib']);
+function empresaParaProxy(em) {
+  const o = {};
+  for (const [l, r] of CAMPOS_EMPRESA) {
+    const v = String(em[l] == null ? '' : em[l]).trim();
+    if (v !== '') o[r] = CAMPOS_NUMERICOS.has(r) ? Number(v) : v;
+  }
+  return o;
+}
+async function chamarProxy(caminho, corpo) {
+  if (!_proxy.url || !_proxy.chave) throw new Error('sem chave de operador (CAMPANHAS_KEY) para falar com o Gestão CDV');
+  const r = await fetch(_proxy.url + caminho, {
+    method: corpo ? 'POST' : 'GET', signal: AbortSignal.timeout(12000),
+    headers: { 'Content-Type': 'application/json', 'X-CDV-Op': _proxy.chave },
+    body: corpo ? JSON.stringify(corpo) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) throw new Error(j.erro || ('Gestão CDV respondeu ' + r.status));
+  return j;
+}
+async function enviarEmpresa() {
+  const j = await chamarProxy('/notas/empresa', { empresa: empresaParaProxy(E.config.emitente), origem: 'tica-promos' });
+  aplicarEmpresaRemota(j.empresa || {});
+  E.empresaSync = { ok: true, em: new Date().toISOString(), pendente: false, erro: '', atualizada: j.atualizada || null };
+  gravar();
+  return E.empresaSync;
+}
+function aplicarEmpresaRemota(r) {
+  const em = E.config.emitente;
+  let faltaLa = false;
+  for (const [l, k] of CAMPOS_EMPRESA) {
+    const v = r[k] == null ? '' : String(r[k]).trim();
+    if (v !== '') em[l] = v;
+    else if (String(em[l] || '').trim() !== '') faltaLa = true;
+  }
+  return faltaLa;
+}
+let _syncEmpresa = null;
+export function sincronizarEmpresa({ maxIdadeMs = 0 } = {}) {
+  const ult = E.empresaSync && E.empresaSync.em ? new Date(E.empresaSync.em).getTime() : 0;
+  if (maxIdadeMs && E.empresaSync && E.empresaSync.ok && !E.empresaSync.pendente && Date.now() - ult < maxIdadeMs) return Promise.resolve(E.empresaSync);
+  if (_syncEmpresa) return _syncEmpresa;
+  _syncEmpresa = (async () => {
+    try {
+      if (E.empresaSync && E.empresaSync.pendente) return await enviarEmpresa();
+      const j = await chamarProxy('/notas/empresa');
+      const faltaLa = aplicarEmpresaRemota(j.empresa || {});
+      if (faltaLa) return await enviarEmpresa();
+      E.empresaSync = { ok: true, em: new Date().toISOString(), pendente: false, erro: '', atualizada: j.atualizada || null };
+      gravar();
+      return E.empresaSync;
+    } catch (e) {
+      E.empresaSync = Object.assign({}, E.empresaSync, { ok: false, erro: e.message, tentativaEm: new Date().toISOString() });
+      gravar();
+      return E.empresaSync;
+    } finally { _syncEmpresa = null; }
+  })();
+  return _syncEmpresa;
 }
 
 // ── Datas (America/Sao_Paulo, -03:00 fixo) ───────────────────────────────────
@@ -378,8 +484,9 @@ function textoServico(modelo, mesId, n) {
 }
 
 // Devolve o XML do infDPS (sem namespace: ele é herdado do <DPS>).
-async function montarInfDps(n, mesId, ambiente, nDPS) {
-  const cfg = E.config, s = cfg.servico, em = cfg.emitente;
+async function montarInfDps(n, mesId, ambiente, nDPS, s = produtoDoPrograma('shopee')) {
+  const cfg = E.config, em = cfg.emitente;
+  if (!s) throw new Error('nenhum produto fiscal escolhido para a Shopee');
   const id = idDps(cfg, nDPS);
   const e = n.endereco || {};
   const cMun = e.ok ? await codigoIbge(e.cep) : '';
@@ -516,9 +623,12 @@ async function emitirNota(mesId, n, { ambiente = E.config.ambiente } = {}) {
     tent.nDPS = proximoNumero(ambiente);
     tent.ambienteDps = ambiente;
   }
-  const { id, xml } = await montarInfDps(n, mesId, ambiente, tent.nDPS);
+  // Produto fiscal: o do programa agora; numa nova tentativa da mesma DPS, o de antes.
+  const pf = (tent.idDps && tent.produtoId && produtoPorId(tent.produtoId)) || produtoDoPrograma('shopee');
+  if (!pf) throw new Error('nenhum produto fiscal escolhido para a Shopee');
+  const { id, xml } = await montarInfDps(n, mesId, ambiente, tent.nDPS, pf);
   const assinado = assinarDps(xml, id, cert);
-  Object.assign(tent, { idDps: id, status: 'emitindo', tentativas: (tent.tentativas || 0) + 1, ultimaTentativaEm: new Date().toISOString() });
+  Object.assign(tent, { idDps: id, produtoId: pf.id, status: 'emitindo', tentativas: (tent.tentativas || 0) + 1, ultimaTentativaEm: new Date().toISOString() });
   gravar();
   let r;
   try {
@@ -559,12 +669,16 @@ export function bloqueiosEmissao(ambiente = E.config.ambiente) {
   if (!cert.cadastrado) b.push('certificado não cadastrado');
   else if (cert.vencido) b.push('certificado vencido');
   else if (!cert.abre) b.push('certificado não abre (senha?)');
-  const em = E.config.emitente, s = E.config.servico;
+  const em = E.config.emitente, s = produtoDoPrograma('shopee');
   if (digitos(em.cnpj).length !== 14) b.push('CNPJ do emitente');
   if (!digitos(em.im)) b.push('inscrição municipal do emitente');
   if (!/^\d{7}$/.test(String(em.cLocEmi))) b.push('município do emitente');
-  if (!/^\d{6}$/.test(String(s.cTribNac))) b.push('código de tributação nacional');
-  if (ambiente === 'producao' && !E.config.codigosConfirmados) b.push('códigos do serviço não confirmados');
+  if (!s) b.push('produto fiscal da Shopee não escolhido');
+  else {
+    if (s.ativo === false) b.push('produto fiscal "' + s.nome + '" desligado');
+    if (!/^\d{6}$/.test(String(s.cTribNac))) b.push('código de tributação nacional de "' + s.nome + '"');
+    if (ambiente === 'producao' && !s.codigosConfirmados) b.push('códigos de "' + s.nome + '" não confirmados com o contador');
+  }
   return b;
 }
 
@@ -587,9 +701,9 @@ async function trabalho() {
   if (!mesesComPendente.length) return;
   const b = bloqueiosEmissao('producao');
   if (b.length) {
-    avisar('critico', 'nfse:bloqueada', 'Notas Shopee esperando configuração',
-      '🧾 *Notas Shopee paradas*\n\nHá notas para emitir (' + mesesComPendente.map(mesTexto).join(', ') + '), mas falta: ' + b.join(', ')
-      + '.\n\nResolva no painel do Tica Promos → Resultados → 🧾 Notas Shopee.', 24 * 3600e3);
+    avisar('critico', 'nfse:bloqueada', 'Notas fiscais (Shopee) esperando configuração',
+      '🧾 *Notas fiscais da Shopee paradas*\n\nHá notas para emitir (' + mesesComPendente.map(mesTexto).join(', ') + '), mas falta: ' + b.join(', ')
+      + '.\n\nResolva no painel do Tica Promos → Resultados → 🧾 Notas Fiscais.', 24 * 3600e3);
     return;
   }
   for (const k of mesesComPendente.sort()) await emitirMes(k, { origem: 'automático' });
@@ -619,11 +733,11 @@ export async function emitirMes(mesId, { origem = 'painel', so = null } = {}) {
   } finally { _emitindo = false; }
   const total = m.notas.filter(n => n.status === 'emitida').reduce((s, n) => s + n.valor, 0);
   registrarLog('Emissão ' + mesTexto(mesId) + ' (' + origem + '): ' + ok + ' emitida(s), ' + falhas.length + ' falha(s)');
-  if (falhas.length) avisar('critico', 'nfse:falhas:' + mesId, 'Notas Shopee com falha',
-    '🧾 *Notas Shopee ' + mesTexto(mesId) + '*\n\n' + ok + ' emitida(s) agora, ' + falhas.length + ' com falha:\n'
+  if (falhas.length) avisar('critico', 'nfse:falhas:' + mesId, 'Notas fiscais (Shopee) com falha',
+    '🧾 *Notas fiscais Shopee ' + mesTexto(mesId) + '*\n\n' + ok + ' emitida(s) agora, ' + falhas.length + ' com falha:\n'
     + falhas.slice(0, 8).map(f => '• ' + f).join('\n') + (falhas.length > 8 ? '\n…' : '')
-    + '\n\nDetalhes no painel → Resultados → 🧾 Notas Shopee.', 6 * 3600e3);
-  else if (ok) avisar('info', 'nfse:ok:' + mesId, 'Notas Shopee ' + mesTexto(mesId) + ' emitidas',
+    + '\n\nDetalhes no painel → Resultados → 🧾 Notas Fiscais.', 6 * 3600e3);
+  else if (ok) avisar('info', 'nfse:ok:' + mesId, 'Notas fiscais Shopee ' + mesTexto(mesId) + ' emitidas',
     ok + ' nota(s) emitida(s); total emitido no mês R$ ' + total.toFixed(2));
   return { ok: true, emitidas: ok, falhas };
 }
@@ -699,14 +813,60 @@ export function salvarConfig(c = {}) {
   novo.horaFim = Math.min(24, Math.max(novo.horaIni + 1, Number(novo.horaFim) || 20));
   novo.minimo = Math.max(0, Number(String(novo.minimo).replace(',', '.')) || 0);
   novo.serie = String(digitos(novo.serie) || '70').slice(0, 5);
-  for (const k of ['cTribNac', 'cTribMun', 'cNBS']) novo.servico[k] = digitos(novo.servico[k]);
-  if (!CAMPOS_TEXTO.test(novo.servico.xDescServ) || !CAMPOS_TEXTO.test(novo.servico.xInfComp)) throw new Error('texto longo demais');
-  // Mexeu nos códigos do serviço: precisa confirmar de novo.
-  const mudouCodigo = ['cTribNac', 'cTribMun', 'cNBS'].some(k => novo.servico[k] !== E.config.servico[k]);
-  if (mudouCodigo && c.codigosConfirmados !== true) novo.codigosConfirmados = false;
+  if (Array.isArray(c.produtos)) novo.produtos = validarProdutos(c.produtos);
+  const progs = Object.assign({}, E.config.programas, c.programas && typeof c.programas === 'object' ? c.programas : {});
+  for (const k of Object.keys(progs)) if (!PROGRAMAS_NOTA[k] || !novo.produtos.some(p => p.id === progs[k])) delete progs[k];
+  if (!progs.shopee) throw new Error('escolha o produto fiscal das notas da Shopee');
+  novo.programas = progs;
+  for (const k of ['cnpj', 'im', 'fone', 'cLocEmi']) novo.emitente[k] = digitos(novo.emitente[k]);
+  novo.emitente.razao = String(novo.emitente.razao || '').trim().slice(0, 300);
+  novo.emitente.email = String(novo.emitente.email || '').trim().slice(0, 80);
   E.config = novo;
   gravar();
   return E.config;
+}
+
+function validarProdutos(lista) {
+  const ids = new Set();
+  return lista.map(p => {
+    const id = String(p.id || '').trim().replace(/[^\w-]/g, '').slice(0, 40) || ('pf-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
+    if (ids.has(id)) throw new Error('produto fiscal repetido: ' + id);
+    ids.add(id);
+    const antes = produtoPorId(id);
+    const x = Object.assign(PRODUTO_SHOPEE_PADRAO(), {
+      id, nome: String(p.nome || '').trim().slice(0, 80), ativo: p.ativo !== false,
+      cTribNac: digitos(p.cTribNac), cTribMun: digitos(p.cTribMun) || '001', cNBS: digitos(p.cNBS),
+      xDescServ: String(p.xDescServ || '').trim(), xInfComp: String(p.xInfComp || '').trim(),
+      tribISSQN: digitos(p.tribISSQN) || '1', tpRetISSQN: digitos(p.tpRetISSQN) || '1',
+      cstPisCofins: digitos(p.cstPisCofins), tpRetPisCofins: digitos(p.tpRetPisCofins) || '0',
+      pTotTribSN: String(p.pTotTribSN == null ? '' : p.pTotTribSN).trim().replace(',', '.'),
+      codigosConfirmados: p.codigosConfirmados === true,
+    });
+    if (!x.nome) throw new Error('produto fiscal sem nome');
+    if (x.cTribNac.length !== 6) throw new Error(x.nome + ': código de tributação nacional precisa de 6 dígitos');
+    if (x.cNBS.length !== 9) throw new Error(x.nome + ': NBS precisa de 9 dígitos');
+    if (!x.xDescServ) throw new Error(x.nome + ': descrição da nota vazia');
+    if (!CAMPOS_TEXTO.test(x.xDescServ) || !CAMPOS_TEXTO.test(x.xInfComp)) throw new Error(x.nome + ': texto longo demais');
+    if (x.pTotTribSN && !/^\d{1,2}(\.\d{1,2})?$/.test(x.pTotTribSN)) throw new Error(x.nome + ': alíquota do Simples inválida');
+    // Mexeu nos códigos: precisa confirmar de novo com o contador (o painel
+    // desmarca a caixa ao editar um código; aqui só vale se veio marcada).
+    if (antes && ['cTribNac', 'cTribMun', 'cNBS'].some(k => antes[k] !== x[k]) && p.codigosConfirmados !== true) x.codigosConfirmados = false;
+    return x;
+  });
+}
+
+// Salva a configuração e, se a empresa mudou, manda para o Gestão CDV.
+export async function salvarConfigCompartilhada(c = {}) {
+  const antes = JSON.stringify(empresaParaProxy(E.config.emitente));
+  salvarConfig(c);
+  let empresaSync = E.empresaSync;
+  if (JSON.stringify(empresaParaProxy(E.config.emitente)) !== antes) {
+    E.empresaSync = Object.assign({}, E.empresaSync, { pendente: true });
+    gravar();
+    try { empresaSync = await enviarEmpresa(); }
+    catch (e) { E.empresaSync = Object.assign({}, E.empresaSync, { ok: false, erro: e.message, tentativaEm: new Date().toISOString() }); gravar(); empresaSync = E.empresaSync; }
+  }
+  return { config: E.config, empresaSync };
 }
 
 // Preenche emitente/regime a partir do XML de uma NFS-e já emitida pela empresa.
@@ -722,13 +882,15 @@ export function importarXmlEmitente(xml) {
     opSimpNac: g(/<opSimpNac>(\d)<\/opSimpNac>/), regApTribSN: g(/<regApTribSN>(\d)<\/regApTribSN>/), regEspTrib: g(/<regEspTrib>(\d)<\/regEspTrib>/),
   };
   for (const k of Object.keys(v)) if (v[k]) em[k] = v[k];
-  const s = E.config.servico;
+  const s = produtoDoPrograma('shopee') || {};
   const trib = { tribISSQN: g(/<tribISSQN>(\d)<\/tribISSQN>/), tpRetISSQN: g(/<tpRetISSQN>(\d)<\/tpRetISSQN>/),
                  cstPisCofins: g(/<piscofins>[\s\S]*?<CST>(\d+)<\/CST>/), tpRetPisCofins: g(/<tpRetPisCofins>(\d)<\/tpRetPisCofins>/),
                  pTotTribSN: g(/<pTotTribSN>([\d.]+)<\/pTotTribSN>/) };
   for (const k of Object.keys(trib)) if (trib[k]) s[k] = trib[k];
+  E.empresaSync = Object.assign({}, E.empresaSync, { pendente: true });
   gravar();
   registrarLog('Dados do emitente importados de um XML de NFS-e');
+  sincronizarEmpresa().catch(() => {});
   return { emitente: em, servico: s, codigosDoXml: { cTribNac: g(/<cTribNac>(\d+)<\/cTribNac>/), cTribMun: g(/<cTribMun>(\d+)<\/cTribMun>/), cNBS: g(/<cNBS>(\d+)<\/cNBS>/) } };
 }
 
@@ -744,11 +906,12 @@ export function estadoNotasShopee() {
       notas: (m.notas || []).map(n => ({ chave: n.chave, doc: n.doc, tipo: n.tipo, nome: n.nome, valor: n.valor, status: n.status,
         lojas: n.lojas, cidade: n.endereco && n.endereco.ok ? n.endereco.cidade + '/' + n.endereco.uf : '', enderecoOk: !!(n.endereco && n.endereco.ok),
         nDPS: n.nDPS || 0, chaveAcesso: n.chaveAcesso || '', nNFSe: n.nNFSe || '', emitidaEm: n.emitidaEm || '', erro: n.erro || '',
-        foraDoSistema: !!n.foraDoSistema, teste: n.teste ? { status: n.teste.status, chaveAcesso: n.teste.chaveAcesso || '', erro: n.teste.erro || '' } : null })),
+        foraDoSistema: !!n.foraDoSistema, produtoId: n.produtoId || '', teste: n.teste ? { status: n.teste.status, chaveAcesso: n.teste.chaveAcesso || '', erro: n.teste.erro || '' } : null })),
       fora: m.fora || [],
     };
   });
-  return { ok: true, config: E.config, certificado: estadoCertificado(), bloqueios: bloqueiosEmissao('producao'),
+  return { ok: true, config: E.config, programasNota: PROGRAMAS_NOTA, empresaSync: E.empresaSync || {},
+           certificado: estadoCertificado(), bloqueios: bloqueiosEmissao('producao'),
            tarefa: E.tarefa, emitindo: _emitindo, mesAlvo: mesAnterior(), meses, log: (E.log || []).slice(0, 30) };
 }
 

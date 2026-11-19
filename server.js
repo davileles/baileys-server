@@ -233,7 +233,7 @@ import {
   formatarOfertaMl, amostrasCardSocialMl, paginaMlBloqueadaHtml,
 } from './radar-ml.js';
 import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
-  salvarConfig as salvarConfigNotasShopee, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
+  salvarConfigCompartilhada as salvarConfigNotasShopee, sincronizarEmpresa as sincronizarEmpresaNotas, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
   marcarNota as marcarNotaShopee, baixarDanfse, previaDps } from './notas-shopee.js';
 import { atenderLongPollPaginasAmazon, registrarResultadoPaginaAmazon, estadoPaginasAmazon } from './paginas-amazon.js';
 import { iniciarPaginasMl, pedirPaginaMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
@@ -23531,7 +23531,8 @@ app.get('/amazon/cupons-pagina/:asin', async (req, res) => {
 // notas-shopee.js. A extensão busca o relatório mensal da Shopee no Chrome do
 // operador (token da extensão); o painel (raiz logada) configura, cadastra o
 // certificado A1 e acompanha. Certificado e senha nunca saem do volume.
-iniciarNotasShopee(SESSAO_DIR, { avisar: (a) => registrarAlerta(a) });
+// Dados da empresa: cadastro único com o Gestão CDV (proxy /notas/empresa, chave de operador).
+iniciarNotasShopee(SESSAO_DIR, { avisar: (a) => registrarAlerta(a), proxyUrl: CDV_PROXY_URL, chaveOp: process.env.CAMPANHAS_KEY || '' });
 app.get('/notas-shopee/tarefa', (req, res) => {
   if (!exigirExtensaoMl(req, res)) return;
   res.json({ ok: true, tarefa: tarefaParaExtensao() });
@@ -23547,13 +23548,15 @@ function exigirRaizNotas(req, res) {
   res.status(403).json({ ok: false, erro: 'só o administrador logado' });
   return false;
 }
-app.get('/notas-shopee', (req, res) => {
+app.get('/notas-shopee', async (req, res) => {
   if (!exigirRaizNotas(req, res)) return;
+  // Traz a empresa do Gestão CDV se a última conferência tem mais de 1 min (até 5 s de espera).
+  await Promise.race([sincronizarEmpresaNotas({ maxIdadeMs: 60000 }).catch(() => {}), new Promise(ok => setTimeout(ok, 5000))]);
   res.json(estadoNotasShopee());
 });
-app.post('/notas-shopee/config', (req, res) => {
+app.post('/notas-shopee/config', async (req, res) => {
   if (!exigirRaizNotas(req, res)) return;
-  try { res.json({ ok: true, config: salvarConfigNotasShopee(req.body || {}) }); }
+  try { res.json(Object.assign({ ok: true }, await salvarConfigNotasShopee(req.body || {}))); }
   catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
 });
 app.post('/notas-shopee/certificado', (req, res) => {
