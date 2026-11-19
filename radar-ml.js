@@ -3513,8 +3513,48 @@ function avisoDeCupomMl(p, desconto, motivo, segmentado) {
  * Nunca inventa desconto: quando o ML nao declara o valor em R$, cai para o
  * calculo pelo percentual sobre o preco lido.
  */
+// Cupom da pagina que NAO vale para este preco (19/11/2026): a pagina lista
+// tambem o cupom cujo minimo o item nao atinge (marcado NOT_MIN/UNMET pelo ML
+// ou com minimo declarado acima do preco). Antes o de maior desconto vencia
+// sem olhar isso — o Jogo de Bits DeWalt de R$ 27 saiu com ECONOMIAEMDOBRO
+// (15%, minimo R$ 199) quando o checkout so dava os 10% de outro cupom.
+// Mesmo filtro que cupomDaPaginaParaCatalogoMl ja aplicava.
+function cupomPaginaValeParaPreco(c, preco) {
+  if (/NOT_MIN|NOT_REACHED|UNMET|INSUFFICIENT/i.test(String(c?.tipoMl || ''))) return false;
+  if (Number(c?.minimo) > 0 && Number(preco) > 0 && Number(preco) < Number(c.minimo)) return false;
+  return true;
+}
+
+// Registro da base que pode ter o codigo citado na mensagem: vigente e com o
+// minimo atingido por este preco. Sem isso o codigo e de outro cupom (ou ja
+// acabou) e quem digitar no checkout recebe erro.
+function codigoDaBaseServe(reg, preco) {
+  if (!reg || !cupomVigente(reg)) return false;
+  if (Number(reg.minimo) > 0 && Number(preco) > 0 && Number(preco) < Number(reg.minimo)) return false;
+  if (Number(reg.maximo) > 0 && Number(preco) > Number(reg.maximo)) return false;
+  return true;
+}
+
+// O ML confirmou o desconto neste anuncio, mas nao ha UM codigo da base que
+// sirva: a oferta sai com o desconto e a instrucao de resgatar na pagina
+// (regra do Davi, 19/11/2026: desconto de resgate no anuncio/carrinho sem
+// codigo e legitimo; o que nao pode e citar codigo que nao funciona).
+function cupomPaginaSemCodigo(p, desconto, motivo) {
+  if (motivo) console.log('[CUPOM-PAGINA] ML campanha ' + (p.idCampanhaLoja || '?') + ' (' +
+    (p.tipo === 'pct' ? p.valor + '%' : 'R$ ' + p.valor) + ') sai sem codigo: ' + motivo);
+  return {
+    cupom: { codigo: null, semCodigo: true, segmentado: false,
+             naoResgatado: String(p.status || '').toLowerCase() === 'unredeemed',
+             desconto, idCampanhaLoja: p.idCampanhaLoja, daPagina: true,
+             ambiguo: false, reg: null, motivoSemCodigo: motivo || null },
+    aviso: null,
+  };
+}
+
 export function resolverCupomPaginaMl(cupons, preco) {
   if (!cupons?.length) return { cupom: null, aviso: null };
+  cupons = cupons.filter(c => cupomPaginaValeParaPreco(c, preco));
+  if (!cupons.length) return { cupom: null, aviso: null };
   // Entre varios, o de maior beneficio em reais.
   const melhorPagina = cupons
     .map(c => ({ c, r: descontoSeguroMl(c, preco) }))
@@ -3572,6 +3612,15 @@ export function resolverCupomPaginaMl(cupons, preco) {
   if (conhecida?.codigo) {
     // Campanha conhecida e com codigo: e ESTE codigo, sem inferencia.
     const reg = cupomPorCodigo('Mercado Livre', conhecida.codigo);
+    // ...desde que o codigo funcione para este preco e ainda esteja vigente.
+    // Aqui a campanha e exata: se o codigo dela nao serve (minimo nao atingido,
+    // esgotado, vencido), o desconto tambem nao existe — a oferta sai sem cupom.
+    if (reg && !codigoDaBaseServe(reg, preco)) {
+      const motivo = conhecida.codigo + (cupomVigente(reg)
+        ? ' tem minimo/teto que este preco nao atende' : ' esta inativo ou vencido na base');
+      console.log('[CUPOM-PAGINA] ML campanha ' + p.idCampanhaLoja + ' ignorada: ' + motivo);
+      return { cupom: null, aviso: avisoDeCupomMl(p, desconto, motivo, false) };
+    }
     return {
       cupom: { codigo: conhecida.codigo, desconto, idCampanhaLoja: p.idCampanhaLoja,
                daPagina: true, ambiguo: false, semCodigo: false, reg },
@@ -3583,12 +3632,21 @@ export function resolverCupomPaginaMl(cupons, preco) {
   // casamento por (tipo, valor) contra a base.
   const casado = casadoAntes || casarCupomDaPagina('Mercado Livre', { ...p, precoRef: preco });
   if (casado.ambiguo) {
-    return {
-      cupom: { codigo: casado.candidatos.map(r => r.codigo).join(' ou '), desconto,
-               idCampanhaLoja: p.idCampanhaLoja, daPagina: true, ambiguo: true,
-               semCodigo: false, reg: casado.candidatos[0] },
-      aviso: null,
-    };
+    // Antes a mensagem saia com "A ou B ou C" para o membro testar. Regra do
+    // Davi (19/11/2026): a oferta leva o cupom que vale, nunca uma lista. Sem
+    // um codigo unico, sai o desconto que o anuncio confirma, sem codigo.
+    return cupomPaginaSemCodigo(p, desconto, 'varios codigos possiveis (' +
+      casado.candidatos.map(r => r.codigo).join(', ') + ')');
+  }
+  if (casado.reg && !codigoDaBaseServe(casado.reg, preco)) {
+    const motivo = casado.reg.codigo + ' nao serve para este preco';
+    // Casou pela campanha (exato): o cupom do anuncio e este, e nao vale aqui.
+    if (casado.via === 'campanha') {
+      console.log('[CUPOM-PAGINA] ML campanha ' + p.idCampanhaLoja + ' ignorada: ' + motivo);
+      return { cupom: null, aviso: avisoDeCupomMl(p, desconto, motivo, false) };
+    }
+    // Casou so pelo percentual: o desconto do anuncio e de outro cupom.
+    return cupomPaginaSemCodigo(p, desconto, motivo);
   }
   if (casado.reg) {
     return {

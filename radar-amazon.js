@@ -1566,6 +1566,13 @@ function palavrasDoTexto(s) {
     .filter(Boolean);
 }
 export function textoCitaCodigo(textoOriginal, codigo) {
+  // Codigo que e palavra comum (DESCONTO, PROMO, FRETE...) so conta quando o
+  // post o apresenta como codigo (19/11/2026): "cupom: DESCONTO", "código
+  // DESCONTO" ou entre crases, em caixa alta. Antes qualquer "desconto" no
+  // texto casava o cupom DESCONTO (25%, sem minimo) e o Jogo de Brocas Makita
+  // saiu com 25% que o anuncio nao tinha.
+  const codUp = String(codigo || '').replace(/^outro:\s*/i, '').trim().toUpperCase();
+  if (PALAVRAS_NAO_CODIGO.has(codUp)) return citaPalavraComoCodigo(textoOriginal, codUp);
   const cod = palavrasDoTexto(String(codigo || '').replace(/^outro:\s*/i, ''));
   if (!cod.length) return false;
   const txt = palavrasDoTexto(textoOriginal);
@@ -2691,6 +2698,17 @@ export async function lerCuponsPaginaAmazon(asin, { forcar = false } = {}) {
 // Codigos que o post cita como cupom: "cupom X", "cupom: X", "código: `X`",
 // "use o código X", "cód. X" e qualquer token em caixa alta entre crases.
 const RE_CODIGO_POST = /(?:\bcupo(?:m|ns)|\bc[oó]d(?:igo|\.)?(?:\s+promocional)?)\s*(?:de\s+desconto\s*)?[:\-]?\s*(?:e|eh|é|de|do|da)?\s*[`*_"'“”]*([A-Z0-9][A-Z0-9._-]{3,29})\b/gi;
+function citaPalavraComoCodigo(texto, codUp) {
+  const t = String(texto || '');
+  const esc = codUp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const reRotulo = new RegExp('(?:\\bcupo(?:m|ns)|\\bc[oó]d(?:igo|\\.)?(?:\\s+promocional)?)\\s*(?:de\\s+desconto\\s*)?[:\\-]?\\s*(?:é\\s*)?[`*_"\'“”]*' + esc + '(?![A-Za-z0-9])', 'i');
+  const m = t.match(reRotulo);
+  // O codigo precisa estar em caixa alta no proprio texto ("cupom desconto" e
+  // frase, "cupom DESCONTO" e codigo).
+  if (m && m[0].slice(-codUp.length) === codUp) return true;
+  return new RegExp('`' + esc + '`').test(t);
+}
+
 export function codigosCitadosNoPost(texto) {
   const t = String(texto || '');
   const achados = new Set();
@@ -4545,11 +4563,12 @@ export function casarCupomDaPagina(loja, cupomPagina) {
       const f = restantes.filter(r => Number(r.limite) === teto);
       if (f.length) restantes = f;
     }
+    // Minimo acima do preco e eliminatorio (19/11/2026): antes o filtro so
+    // valia "se deixasse alguem", e quando todos exigiam R$ 199 num item de
+    // R$ 53 os dois codigos (OFFSEMPREML ou ELETROTECHML) iam para a mensagem.
     const preco = Number(cupomPagina.precoBase || cupomPagina.precoRef) || 0;
-    if (preco) {
-      const f = restantes.filter(r => !(Number(r.minimo) > preco));
-      if (f.length) restantes = f;
-    }
+    if (preco) restantes = restantes.filter(r => !(Number(r.minimo) > preco));
+    if (!restantes.length) return { reg: null, candidatos: [], via: 'valor', ambiguo: false };
     // Desempate nao grava idCampanhaLoja: e evidencia boa, mas nao exata.
     if (restantes.length === 1) {
       return { reg: restantes[0], candidatos: restantes, via: 'valor+teto', ambiguo: false };
