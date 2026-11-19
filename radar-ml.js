@@ -1065,6 +1065,27 @@ async function trilhaPreditaMl(titulo) {
  * Devolve null quando o id nao e de catalogo (404) ou nao ha oferta ativa;
  * outros erros (429, 5xx, token) sobem para quem chama decidir o fallback.
  */
+// Releitura NA HORA DO ENVIO (19/11/2026): o preco que interessa e o da oferta
+// que a mensagem divulga (itemId fixado no link), nao o da primeira oferta do
+// catalogo. Sem o itemId na lista, vale o menor preco do catalogo — releitura
+// nunca pode descartar oferta so porque o ML ordenou outra na frente.
+// null = sem catalogo na API (anuncio classico) ou API indisponivel.
+export async function precoOfertaCatalogoMl(id, itemId = null) {
+  const cat = /^MLBU?\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;
+  if (!cat || !apiMlAutorizada()) return null;
+  let ofertas;
+  try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=50'); }
+  catch (e) {
+    if (/\b404\b/.test(e.message)) return null;
+    throw e;
+  }
+  const lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
+  if (!lista.length) return { preco: null, semOferta: true, catalogoId: cat };
+  const doItem = itemId ? lista.find(r => String(r.item_id || '').toUpperCase() === String(itemId).toUpperCase()) : null;
+  const ref = doItem || lista.reduce((a, b) => (Number(b.price) < Number(a.price) ? b : a));
+  return { preco: Number(ref.price), itemId: ref.item_id || null, doItem: !!doItem, catalogoId: cat };
+}
+
 export async function precoCatalogoApiMl(id) {
   // MLBU (catalogo unificado) tambem serve: /products/{MLBU}/items responde 200.
   const cat = /^MLBU?\d{5,}$/i.test(String(id || '')) ? String(id).toUpperCase() : null;

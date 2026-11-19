@@ -231,6 +231,7 @@ import {
   estadoOrigemSocialMl,
   definirValidadeAntibotMs, estadoAntibotLogadoMl, coberturaApiMl, estadoSocialMl,
   formatarOfertaMl, amostrasCardSocialMl, paginaMlBloqueadaHtml,
+  precoOfertaCatalogoMl, catalogoSemOfertaMl, idCatalogoMl,
 } from './radar-ml.js';
 import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
   salvarConfigCompartilhada as salvarConfigNotasShopee, sincronizarEmpresa as sincronizarEmpresaNotas, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
@@ -5805,11 +5806,48 @@ function ofertaPerecivel(o) {
 // segura a oferta: segue como antes. REVALIDAR_OFERTA_MIN=0 desliga.
 const REVALIDAR_OFERTA_MIN = process.env.REVALIDAR_OFERTA_MIN !== undefined
   ? Number(process.env.REVALIDAR_OFERTA_MIN) : 10;
+// Mercado Livre (19/11/2026, pedido do Davi): o preco do catalogo e relido
+// pela API oficial NA VEZ do envio, sem esperar os 10 min — 1 chamada, sem
+// pagina e sem extensao. Anuncio classico (sem catalogo na API) segue sem
+// releitura. Mesma regra: subiu mais de 3% ou ninguem vende = descartada.
+// REVALIDAR_ML=0 desliga.
+const REVALIDAR_ML = String(process.env.REVALIDAR_ML ?? '1') !== '0';
+async function revalidarOfertaMl(oferta, de, idadeMin) {
+  if (!REVALIDAR_ML) return;
+  const cat = idCatalogoMl(de.catalogoId || de.asin, de.urlProduto || de.url || '');
+  if (!cat) return;
+  const vencida = (motivo) => { const e = new Error(motivo); e.ofertaVencida = true; return e; };
+  let lido = null;
+  try { lido = await precoOfertaCatalogoMl(cat, de.itemId || null); }
+  catch (e) {
+    console.warn('[FRESCOR] #' + oferta.id + ' ' + cat + ' releitura ML falhou (' + e.message + ') — segue.');
+    return;
+  }
+  if (!lido) return;   // anuncio classico ou API sem resposta: segue como antes
+  if (lido.semOferta) {
+    let confirmado = false;
+    try { confirmado = await catalogoSemOfertaMl(cat); } catch (e) { confirmado = false; }
+    if (confirmado) throw vencida('catalogo ' + cat + ' sem oferta no ML na hora do envio');
+    return;
+  }
+  // A captura pode ter usado o preco do anuncio (Pix), ate 10% abaixo da API.
+  const base = Number(de.precoApi || de.preco);
+  const agora = Number(lido.preco);
+  if (Number.isFinite(base) && base > 0 && Number.isFinite(agora) && agora > base * 1.03) {
+    throw vencida('preco no ML subiu de R$ ' + base.toFixed(2) + ' para R$ ' + agora.toFixed(2)
+      + ' antes do envio (' + idadeMin + ' min depois da captura)');
+  }
+  console.log('[FRESCOR] #' + oferta.id + ' ML ' + cat + ' conferida no envio — R$ '
+    + (Number.isFinite(agora) ? agora.toFixed(2) : '?') + ' (capturado R$ ' + (Number.isFinite(base) ? base.toFixed(2) : '?') + ').');
+}
+
 async function revalidarOfertaVelha(oferta) {
-  if (!(REVALIDAR_OFERTA_MIN > 0)) return;
   const ts = Date.parse(oferta?.timestamp || '');
   if (!ts) return;
   const idadeMin = Math.round((Date.now() - ts) / 60000);
+  const _de = oferta.dadosExtraidos || {};
+  if (String(_de.loja || '') === 'Mercado Livre') return revalidarOfertaMl(oferta, _de, idadeMin);
+  if (!(REVALIDAR_OFERTA_MIN > 0)) return;
   if (idadeMin < REVALIDAR_OFERTA_MIN) return;
   const de = oferta.dadosExtraidos || {};
   const asin = de.asin;
@@ -5926,6 +5964,37 @@ function resumoRotaOferta(o) {
   } catch (e) {
     console.warn('[MKT] Rota da oferta #' + (o?.id || '?') + ' indisponivel para o card: ' + e.message);
     return null;
+  }
+}
+
+// ── MESMA OFERTA NO MESMO GRUPO (19/11/2026) ────────────────────────────────
+// Em 09/11 a Bancada Vonder, a Bolsa de Lona e a Frigideira sairam duas vezes
+// no grupo Ferramentas com 1–2 min de diferenca. Produto que saiu num grupo nos
+// ultimos REPETIDA_GRUPO_MIN (30) minutos nao sai de novo NAQUELE grupo; os
+// outros grupos recebem normalmente. Retomada/outbox (semPortao) e quem pede
+// opcoes.ignorarRepeticao ficam de fora. Memoria em RAM: zera no deploy.
+const REPETIDA_GRUPO_MIN = process.env.REPETIDA_GRUPO_MIN !== undefined
+  ? Number(process.env.REPETIDA_GRUPO_MIN) : 30;
+const _envioRecenteGrupo = new Map();   // chave|jid -> ts
+function chaveRepeticaoOferta(oferta) {
+  const de = oferta?.dadosExtraidos || {};
+  const loja = String(de.loja || '').toLowerCase();
+  if (de.asin) return loja + ':' + String(de.asin).toUpperCase();
+  const t = String(de.titulo || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 80);
+  return t ? loja + ':t:' + t : null;
+}
+function ofertaRepetidaNoGrupo(chave, jid) {
+  if (!chave || !(REPETIDA_GRUPO_MIN > 0)) return false;
+  const ts = _envioRecenteGrupo.get(chave + '|' + jid);
+  return !!ts && Date.now() - ts < REPETIDA_GRUPO_MIN * 60000;
+}
+function marcarEnvioNoGrupo(chave, jid) {
+  if (!chave || !(REPETIDA_GRUPO_MIN > 0)) return;
+  _envioRecenteGrupo.set(chave + '|' + jid, Date.now());
+  if (_envioRecenteGrupo.size > 5000) {
+    const corte = Date.now() - REPETIDA_GRUPO_MIN * 60000;
+    for (const [k, v] of _envioRecenteGrupo) if (v < corte) _envioRecenteGrupo.delete(k);
   }
 }
 
@@ -6050,6 +6119,7 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
     try {
       await enviarMensagem(jid, lpDoGrupo ? { text: _rast.texto, linkPreview: lpDoGrupo } : { text: _rast.texto }, 0, op);
       enviados.push(jid);
+      marcarEnvioNoGrupo(chaveRepeticaoOferta(oferta), jid);
       return true;
     } catch (e) {
       console.error('[MKT] Falha ao enviar em ' + jid + ':', e.message);
@@ -6058,7 +6128,21 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
       return false;
     }
   };
-  const _alvosOk = alvos.filter(j => !soCupons.has(j));
+  let _alvosOk = alvos.filter(j => !soCupons.has(j));
+  const _chaveRep = (opcoes.semPortao || opcoes.ignorarRepeticao) ? null : chaveRepeticaoOferta(oferta);
+  if (_chaveRep) {
+    const repetidos = _alvosOk.filter(j => ofertaRepetidaNoGrupo(_chaveRep, j));
+    if (repetidos.length) {
+      _alvosOk = _alvosOk.filter(j => !repetidos.includes(j));
+      console.log('[REPETIDA] Oferta #' + (oferta?.id || '?') + ' ' + _chaveRep + ' ja saiu em ' + repetidos.length
+        + ' grupo(s) nos ultimos ' + REPETIDA_GRUPO_MIN + ' min — fica de fora deles; segue para ' + _alvosOk.length + '.');
+      if (!_alvosOk.length) {
+        const e = new Error('mesma oferta ja enviada nesses grupos nos ultimos ' + REPETIDA_GRUPO_MIN + ' min');
+        e.ofertaVencida = true; e.ofertaRepetida = true;
+        throw e;
+      }
+    }
+  }
   const _porConta = new Map();
   for (const jid of _alvosOk) {
     const c = contaDoGrupo(jid) || 'principal';
