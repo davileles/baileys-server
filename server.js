@@ -5953,21 +5953,6 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
   console.log('[MKT] Oferta #' + (oferta?.id || '?') + ' roteamento: ' + explicarRoteamento(_rota)
     + ' -> ' + alvos.length + ' grupo(s).');
   }
-  // Nota da oferta em modo ativo: so no auto-envio da captura (aplicarNota).
-  // Grupo que tambem e destino de uma trilha aprovada continua recebendo.
-  const _barradasNota = (!_manuais && opcoes.aplicarNota)
-    ? (oferta?.dadosExtraidos?.notaOferta?.trilhasBarradas || []) : [];
-  if (_barradasNota.length) {
-    const _barr = new Set(_barradasNota.map(String));
-    const _okIds = detalharRoteamento(_rota).filter(t => t.entrega && !_barr.has(String(t.id))).map(t => t.id);
-    const _permitidos = new Set(destinosDasTrilhas(_okIds));
-    const antes = alvos.length;
-    alvos = alvos.filter(j => _permitidos.has(j));
-    console.log('[NOTA] Oferta #' + (oferta?.id || '?') + ' fora das trilhas ' + _barradasNota.join(', ')
-      + ' pela nota — ' + alvos.length + ' de ' + antes + ' grupo(s).');
-    if (!alvos.length) throw new Error('Nota da oferta abaixo da minima em todas as trilhas.');
-  }
-
   // ── RECORTE POR TIPO DE DESTINO ──
   // Usado pelo monitor de precos quando o produto e curado e o desconto nao foi
   // fundo o bastante para interromper o grupo geral: a MESMA oferta sai, so que
@@ -6003,6 +5988,24 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
       throw new Error('Nenhum grupo de nicho' + (opcoes.categoriaNicho ? ' "' + opcoes.categoriaNicho + '"' : '')
         + ' entre os destinos desta oferta — confira as trilhas na aba Grupos.');
     }
+  }
+
+  // Nota da oferta em modo ativo: so no auto-envio da captura (aplicarNota).
+  // Roda DEPOIS dos recortes de nicho (categoriaNicho/somenteNicho), para que
+  // "so o nicho" nunca passe por cima do corte da nota. Tira os grupos das
+  // trilhas barradas; grupo que tambem e destino de uma trilha aprovada fica.
+  const _barradasNota = (!_manuais && opcoes.aplicarNota)
+    ? (oferta?.dadosExtraidos?.notaOferta?.trilhasBarradas || []) : [];
+  if (_barradasNota.length) {
+    const _barr = new Set(_barradasNota.map(String));
+    const _okIds = detalharRoteamento(_rota).filter(t => t.entrega && !_barr.has(String(t.id))).map(t => t.id);
+    const _aprovados = new Set(destinosDasTrilhas(_okIds));
+    const _cortados = new Set(destinosDasTrilhas(_barradasNota).filter(j => !_aprovados.has(j)));
+    const antes = alvos.length;
+    alvos = alvos.filter(j => !_cortados.has(j));
+    console.log('[NOTA] Oferta #' + (oferta?.id || '?') + ' fora das trilhas ' + _barradasNota.join(', ')
+      + ' pela nota — ' + alvos.length + ' de ' + antes + ' grupo(s).');
+    if (!alvos.length) throw new Error('Nota da oferta abaixo da minima em todas as trilhas.');
   }
 
   if (!alvos.length) {
