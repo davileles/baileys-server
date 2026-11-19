@@ -5273,7 +5273,7 @@ let _sharp = null, _sharpTentado = false;
 async function carregarSharp() {
   if (_sharpTentado) return _sharp;
   _sharpTentado = true;
-  try { _sharp = (await import('sharp')).default; console.log('[MARCA] sharp carregado — marca d\'agua ativa.'); }
+  try { _sharp = (await import('sharp')).default; try { _sharp.cache(false); _sharp.concurrency(1); } catch {} console.log('[MARCA] sharp carregado — marca d\'agua ativa (cache desligado, 1 por vez).'); }
   catch (e) { console.warn('[MARCA] sharp indisponivel (' + e.message + ') — imagens saem sem marca.'); _sharp = null; }
   return _sharp;
 }

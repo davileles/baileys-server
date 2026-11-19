@@ -22,7 +22,7 @@ let _sharp = null;
 async function sharpOu() {
   if (_sharp === false) return null;
   if (_sharp) return _sharp;
-  try { _sharp = (await import('sharp')).default; return _sharp; }
+  try { _sharp = (await import('sharp')).default; try { _sharp.cache(false); _sharp.concurrency(1); } catch {} return _sharp; }
   catch (e) { _sharp = false; console.warn('[AVISOS] sharp indisponível — avisos sem imagem: ' + e.message); return null; }
 }
 
