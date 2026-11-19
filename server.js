@@ -4335,15 +4335,14 @@ function ehZeDelivery(loja) {
 // iFood (18/11/2026): nao tem programa de afiliado, mas os cupons que chegam
 // pelos canais-fonte do Telegram (Fada, Juao...) valem a divulgacao. Sai SEM
 // link (a linha "RESGATE O CUPOM AQUI" some sozinha no template, porque a
-// variavel fica vazia), so com codigo, e SO no grupo "So cupons": cupom sem
-// comissao nao ocupa os gerais nem os nichos.
+// variavel fica vazia), so com codigo. Destino (19/11/2026): gerais + So
+// cupons, nunca nicho (regra de lojas em rotaNichoDoCupom).
 function ehIfood(loja) {
   const n = String(loja || '').toLowerCase()
     .replace(/^outro:\s*/, '').replace(/[^a-z]/g, '');
   return n.startsWith('ifood');
 }
-// Lojas divulgadas sem afiliado: entram no auto-envio com codigo e saem so no
-// grupo So cupons.
+// Lojas divulgadas sem afiliado: entram no auto-envio so com o codigo.
 function lojaSemAfiliadoSoCupons(loja) { return ehIfood(loja); }
 // Cupom do iFood restrito a primeiro pedido ou a usuarios selecionados frustra
 // quem tenta usar: nao sai sozinho (vai para aprovacao manual).
@@ -5034,6 +5033,14 @@ function _normLojaCupom(s) {
   return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 }
 
+// Lojas cujos cupons podem ir aos grupos de nicho (19/11/2026, regra do Davi).
+const LOJAS_CUPOM_NICHO = ['amazon', 'mercadolivre', 'shopee', 'aliexpress'];
+function lojaCupomVaiAoNicho(loja) {
+  const n = _normLojaCupom(loja).replace(/^outro:\s*/, '').replace(/[^a-z]/g, '');
+  return !!n && LOJAS_CUPOM_NICHO.some(l => n.startsWith(l));
+}
+const RE_LOJA_CUPOM_NICHO = /amazon|amzn\.|a\.co\/|mercado\s*livre|mercadolivre|meli\.la|shopee|shp\.ee|aliexpress|s\.click\.ali|a\.aliexpress/i;
+
 function lojasExcluidasDoNichoCupom(categoria) {
   const taxo = categoriasConfig()?.categorias?.[categoria];
   const lista = Array.isArray(taxo?.cupomLojasExcluidas)
@@ -5051,6 +5058,19 @@ function rotaNichoDoCupom(mensagem, oferta) {
       ? oferta.loteCupons
       : [oferta?.dadosExtraidos].filter(Boolean);
     const lojas = new Set(cupons.map(c => _normLojaCupom(c?.loja)).filter(Boolean));
+    // 19/11/2026 (regra do Davi): grupo de nicho so recebe cupom de Amazon,
+    // Mercado Livre, Shopee e AliExpress. Qualquer outra loja (iFood,
+    // Centauro, cupons da Awin...) fica so nos gerais + So cupons. Lote com
+    // uma loja de fora inteira tambem nao vai ao nicho.
+    // Cupom criado a mao (sem dados extraidos): a loja sai do texto/link.
+    if (!cupons.length && !RE_LOJA_CUPOM_NICHO.test(String(mensagem || ''))) {
+      return { destinos: [], categoria: null, motivo: 'loja fora dos nichos (texto sem Amazon/ML/Shopee/AliExpress)' };
+    }
+    const foraDoNicho = cupons.filter(c => !lojaCupomVaiAoNicho(c?.loja));
+    if (foraDoNicho.length) {
+      const nomes = [...new Set(foraDoNicho.map(c => nomeLojaExibicao(c?.loja) || '?'))].join(', ');
+      return { destinos: [], categoria: null, motivo: 'loja fora dos nichos' + (nomes ? ' (' + nomes + ')' : '') };
+    }
     const restrito = cupons.length > 0 && cupons.every(c => c?.restrito === true);
 
     const cls = classificarProduto({ titulo: String(mensagem || '').replace(/[*_~`]/g, ' ') });
@@ -5098,14 +5118,10 @@ async function _despacharCupomParaGrupos(mensagem, imagem, oferta) {
   const destinos = destinosGerais();
   const soCupons = GRUPOS['tsp_cupons'];
   const _nicho = rotaNichoDoCupom(mensagem, oferta);
-  // Loja sem afiliado (iFood): so o grupo So cupons.
-  const _soGrupoCupons = lojaSemAfiliadoSoCupons(oferta?.dadosExtraidos?.loja);
-  const alvos = _soGrupoCupons
-    ? [...new Set(soCupons || [])]
-    : [...new Set([...destinos, ...soCupons, ..._nicho.destinos])];
-  if (_soGrupoCupons) console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' de loja sem afiliado ('
-    + nomeLojaExibicao(oferta?.dadosExtraidos?.loja) + ') -> so grupo So cupons (' + alvos.length + ').');
-  else console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' nicho: ' + _nicho.motivo
+  // Loja fora de Amazon/ML/Shopee/AliExpress (iFood, Awin...): gerais + So
+  // cupons, nunca nicho (rotaNichoDoCupom ja devolve zero destinos de nicho).
+  const alvos = [...new Set([...destinos, ...soCupons, ..._nicho.destinos])];
+  console.log('[CUPONS] Cupom #' + (oferta?.id || '?') + ' nicho: ' + _nicho.motivo
     + ' -> ' + _nicho.destinos.length + ' grupo(s) de nicho, ' + alvos.length + ' no total.');
   const jaRecebeu = new Set(Array.isArray(oferta?.enviadosParciais) ? oferta.enviadosParciais : []);
   const enviados = [], falhas = [], pulados = [];
