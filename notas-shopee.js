@@ -478,7 +478,7 @@ export function receberRelatorio(b = {}) {
   const { notas, fora } = converterRelatorio(mesId, itens);
   const antigo = E.meses[mesId] || { notas: [] };
   // Nota já emitida (ou em andamento) nunca volta a pendente nem muda de valor.
-  const travadas = new Map((antigo.notas || []).filter(n => n.status !== 'pendente' && n.status !== 'erro' && n.status !== 'ignorada').map(n => [n.chave, n]));
+  const travadas = new Map((antigo.notas || []).filter(n => n.reemissaoDe || (n.status !== 'pendente' && n.status !== 'erro' && n.status !== 'ignorada')).map(n => [n.chave, n]));
   const ignoradas = new Set((antigo.notas || []).filter(n => n.status === 'ignorada').map(n => n.chave));
   const final = notas.map(n => travadas.get(n.chave) || Object.assign(n, ignoradas.has(n.chave) ? { status: 'ignorada' } : {}));
   for (const [k, n] of travadas) if (!final.some(x => x.chave === k)) final.push(n);
@@ -542,7 +542,7 @@ async function montarInfDps(n, mesId, ambiente, nDPS, s = produtoDoPrograma('sho
     + tag('nDPS', String(nDPS))
     // Competência do produto fiscal (19/11/2026); vazio = a padrão da Emissão.
     // Avulsa (mesma regra do Gestão CDV): data digitada; sem ela, a da emissão.
-    + tag('dCompet', n.avulsa ? (n.competencia || dhEmiSp().slice(0, 10)) : competenciaDa(s, mesId))
+    + tag('dCompet', n.competencia || (n.avulsa ? dhEmiSp().slice(0, 10) : competenciaDa(s, mesId)))
     + tag('tpEmit', '1')
     + tag('cLocEmi', em.cLocEmi)
     + '<prest>' + tag('CNPJ', digitos(em.cnpj)) + tag('IM', digitos(em.im)) + tag('fone', digitos(em.fone)) + tag('email', em.email)
@@ -982,6 +982,60 @@ export async function cancelarNota(mesId, chave, { teste = false, motivo = 9, ju
   return r.ok || r.jaCancelada ? { ok: true } : { ok: false, erros: r.erros };
 }
 
+// ── Emitir de novo uma nota cancelada (mesma regra do Gestão CDV, painel-cdv
+// notas-fiscais.js `reemitirUma`) ───────────────────────────────────────────
+// A nota nova assume o lugar da cancelada (mesma chave: o relatório do mês
+// continua casando com ela); a cancelada fica no histórico com a chave renomeada.
+// ajustes: competencia (AAAA-MM-DD, vazio = regra do produto), valor.
+export async function reemitirNota(mesId, chave, ajustes = {}) {
+  const comp = String(ajustes.competencia || '').trim();
+  if (comp && !/^\d{4}-\d{2}-\d{2}$/.test(comp)) throw new Error('competência inválida (use AAAA-MM-DD)');
+  if (comp && comp > dhEmiSp().slice(0, 10)) throw new Error('a competência não pode ser depois de hoje');
+  let valor = null;
+  if (ajustes.valor != null && String(ajustes.valor).trim() !== '') {
+    valor = Math.round(Number(String(ajustes.valor).replace(',', '.')) * 100) / 100;
+    if (!(valor > 0)) throw new Error('valor inválido');
+  }
+  const n = acharNota(mesId, chave);
+  if (!n) throw new Error('nota não encontrada');
+  if (n.status !== 'cancelada') throw new Error('só nota cancelada pode ser emitida de novo');
+  if (n.substituidaPor) throw new Error('esta nota já foi emitida de novo');
+  const pf = (n.produtoId && produtoPorId(n.produtoId)) || (n.produtoFiscalId && produtoPorId(n.produtoFiscalId)) || produtoDoPrograma(n.programa || 'shopee');
+  const b = bloqueiosEmissao('producao', pf);
+  if (b.length) throw new Error('falta: ' + b.join(', '));
+  const nova = { status: 'pendente', criadaEm: new Date().toISOString(), produtoFiscalId: pf ? pf.id : '' };
+  for (const k of ['avulsa', 'doc', 'tipo', 'nome', 'email', 'fone', 'endereco', 'lojas', 'programa', 'descricao']) {
+    if (n[k] !== undefined) nova[k] = JSON.parse(JSON.stringify(n[k]));
+  }
+  nova.valor = valor != null ? valor : n.valor;
+  if (comp) nova.competencia = comp;
+  else if (n.avulsa && n.competencia) nova.competencia = n.competencia;
+  if (mesId === 'avulsa') {
+    nova.chave = 'AV-' + Date.now();
+    nova.reemissaoDe = n.chave;
+    E.avulsas.unshift(nova);
+  } else {
+    // A nova fica com a chave do mês (o relatório continua casando com ela);
+    // a cancelada sai do caminho com chave própria.
+    nova.chave = n.chave;
+    n.chave = n.chave + '~cancelada-' + Date.now().toString(36);
+    nova.reemissaoDe = n.chave;
+    E.meses[mesId].notas.push(nova);
+  }
+  n.substituidaPor = nova.chave;
+  gravar();
+  registrarLog('Nota cancelada de ' + n.nome + ' emitida de novo' + (comp ? ' (competência ' + comp + ')' : ''));
+  const mesDps = mesId === 'avulsa' ? (nova.competencia || dhEmiSp().slice(0, 10)).slice(0, 7).replace('-', '') : mesId;
+  try {
+    const r = await emitirNota(mesDps, nova, { ambiente: 'producao' });
+    registrarLog('Nota emitida de novo: ' + nova.nome + ' → ' + r.chaveAcesso);
+    return { ok: true, chave: nova.chave, chaveAcesso: r.chaveAcesso, nNFSe: r.nNFSe };
+  } catch (e) {
+    registrarLog('Emitir de novo falhou (' + nova.nome + '): ' + e.message);
+    return { ok: false, chave: nova.chave, erro: e.message };
+  }
+}
+
 // DPS assinada de uma nota, sem enviar (conferência no painel). Não consome número.
 export async function previaDps(mesId, chave, ambiente = 'producaorestrita') {
   const m = E.meses[mesId];
@@ -1110,6 +1164,9 @@ export function importarXmlEmitente(xml) {
 }
 
 // ── Estado para o painel ─────────────────────────────────────────────────────
+function camposReemissao(n) {
+  return { reemissaoDe: n.reemissaoDe || '', substituidaPor: n.substituidaPor || '', competencia: n.competencia || '' };
+}
 function camposCancelamento(x) {
   return { canceladaEm: x.canceladaEm || '', canceladaPor: x.canceladaPor || '', motivoCancelamento: x.motivoCancelamento || 0,
            motivo: x.status === 'cancelada' ? (x.motivo || '') : '', cancelamentoErros: x.cancelamentoErros || [] };
@@ -1125,7 +1182,7 @@ export function estadoNotasShopee() {
       notas: (m.notas || []).map(n => ({ chave: n.chave, doc: n.doc, tipo: n.tipo, nome: n.nome, valor: n.valor, status: n.status,
         lojas: n.lojas, cidade: n.endereco && n.endereco.ok ? n.endereco.cidade + '/' + n.endereco.uf : '', enderecoOk: !!(n.endereco && n.endereco.ok),
         nDPS: n.nDPS || 0, chaveAcesso: n.chaveAcesso || '', nNFSe: n.nNFSe || '', emitidaEm: n.emitidaEm || '', erro: n.erro || '',
-        foraDoSistema: !!n.foraDoSistema, produtoId: n.produtoId || '', ...camposCancelamento(n),
+        foraDoSistema: !!n.foraDoSistema, produtoId: n.produtoId || '', ...camposCancelamento(n), ...camposReemissao(n),
         teste: n.teste ? { status: n.teste.status, chaveAcesso: n.teste.chaveAcesso || '', erro: n.teste.erro || '', ...camposCancelamento(n.teste) } : null })),
       fora: m.fora || [],
     };
@@ -1137,7 +1194,7 @@ export function estadoNotasShopee() {
              const x = n.teste || n;
              return { chave: n.chave, criadaEm: n.criadaEm, doc: n.doc, nome: n.nome, valor: n.valor, produtoId: n.produtoFiscalId,
                       teste: !!n.teste, status: x.status, chaveAcesso: x.chaveAcesso || '', nNFSe: x.nNFSe || '', erro: x.erro || '',
-                      foraDoSistema: !!x.foraDoSistema, ...camposCancelamento(x) };
+                      foraDoSistema: !!x.foraDoSistema, ...camposCancelamento(x), ...camposReemissao(n) };
            }) };
 }
 
