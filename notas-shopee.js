@@ -98,7 +98,7 @@ const CONFIG_PADRAO = {
   programas: {},
 };
 
-let E = { config: JSON.parse(JSON.stringify(CONFIG_PADRAO)), proxNDPS: {}, meses: {}, tarefa: null, cepIbge: {}, log: [], empresaSync: {} };
+let E = { config: JSON.parse(JSON.stringify(CONFIG_PADRAO)), proxNDPS: {}, meses: {}, avulsas: [], tarefa: null, cepIbge: {}, log: [], empresaSync: {} };
 
 function escreverAtomico(caminho, dados) {
   const tmp = caminho + '.tmp';
@@ -139,6 +139,8 @@ export function iniciarNotasShopee(sessaoDir, opcoes = {}) {
   } catch (e) { console.error('[NFSE] Estado ilegível, começando vazio:', e.message); }
   // Nota que estava "emitindo" quando o processo caiu: resultado incerto.
   for (const m of Object.values(E.meses || {})) for (const n of m.notas || []) if (n.status === 'emitindo') n.status = 'incerta';
+  if (!Array.isArray(E.avulsas)) E.avulsas = [];
+  for (const n of E.avulsas) { if (n.status === 'emitindo') n.status = 'incerta'; if (n.teste && n.teste.status === 'emitindo') n.teste.status = 'incerta'; }
   gravar();
   setTimeout(() => { trabalho().catch(e => console.error('[NFSE] trabalho:', e.message)); }, 4 * 60000).unref();
   setInterval(() => { trabalho().catch(e => console.error('[NFSE] trabalho:', e.message)); }, 10 * 60000).unref();
@@ -529,6 +531,7 @@ async function montarInfDps(n, mesId, ambiente, nDPS, s = produtoDoPrograma('sho
   const toma = '<toma>' + tag(n.tipo === 'CPF' ? 'CPF' : 'CNPJ', n.doc) + tag('xNome', corta(n.nome, 300))
     + (cMun ? '<end><endNac>' + tag('cMun', cMun) + tag('CEP', e.cep) + '</endNac>' + tag('xLgr', corta(e.xLgr, 255))
       + tag('nro', corta(e.nro, 60)) + tag('xCpl', corta(e.xCpl, 156)) + tag('xBairro', corta(e.xBairro, 60)) + '</end>' : '')
+    + (digitos(n.fone).length >= 10 ? tag('fone', digitos(n.fone).slice(-11)) : '')
     + (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(n.email || '') ? tag('email', corta(n.email, 80)) : '')
     + '</toma>';
   const xml = '<infDPS Id="' + id + '">'
@@ -538,14 +541,15 @@ async function montarInfDps(n, mesId, ambiente, nDPS, s = produtoDoPrograma('sho
     + tag('serie', String(cfg.serie))
     + tag('nDPS', String(nDPS))
     // Competência do produto fiscal (19/11/2026); vazio = a padrão da Emissão.
-    + tag('dCompet', competenciaDa(s, mesId))
+    // Avulsa (mesma regra do Gestão CDV): data digitada; sem ela, a da emissão.
+    + tag('dCompet', n.avulsa ? (n.competencia || dhEmiSp().slice(0, 10)) : competenciaDa(s, mesId))
     + tag('tpEmit', '1')
     + tag('cLocEmi', em.cLocEmi)
     + '<prest>' + tag('CNPJ', digitos(em.cnpj)) + tag('IM', digitos(em.im)) + tag('fone', digitos(em.fone)) + tag('email', em.email)
       + '<regTrib>' + tag('opSimpNac', em.opSimpNac) + tag('regApTribSN', em.regApTribSN) + tag('regEspTrib', em.regEspTrib) + '</regTrib></prest>'
     + toma
     + '<serv><locPrest>' + tag('cLocPrestacao', em.cLocEmi) + '</locPrest>'
-      + '<cServ>' + tag('cTribNac', s.cTribNac) + tag('cTribMun', s.cTribMun) + tag('xDescServ', corta(textoServico(s.xDescServ, mesId, n), 2000)) + tag('cNBS', s.cNBS) + '</cServ>'
+      + '<cServ>' + tag('cTribNac', s.cTribNac) + tag('cTribMun', s.cTribMun) + tag('xDescServ', corta(n.descricao || textoServico(s.xDescServ, mesId, n), 2000)) + tag('cNBS', s.cNBS) + '</cServ>'
       + (s.xInfComp ? '<infoCompl>' + tag('xInfComp', corta(textoServico(s.xInfComp, mesId, n), 2000)) + '</infoCompl>' : '')
     + '</serv>'
     + '<valores><vServPrest>' + tag('vServ', n.valor.toFixed(2)) + '</vServPrest>'
@@ -661,8 +665,10 @@ async function emitirNota(mesId, n, { ambiente = 'producao' } = {}) {
     tent.ambienteDps = ambiente;
   }
   // Produto fiscal: o do programa agora; numa nova tentativa da mesma DPS, o de antes.
-  const pf = (tent.idDps && tent.produtoId && produtoPorId(tent.produtoId)) || produtoDoPrograma('shopee');
-  if (!pf) throw new Error('nenhum produto fiscal escolhido para a Shopee');
+  const pf = (tent.idDps && tent.produtoId && produtoPorId(tent.produtoId))
+    || (n.produtoFiscalId && produtoPorId(n.produtoFiscalId)) || produtoDoPrograma(n.programa || 'shopee');
+  if (!pf) throw new Error('nenhum produto fiscal escolhido');
+  if (ambiente === 'producao' && !pf.codigosConfirmados) throw new Error('códigos de "' + pf.nome + '" não confirmados com o contador');
   const { id, xml } = await montarInfDps(n, mesId, ambiente, tent.nDPS, pf);
   const assinado = assinarDps(xml, id, cert);
   Object.assign(tent, { idDps: id, produtoId: pf.id, status: 'emitindo', tentativas: (tent.tentativas || 0) + 1, ultimaTentativaEm: new Date().toISOString() });
@@ -700,14 +706,14 @@ function naJanela() {
   const h = agoraSp().getUTCHours();
   return h >= E.config.horaIni && h < E.config.horaFim;
 }
-export function bloqueiosEmissao(ambiente = 'producao') {
+export function bloqueiosEmissao(ambiente = 'producao', produto = null) {
   const b = [];
   if (ambiente === 'producao' && E.config.modo !== 'producao') b.push('emissão em ' + (E.config.modo === 'desligado' ? 'Desligado' : 'Homologação') + ' (ligue o modo Produção)');
   const cert = estadoCertificado();
   if (!cert.cadastrado) b.push('certificado não cadastrado');
   else if (cert.vencido) b.push('certificado vencido');
   else if (!cert.abre) b.push('certificado não abre (senha?)');
-  const em = E.config.emitente, s = produtoDoPrograma('shopee');
+  const em = E.config.emitente, s = produto || produtoDoPrograma('shopee');
   if (digitos(em.cnpj).length !== 14) b.push('CNPJ do emitente');
   if (!digitos(em.im)) b.push('inscrição municipal do emitente');
   if (!/^\d{7}$/.test(String(em.cLocEmi))) b.push('município do emitente');
@@ -796,6 +802,60 @@ export async function emitirTeste(mesId, chave) {
   } catch (e) {
     registrarLog('Teste em homologação falhou (' + n.nome + '): ' + e.message);
     return { ok: false, nota: n.nome, erro: e.message };
+  }
+}
+
+// ── Nota avulsa (19/11/2026, mesma função do Gestão CDV) ─────────────────────
+// Tomador digitado, ex.: comissão de afiliados da Amazon, do Mercado Livre ou
+// da Shopee. Teste = homologação (produção restrita); válida = produção, só no
+// modo Produção e com confirmação. Fica em E.avulsas, fora dos meses da Shopee.
+function cpfValido(d) {
+  if (!/^\d{11}$/.test(d) || /^(\d)\1+$/.test(d)) return false;
+  for (const t of [9, 10]) {
+    let s = 0; for (let i = 0; i < t; i++) s += +d[i] * (t + 1 - i);
+    if (((s * 10) % 11) % 10 !== +d[t]) return false;
+  }
+  return true;
+}
+function cnpjValido(d) {
+  if (!/^\d{14}$/.test(d) || /^(\d)\1+$/.test(d)) return false;
+  for (const t of [12, 13]) {
+    let s = 0, p = t - 7;
+    for (let i = 0; i < t; i++) { s += +d[i] * p--; if (p < 2) p = 9; }
+    if ((s % 11 < 2 ? 0 : 11 - s % 11) !== +d[t]) return false;
+  }
+  return true;
+}
+export async function emitirAvulsa(corpo = {}) {
+  const t = corpo.tomador || {};
+  const doc = digitos(t.doc);
+  const tipo = doc.length === 14 ? 'CNPJ' : 'CPF';
+  if (!(tipo === 'CNPJ' ? cnpjValido(doc) : cpfValido(doc))) throw new Error('CPF/CNPJ do tomador inválido');
+  const valor = Math.round(Number(String(corpo.valor).replace(',', '.')) * 100) / 100;
+  if (!(valor > 0)) throw new Error('valor inválido');
+  const pf = produtoPorId(corpo.produtoFiscalId) || produtoPorId(E.config.produtoPadrao);
+  if (!pf) throw new Error('produto fiscal inválido');
+  const comp = corpo.competencia && /^\d{4}-\d{2}-\d{2}$/.test(corpo.competencia) ? corpo.competencia : '';
+  const ambiente = corpo.teste ? 'producaorestrita' : 'producao';
+  if (!corpo.teste && !corpo.confirmar) throw new Error('confirmação ausente');
+  const b = bloqueiosEmissao(ambiente, pf);
+  if (b.length) throw new Error('falta: ' + b.join(', '));
+  const n = {
+    chave: 'AV-' + Date.now(), avulsa: true, criadaEm: new Date().toISOString(), doc, tipo,
+    nome: limpo(t.nome) || doc, email: limpo(t.email), fone: limpo(t.fone), valor, lojas: [],
+    produtoFiscalId: pf.id, descricao: limpo(corpo.descricao), competencia: comp, status: corpo.teste ? 'teste' : 'pendente',
+  };
+  E.avulsas.unshift(n);
+  if (E.avulsas.length > 300) E.avulsas.length = 300;
+  gravar();
+  const mesId = (comp || dhEmiSp()).slice(0, 7).replace('-', '');
+  try {
+    const r = await emitirNota(mesId, n, { ambiente });
+    registrarLog((corpo.teste ? 'Teste avulso em homologação ok: ' : 'Nota avulsa emitida: ') + n.nome + ' → ' + r.chaveAcesso);
+    return { ok: true, chave: n.chave, chaveAcesso: r.chaveAcesso, nNFSe: r.nNFSe, teste: !!corpo.teste };
+  } catch (e) {
+    registrarLog('Nota avulsa' + (corpo.teste ? ' (teste)' : '') + ' falhou (' + n.nome + '): ' + e.message);
+    return { ok: false, chave: n.chave, erro: e.message, teste: !!corpo.teste };
   }
 }
 
@@ -956,7 +1016,12 @@ export function estadoNotasShopee() {
   });
   return { ok: true, config: E.config, programasNota: PROGRAMAS_NOTA, empresaSync: E.empresaSync || {},
            certificado: estadoCertificado(), bloqueios: bloqueiosEmissao('producao'),
-           tarefa: E.tarefa, emitindo: _emitindo, mesAlvo: mesAnterior(), meses, log: (E.log || []).slice(0, 30) };
+           tarefa: E.tarefa, emitindo: _emitindo, mesAlvo: mesAnterior(), meses, log: (E.log || []).slice(0, 30),
+           avulsas: (E.avulsas || []).slice(0, 60).map(n => {
+             const x = n.teste || n;
+             return { chave: n.chave, criadaEm: n.criadaEm, doc: n.doc, nome: n.nome, valor: n.valor, produtoId: n.produtoFiscalId,
+                      teste: !!n.teste, status: x.status, chaveAcesso: x.chaveAcesso || '', nNFSe: x.nNFSe || '', erro: x.erro || '' };
+           }) };
 }
 
 function avisar(nivel, chave, titulo, corpo, janelaMs) {

@@ -235,7 +235,7 @@ import {
 } from './radar-ml.js';
 import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
   salvarConfigCompartilhada as salvarConfigNotasShopee, sincronizarEmpresa as sincronizarEmpresaNotas, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
-  marcarNota as marcarNotaShopee, baixarDanfse, previaDps } from './notas-shopee.js';
+  marcarNota as marcarNotaShopee, baixarDanfse, previaDps, emitirAvulsa as emitirAvulsaNotas } from './notas-shopee.js';
 import { atenderLongPollPaginasAmazon, registrarResultadoPaginaAmazon, estadoPaginasAmazon } from './paginas-amazon.js';
 import { iniciarPaginasMl, pedirPaginaMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
 
@@ -23675,6 +23675,12 @@ app.post('/notas-shopee/mes/:mes/emitir', async (req, res) => {
     const r = await Promise.race([p, new Promise(ok => setTimeout(() => ok(null), 2000))]);
     res.json(r || { ok: true, emAndamento: true });
   } catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
+// Nota avulsa (tomador digitado; teste em homologação ou nota válida com confirmação).
+app.post('/notas-shopee/avulsa', async (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  try { res.json(await emitirAvulsaNotas(req.body || {})); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
 });
 app.post('/notas-shopee/mes/:mes/teste', async (req, res) => {
   if (!exigirRaizNotas(req, res)) return;
