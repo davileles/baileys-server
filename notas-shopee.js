@@ -61,9 +61,15 @@ function PRODUTO_SHOPEE_PADRAO() {
            xInfComp: '', tribISSQN: '1', tpRetISSQN: '1', cstPisCofins: '00',
            tpRetPisCofins: '0', pTotTribSN: '', codigosConfirmados: false };
 }
-// Programas de afiliados que geram nota por aqui. Só a Shopee tem relatório
-// automático hoje; os outros entram aqui quando ganharem a sua fonte.
-export const PROGRAMAS_NOTA = { shopee: 'Shopee · comissão extra de vendedores' };
+// Programas de afiliados que geram nota por aqui. Só a comissão extra da Shopee
+// tem relatório automático hoje; os outros entram quando ganharem a sua fonte.
+// A chave 'shopee' é a comissão extra de vendedores (nome antigo, mantido).
+export const PROGRAMAS_NOTA = {
+  amazon: 'Amazon · comissão de afiliado',
+  mercadolivre: 'Mercado Livre · comissão de afiliado',
+  shopee_afiliado: 'Shopee · comissão de afiliado',
+  shopee: 'Shopee · comissão extra de vendedores',
+};
 
 const CONFIG_PADRAO = {
   ativo: false,                 // emissão automática no mês (produção)
@@ -80,9 +86,11 @@ const CONFIG_PADRAO = {
   emitente: { cnpj: '', im: '', razao: '', fone: '', email: '', cLocEmi: '3106200',
               opSimpNac: '3', regApTribSN: '1', regEspTrib: '0' },
   // Produtos fiscais (19/11/2026): cada um define como a nota sai (códigos,
-  // tributos e texto). Cada programa de afiliados aponta para um produto.
+  // tributos e texto). Todo programa usa o produto padrão; `programas` guarda
+  // só as exceções (programa → outro produto).
   produtos: [PRODUTO_SHOPEE_PADRAO()],
-  programas: { shopee: 'shopee-comissao' },
+  produtoPadrao: 'shopee-comissao',
+  programas: {},
 };
 
 let E = { config: JSON.parse(JSON.stringify(CONFIG_PADRAO)), proxNDPS: {}, meses: {}, tarefa: null, cepIbge: {}, log: [], empresaSync: {} };
@@ -146,12 +154,18 @@ function migrarProdutos(lidoCfg) {
   delete c.servico; delete c.codigosConfirmados;
   if (!Array.isArray(c.produtos) || !c.produtos.length) c.produtos = [PRODUTO_SHOPEE_PADRAO()];
   if (!c.programas || typeof c.programas !== 'object') c.programas = {};
-  if (!c.programas.shopee || !c.produtos.some(p => p.id === c.programas.shopee)) c.programas.shopee = c.produtos[0].id;
+  // Padrão + exceções (19/11/2026): sem padrão gravado, o produto da Shopee vira o padrão
+  // e as exceções iguais a ele saem.
+  if (!lidoCfg.produtoPadrao || !c.produtos.some(p => p.id === c.produtoPadrao)) c.produtoPadrao = (lidoCfg.programas || {}).shopee || c.produtos[0].id;
+  if (!c.produtos.some(p => p.id === c.produtoPadrao)) c.produtoPadrao = c.produtos[0].id;
+  for (const k of Object.keys(c.programas)) if (!PROGRAMAS_NOTA[k] || c.programas[k] === c.produtoPadrao || !c.produtos.some(p => p.id === c.programas[k])) delete c.programas[k];
 }
 
 // ── Produtos fiscais ──────────────────────────────────────────────────────────
 function produtoPorId(id) { return (E.config.produtos || []).find(p => p.id === id) || null; }
-export function produtoDoPrograma(programa = 'shopee') { return produtoPorId((E.config.programas || {})[programa]); }
+export function produtoDoPrograma(programa = 'shopee') {
+  return produtoPorId((E.config.programas || {})[programa]) || produtoPorId(E.config.produtoPadrao) || (E.config.produtos || [])[0] || null;
+}
 
 // ── EMPRESA COMPARTILHADA com o Gestão CDV ───────────────────────────────────
 // A fonte é o proxy (painel-cdv, notas-fiscais.json → empresa), que o gestor-cdv
@@ -814,9 +828,11 @@ export function salvarConfig(c = {}) {
   novo.minimo = Math.max(0, Number(String(novo.minimo).replace(',', '.')) || 0);
   novo.serie = String(digitos(novo.serie) || '70').slice(0, 5);
   if (Array.isArray(c.produtos)) novo.produtos = validarProdutos(c.produtos);
-  const progs = Object.assign({}, E.config.programas, c.programas && typeof c.programas === 'object' ? c.programas : {});
-  for (const k of Object.keys(progs)) if (!PROGRAMAS_NOTA[k] || !novo.produtos.some(p => p.id === progs[k])) delete progs[k];
-  if (!progs.shopee) throw new Error('escolha o produto fiscal das notas da Shopee');
+  if (c.produtoPadrao != null) novo.produtoPadrao = String(c.produtoPadrao);
+  if (!novo.produtos.some(p => p.id === novo.produtoPadrao)) throw new Error('escolha o produto fiscal padrão');
+  // Exceções: a lista enviada substitui a anterior (dá para remover uma).
+  const progs = Object.assign({}, c.programas && typeof c.programas === 'object' ? c.programas : E.config.programas);
+  for (const k of Object.keys(progs)) if (!PROGRAMAS_NOTA[k] || progs[k] === novo.produtoPadrao || !novo.produtos.some(p => p.id === progs[k])) delete progs[k];
   novo.programas = progs;
   for (const k of ['cnpj', 'im', 'fone', 'cLocEmi']) novo.emitente[k] = digitos(novo.emitente[k]);
   novo.emitente.razao = String(novo.emitente.razao || '').trim().slice(0, 300);
