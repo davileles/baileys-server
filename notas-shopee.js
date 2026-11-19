@@ -859,16 +859,127 @@ export async function emitirAvulsa(corpo = {}) {
   }
 }
 
-export function marcarNota(mesId, chave, acao) {
-  const m = E.meses[mesId];
-  const n = m && m.notas.find(x => x.chave === chave);
+export function marcarNota(mesId, chave, acao, extra = {}) {
+  const n = acharNota(mesId, chave);
   if (!n) throw new Error('nota não encontrada');
+  // Cancelada direto no Portal Nacional (mesmo que "Já cancelei no portal" do Gestão CDV).
+  if (acao === 'cancelada-fora') {
+    if (n.status !== 'emitida') throw new Error('só nota emitida');
+    Object.assign(n, { status: 'cancelada', canceladaEm: new Date().toISOString(), canceladaPor: 'portal', motivo: corta(extra.motivo, 255) });
+    gravar();
+    registrarLog('Nota marcada como cancelada no portal: ' + n.nome);
+    return n;
+  }
+  if (mesId === 'avulsa') throw new Error('ação desconhecida');
   if (acao === 'ignorar') { if (n.status === 'emitida') throw new Error('nota já emitida'); n.status = 'ignorada'; }
   else if (acao === 'reativar') { if (n.status !== 'ignorada' && n.status !== 'erro') throw new Error('só nota ignorada ou com erro'); n.status = 'pendente'; n.erro = ''; }
   else if (acao === 'emitida-fora') { if (n.status === 'emitida') throw new Error('nota já emitida'); n.status = 'emitida'; n.foraDoSistema = true; n.emitidaEm = new Date().toISOString(); }
   else throw new Error('ação desconhecida');
   gravar();
   return n;
+}
+
+// ── Cancelamento (evento e101101) ────────────────────────────────────────────
+// Mesma regra do Gestão CDV (painel-cdv/nfse.js `cancelar` + notas-fiscais.js
+// `cancelarUma`), decisão do Davi de 19/11/2026: mudou um, muda o outro.
+// motivo: 1 = erro na emissão, 2 = serviço não prestado, 9 = outros.
+// justificativa: 15 a 255 caracteres. mesId 'avulsa' = nota avulsa.
+function acharNota(mesId, chave) {
+  if (mesId === 'avulsa') return (E.avulsas || []).find(x => x.chave === chave) || null;
+  const m = E.meses[mesId];
+  return (m && (m.notas || []).find(x => x.chave === chave)) || null;
+}
+
+function assinarEvento(id, corpo, cert, versao) {
+  const infCanon = '<infPedReg xmlns="' + NS_NFSE + '" Id="' + id + '">' + corpo + '</infPedReg>';
+  const digest = createHash('sha1').update(infCanon, 'utf8').digest('base64');
+  const signedInfoCorpo = '<CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"></CanonicalizationMethod>'
+    + '<SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"></SignatureMethod>'
+    + '<Reference URI="#' + id + '"><Transforms>'
+    + '<Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"></Transform>'
+    + '<Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"></Transform>'
+    + '</Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"></DigestMethod>'
+    + '<DigestValue>' + digest + '</DigestValue></Reference>';
+  const signedInfoCanon = '<SignedInfo xmlns="' + NS_DSIG + '">' + signedInfoCorpo + '</SignedInfo>';
+  const valor = assinarRsa('sha1', Buffer.from(signedInfoCanon, 'utf8'), createPrivateKey(cert.keyPem)).toString('base64');
+  return '<?xml version="1.0" encoding="UTF-8"?>'
+    + '<pedRegEvento xmlns="' + NS_NFSE + '" versao="' + versao + '"><infPedReg Id="' + id + '">' + corpo + '</infPedReg>'
+    + '<Signature xmlns="' + NS_DSIG + '"><SignedInfo>' + signedInfoCorpo + '</SignedInfo>'
+    + '<SignatureValue>' + valor + '</SignatureValue>'
+    + '<KeyInfo><X509Data><X509Certificate>' + cert.certB64 + '</X509Certificate></X509Data></KeyInfo></Signature>'
+    + '</pedRegEvento>';
+}
+
+function errosLista(json, texto, status) {
+  const lista = (json && (json.erros || json.Erros || json.erro)) || [];
+  const arr = (Array.isArray(lista) ? lista : [lista]).map(e => ({
+    codigo: String(e.Codigo || e.codigo || ''), descricao: String(e.Descricao || e.descricao || ''), complemento: String(e.Complemento || e.complemento || ''),
+  })).filter(e => e.codigo || e.descricao);
+  if (!arr.length) arr.push({ codigo: 'HTTP' + status, descricao: String(texto || '').slice(0, 400), complemento: '' });
+  return arr;
+}
+
+async function pedirCancelamento(ambiente, cert, chaveAcesso, motivo, justificativa, versao = '1.01', tentouOutra = false) {
+  const id = 'PRE' + chaveAcesso + '101101';
+  const corpo = tag('tpAmb', ambiente === 'producao' ? '1' : '2') + tag('verAplic', VER_APLIC) + tag('dhEvento', dhEmiSp())
+    + tag('CNPJAutor', digitos(E.config.emitente.cnpj)) + tag('chNFSe', chaveAcesso)
+    + '<e101101>' + tag('xDesc', 'Cancelamento de NFS-e') + tag('cMotivo', String(motivo)) + tag('xMotivo', justificativa) + '</e101101>';
+  const xml = assinarEvento(id, corpo, cert, versao);
+  let r;
+  try {
+    r = await chamar(URLS[ambiente].sefin + '/nfse/' + chaveAcesso + '/eventos', { metodo: 'POST', cert,
+      corpo: { pedidoRegistroEventoXmlGZipB64: gzipSync(Buffer.from(xml, 'utf8')).toString('base64') } });
+  } catch (e) {
+    return { ok: false, ambiguo: true, erros: [{ codigo: 'REDE', descricao: e.message, complemento: '' }] };
+  }
+  const j = r.json;
+  const evB64 = j && (j.eventoXmlGZipB64 || j.EventoXmlGZipB64);
+  if ((r.status === 200 || r.status === 201) && evB64) {
+    let xmlEv = '';
+    try { xmlEv = gunzipSync(Buffer.from(evB64, 'base64')).toString('utf8'); } catch (_) {}
+    return { ok: true, xml: xmlEv };
+  }
+  const erros = errosLista(j, r.texto, r.status);
+  if (!tentouOutra && erros.some(e => /esquema|schema|vers[aã]o/i.test(e.descricao + ' ' + e.complemento))) {
+    return pedirCancelamento(ambiente, cert, chaveAcesso, motivo, justificativa, '1.00', true);
+  }
+  const jaCancelada = erros.some(e => /j[aá] (est[aá] )?cancelad|evento j[aá] (registrad|vinculad)/i.test(e.descricao + ' ' + e.complemento));
+  return { ok: false, status: r.status, ambiguo: r.status >= 500, jaCancelada, erros };
+}
+
+export async function cancelarNota(mesId, chave, { teste = false, motivo = 9, justificativa = '', origem = 'manual' } = {}) {
+  const n = acharNota(mesId, chave);
+  if (!n) throw new Error('nota não encontrada');
+  const tent = teste ? n.teste : n;
+  if (!tent) throw new Error('essa nota não tem teste emitido');
+  if (tent.status === 'cancelada') return { ok: true, jaCancelada: true };
+  if (tent.status !== 'emitida') throw new Error('só nota emitida pode ser cancelada');
+  if (tent.foraDoSistema) throw new Error('nota emitida fora do sistema: cancele no Portal Nacional e use "Já cancelei no portal"');
+  const ch = digitos(tent.chaveAcesso);
+  if (ch.length !== 50) throw new Error('nota sem chave de acesso: cancele no Portal Nacional e use "Já cancelei no portal"');
+  const mot = [1, 2, 9].includes(Number(motivo)) ? Number(motivo) : 9;
+  const just = corta(justificativa, 255);
+  if (just.length < 15) throw new Error('a justificativa precisa de pelo menos 15 caracteres');
+  const cert = certificado();
+  if (!cert) throw new Error('certificado não cadastrado ou não abre');
+  if (new Date(cert.validoAte) < new Date()) throw new Error('certificado vencido');
+  const ambiente = teste ? 'producaorestrita' : 'producao';
+  let r;
+  try { r = await pedirCancelamento(ambiente, cert, ch, mot, just); }
+  catch (e) { r = { ok: false, erros: [{ codigo: 'LOCAL', descricao: e.message, complemento: '' }] }; }
+  const agora = new Date().toISOString();
+  tent.cancelamentoTentativas = (Number(tent.cancelamentoTentativas) || 0) + 1;
+  tent.cancelamentoTentadoEm = agora;
+  if (r.ok || r.jaCancelada) {
+    Object.assign(tent, { status: 'cancelada', canceladaEm: agora, canceladaPor: origem, motivoCancelamento: mot, motivo: just, cancelamentoErros: [] });
+    if (r.xml) tent.eventoXmlGz = gzipSync(Buffer.from(r.xml, 'utf8')).toString('base64');
+    registrarLog((teste ? 'Teste cancelado' : 'Nota cancelada') + ': ' + n.nome + ' (' + ch + ')');
+  } else {
+    tent.cancelamentoErros = r.erros || [];
+    registrarLog('Cancelamento recusado (' + n.nome + '): ' + (r.erros || []).map(e => e.codigo + ' ' + e.descricao).join('; ').slice(0, 300));
+  }
+  gravar();
+  return r.ok || r.jaCancelada ? { ok: true } : { ok: false, erros: r.erros };
 }
 
 // DPS assinada de uma nota, sem enviar (conferência no painel). Não consome número.
@@ -999,6 +1110,10 @@ export function importarXmlEmitente(xml) {
 }
 
 // ── Estado para o painel ─────────────────────────────────────────────────────
+function camposCancelamento(x) {
+  return { canceladaEm: x.canceladaEm || '', canceladaPor: x.canceladaPor || '', motivoCancelamento: x.motivoCancelamento || 0,
+           motivo: x.status === 'cancelada' ? (x.motivo || '') : '', cancelamentoErros: x.cancelamentoErros || [] };
+}
 export function estadoNotasShopee() {
   const meses = Object.keys(E.meses).sort().reverse().map(k => {
     const m = E.meses[k];
@@ -1010,7 +1125,8 @@ export function estadoNotasShopee() {
       notas: (m.notas || []).map(n => ({ chave: n.chave, doc: n.doc, tipo: n.tipo, nome: n.nome, valor: n.valor, status: n.status,
         lojas: n.lojas, cidade: n.endereco && n.endereco.ok ? n.endereco.cidade + '/' + n.endereco.uf : '', enderecoOk: !!(n.endereco && n.endereco.ok),
         nDPS: n.nDPS || 0, chaveAcesso: n.chaveAcesso || '', nNFSe: n.nNFSe || '', emitidaEm: n.emitidaEm || '', erro: n.erro || '',
-        foraDoSistema: !!n.foraDoSistema, produtoId: n.produtoId || '', teste: n.teste ? { status: n.teste.status, chaveAcesso: n.teste.chaveAcesso || '', erro: n.teste.erro || '' } : null })),
+        foraDoSistema: !!n.foraDoSistema, produtoId: n.produtoId || '', ...camposCancelamento(n),
+        teste: n.teste ? { status: n.teste.status, chaveAcesso: n.teste.chaveAcesso || '', erro: n.teste.erro || '', ...camposCancelamento(n.teste) } : null })),
       fora: m.fora || [],
     };
   });
@@ -1020,7 +1136,8 @@ export function estadoNotasShopee() {
            avulsas: (E.avulsas || []).slice(0, 60).map(n => {
              const x = n.teste || n;
              return { chave: n.chave, criadaEm: n.criadaEm, doc: n.doc, nome: n.nome, valor: n.valor, produtoId: n.produtoFiscalId,
-                      teste: !!n.teste, status: x.status, chaveAcesso: x.chaveAcesso || '', nNFSe: x.nNFSe || '', erro: x.erro || '' };
+                      teste: !!n.teste, status: x.status, chaveAcesso: x.chaveAcesso || '', nNFSe: x.nNFSe || '', erro: x.erro || '',
+                      foraDoSistema: !!x.foraDoSistema, ...camposCancelamento(x) };
            }) };
 }
 

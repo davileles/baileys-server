@@ -235,7 +235,8 @@ import {
 } from './radar-ml.js';
 import { iniciarNotasShopee, estadoNotasShopee, tarefaParaExtensao, pedirRelatorio, receberRelatorio, salvarCertificado,
   salvarConfigCompartilhada as salvarConfigNotasShopee, sincronizarEmpresa as sincronizarEmpresaNotas, importarXmlEmitente, emitirMes as emitirMesNotasShopee, emitirTeste as emitirTesteNotasShopee,
-  marcarNota as marcarNotaShopee, baixarDanfse, previaDps, emitirAvulsa as emitirAvulsaNotas } from './notas-shopee.js';
+  marcarNota as marcarNotaShopee, baixarDanfse, previaDps, emitirAvulsa as emitirAvulsaNotas,
+  cancelarNota as cancelarNotaShopee } from './notas-shopee.js';
 import { atenderLongPollPaginasAmazon, registrarResultadoPaginaAmazon, estadoPaginasAmazon } from './paginas-amazon.js';
 import { iniciarPaginasMl, pedirPaginaMl, atenderLongPollPaginasMl, registrarResultadoPaginaMl, estadoPaginasMl, configurarAvisosPaginasMl, testarVerificacaoMl, zerarContagemPaginasMl } from './paginas-ml.js';
 
@@ -23687,9 +23688,17 @@ app.post('/notas-shopee/mes/:mes/teste', async (req, res) => {
   try { res.json(await emitirTesteNotasShopee(req.params.mes, (req.body || {}).chave || null)); }
   catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
 });
+// Cancelamento no Emissor Nacional (evento e101101), mesma regra do Gestão CDV (/notas/cancelar).
+// mes = AAAAMM ou 'avulsa'; teste = cancela a nota de homologação.
+app.post('/notas-shopee/cancelar', async (req, res) => {
+  if (!exigirRaizNotas(req, res)) return;
+  const b = req.body || {};
+  try { res.json(await cancelarNotaShopee(String(b.mes || ''), String(b.chave || ''), { teste: !!b.teste, motivo: b.motivo, justificativa: b.justificativa })); }
+  catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
+});
 app.post('/notas-shopee/mes/:mes/nota/:chave/:acao', (req, res) => {
   if (!exigirRaizNotas(req, res)) return;
-  try { res.json({ ok: true, nota: marcarNotaShopee(req.params.mes, req.params.chave, req.params.acao) }); }
+  try { res.json({ ok: true, nota: marcarNotaShopee(req.params.mes, req.params.chave, req.params.acao, req.body || {}) }); }
   catch (e) { res.status(400).json({ ok: false, erro: e.message }); }
 });
 app.get('/notas-shopee/mes/:mes/previa/:chave', async (req, res) => {
