@@ -37,6 +37,7 @@ import { createHash, createCipheriv, createDecipheriv, randomBytes, sign as assi
 import { gzipSync, gunzipSync } from 'zlib';
 import https from 'https';
 import forge from 'node-forge';
+import danfse from './danfse.cjs';
 
 // ── Caminhos e estado ─────────────────────────────────────────────────────────
 let DIR = './sessao';
@@ -685,6 +686,7 @@ async function emitirNota(mesId, n, { ambiente = 'producao' } = {}) {
     const chave = r.json && (r.json.chaveAcesso || r.json.ChaveAcesso) || '';
     Object.assign(tent, { status: 'emitida', chaveAcesso: chave, nNFSe: nNfseDoXml(r.json && r.json.nfseXmlGZipB64 || ''),
                           emitidaEm: new Date().toISOString(), erro: '' });
+    guardarXmlNfse(chave, r.json && r.json.nfseXmlGZipB64);
     gravar();
     return tent;
   }
@@ -1047,23 +1049,46 @@ export async function previaDps(mesId, chave, ambiente = 'producaorestrita') {
   return assinarDps(xml, id, cert);
 }
 
+// ── PDF da nota (DANFSe) ─────────────────────────────────────────────────────
+// A API de DANFSe do ADN (adn.nfse.gov.br/danfse/{chave}) foi desligada em
+// 03/08/2026 pela NT 008 e responde 503 para sempre. O PDF agora é montado aqui
+// a partir do XML autorizado (danfse.cjs, o mesmo arquivo do Gestão CDV).
+// O XML fica em sessao/nfse-xml/<chave>.gz (fora do estado, que é regravado a
+// cada mudança); nota emitida antes disso tem o XML buscado na Sefin uma vez.
+function caminhoXml(chave) { return DIR + '/nfse-xml/' + chave + '.gz'; }
+function guardarXmlNfse(chave, gzB64) {
+  if (!/^\d{50}$/.test(String(chave || '')) || !gzB64) return;
+  try {
+    if (!existsSync(DIR + '/nfse-xml')) mkdirSync(DIR + '/nfse-xml', { recursive: true });
+    escreverAtomico(caminhoXml(chave), Buffer.from(String(gzB64), 'base64'));
+  } catch (e) { console.error('[NFSE] Falha ao guardar o XML da nota:', e.message); }
+}
+function lerXmlGuardado(chave) {
+  try { return existsSync(caminhoXml(chave)) ? gunzipSync(readFileSync(caminhoXml(chave))).toString('utf8') : ''; } catch (_) { return ''; }
+}
+function tentativaPorChaveAcesso(chave) {
+  const todas = [];
+  for (const m of Object.values(E.meses || {})) for (const n of (m.notas || [])) todas.push(n, n.teste);
+  for (const n of (E.avulsas || [])) todas.push(n, n.teste);
+  return todas.find(t => t && t.chaveAcesso === chave) || null;
+}
 export async function baixarDanfse(chave, ambiente = 'producao') {
-  const cert = certificado();
-  if (!cert) throw new Error('certificado não cadastrado');
   if (!/^\d{50}$/.test(String(chave))) throw new Error('chave inválida');
-  // O ADN fica instável (503/504) com frequência: tenta de novo antes de desistir.
-  const esperas = [0, 3000, 8000];
-  let ultimo = '';
-  for (const ms of esperas) {
-    if (ms) await new Promise(res => setTimeout(res, ms));
+  let xml = lerXmlGuardado(chave);
+  if (!xml) {
+    const cert = certificado();
+    if (!cert) throw new Error('certificado não cadastrado');
+    const consulta = ' A nota segue emitida; o PDF oficial sai na Consulta Pública do Portal Nacional com a chave ' + chave + '.';
     let r;
-    try { r = await chamar(URLS[ambiente].adn + '/danfse/' + chave, { cert, binario: true, timeoutMs: 45000 }); }
-    catch (e) { ultimo = e.message; continue; }
-    if (r.status === 200 && /pdf/i.test(r.tipo)) return r.buf;
-    ultimo = 'ADN respondeu ' + r.status;
-    if (r.status < 500 && r.status !== 429) break;   // erro definitivo: não adianta repetir
+    try { r = await chamar(URLS[ambiente].sefin + '/nfse/' + chave, { cert, timeoutMs: 45000 }); }
+    catch (e) { throw new Error('a Sefin não respondeu ao pedir o XML da nota (' + e.message + ').' + consulta); }
+    const b64 = r.json && (r.json.nfseXmlGZipB64 || r.json.NfseXmlGZipB64);
+    if (r.status !== 200 || !b64) throw new Error('a Sefin respondeu ' + r.status + ' ao pedir o XML da nota.' + consulta);
+    guardarXmlNfse(chave, b64);
+    xml = gunzipSync(Buffer.from(b64, 'base64')).toString('utf8');
   }
-  throw new Error(ultimo + ' (o ADN da NFS-e Nacional está fora do ar agora; a nota segue emitida, tente de novo mais tarde ou baixe pela Consulta Pública do Portal Nacional com a chave de acesso)');
+  const t = tentativaPorChaveAcesso(chave);
+  return danfse.gerarDanfse(xml, { cancelada: !!t && t.status === 'cancelada' });
 }
 
 // ── Configuração ─────────────────────────────────────────────────────────────
