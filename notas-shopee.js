@@ -74,10 +74,13 @@ export const PROGRAMAS_NOTA = {
 export const PROGRAMAS_NOME = { amazon: 'Amazon', mercadolivre: 'Mercado Livre', shopee_afiliado: 'Shopee', shopee: 'Shopee' };
 
 const CONFIG_PADRAO = {
-  ativo: false,                 // emissão automática no mês (produção)
-  ambiente: 'producao',         // 'producao' | 'producaorestrita'
+  // Emissão (19/11/2026, mesmas opções do Gestão CDV — notas-fiscais.js do painel-cdv):
+  // modo 'desligado' = nada roda sozinho; 'homologacao' = busca o relatório, só sai teste;
+  // 'producao' = notas válidas (botão Emitir); emitirAuto = em produção, emite sozinho.
+  modo: 'homologacao',
+  emitirAuto: false,
   diaInicio: 5,                 // a partir de que dia do mês busca o relatório do mês anterior (folga para o relatório assentar)
-  competencia: 'emissao',       // 'emissao' = data da emissão | 'mes' = último dia do mês do relatório
+  competencia: 'emissao',       // 'emissao' | 'pagamento' | 'mes' (no relatório mensal, pagamento = último dia do mês da comissão)
   horaIni: 9, horaFim: 20,      // janela (SP) para buscar/emitir
   agrupar: true,                // uma nota por CNPJ/CPF
   estrangeiros: false,          // vendedor de fora do Brasil fica de fora (sem documento brasileiro)
@@ -131,6 +134,7 @@ export function iniciarNotasShopee(sessaoDir, opcoes = {}) {
       E = Object.assign(E, lido);
       E.config = mesclar(CONFIG_PADRAO, lido.config || {});
       migrarProdutos(lido.config || {});
+      migrarModo(lido.config || {});
     }
   } catch (e) { console.error('[NFSE] Estado ilegível, começando vazio:', e.message); }
   // Nota que estava "emitindo" quando o processo caiu: resultado incerto.
@@ -161,6 +165,21 @@ function migrarProdutos(lidoCfg) {
   if (!lidoCfg.produtoPadrao || !c.produtos.some(p => p.id === c.produtoPadrao)) c.produtoPadrao = (lidoCfg.programas || {}).shopee || c.produtos[0].id;
   if (!c.produtos.some(p => p.id === c.produtoPadrao)) c.produtoPadrao = c.produtos[0].id;
   for (const k of Object.keys(c.programas)) if (!PROGRAMAS_NOTA[k] || c.programas[k] === c.produtoPadrao || !c.produtos.some(p => p.id === c.programas[k])) delete c.programas[k];
+}
+
+// Antes de 19/11/2026: `ativo` (emitir sozinho) + `ambiente`. Vira modo + emitirAuto
+// sem mudar o que já acontecia: o botão Emitir funcionava sempre (= Produção) e o
+// automático só com `ativo`.
+function migrarModo(lidoCfg) {
+  const c = E.config;
+  if (!lidoCfg.modo) { c.modo = 'producao'; c.emitirAuto = !!lidoCfg.ativo; }
+  delete c.ativo; delete c.ambiente;
+}
+// Data de competência (mesma regra do Gestão CDV): produto fiscal → padrão da Emissão.
+// O relatório mensal não tem data de pagamento por venda: 'pagamento' e 'mes' = último dia do mês.
+function competenciaDa(s, mesId) {
+  const m = (s && s.competencia) || E.config.competencia;
+  return m === 'mes' || m === 'pagamento' ? ultimoDiaDoMes(mesId) : dhEmiSp().slice(0, 10);
 }
 
 // ── Produtos fiscais ──────────────────────────────────────────────────────────
@@ -519,7 +538,7 @@ async function montarInfDps(n, mesId, ambiente, nDPS, s = produtoDoPrograma('sho
     + tag('serie', String(cfg.serie))
     + tag('nDPS', String(nDPS))
     // Competência do produto fiscal (19/11/2026); vazio = a padrão da Emissão.
-    + tag('dCompet', ((s.competencia || cfg.competencia) === 'mes') ? ultimoDiaDoMes(mesId) : dhEmiSp().slice(0, 10))
+    + tag('dCompet', competenciaDa(s, mesId))
     + tag('tpEmit', '1')
     + tag('cLocEmi', em.cLocEmi)
     + '<prest>' + tag('CNPJ', digitos(em.cnpj)) + tag('IM', digitos(em.im)) + tag('fone', digitos(em.fone)) + tag('email', em.email)
@@ -622,7 +641,7 @@ function proximoNumero(ambiente) {
 }
 
 // Emite UMA nota. Grava o número da DPS antes de enviar.
-async function emitirNota(mesId, n, { ambiente = E.config.ambiente } = {}) {
+async function emitirNota(mesId, n, { ambiente = 'producao' } = {}) {
   const cert = certificado();
   if (!cert) throw new Error('certificado não cadastrado ou não abre');
   if (new Date(cert.validoAte) < new Date()) throw new Error('certificado vencido');
@@ -681,8 +700,9 @@ function naJanela() {
   const h = agoraSp().getUTCHours();
   return h >= E.config.horaIni && h < E.config.horaFim;
 }
-export function bloqueiosEmissao(ambiente = E.config.ambiente) {
+export function bloqueiosEmissao(ambiente = 'producao') {
   const b = [];
+  if (ambiente === 'producao' && E.config.modo !== 'producao') b.push('emissão em ' + (E.config.modo === 'desligado' ? 'Desligado' : 'Homologação') + ' (ligue o modo Produção)');
   const cert = estadoCertificado();
   if (!cert.cadastrado) b.push('certificado não cadastrado');
   else if (cert.vencido) b.push('certificado vencido');
@@ -703,7 +723,7 @@ export function bloqueiosEmissao(ambiente = E.config.ambiente) {
 async function trabalho() {
   if (_emitindo) return;
   const cfg = E.config;
-  if (!cfg.ativo || !naJanela()) return;
+  if (cfg.modo === 'desligado' || !naJanela()) return;
   const dia = agoraSp().getUTCDate();
   const alvo = mesAnterior();
   if (dia >= (Number(cfg.diaInicio) || 1)) {
@@ -713,6 +733,7 @@ async function trabalho() {
       return;
     }
   }
+  if (cfg.modo !== 'producao' || !cfg.emitirAuto) return;
   // Automático só emite o mês anterior. Outros meses (buscados à mão no painel,
   // por exemplo um mês que já saiu pelo eNotas) só saem pelo botão Emitir.
   const mesesComPendente = [alvo].filter(k => E.meses[k] && (E.meses[k].notas || []).some(n => ['pendente', 'incerta'].includes(n.status)));
@@ -824,8 +845,10 @@ export async function baixarDanfse(chave, ambiente = 'producao') {
 const CAMPOS_TEXTO = /^[\s\S]{0,2000}$/;
 export function salvarConfig(c = {}) {
   const novo = mesclar(E.config, c);
-  novo.ambiente = novo.ambiente === 'producaorestrita' ? 'producaorestrita' : 'producao';
-  novo.competencia = novo.competencia === 'mes' ? 'mes' : 'emissao';
+  novo.modo = ['desligado', 'homologacao', 'producao'].includes(novo.modo) ? novo.modo : 'homologacao';
+  novo.emitirAuto = novo.emitirAuto === true;
+  delete novo.ativo; delete novo.ambiente;
+  novo.competencia = ['pagamento', 'mes'].includes(novo.competencia) ? novo.competencia : 'emissao';
   novo.diaInicio = Math.min(28, Math.max(1, Number(novo.diaInicio) || 1));
   novo.horaIni = Math.min(23, Math.max(0, Number(novo.horaIni) || 9));
   novo.horaFim = Math.min(24, Math.max(novo.horaIni + 1, Number(novo.horaFim) || 20));
@@ -861,7 +884,7 @@ function validarProdutos(lista) {
       cstPisCofins: digitos(p.cstPisCofins), tpRetPisCofins: digitos(p.tpRetPisCofins) || '0',
       pTotTribSN: String(p.pTotTribSN == null ? '' : p.pTotTribSN).trim().replace(',', '.'),
       codigosConfirmados: p.codigosConfirmados === true,
-      competencia: p.competencia === 'mes' || p.competencia === 'emissao' ? p.competencia : '',
+      competencia: ['emissao', 'pagamento', 'mes'].includes(p.competencia) ? p.competencia : '',
     });
     if (!x.nome) throw new Error('produto fiscal sem nome');
     if (x.cTribNac.length !== 6) throw new Error(x.nome + ': código de tributação nacional precisa de 6 dígitos');
