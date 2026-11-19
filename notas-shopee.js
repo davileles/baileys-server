@@ -70,6 +70,8 @@ export const PROGRAMAS_NOTA = {
   shopee_afiliado: 'Shopee · comissão de afiliado',
   shopee: 'Shopee · comissão extra de vendedores',
 };
+// Nome do programa que entra na tag {programa} da descrição da nota.
+export const PROGRAMAS_NOME = { amazon: 'Amazon', mercadolivre: 'Mercado Livre', shopee_afiliado: 'Shopee', shopee: 'Shopee' };
 
 const CONFIG_PADRAO = {
   ativo: false,                 // emissão automática no mês (produção)
@@ -494,7 +496,8 @@ function idDps(cfg, nDPS) {
 
 function textoServico(modelo, mesId, n) {
   const lojas = n.lojas.map(l => l.nome + ' (ID ' + l.shopId + ')').join(', ');
-  return String(modelo || '').replace(/\{mes\}/g, mesTexto(mesId)).replace(/\{lojas\}/g, lojas).replace(/\{valor\}/g, n.valor.toFixed(2).replace('.', ','));
+  const programa = PROGRAMAS_NOME[n.programa || 'shopee'] || 'Shopee';
+  return String(modelo || '').replace(/\{programa\}/g, programa).replace(/\{mes\}/g, mesTexto(mesId)).replace(/\{lojas\}/g, lojas).replace(/\{valor\}/g, n.valor.toFixed(2).replace('.', ','));
 }
 
 // Devolve o XML do infDPS (sem namespace: ele é herdado do <DPS>).
