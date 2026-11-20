@@ -86,8 +86,9 @@ import {
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
   julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
-  conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie,
+  conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie, relatorioLinhas,
 } from './monitor-precos.js';
+import { registrarRotasKeepa } from './keepa.js';
 import {
   carregarNotaOferta, configNotaOferta, salvarConfigNotaOferta, registrarCapturaFonte,
   avaliarNotaOferta, relatorioNotas,
@@ -9351,6 +9352,8 @@ async function lerPrecosParaSerie(produtos, jid, motivo) {
       registrarLeituraPreco(p.asin, {
         nome: p.titulo, loja: p.loja, preco: p.preco,
         precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
+        // Preco do momento do post (captura), nao leitura nossa — ver monitor-precos.js.
+        origem: 'captura', url: p.link || p.urlLoja || null,
       });
       gravados++;
     } catch (e) { console.warn('[LEITURA] Falha ao gravar serie de ' + p.asin + ':', e.message); }
@@ -9998,6 +10001,9 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         registrarLeituraPreco(p.asin, {
           nome: p.titulo, loja: p.loja, preco: p.preco,
           precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
+          // Preco do momento do post (captura): entra no patamar de promocao e
+          // coloca o produto na vigilancia leve (ver monitor-precos.js).
+          origem: 'captura', url: p.link || p.urlLoja || null,
         });
       }
     } catch (e) { /* serie e conveniencia: nunca segura o pipeline */ }
@@ -23159,6 +23165,16 @@ app.get('/monitor-precos/vereditos', (req, res) => {
   const dias = Math.min(30, Math.max(1, parseInt(req.query.dias, 10) || 7));
   res.json({ ok: true, ...vereditosDisparos({ dias }) });
 });
+
+// GET /monitor-precos/linhas?dias=7 — tres linhas de preco (cheio, patamar de
+// promocao, minimo) julgando cada oferta capturada. SOMBRA: nada e barrado.
+app.get('/monitor-precos/linhas', (req, res) => {
+  const dias = Math.min(30, Math.max(1, parseInt(req.query.dias, 10) || 7));
+  res.json({ ok: true, ...relatorioLinhas({ dias }) });
+});
+
+// Keepa (historico da Amazon, 1 mes de assinatura): /keepa, /keepa/{config,teste,importar,parar,quedas,categorias}
+registrarRotasKeepa(app);
 
 app.get('/monitor-precos/epc', (req, res) => {
   res.json({ ok:true, estado: estadoEpc(),

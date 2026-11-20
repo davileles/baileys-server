@@ -42,6 +42,13 @@ const ARQ_HIST   = 'precos_hist.json';
 const ARQ_ESTADO = 'monitor_precos_estado.json';
 // Escrito pelo coletor (GitHub Actions), somente LIDO aqui.
 const ARQ_EPC    = 'epc-produtos.json';
+// Vigilancia leve do que foi CAPTURADO nos grupos-fonte (20/11/2026). Lista
+// separada da vitrine para nao encher o catalogo do painel.
+const ARQ_CAPT   = 'precos_captura.json';
+// Historico importado do Keepa (Amazon), um arquivo por mes, guardado como
+// pontos de mudanca do minimo diario (nao um ponto por dia): cabe folgado no
+// ~1 MB que a Contents API devolve.
+function nomeShardKeepa(mes) { return 'precos_keepa_' + mes + '.json'; }
 
 const TZ_SP = 'America/Sao_Paulo';
 
@@ -80,9 +87,16 @@ function credenciaisAmazonOk() {
 // conjunto, senao o painel promete vigiar produto que a varredura ignora.
 // O filtro por ASIN valido barra o que mora na mesma vitrine mas nao e produto
 // Amazon (itens AWIN- herdam a loja padrao no cadastro).
-function itensMonitorados() {
-  return listarVitrine().filter(i =>
+function itensMonitorados({ comCaptura = false } = {}) {
+  const vit = listarVitrine().filter(i =>
     _cfg.varredura.lojas.includes(i.loja) && (i.loja !== 'Amazon' || ehItemAmazon(i)));
+  if (!comCaptura || !_cfg.vigilancia?.captura?.ativo) return vit;
+  // Vigilancia de captura: so a varredura enxerga. Painel e simulacao seguem
+  // com a vitrine, para a tabela nao ganhar milhares de linhas.
+  const ids = new Set(vit.map(i => i.asin));
+  const extra = Object.values(_capt).filter(i => !ids.has(i.asin)
+    && _cfg.varredura.lojas.includes(i.loja) && (i.loja !== 'Amazon' || ehItemAmazon(i)));
+  return vit.concat(extra);
 }
 
 // ── CONFIG PADRAO ────────────────────────────────────────────────────────────
@@ -134,6 +148,34 @@ const CFG_PADRAO = {
     // Dias sem divulgacao apos os quais o produto sai da varredura. Item
     // cadastrado a mao ou semeado por EPC nunca e expurgado por aqui.
     expurgoDias: 60,
+    // CAPTURA (20/11/2026): todo produto capturado num grupo-fonte entra numa
+    // vigilancia leve, fora da vitrine. Sem isto a serie de quem nunca foi
+    // divulgado so recebia ponto quando alguem postava o produto — sempre no
+    // preco de promocao — e a "mediana" virava o preco promocional. Leitura 1x
+    // por dia nos primeiros 'diariaDias', depois 1x a cada friaCadaDias.
+    captura: {
+      ativo: true,
+      lojas: ['Amazon', 'Mercado Livre'],
+      expurgoDias: 30,      // sem nova captura ha N dias -> sai
+      diariaDias: 14,
+      maximo: 2500,
+      porRodada: 300,       // teto de leituras de captura por varredura
+      geraCandidato: false, // so alimenta a serie; nao vira candidato do monitor
+    },
+  },
+  // TRES LINHAS DE PRECO (20/11/2026, veredito em sombra):
+  //   cheio   mediana das LEITURAS (varredura, Keepa) dos ultimos 90 dias
+  //   promo   mediana dos precos nos dias em que o produto foi CAPTURADO
+  //   minimo  menor preco dos ultimos 90 dias (hoje fora)
+  linhas: {
+    minCheio: 5,                 // leituras para a linha cheia valer
+    minPromo: 2,                 // dias de captura para o patamar valer
+    minDiasMinimo: 5,            // dias de serie para o "minimo" valer
+    tolMinimoPct: 2,
+    imperdivelAbaixoPromoPct: 3,
+    promoFolgaPct: 2,
+    falsoAteCheioPct: 2,
+    quedaBoaSemPromoPct: 12,
   },
 
   publicacao: {
@@ -315,6 +357,9 @@ const CFG_PADRAO = {
 let _cfg    = clonar(CFG_PADRAO);
 let _hist   = {};    // asin -> { n, loja, dias: { 'YYYY-MM-DD': min }, ult: {preco, precoDe, em, disponivel} }
 let _epc    = { produtos: {} };   // ledger somente-leitura escrito pelo coletor
+let _capt   = {};    // asin -> { asin, loja, nome, url, criadoEm, capturadoEm, capturas } (vigilancia de captura)
+let _keepaAte = {};  // mes -> ultimo dia coberto pelo import do Keepa
+let _ganchoCaptura = null;   // (asin, loja) -> void: chamado quando um produto entra na vigilancia de captura
 let _estado = {      // fila de candidatos + contadores do dia
   fila: [],          // [{ asin, nome, loja, nicho, preco, mediana30, min90, quedaPct, quedaRs, score, recorde, em }]
   cotas: { dia: null, porLoja: {}, porNicho: {} },
@@ -361,7 +406,7 @@ function ler(nome, padrao) {
 function gravar(nome, dados, push = true) {
   try {
     if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
-    const compacto = nome === ARQ_HIST || /^precos_hist_\d{4}-\d{2}\.json$/.test(nome);
+    const compacto = nome === ARQ_HIST || nome === ARQ_CAPT || /^precos_(hist|keepa)_\d{4}-\d{2}\.json$/.test(nome);
     writeFileSync(caminho(nome), JSON.stringify(dados, null, compacto ? 0 : 2));
     if (push) agendarPush(nome);
   } catch (e) {
@@ -402,15 +447,21 @@ function mesesNaJanela(qtd = null) {
 function serializarShard(mes) {
   const out = {};
   for (const [asin, h] of Object.entries(_hist)) {
-    const dias = {}, diasEf = {}, diasDe = {};
+    const dias = {}, diasEf = {}, diasDe = {}, diasC = {}, diasL = {};
     for (const [d, v] of Object.entries(h.dias || {}))   if (mesDoDia(d) === mes) dias[d.slice(8)] = v;
     for (const [d, v] of Object.entries(h.diasEf || {})) if (mesDoDia(d) === mes) diasEf[d.slice(8)] = v;
     for (const [d, v] of Object.entries(h.diasDe || {})) if (mesDoDia(d) === mes) diasDe[d.slice(8)] = v;
+    for (const [d, v] of Object.entries(h.diasC || {}))  if (mesDoDia(d) === mes) diasC[d.slice(8)] = v;
+    for (const [d, v] of Object.entries(h.diasL || {}))  if (mesDoDia(d) === mes) diasL[d.slice(8)] = v;
     // Produto marcado sem oferta entra no shard corrente mesmo sem ponto no mes:
     // sem isto a marca morreria a cada deploy e o preco velho voltaria a valer.
     const semOferta = mes === mesSP() && ((h.ult?.disponivel === false && !!h.ult?.semOfertaEm) || !!h.ult?.falhaEm);
     if (!Object.keys(dias).length && !Object.keys(diasEf).length && !semOferta) continue;
     const reg = { n: h.n, loja: h.loja, dias, diasEf, diasDe };
+    // Origem do ponto (20/11/2026): so os dias com captura carregam os dois
+    // mapas, para o shard nao dobrar de tamanho.
+    if (Object.keys(diasC).length) reg.diasC = diasC;
+    if (Object.keys(diasL).length) reg.diasL = diasL;
     // A ultima leitura e estado corrente, nao historico: mora so no shard do
     // mes atual, senao um shard antigo restaurado sobrescreveria o preco de hoje.
     if (mes === mesSP() && h.ult) reg.ult = h.ult;
@@ -431,6 +482,8 @@ function fundirShard(mes, dados) {
     for (const [d, v] of Object.entries(r.dias   || {})) h.dias[mes + '-' + d]   = v;
     for (const [d, v] of Object.entries(r.diasEf || {})) h.diasEf[mes + '-' + d] = v;
     for (const [d, v] of Object.entries(r.diasDe || {})) h.diasDe[mes + '-' + d] = v;
+    if (r.diasC) { if (!h.diasC) h.diasC = {}; for (const [d, v] of Object.entries(r.diasC)) h.diasC[mes + '-' + d] = v; }
+    if (r.diasL) { if (!h.diasL) h.diasL = {}; for (const [d, v] of Object.entries(r.diasL)) h.diasL[mes + '-' + d] = v; }
     // Vence a leitura mais recente: shards sao fundidos do mais antigo para o
     // mais novo, mas o volume pode ter um shard velho de um deploy anterior.
     // O carimbo considera tambem a marca de sem oferta (que nao mexe em 'em').
@@ -481,7 +534,167 @@ function podarHistorico() {
     for (const d of Object.keys(h.dias || {}))   if (d < corte) delete h.dias[d];
     for (const d of Object.keys(h.diasEf || {})) if (d < corte) delete h.diasEf[d];
     for (const d of Object.keys(h.diasDe || {})) if (d < corte) delete h.diasDe[d];
+    for (const d of Object.keys(h.diasC || {}))  if (d < corte) delete h.diasC[d];
+    for (const d of Object.keys(h.diasL || {}))  if (d < corte) delete h.diasL[d];
+    for (const d of Object.keys(h.diasK || {}))  if (d < corte) delete h.diasK[d];
   }
+}
+
+// ── HISTORICO DO KEEPA (Amazon) ─────────────────────────────────────────────
+// h.diasK guarda o minimo diario importado do Keepa. Nao se mistura com h.dias
+// (a nossa leitura): na estatistica, o dia que temos vence; o do Keepa so
+// preenche o buraco. Em disco: pontos de mudanca por mes.
+function serializarShardKeepa(mes) {
+  const out = {};
+  for (const [asin, h] of Object.entries(_hist)) {
+    if (!h.diasK) continue;
+    const dias = Object.keys(h.diasK).filter(d => mesDoDia(d) === mes).sort();
+    if (!dias.length) continue;
+    const ev = [];
+    let ant = null, diaAnt = null;
+    for (const d of dias) {
+      const v = Math.round(h.diasK[d] * 100);
+      const consecutivo = diaAnt && diffDias(diaAnt, d) === 1;
+      if (v !== ant || !consecutivo) ev.push([d.slice(8), v]);
+      ant = v; diaAnt = d;
+    }
+    out[asin] = { e: ev, f: dias[dias.length - 1].slice(8) };
+  }
+  return { _ate: _keepaAte[mes] || null, p: out };
+}
+
+function fundirShardKeepa(mes, dados) {
+  if (!dados?.p) return;
+  if (dados._ate) _keepaAte[mes] = dados._ate;
+  for (const [asin, r] of Object.entries(dados.p)) {
+    const ev = Array.isArray(r.e) ? r.e : [];
+    if (!ev.length) continue;
+    const h = _hist[asin] || { n: '', loja: 'Amazon', dias: {}, diasEf: {}, diasDe: {}, ult: null };
+    if (!h.diasK) h.diasK = {};
+    const fim = mes + '-' + (r.f || ev[ev.length - 1][0]);
+    for (let i = 0; i < ev.length; i++) {
+      const ini = mes + '-' + ev[i][0];
+      const prox = i + 1 < ev.length ? mes + '-' + ev[i + 1][0] : null;
+      const v = Number(ev[i][1]) / 100;
+      let d = ini;
+      for (let g = 0; g < 32 && d <= fim && (!prox || d < prox); g++) {
+        if (v > 0) h.diasK[d] = v;
+        d = diaSP(Date.parse(d + 'T12:00:00Z') + 86400000);
+      }
+    }
+    _hist[asin] = h;
+  }
+}
+
+/**
+ * Grava no produto o minimo diario vindo do Keepa: { 'AAAA-MM-DD': preco }.
+ * So dias dentro da retencao e ANTES de hoje (hoje e da nossa leitura).
+ */
+export function importarSerieKeepa(asin, diasMin, { nome = '', ate = null } = {}) {
+  if (!asin || !diasMin) return 0;
+  const corte = diaSP(Date.now() - DIAS_RETENCAO * 86400000);
+  const hoje = diaSP();
+  const h = _hist[asin] || { n: nome || '', loja: 'Amazon', dias: {}, diasEf: {}, diasDe: {}, ult: null };
+  h.n = h.n || nome || '';
+  h.loja = h.loja || 'Amazon';
+  h.diasK = {};
+  let n = 0;
+  for (const [d, v] of Object.entries(diasMin)) {
+    if (d < corte || d >= hoje || !Number.isFinite(v) || v <= 0) continue;
+    h.diasK[d] = Math.round(v * 100) / 100;
+    n++;
+  }
+  h.keepaEm = new Date().toISOString();
+  _hist[asin] = h;
+  const mesAte = mesDoDia(ate || diaSP(Date.now() - 86400000));
+  for (const m of mesesNaJanela()) if (m <= mesAte) _keepaAte[m] = ate || diaSP(Date.now() - 86400000);
+  return n;
+}
+
+/** Grava os arquivos do Keepa de toda a janela (chamado ao fim de cada lote). */
+export function gravarShardsKeepa() {
+  for (const m of mesesNaJanela()) {
+    const s = serializarShardKeepa(m);
+    if (Object.keys(s.p).length) gravar(nomeShardKeepa(m), s);
+  }
+}
+
+/** ASINs da Amazon que conhecemos (vitrine, captura e serie), com a marca de importado. */
+export function asinsAmazonConhecidos() {
+  const mapa = new Map();
+  const por = (asin, nome, origem) => {
+    if (!RE_ASIN_AMAZON.test(String(asin || '')) || mapa.has(asin)) return;
+    const h = _hist[asin];
+    mapa.set(asin, { asin, nome: nome || h?.n || '', origem, importadoEm: h?.keepaEm || null,
+                     precoAtual: h?.ult?.preco ?? null, lidoEm: h?.ult?.em ?? null });
+  };
+  for (const i of listarVitrine()) if (i.loja === 'Amazon') por(i.asin, i.nome, i.origemSemeadura || 'vitrine');
+  for (const i of Object.values(_capt)) if (i.loja === 'Amazon') por(i.asin, i.nome, 'captura');
+  for (const [asin, h] of Object.entries(_hist)) if (h.loja === 'Amazon') por(asin, h.n, 'serie');
+  return [...mapa.values()];
+}
+
+/** Gancho do keepa.js: ASIN novo da Amazon entrou na vigilancia de captura. */
+export function definirGanchoCaptura(fn) { _ganchoCaptura = typeof fn === 'function' ? fn : null; }
+
+/** Dias (nossos + Keepa) do produto: o nosso vence no mesmo dia. */
+function diasDoProduto(h) {
+  if (!h) return {};
+  return h.diasK ? { ...h.diasK, ...(h.dias || {}) } : (h.dias || {});
+}
+
+// ── VIGILANCIA DE CAPTURA ───────────────────────────────────────────────────
+let _captTimer = null;
+function agendarGravarCapt() {
+  if (_captTimer) return;
+  _captTimer = setTimeout(() => { _captTimer = null; gravar(ARQ_CAPT, _capt); }, 60000);
+  if (_captTimer.unref) _captTimer.unref();
+}
+
+function vigiarProdutoCapturado({ asin, loja, nome, url }) {
+  const cc = _cfg.vigilancia?.captura;
+  if (!_cfg.vigilancia?.ativo || !cc?.ativo || !asin) return false;
+  if (!cc.lojas.includes(loja) || !_cfg.varredura.lojas.includes(loja)) return false;
+  if (loja === 'Amazon' && !ehItemAmazon({ asin, loja })) return false;
+  if (itemVitrine(asin)) return false;     // ja vigiado pela vitrine
+  const agora = new Date().toISOString();
+  const ex = _capt[asin];
+  if (ex) {
+    ex.capturadoEm = agora;
+    ex.capturas = (ex.capturas || 1) + 1;
+    if (nome) ex.nome = String(nome).slice(0, 120);
+    if (url && !ex.url) ex.url = url;
+    agendarGravarCapt();
+    return false;
+  }
+  if (Object.keys(_capt).length >= cc.maximo && !expurgarCaptura({ forcar: 1 })) return false;
+  _capt[asin] = { asin, loja, nome: String(nome || '').slice(0, 120), url: url || '',
+                  criadoEm: agora, capturadoEm: agora, capturas: 1, origemSemeadura: 'captura' };
+  agendarGravarCapt();
+  try { if (_ganchoCaptura) _ganchoCaptura(asin, loja); } catch (e) { /* gancho nunca segura captura */ }
+  return true;
+}
+
+export function expurgarCaptura({ forcar = 0 } = {}) {
+  const cc = _cfg.vigilancia?.captura;
+  const limite = Date.now() - (cc?.expurgoDias ?? 30) * 86400000;
+  const lista = Object.values(_capt)
+    .map(i => ({ i, q: Date.parse(i.capturadoEm || i.criadoEm || 0) || 0 }))
+    .sort((a, b) => a.q - b.q);
+  const alvos = forcar ? lista.slice(0, forcar) : lista.filter(x => x.q < limite);
+  for (const { i } of alvos) delete _capt[i.asin];
+  // Produto que entrou na vitrine (foi divulgado) sai daqui: a vitrine assume.
+  let migrados = 0;
+  for (const asin of Object.keys(_capt)) if (itemVitrine(asin)) { delete _capt[asin]; migrados++; }
+  if (alvos.length || migrados) agendarGravarCapt();
+  return alvos.length;
+}
+
+export function estadoCaptura() {
+  const itens = Object.values(_capt);
+  const porLoja = {};
+  for (const i of itens) porLoja[i.loja] = (porLoja[i.loja] || 0) + 1;
+  return { total: itens.length, porLoja, config: _cfg.vigilancia?.captura || null };
 }
 
 /**
@@ -499,6 +712,17 @@ export async function restaurarShardsDePrecos(meses = null) {
     const d = ler(nomeShard(m), null);
     if (d) fundirShard(m, d);
   }
+  // Keepa e captura (20/11/2026): nomes dinamicos/novos, mesmo motivo.
+  for (const m of alvos) {
+    if (await baixarArquivoDoGitHub(nomeShardKeepa(m))) {
+      const k = ler(nomeShardKeepa(m), null);
+      if (k) fundirShardKeepa(m, k);
+    }
+  }
+  if (!Object.keys(_capt).length && await baixarArquivoDoGitHub(ARQ_CAPT)) {
+    const cp = ler(ARQ_CAPT, {});
+    if (cp && typeof cp === 'object' && !Array.isArray(cp)) _capt = cp;
+  }
   podarHistorico();
   console.log('[PRECOS] Shards restaurados — ' + ok + ' de ' + alvos.length + ' mes(es) ('
     + alvos.join(', ') + '), ' + Object.keys(_hist).length + ' produto(s) com serie.');
@@ -515,7 +739,13 @@ export function carregarMonitorPrecos() {
     if (d) fundirShard(m, d);
   }
   if (!Object.keys(_hist).length) migrarHistoricoUnico();
+  for (const m of [...mesesNaJanela()].reverse()) {
+    const k = ler(nomeShardKeepa(m), null);
+    if (k) fundirShardKeepa(m, k);
+  }
   podarHistorico();
+  _capt   = ler(ARQ_CAPT, {});
+  if (!_capt || typeof _capt !== 'object' || Array.isArray(_capt)) _capt = {};
   _epc    = ler(ARQ_EPC, { produtos: {} });
   _estado = { ..._estado, ...ler(ARQ_ESTADO, {}) };
   if (!Array.isArray(_estado.fila)) _estado.fila = [];
@@ -551,6 +781,19 @@ function estruturarCfg(bruto) {
   const vg = b.vigilancia || {};
   out.vigilancia.ativo       = vg.ativo !== false;
   out.vigilancia.expurgoDias = limitar(vg.expurgoDias, 1, 730, CFG_PADRAO.vigilancia.expurgoDias);
+  const vc = vg.captura || {}, pc = CFG_PADRAO.vigilancia.captura;
+  out.vigilancia.captura = {
+    ativo: vc.ativo !== false,
+    lojas: Array.isArray(vc.lojas) ? vc.lojas.filter(l => LOJAS_MONITORAVEIS_PRECO.includes(l)) : pc.lojas.slice(),
+    expurgoDias: limitar(vc.expurgoDias, 1, 365, pc.expurgoDias),
+    diariaDias: limitar(vc.diariaDias, 0, 90, pc.diariaDias),
+    maximo: limitar(vc.maximo, 0, 20000, pc.maximo),
+    porRodada: limitar(vc.porRodada, 10, 5000, pc.porRodada),
+    geraCandidato: vc.geraCandidato === true,
+  };
+  const ln = b.linhas || {}, pl = CFG_PADRAO.linhas;
+  out.linhas = {};
+  for (const k of Object.keys(pl)) out.linhas[k] = limitar(ln[k], 0, 100, pl[k]);
 
   const p = b.publicacao || {};
   const jan = Array.isArray(p.janelas)
@@ -702,7 +945,7 @@ export function salvarConfigMonitorPrecos(parcial = {}) {
 // 8 leituras/dia e 200 produtos, guardar tudo daria ~2 MB de serie em 90 dias
 // e a Contents API para de devolver arquivo acima de ~1 MB — a restauracao
 // pos-deploy morreria em silencio. O minimo diario e o que o gatilho usa.
-function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfetivo, itemId }) {
+function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfetivo, itemId, origem = 'leitura' }) {
   if (!asin) return null;
   if (!Number.isFinite(preco) || preco <= 0) return null;
   const dia = diaSP();
@@ -711,7 +954,22 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
   if (!h.diasDe) h.diasDe = {};
   h.n = nome || h.n;
   h.loja = loja || h.loja;
+  const antes = h.dias[dia];
   h.dias[dia] = (h.dias[dia] === undefined) ? preco : Math.min(h.dias[dia], preco);
+
+  // ORIGEM DO PONTO (20/11/2026): captura = preco do momento em que alguem
+  // postou o produto (quase sempre promocao); leitura = varredura nossa. So o
+  // dia que teve captura guarda os dois minimos separados (diasC e diasL); no
+  // dia sem captura, h.dias ja e a leitura.
+  if (origem === 'captura') {
+    if (!h.diasC) h.diasC = {};
+    if (!h.diasL) h.diasL = {};
+    if (h.diasC[dia] === undefined && antes !== undefined && h.diasL[dia] === undefined) h.diasL[dia] = antes;
+    h.diasC[dia] = (h.diasC[dia] === undefined) ? preco : Math.min(h.diasC[dia], preco);
+  } else if (h.diasC && h.diasC[dia] !== undefined) {
+    if (!h.diasL) h.diasL = {};
+    h.diasL[dia] = (h.diasL[dia] === undefined) ? preco : Math.min(h.diasL[dia], preco);
+  }
 
   // SERIE DO 'DE': o preco de tabela que a loja anuncia. Guardado para medir,
   // ao longo do tempo, o quanto o de->por das nossas ofertas e real — que e a
@@ -729,8 +987,12 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
   const ef = Number.isFinite(precoEfetivo) && precoEfetivo > 0 ? Math.min(precoEfetivo, preco) : preco;
   h.diasEf[dia] = (h.diasEf[dia] === undefined) ? ef : Math.min(h.diasEf[dia], ef);
 
+  const _agoraIso = new Date().toISOString();
   h.ult = { preco, precoDe: precoDe ?? null, disponivel: disponivel !== false,
-            precoEfetivo: ef, em: new Date().toISOString() };
+            precoEfetivo: ef, em: _agoraIso,
+            // Ultima leitura NOSSA (nao captura): e o que a camada da vigilancia
+            // de captura olha para decidir se ja leu hoje.
+            leituraEm: origem === 'captura' ? (h.ult?.leituraEm || null) : _agoraIso };
   // ML catalogo: a oferta de onde saiu o preco (o painel abre /p/ com
   // pdp_filters nela, como a mensagem enviada — sem isso cai em "ver opcoes").
   if (itemId) h.ult.itemId = String(itemId);
@@ -740,6 +1002,8 @@ function registrarPreco(asin, { nome, loja, preco, precoDe, disponivel, precoEfe
   for (const d of Object.keys(h.dias))   if (d < corte) delete h.dias[d];
   for (const d of Object.keys(h.diasEf)) if (d < corte) delete h.diasEf[d];
   for (const d of Object.keys(h.diasDe)) if (d < corte) delete h.diasDe[d];
+  for (const d of Object.keys(h.diasC || {})) if (d < corte) delete h.diasC[d];
+  for (const d of Object.keys(h.diasL || {})) if (d < corte) delete h.diasL[d];
 
   _hist[asin] = h;
   return h;
@@ -838,7 +1102,12 @@ function registrarSemOferta(asin, { nome, loja, motivo } = {}) {
  */
 export function registrarLeituraPreco(asin, dados = {}) {
   if (!asin) return null;
-  const h = registrarPreco(String(asin), dados);
+  const { url = null, ...resto } = dados || {};
+  const h = registrarPreco(String(asin), resto);
+  if (h && resto.origem === 'captura') {
+    try { vigiarProdutoCapturado({ asin: String(asin), loja: resto.loja, nome: resto.nome, url }); }
+    catch (e) { console.warn('[PRECOS] Vigilancia de captura falhou para ' + asin + ':', e.message); }
+  }
   if (h) gravarShardCorrente();
   return h;
 }
@@ -858,8 +1127,9 @@ function diffDias(a, b) { return Math.round((Date.parse(b + 'T12:00:00Z') - Date
 export function diasComoMenorPreco(asin, preco) {
   const cfg = _cfg.selo;
   if (!cfg?.ativo || !Number.isFinite(preco) || preco <= 0) return null;
-  const h = _hist[asin];
-  if (!h?.dias) return null;
+  const h0 = _hist[asin];
+  if (!h0?.dias) return null;
+  const h = { ...h0, dias: diasDoProduto(h0) };
   const hoje = diaSP();
   const val = d => {
     const a = h.dias[d], e = h.diasEf?.[d];
@@ -886,8 +1156,9 @@ export function diasComoMenorPreco(asin, preco) {
 export function quedaVsHabitual(asin, preco) {
   const cfg = _cfg.selo;
   if (!cfg?.ativo || cfg.queda === false || !Number.isFinite(preco) || preco <= 0) return null;
-  const h = _hist[asin];
-  if (!h?.dias) return null;
+  const h0 = _hist[asin];
+  if (!h0?.dias) return null;
+  const h = { dias: diasDoProduto(h0) };
   const hoje = diaSP();
   const vals = Object.keys(h.dias)
     .filter(d => d < hoje && diffDias(d, hoje) <= 30)
@@ -926,6 +1197,8 @@ export function expurgarLeiturasDaSerie(asin, { preco = null, dias = null, janel
     delete h.dias[d];
     if (h.diasEf) delete h.diasEf[d];
     if (h.diasDe) delete h.diasDe[d];
+    if (h.diasC) delete h.diasC[d];
+    if (h.diasL) delete h.diasL[d];
   }
   if (!removidos.length) return { ok: true, removidos };
   const eraUlt = h.ult && removidos.some(r => Math.abs(Number(h.ult.preco) - r.v) <= 0.011);
@@ -983,7 +1256,7 @@ function estatisticasDeSerie(h, ult) {
   const corte30 = diaSP(hoje - 30 * 86400000);
   const corte90 = diaSP(hoje - 90 * 86400000);
 
-  const pares = Object.entries(h.dias).sort((a, b) => a[0] < b[0] ? -1 : 1);
+  const pares = Object.entries(diasDoProduto(h)).sort((a, b) => a[0] < b[0] ? -1 : 1);
   const v30 = pares.filter(([d]) => d >= corte30).map(([, v]) => v);
   const v90 = pares.filter(([d]) => d >= corte90).map(([, v]) => v);
   if (!v90.length) return null;
@@ -1033,6 +1306,8 @@ function estatisticasDeSerie(h, ult) {
   // Series de 90 dias em ordem, para o recorde ESTRITO (minAntesDoPatamar).
   // Nao enumeraveis: o objeto de estatisticas sai em varias rotas e nao precisa
   // carregar a serie inteira no JSON.
+  try { st.linhas = linhasDePreco(h); } catch (e) { st.linhas = null; }
+  if (h.diasK) st.diasKeepa = Object.keys(h.diasK).length;
   Object.defineProperty(st, 'serie90', { value: pares.filter(([d]) => d >= corte90), enumerable: false });
   Object.defineProperty(st, 'serieEf90', { value: paresEf.filter(([d]) => d >= corte90), enumerable: false });
   return st;
@@ -1126,6 +1401,8 @@ export function historicoDe(asin) {
   return { asin, nome: h.n, loja: h.loja, ult: h.ult,
            serie: Object.entries(h.dias).sort((a, b) => a[0] < b[0] ? -1 : 1).map(([d, v]) => ({ d, v })),
            serieEfetiva: Object.entries(h.diasEf || {}).sort((a, b) => a[0] < b[0] ? -1 : 1).map(([d, v]) => ({ d, v })),
+           serieCaptura: Object.entries(h.diasC || {}).sort((a, b) => a[0] < b[0] ? -1 : 1).map(([d, v]) => ({ d, v })),
+           serieKeepa: Object.entries(h.diasK || {}).sort((a, b) => a[0] < b[0] ? -1 : 1).map(([d, v]) => ({ d, v })),
            stats: estatisticas(asin) };
 }
 
@@ -1639,6 +1916,106 @@ function classeDoVeredito(av) {
   if (mo.startsWith('abaixo') || mo.startsWith('acima')) return 'fora da faixa de preco';
   return 'sem queda';
 }
+// ── TRES LINHAS DE PRECO (20/11/2026) ──────────────────────────────────────
+// Ver CFG_PADRAO.linhas. Hoje fica FORA da conta: so o dia anterior conta como
+// historia. Dia com captura entra no patamar de promocao; a leitura daquele
+// dia (diasL), se houve, entra no cheio. Dia sem captura: Keepa primeiro (nao
+// tem o vies de dia de post), depois a nossa leitura.
+function linhasDePreco(h) {
+  if (!h) return null;
+  const cfg = _cfg.linhas || CFG_PADRAO.linhas;
+  const hoje = diaSP();
+  const corte90 = diaSP(Date.now() - 90 * 86400000);
+  const leit = [], promo = [], todos = [];
+  const dias = new Set([...Object.keys(h.dias || {}), ...Object.keys(h.diasK || {})]);
+  for (const d of dias) {
+    if (d < corte90 || d >= hoje) continue;
+    const geral = h.dias?.[d] ?? h.diasK?.[d];
+    if (Number.isFinite(geral)) todos.push(geral);
+    const cap = h.diasC?.[d];
+    if (cap !== undefined) {
+      promo.push(cap);
+      const l = h.diasL?.[d] ?? h.diasK?.[d];
+      if (Number.isFinite(l)) leit.push(l);
+    } else {
+      const l = h.diasK?.[d] ?? h.dias?.[d];
+      if (Number.isFinite(l)) leit.push(l);
+    }
+  }
+  const r2 = v => Number.isFinite(v) ? Math.round(v * 100) / 100 : null;
+  return {
+    cheio: leit.length >= cfg.minCheio ? r2(medianaDe(leit)) : null,
+    nCheio: leit.length,
+    patamarPromo: promo.length >= cfg.minPromo ? r2(medianaDe(promo)) : null,
+    nPromo: promo.length,
+    minAnterior: todos.length >= cfg.minDiasMinimo ? r2(Math.min(...todos)) : null,
+    nDias: todos.length,
+  };
+}
+
+/**
+ * Veredito das tres linhas para um preco. SOMBRA: nada e barrado por isto.
+ *   imperdivel  no menor preco de 90 dias, ou abaixo do patamar de promocao
+ *   boa         no patamar de promocao (ou queda funda contra o cheio)
+ *   comum       entre o patamar de promocao e o preco cheio
+ *   falsa       no preco cheio ou acima
+ */
+export function vereditoLinhas(asin, preco) {
+  const p = Number(preco);
+  const h = _hist[asin];
+  if (!h || !Number.isFinite(p) || p <= 0) return { classe: 'sem base', motivo: 'sem serie' };
+  const L = linhasDePreco(h) || {};
+  const cfg = _cfg.linhas || CFG_PADRAO.linhas;
+  const { cheio, patamarPromo, minAnterior } = L;
+  const descontoRealPct = cheio ? Math.round((1 - p / cheio) * 1000) / 10 : null;
+  const base = { ...L, preco: p, descontoRealPct };
+  if (!cheio && !patamarPromo && !Number.isFinite(minAnterior)) return { ...base, classe: 'sem base', motivo: 'historico curto' };
+  if (Number.isFinite(minAnterior) && p <= minAnterior * (1 + cfg.tolMinimoPct / 100) && !(descontoRealPct !== null && descontoRealPct <= 0))
+    return { ...base, classe: 'imperdivel', motivo: 'no menor preco de 90 dias' };
+  if (patamarPromo && p <= patamarPromo * (1 - cfg.imperdivelAbaixoPromoPct / 100))
+    return { ...base, classe: 'imperdivel', motivo: 'abaixo do patamar de promocao' };
+  if (patamarPromo && p <= patamarPromo * (1 + cfg.promoFolgaPct / 100))
+    return { ...base, classe: 'boa', motivo: 'no patamar de promocao' };
+  if (cheio && p >= cheio * (1 - cfg.falsoAteCheioPct / 100))
+    return { ...base, classe: 'falsa', motivo: 'no preco cheio ou acima' };
+  if (cheio && !patamarPromo)
+    return descontoRealPct >= cfg.quedaBoaSemPromoPct
+      ? { ...base, classe: 'boa', motivo: descontoRealPct + '% abaixo do preco cheio' }
+      : { ...base, classe: 'comum', motivo: 'so ' + descontoRealPct + '% abaixo do preco cheio' };
+  return { ...base, classe: 'comum', motivo: 'acima do patamar de promocao' };
+}
+
+// Registro das capturas julgadas pelas linhas (sombra), para medir antes de ligar.
+const LINHAS_MAX = 1500;
+function registrarLinhaCaptura(reg) {
+  const lista = _estado.linhasCapturas || (_estado.linhasCapturas = []);
+  const dez = Date.now() - 10 * 60000;
+  if (lista.some(x => x.asin === reg.asin && x.preco === reg.preco && Date.parse(x.em) >= dez)) return;
+  lista.unshift(reg);
+  if (lista.length > LINHAS_MAX) lista.length = LINHAS_MAX;
+}
+
+export function relatorioLinhas({ dias = 7 } = {}) {
+  const corte = Date.now() - dias * 86400000;
+  const lista = (_estado.linhasCapturas || []).filter(x => Date.parse(x.em) >= corte);
+  const porClasse = {}, cruzado = {};
+  for (const x of lista) {
+    porClasse[x.classe] = (porClasse[x.classe] || 0) + 1;
+    const k = x.classe + ' x filtro ' + (x.filtro || 'sem julgamento');
+    cruzado[k] = (cruzado[k] || 0) + 1;
+  }
+  const exemplos = {};
+  for (const x of lista) {
+    const arr = exemplos[x.classe] || (exemplos[x.classe] = []);
+    if (arr.length < 8) arr.push(x);
+  }
+  const comCheio = lista.filter(x => x.cheio).length;
+  return { dias, total: lista.length, porClasse, cruzado,
+           cobertura: { comPrecoCheio: comCheio, comPatamarPromo: lista.filter(x => x.patamarPromo).length,
+                        pctComCheio: lista.length ? Math.round(1000 * comCheio / lista.length) / 10 : null },
+           captura: estadoCaptura(), config: _cfg.linhas, exemplos };
+}
+
 // ── FILTRO DE DISPARO ───────────────────────────────────────────────────────
 // Le o veredito do avaliar() so pelo lado do PRECO. Cooldown, EPC, faixa de
 // preco e "outra loja mais barata" nao sao desconto falso e nao vetam aqui.
@@ -1667,7 +2044,25 @@ function classificarFiltro(av, stats, nicho) {
  * Consulta ANTES de um disparo automatico. Nao grava nada.
  * Retorna { modo, vetar, julgavel, nivel, veto, bloqueia, motivo, diasSerie, mediana30 }.
  */
-export function filtroDisparo({ asin, loja, nome, preco, precoDe, cupom = null }) {
+export function filtroDisparo(args = {}) {
+  const r = filtroDisparoBase(args);
+  // Linhas de preco em SOMBRA: acompanham o retorno e entram no relatorio,
+  // sem mudar veto nem bloqueio.
+  try {
+    if (args.asin && Number(args.preco) > 0) {
+      const v = vereditoLinhas(args.asin, Number(args.preco));
+      r.linhas = v;
+      registrarLinhaCaptura({ em: new Date().toISOString(), asin: args.asin, loja: args.loja || null,
+        nome: String(args.nome || '').slice(0, 90), preco: Number(args.preco), classe: v.classe, motivo: v.motivo,
+        cheio: v.cheio ?? null, patamarPromo: v.patamarPromo ?? null, minAnterior: v.minAnterior ?? null,
+        descontoRealPct: v.descontoRealPct ?? null,
+        filtro: r.nivel || (r.julgavel ? 'queda real' : null) });
+    }
+  } catch (e) { /* linhas nunca derrubam o filtro */ }
+  return r;
+}
+
+function filtroDisparoBase({ asin, loja, nome, preco, precoDe, cupom = null }) {
   const cfg = _cfg.filtroDisparo || CFG_PADRAO.filtroDisparo;
   const base = { modo: cfg.modo, vetar: cfg.vetar, julgavel: false, nivel: null, veto: false, bloqueia: false };
   // Trava de queda anormal: independente do modo do filtro (ate 'off'). Bloqueia
@@ -1735,6 +2130,10 @@ export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null,
     const c = classificarFiltro(av, stats, nicho);
     reg.filtro = { julgavel: c.julgavel, nivel: c.nivel };
   } catch (e) { /* relatorio nao segura envio */ }
+  try {
+    const vl = vereditoLinhas(asin, Number(preco));
+    reg.linhas = { classe: vl.classe, descontoRealPct: vl.descontoRealPct ?? null };
+  } catch (e) { /* idem */ }
   _estado.vereditosDisparos = [reg, ...(_estado.vereditosDisparos || [])].slice(0, VEREDITOS_MAX);
   return reg;
 }
@@ -1779,7 +2178,9 @@ export function vereditosDisparos({ dias = 7 } = {}) {
   };
   filtro.cortePctFalsoDesconto = comFiltro.length ? Math.round(1000 * filtro.falsoDesconto / comFiltro.length) / 10 : null;
   filtro.cortePctSemQuedaReal  = comFiltro.length ? Math.round(1000 * (filtro.falsoDesconto + filtro.semQuedaReal) / comFiltro.length) / 10 : null;
-  return { dias, total: lista.length, porVeredito, filtro,
+  const porLinha = {};
+  for (const v of lista) if (v.linhas) porLinha[v.linhas.classe] = (porLinha[v.linhas.classe] || 0) + 1;
+  return { dias, total: lista.length, porVeredito, filtro, porLinha,
     sinalizadosAntes: sinalizados.length,
     sinalizadoAntesMedianaMin: sinalizados.length ? sinalizados.map(v => v.sinalizadoAntesMin).sort((a, b) => a - b)[Math.floor(sinalizados.length / 2)] : null,
     passariamPorDia: Object.entries(_estado.passariamPorDia || {}).sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([dia, v]) => ({ dia, ...v })),
@@ -1848,6 +2249,7 @@ export function expurgarVigilancia({ forcar = 0, simular = false } = {}) {
  * Item manual ou semeado por EPC e sempre quente: alguem o escolheu de proposito.
  */
 function ehCamadaQuente(item) {
+  if (item.origemSemeadura === 'captura') return false;
   if (item.origemSemeadura !== 'divulgacao') return true;
   // Semeado por divulgacao mas curado pelo operador (nicho) ou em rotacao de
   // disparo manual: e base de trabalho diaria, precisa de leitura fresca.
@@ -1861,6 +2263,14 @@ function ehCamadaQuente(item) {
 /** Item frio ja lido dentro do intervalo da camada fria pode ser pulado. */
 function friaJaLidaHoje(item) {
   const h = _hist[item.asin];
+  if (item.origemSemeadura === 'captura') {
+    // A captura atualiza ult.em; o que conta aqui e a ultima leitura NOSSA.
+    const cc = _cfg.vigilancia?.captura || CFG_PADRAO.vigilancia.captura;
+    const nova = (Date.now() - (Date.parse(item.criadoEm || 0) || 0)) < cc.diariaDias * 86400000;
+    const intervalo = (nova ? 1 : _cfg.varredura.friaCadaDias) * 86400000 - 3600000;
+    const ul = Date.parse(h?.ult?.leituraEm || h?.ult?.falhaEm || 0) || 0;
+    return !!ul && (Date.now() - ul) < intervalo;
+  }
   const carimbo = carimboUlt(h?.ult);
   const ultimo = carimbo ? Date.parse(carimbo) : 0;
   if (!ultimo) return false;
@@ -1920,7 +2330,8 @@ export async function varrer({ manual = false } = {}) {
     const { nicho, curado } = nichoDoProduto(item, leitura.titulo);
     const av = avaliar(item, leitura, stats, nicho, curado);
     resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
-    if (av.passou) { enfileirar(av); resumo.candidatos++; aprovadosRodada.push({ av, item }); }
+    const soSerie = item.origemSemeadura === 'captura' && !_cfg.vigilancia?.captura?.geraCandidato;
+    if (av.passou && !soSerie) { enfileirar(av); resumo.candidatos++; aprovadosRodada.push({ av, item }); }
   };
 
   const falhar = (item, msg) => {
@@ -1933,9 +2344,18 @@ export async function varrer({ manual = false } = {}) {
     // vigilancia automatica enche a vitrine. Quente (divulgado ha pouco, mais
     // manual e EPC) le sempre; a cauda fria le 1x a cada friaCadaDias. Rodada
     // manual ignora a camada — quem clicou quer a leitura inteira.
-    const todos = itensMonitorados();
-    const itens = manual ? todos
+    try { expurgarCaptura(); } catch (e) { /* expurgo nunca segura a varredura */ }
+    const todos = itensMonitorados({ comCaptura: true });
+    let itens = manual ? todos.filter(i => i.origemSemeadura !== 'captura')
       : todos.filter(i => ehCamadaQuente(i) || !friaJaLidaHoje(i));
+    // Captura: teto por rodada, mais antigos (sem leitura) primeiro.
+    const tetoCapt = _cfg.vigilancia?.captura?.porRodada ?? 300;
+    const capt = itens.filter(i => i.origemSemeadura === 'captura')
+      .sort((a, b) => (Date.parse(_hist[a.asin]?.ult?.leituraEm || 0) || 0) - (Date.parse(_hist[b.asin]?.ult?.leituraEm || 0) || 0));
+    if (capt.length > tetoCapt) {
+      const fora = new Set(capt.slice(tetoCapt).map(i => i.asin));
+      itens = itens.filter(i => !fora.has(i.asin));
+    }
     resumo.pulados = todos.length - itens.length;
     // A Amazon le de 10 em 10; as outras, uma por vez. Separar aqui e o que
     // permite cada API ser usada do jeito mais barato que ela oferece.

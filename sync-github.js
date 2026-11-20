@@ -87,6 +87,10 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // Avisos de preco no privado (avisos-preco.js): pedidos dos clientes, com
   // nome e telefone. Vai para o repo PRIVADO de dados, como todo o resto daqui.
   'avisos_preco.json',
+  // Vigilancia leve dos produtos capturados nos grupos-fonte (monitor-precos.js,
+  // 20/11/2026): sem ela, depois de um deploy em volume novo, a serie de quem
+  // nunca foi divulgado voltaria a receber ponto so nos dias de post.
+  'precos_captura.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.
@@ -104,7 +108,7 @@ const RE_NOME_HISTORICO = /^historico_envios_\d{4}-\d{2}\.json$/;
 // com a serie efetiva em paralelo, um arquivo unico passaria de 1 MB em poucos
 // meses — e acima disso a Contents API para de devolver o conteudo na leitura,
 // matando a restauracao pos-deploy em silencio.
-const RE_NOME_PRECOS = /^precos_hist_\d{4}-\d{2}\.json$/;
+const RE_NOME_PRECOS = /^precos_(hist|keepa)_\d{4}-\d{2}\.json$/;   // keepa: historico importado da Amazon (20/11/2026)
 // Shards diarios do mapa de links rastreados (links_rastreio_2026-09-15.json).
 // Diario, e nao mensal, porque o proxy le o shard no clique quando o servidor
 // esta fora: arquivo pequeno = fallback rapido. Sobem por agendarPush e sao
