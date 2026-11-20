@@ -588,13 +588,27 @@ export function assinarDps(infXml, id, cert) {
 }
 
 // ── Chamadas à Sefin / ADN (mTLS com o certificado A1) ───────────────────────
+// 20/11/2026: um Agent por certificado, com keepAlive — antes cada chamada abria
+// um contexto TLS novo com a chave/certificado (memória nativa do OpenSSL) e uma
+// conexão nova; em dia de ~600 notas eram milhares de handshakes. chamadasSefin
+// conta as chamadas desde o boot (aparece em /memoria via registrarMedidor).
+let _agentSefin = null, _agentSefinCert = null;
+export const chamadasSefin = { total: 0, desde: new Date().toISOString() };
+function agentSefin(cert) {
+  if (_agentSefin && _agentSefinCert === cert.certB64) return _agentSefin;
+  try { _agentSefin?.destroy(); } catch (_) {}
+  _agentSefin = new https.Agent({ key: cert.keyPem, cert: cert.certPem, keepAlive: true, maxSockets: 4, maxFreeSockets: 2, timeout: 60000 });
+  _agentSefinCert = cert.certB64;
+  return _agentSefin;
+}
 function chamar(url, { metodo = 'GET', corpo = null, cert, timeoutMs = 60000, binario = false } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const dados = corpo ? Buffer.from(JSON.stringify(corpo), 'utf8') : null;
+    chamadasSefin.total++;
     const req = https.request({
       method: metodo, hostname: u.hostname, path: u.pathname + u.search, port: 443,
-      key: cert.keyPem, cert: cert.certPem, timeout: timeoutMs,
+      agent: agentSefin(cert), timeout: timeoutMs,
       headers: Object.assign({ Accept: binario ? 'application/pdf' : 'application/json' },
         dados ? { 'Content-Type': 'application/json', 'Content-Length': dados.length } : {}),
     }, res => {

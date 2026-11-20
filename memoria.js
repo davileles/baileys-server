@@ -15,6 +15,45 @@
 // estrutura do codigo crescendo — os medidores mostram qual.
 
 import v8 from 'node:v8';
+import { readFileSync } from 'node:fs';
+
+// ── Memoria vista pelo sistema (20/11/2026) ──────────────────────────────────
+// process.memoryUsage() so mostra o processo. O Railway cobra pelo contêiner
+// (cgroup), que tambem conta o cache de arquivos do volume. Aqui separamos:
+//   - processo: RssAnon (malloc/nativo) x RssFile (arquivos mapeados);
+//   - cgroup: anon x file (cache de disco) x kernel/sock — o que o Railway soma;
+//   - alocador: se o jemalloc esta carregado (LD_PRELOAD) e o MALLOC_ARENA_MAX.
+function _kbLinha(txt, chave) {
+  const m = new RegExp('^' + chave + ':\\s+(\\d+)\\s*kB', 'm').exec(txt || '');
+  return m ? Math.round(Number(m[1]) / 1024 * 10) / 10 : null;
+}
+function _ler(caminho) { try { return readFileSync(caminho, 'utf8'); } catch { return null; } }
+export function memoriaDoSistema() {
+  const st = _ler('/proc/self/status');
+  const processo = st ? {
+    rss: _kbLinha(st, 'VmRSS'), picoRss: _kbLinha(st, 'VmHWM'),
+    anon: _kbLinha(st, 'RssAnon'), arquivos: _kbLinha(st, 'RssFile'), shmem: _kbLinha(st, 'RssShmem'),
+    threads: Number((/^Threads:\s+(\d+)/m.exec(st) || [])[1]) || null,
+  } : null;
+  let cgroup = null;
+  const v2 = _ler('/sys/fs/cgroup/memory.stat');
+  const v1 = v2 ? null : _ler('/sys/fs/cgroup/memory/memory.stat');
+  const stat = v2 || v1;
+  if (stat) {
+    const val = k => { const m = new RegExp('^' + k + ' (\\d+)$', 'm').exec(stat); return m ? Math.round(Number(m[1]) / 1048576 * 10) / 10 : null; };
+    const atual = Number((_ler(v2 ? '/sys/fs/cgroup/memory.current' : '/sys/fs/cgroup/memory/memory.usage_in_bytes') || '').trim()) || 0;
+    cgroup = v2
+      ? { total: Math.round(atual / 1048576 * 10) / 10, anon: val('anon'), cacheArquivos: val('file'),
+          kernel: val('kernel'), sock: val('sock'), shmem: val('shmem'), arquivoSujo: val('file_dirty') }
+      : { total: Math.round(atual / 1048576 * 10) / 10, anon: val('total_rss'), cacheArquivos: val('total_cache') };
+  }
+  const maps = _ler('/proc/self/maps') || '';
+  return {
+    processo, cgroup,
+    alocador: { jemalloc: /jemalloc/.test(maps), ldPreload: process.env.LD_PRELOAD || null,
+                mallocArenaMax: process.env.MALLOC_ARENA_MAX || null },
+  };
+}
 
 const AMOSTRA_MS = 10 * 60000;
 const AMOSTRAS_MAX = 288;            // 48 h
@@ -77,10 +116,14 @@ function _mbAproximado(alvo, itens) {
 
 function _amostrar() {
   const m = process.memoryUsage();
+  let sis = null;
+  try { sis = memoriaDoSistema(); } catch {}
   _amostras.push({
     em: new Date().toISOString(),
     rss: mb(m.rss), heapUsado: mb(m.heapUsed), heapTotal: mb(m.heapTotal),
     foraDoHeap: mb(m.rss - m.heapTotal), externo: mb(m.external), arrayBuffers: mb(m.arrayBuffers),
+    anon: sis?.processo?.anon ?? null, cgroup: sis?.cgroup?.total ?? null,
+    cacheArquivos: sis?.cgroup?.cacheArquivos ?? null,
   });
   if (_amostras.length > AMOSTRAS_MAX) _amostras.shift();
   const em = new Date().toISOString();
@@ -138,6 +181,7 @@ export function estadoMemoria({ detalhe = false } = {}) {
     leitura: agora.foraDoHeap > agora.heapTotal
       ? 'A maior parte da memoria esta FORA do heap do JS (Buffers, sharp, sockets ou fragmentacao).'
       : 'A maior parte da memoria esta no heap do JS: ver as estruturas que mais cresceram.',
+    sistema: (() => { try { return memoriaDoSistema(); } catch (e) { return { erro: e.message }; } })(),
     espacosDoHeap: espacos,
     estruturas,
     amostras: _amostras,
