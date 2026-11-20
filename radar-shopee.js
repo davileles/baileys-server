@@ -245,6 +245,8 @@ export function descontoCupomResgate(info, preco) {
   return Math.round(d * 100) / 100;
 }
 
+const RE_CUPONS_GENERICOS = /cupo[mn]s\s*(?:do\s*dia|di[aá]rios?|da\s*shopee|do\s*m[eê]s|dispon[ií]veis|liberados|novos)|(?:todos|mais|central)\s*(?:os\s*|de\s*)?cupo[mn]s|resgat\w*\s*(?:os\s*|seus\s*)?cupo[mn]s/;
+
 /** Links do post que nao sao produto e que o texto apresenta como resgate de cupom. */
 function linksDeResgate(texto, links) {
   const outros = links.filter(l => !l.ids && l.final && /shopee\.com\.br/i.test(l.final));
@@ -257,7 +259,13 @@ function linksDeResgate(texto, links) {
     if (!info && outros.length === 1) info = lerCupomResgate(texto);
     const fala = /cupo[mn]|resgat|voucher/.test(String(bloco).normalize('NFKC').toLowerCase());
     if (!info && !fala) continue;
-    saida.push({ url: l.url, final: l.final, limpa: limparLinkResgate(l.final), info });
+    // Link genérico da vitrine de cupons ("Cupons do dia:", "Resgate cupons
+    // diários aqui", "todos os cupons da Shopee") sem valor no post: não é o
+    // cupom desta oferta (20/11/2026, regra do Davi; Loucos por Promos #49475
+    // ficou retida por isso). Segue em linksResgate para o gate do preço do
+    // post não contar como segundo produto, mas não segura a oferta.
+    const generico = !info && RE_CUPONS_GENERICOS.test(String(bloco).normalize('NFKC').toLowerCase());
+    saida.push({ url: l.url, final: l.final, limpa: limparLinkResgate(l.final), info, generico });
   }
   return saida;
 }
@@ -457,10 +465,11 @@ export async function processarTextoShopee(texto, opcoes = {}) {
     // que nao saiu) segura a oferta para revisao: sair pelo preco cheio com o
     // post prometendo cupom e o que esta regra existe para evitar.
     let cupomResgatePendente = null;
-    if (!cupom && resgates.length) {
-      const rg = resgates.length === 1 ? resgates[0] : null;
+    const resgatesCupom = resgates.filter(r => !r.generico);
+    if (!cupom && resgatesCupom.length) {
+      const rg = resgatesCupom.length === 1 ? resgatesCupom[0] : null;
       if (!rg) {
-        cupomResgatePendente = { motivo: 'post traz ' + resgates.length + ' links de resgate de cupom' };
+        cupomResgatePendente = { motivo: 'post traz ' + resgatesCupom.length + ' links de resgate de cupom' };
       } else if (!rg.info) {
         cupomResgatePendente = { motivo: 'post pede para resgatar um cupom mas não deu para ler o valor', origem: rg.url };
       } else {
