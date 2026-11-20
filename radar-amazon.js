@@ -2644,6 +2644,11 @@ export function extrairCuponsPaginaAmazon(html) {
       salvar: /salve o cupom/i.test(texto),
       texto: texto.slice(0, 200),
     };
+    // Cupom preso a forma de pagamento (NuPay, Pix, cartao de um banco): nao
+    // vale para qualquer cliente. Em 19/11/2026 o BLACKNUPAY20 (20% pagando
+    // com NuPay) entrou sozinho em ~135 ofertas da Amazon que nao o citavam e
+    // fez o preco "da loja" ficar 20% abaixo do post — dezenas presas na fila.
+    c.pagamento = meioDePagamentoDoCupom(c.codigo, texto);
     const chave = (c.codigo || '') + '|' + c.texto;
     if (vistos.has(chave)) continue;
     vistos.add(chave);
@@ -2652,7 +2657,26 @@ export function extrairCuponsPaginaAmazon(html) {
   return saida;
 }
 
-/** Cupom que vale para qualquer cliente: tem codigo e desconto, nao e 1a compra nem Prime. */
+// Meio de pagamento exigido pelo cupom, pelo codigo ou pelo texto do selo.
+// Devolve o nome para a linha IMPORTANTE ou null.
+const MEIOS_PAGAMENTO = [
+  [/NU\s*PAY/i, 'NuPay'], [/NUBANK/i, 'Nubank'], [/PIX/i, 'Pix'], [/MERCADO\s*PAGO/i, 'Mercado Pago'],
+  [/PICPAY/i, 'PicPay'], [/ITA[UÚ]/i, 'cartão Itaú'], [/BRADESCO/i, 'cartão Bradesco'], [/SANTANDER/i, 'cartão Santander'],
+  [/\bINTER\b/i, 'Banco Inter'], [/\bC6\b/i, 'C6 Bank'], [/\bELO\b/i, 'cartão Elo'], [/\bVISA\b/i, 'cartão Visa'],
+  [/MASTER\s*CARD/i, 'Mastercard'], [/AMEX|AMERICAN EXPRESS/i, 'American Express'],
+];
+export function meioDePagamentoDoCupom(codigo, texto) {
+  const cod = String(codigo || '');
+  const t = String(texto || '');
+  const porPagamento = /pagando com|pagamento (?:com|via|no|pelo)|pague com|forma de pagamento|no cart[aã]o|cart[aã]o de cr[eé]dito/i.test(t);
+  for (const [re, nome] of MEIOS_PAGAMENTO) {
+    if (re.test(cod)) return nome;
+    if (porPagamento && re.test(t)) return nome;
+  }
+  return porPagamento ? 'forma de pagamento indicada na página' : null;
+}
+
+/** Cupom que vale para qualquer cliente: tem codigo e desconto, nao e 1a compra, Prime nem preso a pagamento. */
 function cupomPaginaUtil(c) {
   return !!(c && c.codigo && c.tipo && c.valor > 0 && !c.primeiraCompra && !c.prime);
 }
@@ -2750,12 +2774,18 @@ export async function cupomDaPaginaAmazon(p, texto) {
       return null;
     }
   } else {
-    escolhido = uteis.map(c => ({ c, d: descontoDe(c) })).sort((a, b) => b.d - a.d)[0]?.c || null;
+    // Sem codigo no post: so entra cupom que vale para qualquer cliente. Cupom
+    // preso a forma de pagamento (NuPay, Pix, banco) fica de fora — so entra
+    // quando o proprio post o cita (ramo de cima).
+    escolhido = uteis.filter(c => !c.pagamento)
+      .map(c => ({ c, d: descontoDe(c) })).sort((a, b) => b.d - a.d)[0]?.c || null;
   }
   if (!escolhido) return null;
   const desconto = descontoDe(escolhido);
   if (!(desconto > 0)) return null;
-  const importante = escolhido.soApp
+  const importante = escolhido.pagamento
+    ? 'Cupom válido pagando com ' + escolhido.pagamento + ' — insira o código na finalização da compra'
+    : escolhido.soApp
     ? 'Válido só no app da Amazon — insira o código na finalização da compra'
     : escolhido.salvar ? 'Salve o cupom na página do produto antes de finalizar' : '';
   return {

@@ -32,7 +32,7 @@ import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
 import { registrarSeloPreco, registrarSeloQueda, listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
-import { classificarProduto, categoriaConfiavel } from './categorizador.js';
+import { classificarProduto, categoriaConfiavel, avaliarCuradoriaNicho } from './categorizador.js';
 import { buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk } from './radar-shopee.js';
 import { buscarDadosProdutoMl, precoCatalogoApiMl, tokenAffOk, catalogoSemOfertaMl, idCatalogoMl } from './radar-ml.js';
 
@@ -290,6 +290,10 @@ const CFG_PADRAO = {
     // barra falso desconto); o resto segue no 'vetar' geral. Oferta que so
     // passa pelo moderado do nicho sai SO nos grupos do nicho (soNicho).
     vetarPorNicho: { bebidas: 'falsoDesconto' },
+    // Queda minima (%) para a oferta que so passa pelo rigor do nicho. Em
+    // 19/11/2026 o moderado de Bebidas soltou quedas de 0,1%, 0,9% e 1,5%,
+    // preco de sempre. Abaixo do piso o nicho veta como o geral.
+    pisoPorNicho: { bebidas: 3 },
   },
 
   // TRAVA DE QUEDA ANORMAL (08/10/2026): queda de 'pct'% ou mais contra a
@@ -626,6 +630,12 @@ function estruturarCfg(bruto) {
   out.filtroDisparo.vetarPorNicho = {};
   for (const [n, v] of Object.entries(vpn || {})) {
     if (String(n).trim() && ['falsoDesconto', 'semQuedaReal'].includes(v)) out.filtroDisparo.vetarPorNicho[String(n).trim()] = v;
+  }
+  out.filtroDisparo.pisoPorNicho = {};
+  const _pisos = (fd.pisoPorNicho && typeof fd.pisoPorNicho === 'object') ? fd.pisoPorNicho : CFG_PADRAO.filtroDisparo.pisoPorNicho;
+  for (const [n, v] of Object.entries(_pisos || {})) {
+    const num = Number(v);
+    if (String(n).trim() && Number.isFinite(num) && num >= 0 && num <= 50) out.filtroDisparo.pisoPorNicho[String(n).trim()] = num;
   }
 
   const tq = b.travaQueda || {};
@@ -1642,7 +1652,14 @@ function classificarFiltro(av, stats, nicho) {
   const qe = Number.isFinite(av.quedaPctEfetivo) ? av.quedaPctEfetivo : null;
   if (qb === null && qe === null) return { julgavel: false, nivel: null, motivo: av.motivo || 'sem leitura de preco' };
   const melhor = Math.max(qb ?? -Infinity, qe ?? -Infinity);
-  if (melhor <= 0) return { julgavel: true, nivel: 'falsoDesconto', motivo: 'preco na mediana de 30d ou acima (' + melhor + '%)', quedaPct: melhor };
+  // quedaPct e (1 - preco/mediana): negativo = preco ACIMA da mediana. O log
+  // antigo mostrava "(-13.4%)" e foi lido como "13% abaixo" (19/11/2026).
+  if (melhor <= 0) {
+    const acima = Math.round(-melhor * 10) / 10;
+    return { julgavel: true, nivel: 'falsoDesconto', quedaPct: melhor,
+             motivo: acima > 0 ? 'preco ' + String(acima).replace('.', ',') + '% ACIMA da mediana de 30d'
+                               : 'preco igual a mediana de 30d' };
+  }
   return { julgavel: true, nivel: 'semQuedaReal', motivo: av.motivo || ('queda de ' + melhor + '%'), quedaPct: melhor };
 }
 
@@ -1678,7 +1695,15 @@ export function filtroDisparo({ asin, loja, nome, preco, precoDe, cupom = null }
     const vetarNicho = (cfg.vetarPorNicho || {})[nicho] || cfg.vetar;
     const vetoGeral = !!c.nivel && (cfg.vetar === 'semQuedaReal' || c.nivel === 'falsoDesconto');
     const veto = !!c.nivel && (vetarNicho === 'semQuedaReal' || c.nivel === 'falsoDesconto');
-    const soNicho = !veto && vetoGeral && vetarNicho !== cfg.vetar;
+    let soNicho = !veto && vetoGeral && vetarNicho !== cfg.vetar;
+    // Piso do rigor do nicho: passou so pelo moderado com queda abaixo do piso
+    // = preco de sempre, veta igual ao geral.
+    const piso = Number((cfg.pisoPorNicho || {})[nicho]);
+    if (soNicho && Number.isFinite(piso) && piso > 0 && !(Number(c.quedaPct) >= piso)) {
+      return { ...base, ...c, nicho, veto: true, soNicho: false, vetarNicho, bloqueia: cfg.modo === 'ativo',
+               motivo: 'queda de ' + String(c.quedaPct).replace('.', ',') + '% abaixo do piso de ' + piso + '% do nicho ' + nicho,
+               diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null };
+    }
     return { ...base, ...c, nicho, veto, soNicho, vetarNicho, bloqueia: veto && cfg.modo === 'ativo',
              diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null };
   } catch (e) {
@@ -2412,16 +2437,21 @@ export async function dispararMonitorado(item, candidato = {}) {
     }
   }
 
-  const { oferta, ehCurado, espelhouNoGeral } = await prepararOfertaMonitor(item, candidato, o);
+  const { oferta, ehCurado, espelhouNoGeral, nichoJunto } = await prepararOfertaMonitor(item, candidato, o);
 
   // somenteNicho corta os grupos gerais DENTRO do laco de envio: a mesma oferta,
   // um subconjunto de destinos. Sem esta opcao o envio e indivisivel e nao ha
   // como publicar no nicho segurando o geral.
+  // Oferta do monitor nao tem grupo-fonte: o roteamento sozinho so acha as
+  // trilhas gerais. "nicho+geral" precisa pedir a trilha do nicho (categoriaNicho),
+  // senao sai so nos gerais — foi o que aconteceu em 19/11/2026 com o Mini Kart,
+  // os LEGO, a Barbie e o vinho J.P. Chenet (log dizia nicho+geral, 30 grupos).
   const env = await _deps.enviarOferta(o.mensagem, null, oferta,
-    espelhouNoGeral ? {} : { somenteNicho: true, categoriaNicho: String(item.nicho).trim() });
+    !espelhouNoGeral ? { somenteNicho: true, categoriaNicho: String(item.nicho).trim() }
+      : nichoJunto ? { categoriaNicho: nichoJunto } : {});
   marcarProdutoDisparado(item);
   return { ok: true, nome: o.nome, preco: o.produto.preco, grupos: env.enviados.length,
-           cupom: o.cupom?.codigo || null, espelhouNoGeral };
+           cupom: o.cupom?.codigo || null, espelhouNoGeral, nichoJunto: nichoJunto || null };
 }
 
 // Marca o produto inteiro, nao so a loja que saiu: as outras lojas do mesmo
@@ -2460,6 +2490,20 @@ async function prepararOfertaMonitor(item, candidato, o) {
       || cotaDisponivel(item.loja, String(item.nicho).trim()).ok;
     espelhouNoGeral = fundo && temCota;
   }
+  // Nicho que vai junto com o geral: curado espelhado leva o proprio nicho;
+  // nao-curado leva o nicho do classificador quando a categoria e confiavel e
+  // a curadoria do grupo de nicho aprova (mesma regra da captura).
+  let nichoJunto = null;
+  if (espelhouNoGeral) {
+    if (ehCurado) nichoJunto = String(item.nicho).trim();
+    else if (categoriaConfiavel(cls)) {
+      try {
+        const cur = avaliarCuradoriaNicho(cls.categoria, { titulo: o.produto?.titulo || item.nome,
+          stats: { dias: Number(candidato.diasSerie ?? estatisticas(item.asin)?.dias ?? 0), quedaVsMediana: quedaPct } });
+        if (cur.ok) nichoJunto = cls.categoria;
+      } catch (e) { nichoJunto = null; }
+    }
+  }
 
   const oferta = {
     id: _deps.gerarId(),
@@ -2494,7 +2538,7 @@ async function prepararOfertaMonitor(item, candidato, o) {
     if (img) oferta.imagens = [img];
   } catch (e) {}
 
-  return { oferta, ehCurado, espelhouNoGeral, cls };
+  return { oferta, ehCurado, espelhouNoGeral, nichoJunto, cls };
 }
 
 // ── CARD DE REVISAO (bot) ────────────────────────────────────────────────────

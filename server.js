@@ -5977,6 +5977,19 @@ function resumoRotaOferta(o) {
 const REPETIDA_GRUPO_MIN = process.env.REPETIDA_GRUPO_MIN !== undefined
   ? Number(process.env.REPETIDA_GRUPO_MIN) : 30;
 const _envioRecenteGrupo = new Map();   // chave|jid -> ts
+// Contagem de descartes do filtro de preco por produto (24 h, RAM).
+const _descartesFiltro = new Map();   // asin -> [ts]
+function contarDescarteFiltro(asin) {
+  if (!asin) return 1;
+  const agora = Date.now(), corte = agora - 24 * 3600000;
+  const l = (_descartesFiltro.get(asin) || []).filter(t => t > corte);
+  l.push(agora);
+  _descartesFiltro.set(asin, l);
+  if (_descartesFiltro.size > 3000) {
+    for (const [k, v] of _descartesFiltro) if (!v.some(t => t > corte)) _descartesFiltro.delete(k);
+  }
+  return l.length;
+}
 function chaveRepeticaoOferta(oferta) {
   const de = oferta?.dadosExtraidos || {};
   const loja = String(de.loja || '').toLowerCase();
@@ -6082,6 +6095,14 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
     // Fonte so de nicho e produto que o classificador nao confirmou no nicho:
     // nao e erro de configuracao, e oferta possivelmente fora do nicho.
     const _nichoFonte = nichoDaFonte(_rota.fonte);
+    // Categoria confirmada no proprio nicho, mas a curadoria do grupo de nicho
+    // reprovou (marca/serie/queda em tsp/categorias.json): dizer isso, e nao
+    // "o classificador nao confirmou" (19/11/2026: 7 casos lidos como erro).
+    if (_nichoFonte && trilhas().length && _rota.nichoBarrado && _rota.nichoBarrado === _nichoFonte) {
+      const _motCur = oferta?.dadosExtraidos?.curadoriaNicho?.motivo || 'reprovada';
+      throw new Error('curadoria do nicho ' + _nichoFonte + ' barrou: ' + _motCur
+        + ' — marque a trilha a mao se quiser enviar.');
+    }
     if (_nichoFonte && trilhas().length) {
       throw new Error('fora do nicho ' + _nichoFonte + '? o classificador nao confirmou a categoria'
         + (_rota.categoria && _rota.categoriaConfiavel ? ' (leu ' + _rota.categoria + ')' : '')
@@ -10291,7 +10312,12 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       oferta.descartadaPorFiltro = true;
       filaPendentes.unshift(oferta);
       salvarFila();
-      console.log('[FILTRO] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA — ' + oferta.motivoFila);
+      // Repeticao: o mesmo produto barrado de novo (outra fonte, repost) ganha
+      // so a marca de quantas vezes no log, para o relatorio contar produtos e
+      // nao linhas. Memoria em RAM, janela de 24 h.
+      const _vezes = contarDescarteFiltro(p.asin);
+      console.log('[FILTRO] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA'
+        + (_vezes > 1 ? ' (repeticao: ' + _vezes + ' vezes em 24 h)' : '') + ' — ' + oferta.motivoFila);
       continue;
     }
     const _elegivelAuto = autoEnvioModoOferta() === 'on' && !_seguraPorPreco && !oferta.cupomForaDaBase
