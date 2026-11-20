@@ -5867,7 +5867,10 @@ async function revalidarOfertaVelha(oferta) {
   }
   // Preco do post aplicado (Programe e Poupe): a loja segue mostrando o preco
   // de balcao, entao a releitura compara com o da loja na captura.
-  const base = Number(oferta.precoDoPost?.aplicado && oferta.precoDoPost.calculado > 0
+  // Preco tirado da pagina (menor que a API): a releitura e da API, entao
+  // compara com o numero da API na captura.
+  const base = Number(de.precoApi > 0 ? de.precoApi
+    : oferta.precoDoPost?.aplicado && oferta.precoDoPost.calculado > 0
     ? oferta.precoDoPost.calculado : de.preco);
   if (!p || !p.disponivel) {
     throw vencida('indisponivel na Amazon depois de ' + idadeMin + ' min na fila');
@@ -10098,6 +10101,9 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         asin: p.asin,
         titulo: p.titulo,
         preco: p.preco,
+        // Preco da API quando a pagina mostrou um menor e ele virou o preco
+        // (comPrecoAVista, 20/11/2026): o frescor compara a releitura com este.
+        ...(p.precoApi > 0 ? { precoApi: p.precoApi, precoOrigem: p.precoOrigem || 'pagina' } : {}),
         precoDe: p.precoDe,
         desconto: p.desconto,
         link: p.link,

@@ -2236,12 +2236,29 @@ async function baixarPaginaProduto(asin) {
  * da metade dele (sinal de que a regex pegou preco de outro item da pagina),
  * devolve null e a mensagem sai com o preco da API, como sempre saiu.
  */
-function extrairAVista(html, precoApi) {
-  const mValor = RE_AVISTA_VALOR.exec(html);
-  const mMsg   = RE_AVISTA_MSG.exec(html);
-  if (!mValor) return null;
+// Preco que o cliente ve no buy box. A pagina inteira (Railway) traz o campo
+// customerVisiblePrice; os trechos que a extensao devolve (20/11/2026) trazem o
+// bloco corePrice, com o "priceAmount" do JSON ou o a-offscreen do priceToPay.
+function precoVisivelDaPagina(html) {
+  const s = String(html || '');
+  const mV = RE_AVISTA_VALOR.exec(s);
+  if (mV) return Number(mV[1]);
+  const mP = /"priceAmount"\s*:\s*([\d.]+)/.exec(s);
+  if (mP) return Number(mP[1]);
+  const i = s.search(/priceToPay|apex-pricetopay/);
+  if (i >= 0) {
+    const mO = /a-offscreen">(?:\s|&nbsp;)*R\$(?:\s|&nbsp;)*([\d.]+,\d{2})/.exec(s.slice(i, i + 3000));
+    if (mO) return Number(mO[1].replace(/\./g, '').replace(',', '.'));
+  }
+  return null;
+}
 
-  const preco = Number(mValor[1]);
+function extrairAVista(html, precoApi) {
+  const mMsg   = RE_AVISTA_MSG.exec(html);
+  const visivel = precoVisivelDaPagina(html);
+  if (!(visivel > 0)) return null;
+
+  const preco = visivel;
   const api   = Number(precoApi);
   if (!Number.isFinite(preco) || !Number.isFinite(api)) return null;
   if (preco >= api || preco < api * 0.5) return null;
@@ -2462,9 +2479,26 @@ export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
     return visto.dados;
   }
 
+  // Railway barrado (pausa) ou sem a pagina: o preco visivel vem da extensao
+  // Captura Tica (20/11/2026, #49526: API R$ 88,98, pagina R$ 79,99 — o
+  // menor dos dois e o que vale). A pagina fica guardada para a leitura de
+  // cupons logo em seguida nao pedir de novo.
+  const pelaExtensao = async () => {
+    try {
+      const pg = await pedirPaginaAmazon('https://www.amazon.com.br/dp/' + asin, { motivo: 'preco' });
+      if (!pg || pg.semProduto || !pg.html) return null;
+      _pdpRecente.set(asin, { em: Date.now(), html: pg.html });
+      if (_pdpRecente.size > 30) _pdpRecente.delete(_pdpRecente.keys().next().value);
+      const d = extrairAVista(pg.html, precoApi);
+      _avistaCache.set(asin, { em: Date.now(), dados: d });
+      if (d) console.log('[AVISTA] ' + asin + ' R$ ' + d.preco + ' (' + d.percentual + '% abaixo da API, pagina via extensao)');
+      return d;
+    } catch (e) { return null; }
+  };
+
   // Bloqueado ha pouco: nao insiste. Cada tentativa durante a pausa so renova
   // o motivo do bloqueio, e a oferta sai com o preco a prazo de qualquer jeito.
-  if (!opcoes.forcar && Date.now() < _avistaPausaAte) return null;
+  if (!opcoes.forcar && Date.now() < _avistaPausaAte) return pelaExtensao();
 
   let dados = null, html = '';
   try {
@@ -2479,7 +2513,7 @@ export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
     // Falha de rede NAO vira cache negativo: seria silenciar o a vista por 6h
     // por causa de um timeout.
     console.warn('[AVISTA] ' + asin + ' — ' + e.message);
-    return null;
+    return pelaExtensao();
   }
 
   if (!html) {
@@ -2490,8 +2524,11 @@ export async function lerPrecoAVista(asin, precoApi, opcoes = {}) {
       console.warn('[AVISTA] Amazon barrando a leitura de PDP — pausado por 30 min. '
         + 'As ofertas seguem saindo com o preco a prazo da API.');
     }
-    return null;
+    return pelaExtensao();
   }
+  // Pagina sem o preco visivel (intermediaria de robo, HTML cortado): o
+  // Railway nao viu o produto, entao a extensao tenta.
+  if (!dados && !(precoVisivelDaPagina(html) > 0)) return pelaExtensao();
   _avistaFalhas = 0;
 
   _avistaCache.set(asin, { em: Date.now(), dados });
@@ -2543,6 +2580,18 @@ export async function comPrecoAVista(p, texto = '') {
   const a = await lerPrecoAVista(p.asin, p.preco)
          || (E().cfg.avistaDoPost === false ? null : avistaDoTexto(texto, p.preco));
   if (!a) return p;
+  // Buy box mais barato que a API, sem condicao de pagamento: e o preco da
+  // loja (regra do Davi, 20/11/2026: vale o menor entre API e pagina). Vira o
+  // proprio preco, e o cupom passa a ser calculado sobre ele. precoApi fica
+  // para o frescor comparar a releitura da API com o numero da API.
+  if (a.semCondicao && a.origem !== 'post' && a.preco > 0 && a.preco < p.preco) {
+    p.precoApi = p.preco;
+    p.preco = a.preco;
+    p.precoOrigem = 'pagina';
+    if (p.precoDe > p.preco) p.desconto = Math.round((1 - p.preco / p.precoDe) * 100);
+    console.log('[PRECO-AMZ] ' + p.asin + ' pagina R$ ' + a.preco + ' < API R$ ' + p.precoApi + ' — vale o da pagina');
+    return p;
+  }
   p.precoAVista = a.preco;
   p.avistaPct   = a.percentual;
   p.avistaMeios = a.meios;
