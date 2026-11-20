@@ -9163,6 +9163,18 @@ function precoDoPostParaOferta(texto, p, r, umProdutoSo) {
     diferencaPct: Math.round((razao - 1) * 1000) / 10,
   };
   if (igual) return { ...base, igual: true, aplicar: false, retem: false };
+  // Post que anuncia o preco ANTES do cupom (20/11/2026, #49458: post R$ 309 +
+  // BLACK15, loja R$ 262,65 com o cupom): o grupo escreveu o valor sem o cupom e
+  // so citou o codigo. E o mesmo preco da loja; trocar pelo do post apagava o
+  // desconto do cupom e segurava a oferta. Mantem o preco com cupom e libera.
+  if (r.cupom) {
+    const alt = [p.precoAVista && p.avistaPct ? p.precoAVista : null, p.preco]
+      .map(Number).filter(v => v > 0).map(v => Math.round(v * 100) / 100);
+    const bate = alt.some(v => Math.abs(declarado - v) <= PRECO_POST_TOLERANCIA_RS
+      || Math.abs(declarado / v - 1) <= PRECO_POST_TOLERANCIA_PCT
+      || (lido.semCentavos && v >= declarado && v < declarado + 1));
+    if (bate) return { ...base, igual: true, aplicar: false, retem: false, antesDoCupom: true };
+  }
   // Diferenca de centavos (03/11/2026, #40208: post R$ 39,90 x loja R$ 39,99,
   // -0,2%, ficou retida): ate 1% OU ate R$ 1 e o mesmo preco. Sai sozinha com
   // o numero do post, sem card. Acima disso segue a regra de sempre.
