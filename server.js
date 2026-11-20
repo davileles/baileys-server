@@ -20308,6 +20308,9 @@ app.get('/tsp/categorias', (req, res) => {
 // manda sempre o estado completo, entao merge parcial so criaria divergencia
 // entre o que o operador ve e o que o classificador usa.
 app.post('/tsp/categorias', (req, res) => {
+  // 20/11/2026: sem login a rota aceitava reescrever a taxonomia inteira
+  // (classificador, marcas da curadoria, roteamento dos nichos).
+  if (!ehAdminRaiz(req)) return res.status(401).json({ ok:false, erro:'faca login no painel' });
   const { categorias, limiarConfianca, espelhoOperador } = req.body || {};
   if (!categorias || typeof categorias !== 'object' || Array.isArray(categorias)) {
     return res.status(400).json({ ok:false, erro:'"categorias" deve ser um objeto id -> definicao.' });
@@ -20404,6 +20407,7 @@ app.get('/tsp/trilha-ml', async (req, res) => {
 });
 
 app.post('/tsp/categorias/espelho', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(401).json({ ok:false, erro:'faca login no painel' });
   const { categorias } = req.body || {};
   if (!Array.isArray(categorias)) return res.status(400).json({ ok:false, erro:'"categorias" deve ser um array.' });
   const validas = Object.keys(categoriasConfig().categorias || {});
