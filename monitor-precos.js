@@ -29,7 +29,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { agendarPush, baixarArquivoDoGitHub } from './sync-github.js';
-import { registrarSeloPreco, registrarSeloQueda, listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
+import { registrarSeloPreco, registrarSeloQueda, registrarSeloLinhas, listarVitrine, itemVitrine, salvarItemVitrine, removerItemVitrine, cupomPorCodigo, cupomVigente, calcularDesconto, marcarDisparo, itensDoGrupo,
          buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon } from './radar-amazon.js';
 import { credencialTsp } from './config-tsp.js';
 import { classificarProduto, categoriaConfiavel, avaliarCuradoriaNicho } from './categorizador.js';
@@ -176,6 +176,14 @@ const CFG_PADRAO = {
     promoFolgaPct: 2,
     falsoAteCheioPct: 2,
     quedaBoaSemPromoPct: 12,
+    // Imperdivel exige estar pelo menos N% abaixo do preco cheio (21/11/2026:
+    // na analise de 20/11, Johnnie Walker 18, purificador e fone estavam no
+    // menor preco de 90 dias mas so 3-7% abaixo do normal).
+    minDescontoImperdivelPct: 8,
+    // Selo na mensagem (pedido do Davi, 21/11/2026): imperdivel e boa ganham
+    // marca na linha do {{menor_preco}}. seloAtivo=0 desliga.
+    seloAtivo: 1,
+    seloMinDescontoPct: 5,      // abaixo disso a % nao aparece no selo
   },
 
   publicacao: {
@@ -1970,9 +1978,11 @@ export function vereditoLinhas(asin, preco) {
   const descontoRealPct = cheio ? Math.round((1 - p / cheio) * 1000) / 10 : null;
   const base = { ...L, preco: p, descontoRealPct };
   if (!cheio && !patamarPromo && !Number.isFinite(minAnterior)) return { ...base, classe: 'sem base', motivo: 'historico curto' };
-  if (Number.isFinite(minAnterior) && p <= minAnterior * (1 + cfg.tolMinimoPct / 100) && !(descontoRealPct !== null && descontoRealPct <= 0))
+  // Imperdivel tambem exige distancia do preco cheio (quando ele e conhecido).
+  const longeDoCheio = descontoRealPct === null || descontoRealPct >= (cfg.minDescontoImperdivelPct ?? 8);
+  if (longeDoCheio && Number.isFinite(minAnterior) && p <= minAnterior * (1 + cfg.tolMinimoPct / 100) && !(descontoRealPct !== null && descontoRealPct <= 0))
     return { ...base, classe: 'imperdivel', motivo: 'no menor preco de 90 dias' };
-  if (patamarPromo && p <= patamarPromo * (1 - cfg.imperdivelAbaixoPromoPct / 100))
+  if (longeDoCheio && patamarPromo && p <= patamarPromo * (1 - cfg.imperdivelAbaixoPromoPct / 100))
     return { ...base, classe: 'imperdivel', motivo: 'abaixo do patamar de promocao' };
   if (patamarPromo && p <= patamarPromo * (1 + cfg.promoFolgaPct / 100))
     return { ...base, classe: 'boa', motivo: 'no patamar de promocao' };
@@ -1983,6 +1993,21 @@ export function vereditoLinhas(asin, preco) {
       ? { ...base, classe: 'boa', motivo: descontoRealPct + '% abaixo do preco cheio' }
       : { ...base, classe: 'comum', motivo: 'so ' + descontoRealPct + '% abaixo do preco cheio' };
   return { ...base, classe: 'comum', motivo: 'acima do patamar de promocao' };
+}
+
+/**
+ * Selo da mensagem: { texto, classe } para imperdivel/boa; null no resto.
+ * Sem preco cheio conhecido nao ha selo (nao da para dizer "abaixo do normal").
+ */
+export function seloDasLinhas(asin, preco) {
+  const cfg = _cfg.linhas || CFG_PADRAO.linhas;
+  if (!cfg.seloAtivo) return null;
+  const v = vereditoLinhas(asin, preco);
+  if (!v || !v.cheio || !['imperdivel', 'boa'].includes(v.classe)) return null;
+  const d = v.descontoRealPct;
+  const pct = Number.isFinite(d) && d >= (cfg.seloMinDescontoPct ?? 5) ? Math.floor(d) + '% abaixo do preço normal' : '';
+  const titulo = v.classe === 'imperdivel' ? '🔥 OFERTA IMPERDÍVEL' : '✅ BOA OFERTA';
+  return { classe: v.classe, texto: pct ? titulo + ' · ' + pct : titulo };
 }
 
 // Registro das capturas julgadas pelas linhas (sombra), para medir antes de ligar.
@@ -3227,6 +3252,7 @@ export function iniciarMonitorPrecos(deps) {
   carregarMonitorPrecos();
   registrarSeloPreco(diasComoMenorPreco);
   registrarSeloQueda(quedaVsHabitual);
+  registrarSeloLinhas(seloDasLinhas);
   // Shard tem nome dinamico e nao entra na varredura do boot do sync: num
   // volume novo do Railway o disco esta vazio e a serie inteira mora so no
   // repo. Sem esta restauracao, a primeira gravacao do mes subiria um shard
