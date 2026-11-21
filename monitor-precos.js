@@ -1762,16 +1762,25 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   // A leitura efetiva so entra quando a serie efetiva ja existe E o cupom de
   // agora e real: o desconto e recalculado aqui, nao herdado do que estava
   // gravado ontem.
+  // Cupom INFORMADO com a oferta (post, pagina da loja, lista: leitura.
+  // precoComCupom) vence o vinculado — e o preco que o cliente vai pagar.
   let cupomAtual = null;
-  if (_cfg.publicacao.aplicarCupom) {
+  const pcc = Number(leitura.precoComCupom);
+  if (Number.isFinite(pcc) && pcc > 0 && pcc < preco) {
+    cupomAtual = { reg: { codigo: leitura.cupomCodigo || null }, desconto: Math.round((preco - pcc) * 100) / 100, informado: true };
+  } else if (_cfg.publicacao.aplicarCupom) {
     try { cupomAtual = cupomVinculado(item, preco); } catch (e) { cupomAtual = null; }
   }
   const precoEfetivo = cupomAtual ? Math.round((preco - cupomAtual.desconto) * 100) / 100 : preco;
   const ef = stats.efetivo;
-  const usarEfetivo = _cfg.publicacao.considerarCupom && ef && ef.dias >= r.maturidadeMinDias;
-  const mEfet = usarEfetivo
-    ? medir(precoEfetivo, ef.mediana30 ?? ef.min90, ef.min90, stats.serieEf90)
-    : null;
+  const efMaduro = !!(ef && ef.dias >= r.maturidadeMinDias);
+  // Serie com cupom madura: compara contra ela (cupom que existe sempre nao e
+  // queda). Sem ela, o preco com cupom e comparado com a serie de etiqueta
+  // (nossa + Keepa) — sem isto o cupom era ignorado e a oferta descartada.
+  const usarEfetivo = (_cfg.publicacao.considerarCupom || cupomAtual?.informado) && (efMaduro || !!cupomAtual);
+  const mEfet = !usarEfetivo ? null
+    : efMaduro ? medir(precoEfetivo, ef.mediana30 ?? ef.min90, ef.min90, stats.serieEf90)
+    : medir(precoEfetivo, ref, stats.min90, stats.serie90);
 
   // Vence a leitura que APROVA. Se as duas aprovam, vence a de queda maior — e
   // ela que descreve melhor o tamanho real da oportunidade.
@@ -1789,6 +1798,7 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
                     quedaPctBruto: mBruto?.quedaPct ?? null,
                     quedaPctEfetivo: mEfet?.quedaPct ?? null,
                     medianaEfetiva30: ef?.mediana30 ?? null,
+                    refCupom: mEfet ? (efMaduro ? 'serie com cupom' : 'serie de etiqueta') : null,
                     minEfetivo90: ef?.min90 ?? null };
 
   if (!venc) {
@@ -2102,6 +2112,24 @@ export function relatorioLinhas({ dias = 7 } = {}) {
            captura: estadoCaptura(), config: _cfg.linhas, exemplos };
 }
 
+// Cupom que veio COM a oferta (post do grupo, pagina da loja, lista): pode
+// chegar como codigo (string) ou como o objeto da oferta { codigo, desconto }.
+// Junto com o preco final informado, vira a leitura com cupom do avaliar —
+// o filtro nunca pode descartar uma oferta cujo preco caiu por causa do
+// cupom (21/11/2026, regra do Davi).
+function leituraComCupom(preco, precoDe, cupom, precoFinal) {
+  const p = Number(preco);
+  const leitura = { preco: p, precoDe: Number(precoDe), disponivel: true };
+  const cod = cupom && typeof cupom === 'object' ? (cupom.codigo || null) : (cupom ? String(cupom) : null);
+  let pf = Number(precoFinal);
+  if (!(pf > 0) && cupom && typeof cupom === 'object' && Number(cupom.desconto) > 0) pf = p - Number(cupom.desconto);
+  if (Number.isFinite(p) && p > 0 && pf > 0 && pf < p - 0.004) {
+    leitura.precoComCupom = Math.round(pf * 100) / 100;
+    leitura.cupomCodigo = cod;
+  }
+  return { leitura, codigo: cod };
+}
+
 // ── FILTRO DE DISPARO ───────────────────────────────────────────────────────
 // Le o veredito do avaliar() so pelo lado do PRECO. Cooldown, EPC, faixa de
 // preco e "outra loja mais barata" nao sao desconto falso e nao vetam aqui.
@@ -2136,10 +2164,13 @@ export function filtroDisparo(args = {}) {
   // sem mudar veto nem bloqueio.
   try {
     if (args.asin && Number(args.preco) > 0) {
-      const v = vereditoLinhas(args.asin, Number(args.preco));
+      const { leitura } = leituraComCupom(args.preco, args.precoDe, args.cupom, args.precoFinal);
+      const pPago = leitura.precoComCupom || Number(args.preco);
+      const v = vereditoLinhas(args.asin, pPago);
       r.linhas = v;
       registrarLinhaCaptura({ em: new Date().toISOString(), asin: args.asin, loja: args.loja || null,
-        nome: String(args.nome || '').slice(0, 90), preco: Number(args.preco), classe: v.classe, motivo: v.motivo,
+        nome: String(args.nome || '').slice(0, 90), preco: pPago, precoEtiqueta: Number(args.preco),
+        cupom: leitura.cupomCodigo || null, classe: v.classe, motivo: v.motivo,
         cheio: v.cheio ?? null, patamarPromo: v.patamarPromo ?? null, minAnterior: v.minAnterior ?? null,
         descontoRealPct: v.descontoRealPct ?? null,
         filtro: r.nivel || (r.julgavel ? 'queda real' : null) });
@@ -2148,7 +2179,7 @@ export function filtroDisparo(args = {}) {
   return r;
 }
 
-function filtroDisparoBase({ asin, loja, nome, preco, precoDe, cupom = null }) {
+function filtroDisparoBase({ asin, loja, nome, preco, precoDe, cupom = null, precoFinal = null }) {
   const cfg = _cfg.filtroDisparo || CFG_PADRAO.filtroDisparo;
   const base = { modo: cfg.modo, vetar: cfg.vetar, julgavel: false, nivel: null, veto: false, bloqueia: false };
   // Trava de queda anormal: independente do modo do filtro (ate 'off'). Bloqueia
@@ -2165,10 +2196,11 @@ function filtroDisparoBase({ asin, loja, nome, preco, precoDe, cupom = null }) {
   if (cfg.modo === 'off' || !asin || !Number.isFinite(Number(preco)) || Number(preco) <= 0) return base;
   try {
     const item = { ...(itemVitrine(asin) || { asin, loja, nome: nome || '' }) };
-    if (cupom && !item.cupom) item.cupom = cupom;
+    const { leitura, codigo } = leituraComCupom(preco, precoDe, cupom, precoFinal);
+    if (codigo && !item.cupom) item.cupom = codigo;
     const stats = estatisticas(asin);
     const { nicho } = nichoDoProduto(item, nome || _hist[asin]?.n || item.nome);
-    const av = avaliar(item, { preco: Number(preco), precoDe: Number(precoDe), disponivel: true }, stats, nicho);
+    const av = avaliar(item, leitura, stats, nicho);
     const c = classificarFiltro(av, stats, nicho);
     // Rigor do nicho (vetarPorNicho) vale para os grupos do nicho; o geral
     // segue com cfg.vetar. Passou so pelo do nicho -> soNicho (o chamador
@@ -2186,27 +2218,31 @@ function filtroDisparoBase({ asin, loja, nome, preco, precoDe, cupom = null }) {
                diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null };
     }
     return { ...base, ...c, nicho, veto, soNicho, vetarNicho, bloqueia: veto && cfg.modo === 'ativo',
-             diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null };
+             diasSerie: stats?.dias ?? 0, mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null,
+             precoComCupom: leitura.precoComCupom ?? null, via: av.via || null,
+             quedaPctBruto: av.quedaPctBruto ?? null, quedaPctEfetivo: av.quedaPctEfetivo ?? null };
   } catch (e) {
     // Filtro nunca derruba envio: erro = nao julgavel.
     return { ...base, motivo: 'erro: ' + e.message };
   }
 }
 
-export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null, cupom = null }) {
+export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null, cupom = null, precoFinal = null }) {
   if (!asin) return null;
-  const item = itemVitrine(asin) || { asin, loja, nome: nome || '', cupom: cupom || '' };
-  if (cupom && !item.cupom) item.cupom = cupom;
+  const { leitura, codigo } = leituraComCupom(preco, precoDe, cupom, precoFinal);
+  const item = { ...(itemVitrine(asin) || { asin, loja, nome: nome || '' }) };
+  if (codigo && !item.cupom) item.cupom = codigo;
   const h = _hist[asin];
   const stats = estatisticas(asin);
   const { nicho } = nichoDoProduto(item, nome || h?.n || item.nome);
   let av;
-  try { av = avaliar(item, { preco: Number(preco), precoDe: Number(precoDe), disponivel: true }, stats, nicho); }
+  try { av = avaliar(item, leitura, stats, nicho); }
   catch (e) { av = { passou: false, motivo: 'erro: ' + e.message }; }
   const naFila = _estado.fila.find(f => f.asin === asin);
   const reg = {
     em: new Date().toISOString(), asin, loja, nome: String(nome || item.nome || '').slice(0, 120), nicho, origem,
     preco: Number(preco) || null, precoDe: Number(precoDe) || null,
+    precoComCupom: leitura.precoComCupom ?? null, cupom: leitura.cupomCodigo || null,
     mediana30: stats?.mediana30 ?? null, min90: stats?.min90 ?? null, diasSerie: stats?.dias ?? 0,
     quedaPct: av.quedaPct ?? null, recorde: !!av.recorde, via: av.via || null,
     veredito: classeDoVeredito(av), motivo: av.motivo || null,
@@ -2217,7 +2253,7 @@ export function julgarDisparo({ asin, loja, nome, preco, precoDe, origem = null,
     reg.filtro = { julgavel: c.julgavel, nivel: c.nivel };
   } catch (e) { /* relatorio nao segura envio */ }
   try {
-    const vl = vereditoLinhas(asin, Number(preco));
+    const vl = vereditoLinhas(asin, leitura.precoComCupom || Number(preco));
     reg.linhas = { classe: vl.classe, descontoRealPct: vl.descontoRealPct ?? null };
   } catch (e) { /* idem */ }
   _estado.vereditosDisparos = [reg, ...(_estado.vereditosDisparos || [])].slice(0, VEREDITOS_MAX);
@@ -2413,7 +2449,8 @@ function processarLeituraVarredura(item, leitura, resumo, aprovadosRodada) {
   // preco dizendo imperdivel ou boa (queda real contra o preco cheio).
   if (av.passou && !soSerie && item.origemSemeadura === 'keepa-radar') {
     let cls = null;
-    try { cls = vereditoLinhas(item.asin, leitura.preco)?.classe || null; } catch { cls = null; }
+    const pPago = Number.isFinite(av.precoEfetivo) && av.precoEfetivo > 0 ? Math.min(av.precoEfetivo, leitura.preco) : leitura.preco;
+    try { cls = vereditoLinhas(item.asin, pPago)?.classe || null; } catch { cls = null; }
     if (cls !== 'imperdivel' && cls !== 'boa') {
       resumo.radarBarrados = (resumo.radarBarrados || 0) + 1;
       resumo.porMotivo['radar keepa: linhas ' + (cls || 'sem base')] = (resumo.porMotivo['radar keepa: linhas ' + (cls || 'sem base')] || 0) + 1;

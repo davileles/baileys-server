@@ -6613,7 +6613,8 @@ async function registrarEnvioHistorico(oferta) {
       // semear a serie (senao "sem serie" nunca apareceria).
       try {
         const v = julgarDisparo({ asin: d.asin, loja: d.loja, nome: d.titulo, preco: Number(d.preco), precoDe: Number(d.precoDe),
-          origem: oferta.autoEnviado ? 'auto-envio' : (oferta.grupoOrigem || oferta.origem || 'fila'), cupom: d.cupom || oferta.cupom || null });
+          origem: oferta.autoEnviado ? 'auto-envio' : (oferta.grupoOrigem || oferta.origem || 'fila'), cupom: d.cupom || oferta.cupom || null,
+          precoFinal: Number(d.precoFinal) || null });
         if (v) console.log('[PRECOS] Sombra — ' + d.asin + ': ' + v.veredito + (v.motivo && v.veredito !== 'passou' ? ' (' + v.motivo + ')' : ''));
       } catch (e) { console.warn('[PRECOS] Sombra falhou para ' + d.asin + ':', e.message); }
       try {
@@ -10003,6 +10004,9 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         registrarLeituraPreco(p.asin, {
           nome: p.titulo, loja: p.loja, preco: p.preco,
           precoDe: p.precoDe ?? null, disponivel: p.disponivel !== false,
+          // Preco com o cupom da oferta: alimenta a serie com cupom, que e o que
+          // mostra depois se o cupom e de sempre (21/11/2026).
+          precoEfetivo: r.cupom && Number(r.precoFinal) > 0 && Number(r.precoFinal) < p.preco ? Number(r.precoFinal) : undefined,
           // Preco do momento do post (captura): entra no patamar de promocao e
           // coloca o produto na vigilancia leve (ver monitor-precos.js).
           origem: 'captura', url: p.link || p.urlLoja || null,
@@ -10335,13 +10339,17 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     let _filtro = null;
     if (!oferta.dadosExtraidos.precoDeReferencia) {
       try {
+        // Cupom da oferta + preco final: o filtro julga o preco que o cliente
+        // paga, nao so a etiqueta (21/11/2026).
         _filtro = filtroDisparo({ asin: p.asin, loja: p.loja, nome: p.titulo, preco: Number(p.preco),
-          precoDe: Number(p.precoDe), cupom: oferta.dadosExtraidos.cupom || null });
+          precoDe: Number(p.precoDe), cupom: oferta.dadosExtraidos.cupom || null,
+          precoFinal: Number(oferta.dadosExtraidos.precoFinal) || null });
         if (_filtro?.julgavel) {
           oferta.dadosExtraidos.filtroPreco = { modo: _filtro.modo, nivel: _filtro.nivel, veto: _filtro.veto,
             bloqueia: _filtro.bloqueia, motivo: _filtro.motivo, diasSerie: _filtro.diasSerie, mediana30: _filtro.mediana30 };
           if (_filtro.veto) console.log('[FILTRO] #' + oferta.id + ' ' + (p.asin || '?') + ' — '
-            + (_filtro.bloqueia ? 'SEGURADA' : 'vetaria (sombra)') + ': ' + _filtro.nivel + ' — ' + _filtro.motivo);
+            + (_filtro.bloqueia ? 'SEGURADA' : 'vetaria (sombra)') + ': ' + _filtro.nivel + ' — ' + _filtro.motivo
+          + (_filtro.precoComCupom ? ' [com cupom R$ ' + _filtro.precoComCupom + ': queda ' + (_filtro.quedaPctEfetivo ?? '?') + '%]' : ''));
         }
       } catch (e) { /* filtro nunca segura o pipeline por erro */ }
     }
@@ -21289,7 +21297,8 @@ async function _dispararProdutoDaLista(asin, codigoCupom, roteamento = 'geral', 
   if (!o.precoDeReferencia) {
     try {
       const _f = filtroDisparo({ asin: o.asin || asin, loja: o.produto.loja, nome: o.produto.titulo,
-        preco: Number(o.produto.preco), precoDe: Number(o.produto.precoDe), cupom: o.cupom?.codigo || null });
+        preco: Number(o.produto.preco), precoDe: Number(o.produto.precoDe), cupom: o.cupom || null,
+        precoFinal: Number(o.precoFinal) || null });
       // Trava de queda anormal (50%+ contra a mediana): nao sai por lista nem
       // por envio unico de varios itens — vira card de revisao no bot, onde o
       // operador confere o preco e envia com um toque. Unica excecao: item cujo
