@@ -3174,13 +3174,34 @@ export function registrarSeloQueda(fn) { _provedorQueda = typeof fn === 'functio
 // desligado. Imperdivel/boa ganham uma marca na mensagem; o resto, nada.
 let _provedorLinhas = null;
 export function registrarSeloLinhas(fn) { _provedorLinhas = typeof fn === 'function' ? fn : null; }
-function seloDaOferta(p, preco) {
+function seloInfo(p, preco) {
+  const vazio = { texto: '', normal: null };
   const chave = p?.chaveSerie || p?.asin;
-  if (!_provedorLinhas || !chave || !Number.isFinite(preco) || preco <= 0) return '';
+  if (!_provedorLinhas || !chave || !Number.isFinite(preco) || preco <= 0) return vazio;
   try {
     const v = _provedorLinhas(String(chave), preco);
-    return v && v.texto ? String(v.texto) : '';
-  } catch { return ''; }
+    if (!v || !v.texto) return vazio;
+    return { texto: String(v.texto), normal: Number(v.normal) > 0 ? Number(v.normal) : null };
+  } catch { return vazio; }
+}
+function seloDaOferta(p, preco) { return seloInfo(p, preco).texto; }
+// "De" = preco normal do selo (21/11/2026, pedido do Davi): a mensagem do
+// relogio Accutime saiu "De R$ 39,10 Por R$ 34,90" (o "De" da pagina) com
+// "65% abaixo do preço normal" (normal R$ 101) — quem le ve 11% e acha falso.
+// Quando o selo traz a %, o "De", a economia e o desconto passam a usar o
+// mesmo preco normal. "De" digitado pelo operador na extensao vence.
+function numeroBrl(s) {
+  const n = Number(String(s ?? '').replace(/\./g, '').replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
+}
+function aplicarDeDoSelo(vars) {
+  const normal = Number(vars.selo_normal);
+  const fin = numeroBrl(vars.preco);
+  if (!(normal > 0) || !(fin > 0) || normal <= fin) return vars;
+  vars.preco_de = brl(normal);
+  vars.economia = brl(normal - fin);
+  vars.desconto = Math.round((1 - fin / normal) * 100);
+  return vars;
 }
 // O selo tem linha propria no template ({{selo_oferta}}, logo abaixo do
 // titulo — decisao do Davi em 21/11/2026). A linha do {{menor_preco}} fica com
@@ -3313,7 +3334,9 @@ function aplicarAjustesVars(vars, p, cupom, aj) {
     Object.assign(vars, comparacaoUltimoEnvio(p, final));
     if (aj.preco) {
       const n = Number(vars.menor_preco_dias) || null;
-      vars.selo_oferta = seloDaOferta(p, final);
+      const s = seloInfo(p, final);
+      vars.selo_oferta = s.texto;
+      vars.selo_normal = s.normal ? String(s.normal) : '';
       vars.menor_preco = juntarSelo(vars.selo_oferta, n ? 'Menor preço dos últimos ' + n + ' dias' : (vars.queda_habitual || vars.vs_ultimo_envio));
     } else if (vars.menor_preco_veio_do_envio) {
       vars.menor_preco = juntarSelo(vars.selo_oferta, vars.vs_ultimo_envio);
@@ -3325,7 +3348,8 @@ function aplicarAjustesVars(vars, p, cupom, aj) {
 export function varsDoProduto(p, cupom) {
   const vars = _varsDoProdutoBase(p, cupom);
   const aj = ajustesOfertaAtivos();
-  return aj ? aplicarAjustesVars(vars, p, cupom, aj) : vars;
+  const out = aj ? aplicarAjustesVars(vars, p, cupom, aj) : vars;
+  return (aj && aj.precoDe) ? out : aplicarDeDoSelo(out);
 }
 
 function _varsDoProdutoBase(p, cupom) {
@@ -3390,9 +3414,11 @@ function _varsDoProdutoBase(p, cupom) {
       const doEnvio = !n && !queda && !!ult.vs_ultimo_envio;
       // Selo da classe (imperdivel/boa) sobre o preco com cupom, sem o a vista
       // — a mesma base da serie. Vai na frente da linha do {{menor_preco}}.
-      const selo = seloDaOferta(p, precoPrazo);
+      const sInfo = seloInfo(p, precoPrazo);
+      const selo = sInfo.texto;
       return { menor_preco: juntarSelo(selo, n ? 'Menor preço dos últimos ' + n + ' dias' : (queda || ult.vs_ultimo_envio)),
                selo_oferta: selo,
+               selo_normal: sInfo.normal ? String(sInfo.normal) : '',
                menor_preco_dias: n ? String(n) : '',
                queda_habitual: queda,
                menor_preco_veio_do_envio: doEnvio ? '1' : '',

@@ -91,6 +91,9 @@ export const NOMES_SINCRONIZAVEIS = new Set([
   // 20/11/2026): sem ela, depois de um deploy em volume novo, a serie de quem
   // nunca foi divulgado voltaria a receber ponto so nos dias de post.
   'precos_captura.json',
+  // Referencia longa do Keepa (monitor-precos.js, 21/11/2026): mediana de 12
+  // meses e preco de tabela por ASIN. Precisa sobreviver ao fim da assinatura.
+  'precos_keepa_ref.json',
 ]);
 
 // Compat: modulos antigos listam Object.keys() daqui; e a visao da RAIZ.

@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import {
   importarSerieKeepa, gravarShardsKeepa, asinsAmazonConhecidos, definirGanchoCaptura,
-  vereditoLinhas, historicoDe, epcDe, avaliarAgoraAmazon,
+  vereditoLinhas, historicoDe, epcDe, avaliarAgoraAmazon, registrarReferenciaLonga,
 } from './monitor-precos.js';
 import { registrarOkFonte, registrarFalhaFonte, fonteFora, estadoFontes } from './saude-fontes.js';
 
@@ -35,6 +35,10 @@ const KEEPA_EPOCA_MIN = 21564000;
 const SESSAO_DIR = './sessao';
 const ARQ = SESSAO_DIR + '/keepa_estado.json';   // so no volume: estado do job, sem dado sensivel
 const DIAS_HISTORICO = 120;
+// Referencia longa (21/11/2026): o pedido traz 12 meses (mesmo custo de token:
+// o Keepa cobra por produto, nao por dia). A serie diaria continua com 120 dias;
+// dos 12 meses sai so a mediana e o preco de tabela (LISTPRICE, csv[4]).
+const DIAS_REF_LONGA = 365;
 const LOTE_MAX = 100;
 
 const CFG_PADRAO = {
@@ -164,8 +168,8 @@ function minimoDiario(csv, desdeTs) {
   return out;
 }
 
-function serieDoProduto(prod, fonte) {
-  const desde = Date.now() - DIAS_HISTORICO * 86400000;
+function serieDoProduto(prod, fonte, dias = DIAS_HISTORICO) {
+  const desde = Date.now() - dias * 86400000;
   const amazon = minimoDiario(prod?.csv?.[0], desde);
   const novo = minimoDiario(prod?.csv?.[1], desde);
   if (fonte === 'amazon') return amazon;
@@ -173,6 +177,21 @@ function serieDoProduto(prod, fonte) {
   const out = { ...novo };
   for (const [d, v] of Object.entries(amazon)) out[d] = out[d] === undefined ? v : Math.min(out[d], v);
   return out;
+}
+
+// Ultimo valor de um csv do Keepa (-1 = sem valor).
+function ultimoValorCsv(csv) {
+  if (!Array.isArray(csv) || csv.length < 2) return null;
+  const v = Number(csv[csv.length - 1]);
+  return v > 0 ? v / 100 : null;
+}
+function referenciaLonga(prod, fonte) {
+  const serie = serieDoProduto(prod, fonte, DIAS_REF_LONGA);
+  const hoje = diaSP(Date.now());
+  const vals = Object.entries(serie).filter(([d]) => d < hoje).map(([, v]) => v).sort((a, b) => a - b);
+  const n = vals.length;
+  const m365 = n ? (n % 2 ? vals[(n - 1) / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2) : null;
+  return { m365, n365: n, lista: ultimoValorCsv(prod?.csv?.[4]) };
 }
 
 function precoAtualKeepa(serie) {
@@ -193,7 +212,7 @@ function conferir(asin, serie) {
 }
 
 async function buscarProdutos(asins) {
-  const d = await chamar('/product', { domain: String(DOMINIO_BR), asin: asins.join(','), days: String(DIAS_HISTORICO) });
+  const d = await chamar('/product', { domain: String(DOMINIO_BR), asin: asins.join(','), days: String(DIAS_REF_LONGA) });
   return Array.isArray(d?.products) ? d.products : [];
 }
 
@@ -206,7 +225,12 @@ function aplicarProduto(prod, { gravarSerie = true } = {}) {
   const c = conferir(asin, serie);
   if (!c.ok) return { asin, ok: false, motivo: 'divergente (Keepa R$ ' + c.atual + ' x nosso R$ ' + c.nosso + ')', ...c, dias };
   const n = gravarSerie ? importarSerieKeepa(asin, serie, { nome: prod.title || '' }) : dias;
-  return { asin, ok: true, dias: n, ...c };
+  let ref = null;
+  if (gravarSerie) {
+    try { ref = referenciaLonga(prod, _e.cfg.fonte); registrarReferenciaLonga(asin, ref); }
+    catch (e) { console.warn('[KEEPA] Referencia longa de ' + asin + ':', e.message); }
+  }
+  return { asin, ok: true, dias: n, ref, ...c };
 }
 
 // ── JOB DE IMPORTACAO ───────────────────────────────────────────────────────
@@ -226,14 +250,18 @@ function agendarShards() {
 }
 
 function registrarResultado(asin, r) {
-  _e.resultados[asin] = { ok: r.ok, motivo: r.motivo || null, dias: r.dias || 0, razao: r.razao ?? null, em: new Date().toISOString() };
+  // v:2 = lido ja com o pedido de 12 meses (21/11/2026): recusado ou sem
+  // historico nao volta para a fila a cada deploy so por faltar a referencia.
+  _e.resultados[asin] = { ok: r.ok, motivo: r.motivo || null, dias: r.dias || 0, razao: r.razao ?? null, em: new Date().toISOString(), v: 2 };
   const i = _e.fila.indexOf(asin);
   if (i >= 0) _e.fila.splice(i, 1);
 }
 export function montarFila({ reimportar = false, limite = null } = {}) {
   const conhecidos = asinsAmazonConhecidos();
   const ja = new Set(_e.fila);
-  let novos = conhecidos.filter(x => (reimportar || !x.importadoEm) && !ja.has(x.asin)).map(x => x.asin);
+  // Sem referencia longa (importado antes de 21/11/2026) tambem entra: a fila
+  // re-le o produto uma vez para trazer os 12 meses e o preco de tabela.
+  let novos = conhecidos.filter(x => (reimportar || !x.importadoEm || (!x.refEm && _e.resultados[x.asin]?.v !== 2)) && !ja.has(x.asin)).map(x => x.asin);
   if (Number.isFinite(limite) && limite > 0) novos = novos.slice(0, limite);
   _e.fila.push(...novos);
   ordenarFilaPorCliques();
@@ -522,6 +550,7 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
       const c = conferir(asin, serie);
       const dias = Object.keys(serie).sort();
       res.json({ ok: true, asin, titulo: p.title || null, fonte: _e.cfg.fonte, dias: dias.length,
+                 referenciaLonga: referenciaLonga(p, _e.cfg.fonte),
                  ultimos: dias.slice(-15).map(d => ({ d, v: serie[d] })), conferencia: c, tokens: _e.tokens });
     } catch (e) { res.status(500).json({ ok: false, erro: e.message, tokens: _e.tokens }); }
   }));
@@ -558,6 +587,15 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
   }));
 
   // Fila que ficou de um boot anterior volta a rodar sozinha (so com chave).
-  if (chave() && _e.fila.length) setTimeout(() => rodarFila().catch(() => {}), 90000);
+  // Desde 21/11/2026 o boot tambem enfileira quem ainda nao tem a referencia
+  // longa (12 meses + tabela): uma passada so, ordenada por cliques, deixando
+  // a reserva de tokens para a consulta na hora e o radar.
+  if (chave()) setTimeout(() => {
+    try {
+      const f = montarFila();
+      if (f.adicionados) console.log('[KEEPA] Referencia longa — ' + f.adicionados + ' produto(s) na fila para reler 12 meses.');
+    } catch (e) { console.warn('[KEEPA] Fila da referencia longa:', e.message); }
+    if (_e.fila.length && !_rodando) rodarFila().catch(() => {});
+  }, 90000);
   iniciarRadar();
 }

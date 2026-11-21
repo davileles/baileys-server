@@ -45,6 +45,11 @@ const ARQ_EPC    = 'epc-produtos.json';
 // Vigilancia leve do que foi CAPTURADO nos grupos-fonte (20/11/2026). Lista
 // separada da vitrine para nao encher o catalogo do painel.
 const ARQ_CAPT   = 'precos_captura.json';
+// Referencia longa do Keepa (21/11/2026): mediana de 12 meses + preco de
+// tabela por ASIN. Arquivo proprio e pequeno (~60 bytes por produto): a serie
+// diaria continua com 120 dias de retencao.
+const ARQ_REF    = 'precos_keepa_ref.json';
+const REF_LONGA_VALIDADE_DIAS = 120;
 // Historico importado do Keepa (Amazon), um arquivo por mes, guardado como
 // pontos de mudanca do minimo diario (nao um ponto por dia): cabe folgado no
 // ~1 MB que a Contents API devolve.
@@ -188,6 +193,17 @@ const CFG_PADRAO = {
     // na analise de 20/11, Johnnie Walker 18, purificador e fone estavam no
     // menor preco de 90 dias mas so 3-7% abaixo do normal).
     minDescontoImperdivelPct: 8,
+    // Referencia longa (21/11/2026, analise de 1.125 ofertas de 07-21/11): a
+    // mediana de 90 dias so enxerga ~4 meses e, perto da Black Friday, pega
+    // tanto promocao de julho quanto preco inflado de setembro. O preco cheio
+    // passa a ser o MENOR entre (a) a mediana de 90 dias, (b) a mediana de 12
+    // meses do Keepa e (c) o preco de tabela da Amazon (LISTPRICE) — preco
+    // "normal" acima da tabela da propria loja nao e normal (ex.: camiseta
+    // Henley a R$ 755 com tabela de R$ 259; mamadeira a R$ 53 com tabela de
+    // R$ 31,90). 0 desliga cada um sem deploy.
+    referenciaLonga: 1,
+    minDiasLongo: 90,            // dias de serie nos 12 meses para a mediana longa valer
+    tetoTabela: 1,
     // Selo na mensagem (pedido do Davi, 21/11/2026): imperdivel e boa ganham
     // marca na linha do {{menor_preco}}. seloAtivo=0 desliga.
     seloAtivo: 1,
@@ -375,6 +391,7 @@ let _hist   = {};    // asin -> { n, loja, dias: { 'YYYY-MM-DD': min }, ult: {pr
 let _epc    = { produtos: {} };   // ledger somente-leitura escrito pelo coletor
 let _capt   = {};    // asin -> { asin, loja, nome, url, criadoEm, capturadoEm, capturas } (vigilancia de captura)
 let _keepaAte = {};  // mes -> ultimo dia coberto pelo import do Keepa
+let _refK = {};      // asin -> { m365, n365, lista, em } (referencia longa do Keepa, 21/11/2026)
 let _ganchoCaptura = null;   // (asin, loja) -> void: chamado quando um produto entra na vigilancia de captura
 let _estado = {      // fila de candidatos + contadores do dia
   fila: [],          // [{ asin, nome, loja, nicho, preco, mediana30, min90, quedaPct, quedaRs, score, recorde, em }]
@@ -422,7 +439,7 @@ function ler(nome, padrao) {
 function gravar(nome, dados, push = true) {
   try {
     if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
-    const compacto = nome === ARQ_HIST || nome === ARQ_CAPT || /^precos_(hist|keepa|descontinho)_\d{4}-\d{2}\.json$/.test(nome);
+    const compacto = nome === ARQ_HIST || nome === ARQ_CAPT || nome === ARQ_REF || /^precos_(hist|keepa|descontinho)_\d{4}-\d{2}\.json$/.test(nome);
     writeFileSync(caminho(nome), JSON.stringify(dados, null, compacto ? 0 : 2));
     if (push) agendarPush(nome);
   } catch (e) {
@@ -684,6 +701,38 @@ export function produtosConhecidosDaLoja(loja) {
   return [...mapa.values()];
 }
 
+// ── REFERENCIA LONGA DO KEEPA ───────────────────────────────────────────────
+// Fica num mapa proprio (_refK, persistido em ARQ_REF) e e pendurada no objeto
+// da serie (h.refK, so em memoria) para as linhas de preco lerem sem o ASIN.
+let _refTimer = null;
+function agendarGravarRef() {
+  if (_refTimer) return;
+  _refTimer = setTimeout(() => { _refTimer = null; gravar(ARQ_REF, _refK); }, 60000);
+  if (_refTimer.unref) _refTimer.unref();
+}
+function pendurarRefs() {
+  for (const [asin, r] of Object.entries(_refK)) if (_hist[asin]) _hist[asin].refK = r;
+}
+function carregarRefs(bruto) {
+  _refK = (bruto && typeof bruto === 'object' && !Array.isArray(bruto)) ? bruto : {};
+  pendurarRefs();
+}
+/** Chamado pelo keepa.js a cada produto importado: { m365, n365, lista }. */
+export function registrarReferenciaLonga(asin, ref) {
+  if (!asin || !ref) return false;
+  const r = {
+    m365: Number.isFinite(ref.m365) && ref.m365 > 0 ? Math.round(ref.m365 * 100) / 100 : null,
+    n365: Number(ref.n365) || 0,
+    lista: Number.isFinite(ref.lista) && ref.lista > 0 ? Math.round(ref.lista * 100) / 100 : null,
+    em: new Date().toISOString(),
+  };
+  _refK[asin] = r;
+  if (_hist[asin]) _hist[asin].refK = r;
+  agendarGravarRef();
+  return true;
+}
+export function referenciaLongaDe(asin) { return _refK[asin] || null; }
+
 /** ASINs da Amazon que conhecemos (vitrine, captura e serie), com a marca de importado. */
 export function asinsAmazonConhecidos() {
   const mapa = new Map();
@@ -691,6 +740,7 @@ export function asinsAmazonConhecidos() {
     if (!RE_ASIN_AMAZON.test(String(asin || '')) || mapa.has(asin)) return;
     const h = _hist[asin];
     mapa.set(asin, { asin, nome: nome || h?.n || '', origem, importadoEm: h?.keepaEm || null,
+                     refEm: _refK[asin]?.em || null,
                      precoAtual: h?.ult?.preco ?? null, lidoEm: h?.ult?.em ?? null });
   };
   for (const i of listarVitrine()) if (i.loja === 'Amazon') por(i.asin, i.nome, i.origemSemeadura || 'vitrine');
@@ -790,6 +840,8 @@ export async function restaurarShardsDePrecos(meses = null) {
     const cp = ler(ARQ_CAPT, {});
     if (cp && typeof cp === 'object' && !Array.isArray(cp)) _capt = cp;
   }
+  if (!Object.keys(_refK).length && await baixarArquivoDoGitHub(ARQ_REF)) carregarRefs(ler(ARQ_REF, {}));
+  else pendurarRefs();
   podarHistorico();
   console.log('[PRECOS] Shards restaurados — ' + ok + ' de ' + alvos.length + ' mes(es) ('
     + alvos.join(', ') + '), ' + Object.keys(_hist).length + ' produto(s) com serie.');
@@ -813,6 +865,7 @@ export function carregarMonitorPrecos() {
     }
   }
   podarHistorico();
+  carregarRefs(ler(ARQ_REF, {}));
   _capt   = ler(ARQ_CAPT, {});
   if (!_capt || typeof _capt !== 'object' || Array.isArray(_capt)) _capt = {};
   _epc    = ler(ARQ_EPC, { produtos: {} });
@@ -2022,8 +2075,23 @@ function linhasDePreco(h) {
     }
   }
   const r2 = v => Number.isFinite(v) ? Math.round(v * 100) / 100 : null;
+  const cheio90 = leit.length >= cfg.minCheio ? r2(medianaDe(leit)) : null;
+  // Preco cheio = o MENOR entre a mediana de 90 dias, a de 12 meses do Keepa e
+  // a tabela da Amazon (ver CFG_PADRAO.linhas.referenciaLonga). baseCheio diz
+  // de onde veio, para o card e o relatorio.
+  const ref = h.refK;
+  const refValida = ref && (Date.now() - Date.parse(ref.em || 0)) <= REF_LONGA_VALIDADE_DIAS * 86400000;
+  const cheioLongo = refValida && cfg.referenciaLonga && ref.m365 && ref.n365 >= cfg.minDiasLongo ? ref.m365 : null;
+  const tabela = refValida && cfg.tetoTabela && ref.lista ? ref.lista : null;
+  let cheio = cheio90, baseCheio = cheio90 ? '90d' : null;
+  if (cheioLongo && (!cheio || cheioLongo < cheio)) { cheio = cheioLongo; baseCheio = '12m'; }
+  if (tabela && (!cheio || tabela < cheio)) { cheio = tabela; baseCheio = 'tabela'; }
   return {
-    cheio: leit.length >= cfg.minCheio ? r2(medianaDe(leit)) : null,
+    cheio: r2(cheio),
+    baseCheio,
+    cheio90,
+    cheioLongo: r2(cheioLongo),
+    tabela: r2(tabela),
     nCheio: leit.length,
     patamarPromo: promo.length >= cfg.minPromo ? r2(medianaDe(promo)) : null,
     nPromo: promo.length,
@@ -2078,7 +2146,10 @@ export function seloDasLinhas(asin, preco) {
   const d = v.descontoRealPct;
   const pct = Number.isFinite(d) && d >= (cfg.seloMinDescontoPct ?? 5) ? Math.floor(d) + '% abaixo do preço normal' : '';
   const titulo = v.classe === 'imperdivel' ? '🔥 OFERTA IMPERDÍVEL' : '✅ BOA OFERTA';
-  return { classe: v.classe, texto: pct ? titulo + ' · ' + pct : titulo };
+  // normal/pct (21/11/2026): o "De" da mensagem passa a ser o mesmo preco
+  // normal do selo, para "De" e "% abaixo" nunca se contradizerem.
+  return { classe: v.classe, texto: pct ? titulo + ' · ' + pct : titulo,
+           normal: pct ? v.cheio : null, pct: pct ? Math.floor(d) : null, baseCheio: v.baseCheio || null };
 }
 
 // Registro das capturas julgadas pelas linhas (sombra), para medir antes de ligar.
