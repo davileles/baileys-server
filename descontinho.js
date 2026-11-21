@@ -84,7 +84,9 @@ function agendarGravarSerie() {
 }
 
 const dormir = ms => new Promise(r => setTimeout(r, ms));
-const diaSP = ts => new Date(ts).toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+// Formatador unico (21/11/2026): criar um por chamada estourava a memoria nativa.
+const _FMT_DIA_SP = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' });
+const diaSP = ts => _FMT_DIA_SP.format(new Date(ts));
 
 // Um pedido por vez a cada INTERVALO_MS (o que vem da captura so espera a vez).
 async function vez() {

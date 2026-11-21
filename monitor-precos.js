@@ -411,11 +411,16 @@ let _timerVarredura = null;
 function clonar(o) { return JSON.parse(JSON.stringify(o)); }
 
 // ── DATA / FUSO ──────────────────────────────────────────────────────────────
+// Formatadores criados UMA vez (21/11/2026): new Intl.DateTimeFormat a cada
+// chamada aloca memoria nativa do ICU que o GC quase nao ve. Com o historico
+// do Keepa (milhoes de chamadas no boot) o processo passava de 24 GB e morria.
+const _FMT_DIA_SP = new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP });
+const _FMT_HM_SP  = new Intl.DateTimeFormat('en-GB', { timeZone: TZ_SP, hour: '2-digit', minute: '2-digit', hour12: false });
 function diaSP(ts = Date.now()) {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ_SP }).format(new Date(ts));
+  return _FMT_DIA_SP.format(new Date(ts));
 }
 function minutosSP(ts = Date.now()) {
-  const p = new Intl.DateTimeFormat('en-GB', { timeZone: TZ_SP, hour: '2-digit', minute: '2-digit', hour12: false })
+  const p = _FMT_HM_SP
     .format(new Date(ts)).split(':');
   return (+p[0]) * 60 + (+p[1]);
 }

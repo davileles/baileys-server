@@ -109,7 +109,9 @@ function chave() { return String(process.env.KEEPA_API_KEY || '').trim(); }
 export function keepaConfigurado() { return !!chave(); }
 
 const dormir = ms => new Promise(r => setTimeout(r, ms));
-const diaSP = ts => new Date(ts).toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+// Formatador unico (21/11/2026): criar um por chamada estourava a memoria nativa.
+const _FMT_DIA_SP = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo' });
+const diaSP = ts => _FMT_DIA_SP.format(new Date(ts));
 const tsKeepa = t => (Number(t) + KEEPA_EPOCA_MIN) * 60000;
 
 async function chamar(caminho, params = {}, { metodo = 'GET', corpo = null } = {}) {
