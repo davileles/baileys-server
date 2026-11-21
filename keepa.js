@@ -21,6 +21,13 @@ import {
   importarSerieKeepa, gravarShardsKeepa, asinsAmazonConhecidos, definirGanchoCaptura,
   vereditoLinhas, historicoDe, epcDe, avaliarAgoraAmazon,
 } from './monitor-precos.js';
+import { registrarOkFonte, registrarFalhaFonte, fonteFora, estadoFontes } from './saude-fontes.js';
+
+// Saude (21/11/2026): queda do Keepa avisa o grupo do operador; as ofertas
+// seguem saindo sem o historico dele (regra do Davi).
+const NOME_FONTE = 'Keepa (histórico da Amazon)';
+const EFEITO_QUEDA = 'só que produto novo da Amazon é julgado sem histórico de fora';
+const falhaKeepa = (erro, grave = false) => registrarFalhaFonte('keepa', erro, { nome: NOME_FONTE, grave, efeito: EFEITO_QUEDA });
 
 const BASE = 'https://api.keepa.com';
 const DOMINIO_BR = 12;
@@ -97,14 +104,25 @@ async function chamar(caminho, params = {}, { metodo = 'GET', corpo = null } = {
   const k = chave();
   if (!k) throw new Error('KEEPA_API_KEY nao configurada no Railway');
   const qs = new URLSearchParams({ key: k, ...params });
-  const res = await fetch(BASE + caminho + '?' + qs.toString(), {
-    method: metodo,
-    headers: corpo ? { 'Content-Type': 'application/json' } : undefined,
-    body: corpo ? JSON.stringify(corpo) : undefined,
-    signal: AbortSignal.timeout(60000),
-  });
+  let res;
+  try {
+    res = await fetch(BASE + caminho + '?' + qs.toString(), {
+      method: metodo,
+      headers: corpo ? { 'Content-Type': 'application/json' } : undefined,
+      body: corpo ? JSON.stringify(corpo) : undefined,
+      signal: AbortSignal.timeout(60000),
+    });
+  } catch (e) {
+    falhaKeepa(e.name === 'TimeoutError' ? 'sem resposta em 60 s' : e.message);
+    throw e;
+  }
   let dados = null;
   try { dados = await res.json(); } catch { dados = null; }
+  // 429 = so o saldo de tokens acabou (o job espera a recarga): nao e queda.
+  // 401/402/403 = chave ou assinatura recusada: nao volta sozinho, avisa ja.
+  if (res.ok) registrarOkFonte('keepa', { nome: NOME_FONTE });
+  else if ([401, 402, 403].includes(res.status)) falhaKeepa('HTTP ' + res.status + ' — ' + (dados?.error?.message || 'chave ou assinatura recusada'), true);
+  else if (res.status >= 500 || !dados) falhaKeepa('HTTP ' + res.status);
   if (dados && Number.isFinite(dados.tokensLeft)) {
     _e.tokens = { restantes: dados.tokensLeft, recargaEmMs: dados.refillIn ?? null,
                   porMinuto: dados.refillRate ?? null, consumidos: dados.tokensConsumed ?? null,
@@ -315,6 +333,7 @@ export async function consultarKeepaAgora(asin, esperaMs = null) {
     asin = String(asin || '').trim().toUpperCase();
     const cn = _e.cfg.consultaNaHora || {};
     if (!/^B[A-Z0-9]{9}$/.test(asin) || !chave() || cn.ativo === false) return { consultou: false, motivo: 'desligado' };
+    if (fonteFora('keepa')) return { consultou: false, motivo: 'Keepa fora do ar (aviso no grupo do operador)' };
     const r0 = _e.resultados[asin];
     if (r0 && (r0.ok || (Date.now() - Date.parse(r0.em || 0)) < 7 * 86400000)) return { consultou: false, motivo: 'ja consultado', ok: !!r0.ok };
     if (Number.isFinite(_e.tokens?.restantes) && _e.tokens.restantes < 1
@@ -451,6 +470,7 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
   app.get('/keepa', soRaiz((req, res) => {
     const r = Object.values(_e.resultados);
     res.json({ ok: true, configurado: keepaConfigurado(), rodando: _rodando, cfg: _e.cfg, tokens: _e.tokens,
+               saude: estadoFontes().keepa || null,
                naFila: _e.fila.length, job: _e.job,
                radar: { rodando: _radarRodando, ultima: _e.radar?.ultima || null, historico: (_e.radar?.historico || []).slice(0, 30),
                         vistos24h: Object.keys(_e.radar?.vistos || {}).length },

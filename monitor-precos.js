@@ -49,6 +49,14 @@ const ARQ_CAPT   = 'precos_captura.json';
 // pontos de mudanca do minimo diario (nao um ponto por dia): cabe folgado no
 // ~1 MB que a Contents API devolve.
 function nomeShardKeepa(mes) { return 'precos_keepa_' + mes + '.json'; }
+// Historico externo por fonte (21/11/2026): 'keepa' (Amazon) e 'descontinho'
+// (Shopee, descontinho.app). Os dois vivem em h.diasK (o dia nosso vence) e
+// cada fonte tem os proprios arquivos, para um nao inchar o outro.
+const FONTES_EXTERNAS = { keepa: 'Amazon', descontinho: 'Shopee' };
+function nomeShardExterno(mes, fonte = 'keepa') {
+  return fonte === 'keepa' ? nomeShardKeepa(mes) : 'precos_' + fonte + '_' + mes + '.json';
+}
+const fonteDoHist = h => h?.fonteK || 'keepa';
 
 const TZ_SP = 'America/Sao_Paulo';
 
@@ -414,7 +422,7 @@ function ler(nome, padrao) {
 function gravar(nome, dados, push = true) {
   try {
     if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
-    const compacto = nome === ARQ_HIST || nome === ARQ_CAPT || /^precos_(hist|keepa)_\d{4}-\d{2}\.json$/.test(nome);
+    const compacto = nome === ARQ_HIST || nome === ARQ_CAPT || /^precos_(hist|keepa|descontinho)_\d{4}-\d{2}\.json$/.test(nome);
     writeFileSync(caminho(nome), JSON.stringify(dados, null, compacto ? 0 : 2));
     if (push) agendarPush(nome);
   } catch (e) {
@@ -552,10 +560,10 @@ function podarHistorico() {
 // h.diasK guarda o minimo diario importado do Keepa. Nao se mistura com h.dias
 // (a nossa leitura): na estatistica, o dia que temos vence; o do Keepa so
 // preenche o buraco. Em disco: pontos de mudanca por mes.
-function serializarShardKeepa(mes) {
+function serializarShardKeepa(mes, fonte = 'keepa') {
   const out = {};
   for (const [asin, h] of Object.entries(_hist)) {
-    if (!h.diasK) continue;
+    if (!h.diasK || fonteDoHist(h) !== fonte) continue;
     const dias = Object.keys(h.diasK).filter(d => mesDoDia(d) === mes).sort();
     if (!dias.length) continue;
     const ev = [];
@@ -568,17 +576,18 @@ function serializarShardKeepa(mes) {
     }
     out[asin] = { e: ev, f: dias[dias.length - 1].slice(8) };
   }
-  return { _ate: _keepaAte[mes] || null, p: out };
+  return { _ate: fonte === 'keepa' ? (_keepaAte[mes] || null) : null, p: out };
 }
 
-function fundirShardKeepa(mes, dados) {
+function fundirShardKeepa(mes, dados, fonte = 'keepa') {
   if (!dados?.p) return;
-  if (dados._ate) _keepaAte[mes] = dados._ate;
+  if (dados._ate && fonte === 'keepa') _keepaAte[mes] = dados._ate;
   for (const [asin, r] of Object.entries(dados.p)) {
     const ev = Array.isArray(r.e) ? r.e : [];
     if (!ev.length) continue;
-    const h = _hist[asin] || { n: '', loja: 'Amazon', dias: {}, diasEf: {}, diasDe: {}, ult: null };
+    const h = _hist[asin] || { n: '', loja: FONTES_EXTERNAS[fonte] || 'Amazon', dias: {}, diasEf: {}, diasDe: {}, ult: null };
     if (!h.diasK) h.diasK = {};
+    if (fonte !== 'keepa') h.fonteK = fonte;
     const fim = mes + '-' + (r.f || ev[ev.length - 1][0]);
     for (let i = 0; i < ev.length; i++) {
       const ini = mes + '-' + ev[i][0];
@@ -620,11 +629,59 @@ export function importarSerieKeepa(asin, diasMin, { nome = '', ate = null } = {}
 }
 
 /** Grava os arquivos do Keepa de toda a janela (chamado ao fim de cada lote). */
-export function gravarShardsKeepa() {
+export function gravarShardsKeepa() { gravarShardsExternos('keepa'); }
+
+/** Grava os arquivos de historico externo de uma fonte ('keepa' | 'descontinho'). */
+export function gravarShardsExternos(fonte = 'keepa') {
   for (const m of mesesNaJanela()) {
-    const s = serializarShardKeepa(m);
-    if (Object.keys(s.p).length) gravar(nomeShardKeepa(m), s);
+    const s = serializarShardKeepa(m, fonte);
+    if (Object.keys(s.p).length) gravar(nomeShardExterno(m, fonte), s);
   }
+}
+
+/**
+ * Historico externo de outra fonte (hoje: Descontinho, Shopee). Diferente do
+ * Keepa, a fonte so cobre ~30 dias: os dias novos SOMAM aos que ja estavam
+ * (o dia que a fonte trouxe agora vence o antigo). So dias antes de hoje.
+ */
+export function importarSerieExterna(id, diasMin, { nome = '', loja = 'Shopee', fonte = 'descontinho' } = {}) {
+  if (!id || !diasMin) return 0;
+  const corte = diaSP(Date.now() - DIAS_RETENCAO * 86400000);
+  const hoje = diaSP();
+  const h = _hist[id] || { n: nome || '', loja, dias: {}, diasEf: {}, diasDe: {}, ult: null };
+  // Produto que ja tem historico de outra fonte (Keepa) nao troca de fonte.
+  if (h.diasK && Object.keys(h.diasK).length && fonteDoHist(h) !== fonte) return 0;
+  h.n = h.n || nome || '';
+  h.loja = h.loja || loja;
+  h.fonteK = fonte;
+  if (!h.diasK) h.diasK = {};
+  let n = 0;
+  for (const [d, v] of Object.entries(diasMin)) {
+    if (d < corte || d >= hoje || !Number.isFinite(v) || v <= 0) continue;
+    h.diasK[d] = Math.round(v * 100) / 100;
+    n++;
+  }
+  h.extEm = new Date().toISOString();
+  _hist[id] = h;
+  return n;
+}
+
+/** Produtos de uma loja que conhecemos (vitrine, captura e serie), com a ultima vez vistos. */
+export function produtosConhecidosDaLoja(loja) {
+  const mapa = new Map();
+  const por = (id, nome, origem) => {
+    id = String(id || '');
+    if (!id || mapa.has(id)) return;
+    const h = _hist[id];
+    const dias = Object.keys(h?.dias || {}).sort();
+    mapa.set(id, { id, nome: nome || h?.n || '', origem, extEm: h?.extEm || null,
+                   precoAtual: h?.ult?.preco ?? null,
+                   vistoEm: h?.ult?.em || (dias.length ? dias[dias.length - 1] : null) });
+  };
+  for (const i of listarVitrine()) if (i.loja === loja) por(i.asin, i.nome, i.origemSemeadura || 'vitrine');
+  for (const i of Object.values(_capt)) if (i.loja === loja) por(i.asin, i.nome, 'captura');
+  for (const [id, h] of Object.entries(_hist)) if (h.loja === loja) por(id, h.n, 'serie');
+  return [...mapa.values()];
 }
 
 /** ASINs da Amazon que conhecemos (vitrine, captura e serie), com a marca de importado. */
@@ -721,10 +778,12 @@ export async function restaurarShardsDePrecos(meses = null) {
     if (d) fundirShard(m, d);
   }
   // Keepa e captura (20/11/2026): nomes dinamicos/novos, mesmo motivo.
-  for (const m of alvos) {
-    if (await baixarArquivoDoGitHub(nomeShardKeepa(m))) {
-      const k = ler(nomeShardKeepa(m), null);
-      if (k) fundirShardKeepa(m, k);
+  for (const fonte of Object.keys(FONTES_EXTERNAS)) {
+    for (const m of alvos) {
+      if (await baixarArquivoDoGitHub(nomeShardExterno(m, fonte))) {
+        const k = ler(nomeShardExterno(m, fonte), null);
+        if (k) fundirShardKeepa(m, k, fonte);
+      }
     }
   }
   if (!Object.keys(_capt).length && await baixarArquivoDoGitHub(ARQ_CAPT)) {
@@ -747,9 +806,11 @@ export function carregarMonitorPrecos() {
     if (d) fundirShard(m, d);
   }
   if (!Object.keys(_hist).length) migrarHistoricoUnico();
-  for (const m of [...mesesNaJanela()].reverse()) {
-    const k = ler(nomeShardKeepa(m), null);
-    if (k) fundirShardKeepa(m, k);
+  for (const fonte of Object.keys(FONTES_EXTERNAS)) {
+    for (const m of [...mesesNaJanela()].reverse()) {
+      const k = ler(nomeShardExterno(m, fonte), null);
+      if (k) fundirShardKeepa(m, k, fonte);
+    }
   }
   podarHistorico();
   _capt   = ler(ARQ_CAPT, {});

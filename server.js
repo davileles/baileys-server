@@ -89,6 +89,8 @@ import {
   conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie, relatorioLinhas,
 } from './monitor-precos.js';
 import { registrarRotasKeepa, consultarKeepaAgora } from './keepa.js';
+import { registrarRotasDescontinho, historicoShopeeNaHora } from './descontinho.js';
+import { definirAlertaFontes, estadoFontes } from './saude-fontes.js';
 import {
   carregarNotaOferta, configNotaOferta, salvarConfigNotaOferta, registrarCapturaFonte,
   avaliarNotaOferta, relatorioNotas,
@@ -10321,6 +10323,14 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         if (_k?.consultou) console.log('[KEEPA] #' + oferta.id + ' ' + p.asin + ' consultado na hora — '
           + (_k.ok ? _k.dias + ' dia(s) de historico' : (_k.motivo || 'sem historico')));
       } catch (e) { /* Keepa nunca segura o pipeline */ }
+    }
+    // Shopee sem consulta recente: historico do Descontinho (ate 2,5 s, API
+    // publica). Erro, prazo estourado ou fonte fora = segue sem (21/11/2026).
+    if (p.loja === 'Shopee' && p.asin && !oferta.dadosExtraidos.precoDeReferencia) {
+      try {
+        const _d = await historicoShopeeNaHora(p.asin);
+        if (_d?.usado) console.log('[DESCONTINHO] #' + oferta.id + ' ' + p.asin + ' — ' + _d.dias + ' dia(s) de historico');
+      } catch (e) { /* Descontinho nunca segura o pipeline */ }
     }
     let _filtro = null;
     if (!oferta.dadosExtraidos.precoDeReferencia) {
@@ -23184,6 +23194,15 @@ app.get('/monitor-precos/linhas', (req, res) => {
 
 // Keepa (historico da Amazon, 1 mes de assinatura): /keepa, /keepa/{config,teste,importar,parar,quedas,categorias}
 registrarRotasKeepa(app, { exigeRaiz: ehAdminRaiz });   // so raiz logada: toda rota gasta token da assinatura
+// Descontinho (historico da Shopee): /descontinho, /descontinho/{config,teste,importar,parar}
+registrarRotasDescontinho(app, { exigeRaiz: ehAdminRaiz });
+// Queda do Keepa/Descontinho: aviso (e o "voltou") no grupo do operador. As
+// ofertas seguem saindo sem o historico de fora (21/11/2026, regra do Davi).
+definirAlertaFontes(a => registrarAlerta(a));
+app.get('/fontes-historico', (req, res) => {
+  if (!ehAdminRaiz(req)) return res.status(403).json({ ok: false, erro: 'somente o administrador autenticado' });
+  res.json({ ok: true, fontes: estadoFontes() });
+});
 
 app.get('/monitor-precos/epc', (req, res) => {
   res.json({ ok:true, estado: estadoEpc(),

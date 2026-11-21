@@ -108,7 +108,7 @@ const RE_NOME_HISTORICO = /^historico_envios_\d{4}-\d{2}\.json$/;
 // com a serie efetiva em paralelo, um arquivo unico passaria de 1 MB em poucos
 // meses — e acima disso a Contents API para de devolver o conteudo na leitura,
 // matando a restauracao pos-deploy em silencio.
-const RE_NOME_PRECOS = /^precos_(hist|keepa)_\d{4}-\d{2}\.json$/;   // keepa: historico importado da Amazon (20/11/2026)
+const RE_NOME_PRECOS = /^precos_(hist|keepa|descontinho)_\d{4}-\d{2}\.json$/;   // keepa: historico importado da Amazon (20/11/2026)
 // Shards diarios do mapa de links rastreados (links_rastreio_2026-09-15.json).
 // Diario, e nao mensal, porque o proxy le o shard no clique quando o servidor
 // esta fora: arquivo pequeno = fallback rapido. Sobem por agendarPush e sao
