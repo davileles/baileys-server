@@ -23174,7 +23174,7 @@ app.get('/monitor-precos/linhas', (req, res) => {
 });
 
 // Keepa (historico da Amazon, 1 mes de assinatura): /keepa, /keepa/{config,teste,importar,parar,quedas,categorias}
-registrarRotasKeepa(app);
+registrarRotasKeepa(app, { exigeRaiz: ehAdminRaiz });   // so raiz logada: toda rota gasta token da assinatura
 
 app.get('/monitor-precos/epc', (req, res) => {
   res.json({ ok:true, estado: estadoEpc(),

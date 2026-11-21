@@ -262,7 +262,13 @@ export async function quedasPorCategoria({ categoria = null, deltaMinPct = null,
 }
 
 // ── ROTAS ───────────────────────────────────────────────────────────────────
-export function registrarRotasKeepa(app) {
+export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
+  // Toda rota do Keepa gasta token da assinatura (ou mostra o estado dela):
+  // so a raiz logada usa. Sem a funcao de checagem, nada abre.
+  const soRaiz = h => (req, res) => {
+    if (typeof exigeRaiz !== 'function' || !exigeRaiz(req)) return res.status(403).json({ ok: false, erro: 'somente o administrador autenticado' });
+    return h(req, res);
+  };
   // ASIN novo na vigilancia de captura -> fila do import (so com chave e config ligada).
   definirGanchoCaptura((asin, loja) => {
     if (loja !== 'Amazon' || !chave() || !_e.cfg.capturaNaHora) return;
@@ -272,16 +278,16 @@ export function registrarRotasKeepa(app) {
     if (!_rodando) setTimeout(() => rodarFila().catch(e => console.warn('[KEEPA] Fila falhou:', e.message)), 5000);
   });
 
-  app.get('/keepa', (req, res) => {
+  app.get('/keepa', soRaiz((req, res) => {
     const r = Object.values(_e.resultados);
     res.json({ ok: true, configurado: keepaConfigurado(), rodando: _rodando, cfg: _e.cfg, tokens: _e.tokens,
                naFila: _e.fila.length, job: _e.job,
                resultados: { total: r.length, ok: r.filter(x => x.ok).length, recusados: r.filter(x => !x.ok).length,
                              exemplosRecusados: Object.entries(_e.resultados).filter(([, x]) => !x.ok).slice(0, 15)
                                .map(([asin, x]) => ({ asin, motivo: x.motivo })) } });
-  });
+  }));
 
-  app.post('/keepa/config', (req, res) => {
+  app.post('/keepa/config', soRaiz((req, res) => {
     const b = req.body || {};
     if (['menor', 'amazon', 'novo'].includes(b.fonte)) _e.cfg.fonte = b.fonte;
     if (typeof b.capturaNaHora === 'boolean') _e.cfg.capturaNaHora = b.capturaNaHora;
@@ -293,10 +299,10 @@ export function registrarRotasKeepa(app) {
     }
     salvar();
     res.json({ ok: true, cfg: _e.cfg });
-  });
+  }));
 
   // Teste com 1 ASIN: mostra a serie lida e a conferencia, SEM gravar nada.
-  app.post('/keepa/teste', async (req, res) => {
+  app.post('/keepa/teste', soRaiz(async (req, res) => {
     try {
       const asin = String(req.body?.asin || req.query.asin || '').trim().toUpperCase();
       if (!/^B[A-Z0-9]{9}$/.test(asin)) return res.status(400).json({ ok: false, erro: 'asin invalido' });
@@ -308,25 +314,25 @@ export function registrarRotasKeepa(app) {
       res.json({ ok: true, asin, titulo: p.title || null, fonte: _e.cfg.fonte, dias: dias.length,
                  ultimos: dias.slice(-15).map(d => ({ d, v: serie[d] })), conferencia: c, tokens: _e.tokens });
     } catch (e) { res.status(500).json({ ok: false, erro: e.message, tokens: _e.tokens }); }
-  });
+  }));
 
-  app.post('/keepa/importar', (req, res) => {
+  app.post('/keepa/importar', soRaiz((req, res) => {
     if (!chave()) return res.status(400).json({ ok: false, erro: 'KEEPA_API_KEY nao configurada' });
     const f = montarFila({ reimportar: req.body?.reimportar === true, limite: Number(req.body?.limite) || null });
     if (!_rodando) rodarFila().catch(e => console.warn('[KEEPA] Import falhou:', e.message));
     res.json({ ok: true, ...f, rodando: true });
-  });
+  }));
 
-  app.post('/keepa/parar', (req, res) => { _parar = true; res.json({ ok: true, naFila: _e.fila.length }); });
+  app.post('/keepa/parar', soRaiz((req, res) => { _parar = true; res.json({ ok: true, naFila: _e.fila.length }); }));
 
-  app.get('/keepa/quedas', async (req, res) => {
+  app.get('/keepa/quedas', soRaiz(async (req, res) => {
     try { res.json({ ok: true, ...(await quedasPorCategoria({ categoria: req.query.categoria || null,
       deltaMinPct: req.query.min ?? null, periodo: req.query.periodo ?? null, pagina: req.query.pagina || 0 })) }); }
     catch (e) { res.status(500).json({ ok: false, erro: e.message, tokens: _e.tokens }); }
-  });
+  }));
 
   // Busca de categoria (para achar o id de Bebidas, Ferramentas...).
-  app.get('/keepa/categorias', async (req, res) => {
+  app.get('/keepa/categorias', soRaiz(async (req, res) => {
     try {
       const termo = String(req.query.termo || '').trim();
       if (!termo) return res.status(400).json({ ok: false, erro: 'informe ?termo=' });
@@ -334,7 +340,7 @@ export function registrarRotasKeepa(app) {
       const cats = Object.values(d?.categories || {}).map(c => ({ id: c.catId, nome: c.name, pai: c.parent ?? null, produtos: c.productCount ?? null }));
       res.json({ ok: true, categorias: cats, tokens: _e.tokens });
     } catch (e) { res.status(500).json({ ok: false, erro: e.message, tokens: _e.tokens }); }
-  });
+  }));
 
   // Fila que ficou de um boot anterior volta a rodar sozinha (so com chave).
   if (chave() && _e.fila.length) setTimeout(() => rodarFila().catch(() => {}), 90000);
