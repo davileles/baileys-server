@@ -2275,6 +2275,9 @@ export function expurgarVigilancia({ forcar = 0, simular = false } = {}) {
  */
 function ehCamadaQuente(item) {
   if (item.origemSemeadura === 'captura') return false;
+  // Radar do Keepa: quente nos 3 primeiros dias (a queda costuma durar pouco),
+  // depois segue a regra da captura.
+  if (item.origemSemeadura === 'keepa-radar') return (Date.now() - (Date.parse(item.capturadoEm || item.criadoEm || 0) || 0)) < 3 * 86400000;
   if (item.origemSemeadura !== 'divulgacao') return true;
   // Semeado por divulgacao mas curado pelo operador (nicho) ou em rotacao de
   // disparo manual: e base de trabalho diaria, precisa de leitura fresca.
@@ -2288,7 +2291,7 @@ function ehCamadaQuente(item) {
 /** Item frio ja lido dentro do intervalo da camada fria pode ser pulado. */
 function friaJaLidaHoje(item) {
   const h = _hist[item.asin];
-  if (item.origemSemeadura === 'captura') {
+  if (item.origemSemeadura === 'captura' || item.origemSemeadura === 'keepa-radar') {
     // A captura atualiza ult.em; o que conta aqui e a ultima leitura NOSSA.
     const cc = _cfg.vigilancia?.captura || CFG_PADRAO.vigilancia.captura;
     const nova = (Date.now() - (Date.parse(item.criadoEm || 0) || 0)) < cc.diariaDias * 86400000;
@@ -2300,6 +2303,118 @@ function friaJaLidaHoje(item) {
   const ultimo = carimbo ? Date.parse(carimbo) : 0;
   if (!ultimo) return false;
   return (Date.now() - ultimo) < _cfg.varredura.friaCadaDias * 86400000;
+}
+
+// Grava a leitura na serie e decide se vira candidato. Uma regra so para a
+// varredura e para o radar do Keepa (avaliarAgoraAmazon).
+function processarLeituraVarredura(item, leitura, resumo, aprovadosRodada) {
+  // Cupom vigente AGORA, para a serie efetiva. Calculado na varredura porque
+  // e aqui que se sabe qual era o cupom naquele instante — reconstruir isso
+  // depois seria impossivel: cupom expira e some da base.
+  let descontoAgora = 0;
+  if (_cfg.publicacao.aplicarCupom && Number.isFinite(leitura.preco)) {
+    try { descontoAgora = cupomVinculado(item, leitura.preco)?.desconto || 0; }
+    catch (e) { descontoAgora = 0; }
+  }
+  // A loja tem uma oferta suspeita na frente (ML): o preco dela pode ja estar
+  // na serie, de varreduras anteriores a trava. Sai antes de a leitura boa
+  // entrar — registrarPreco guarda o MINIMO do dia e manteria o falso.
+  if (leitura.ofertaSuspeita?.preco) {
+    try {
+      const ex = expurgarLeiturasDaSerie(item.asin, { preco: leitura.ofertaSuspeita.preco });
+      if (ex.removidos?.length) resumo.expurgadas = (resumo.expurgadas || 0) + ex.removidos.length;
+    } catch (e) { console.warn('[PRECOS] Expurgo de ' + item.asin + ' falhou:', e.message); }
+    resumo.suspeitas = (resumo.suspeitas || 0) + 1;
+  }
+  registrarPreco(item.asin, {
+    nome: leitura.titulo || item.nome, loja: item.loja,
+    preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
+    itemId: leitura.itemId || null,
+    precoEfetivo: Number.isFinite(leitura.preco) ? leitura.preco - descontoAgora : null,
+  });
+  // Loja respondeu sem preco = sem oferta ativa. Marca para a ultima leitura
+  // boa parar de se passar por preco atual (ver registrarSemOferta).
+  if (!Number.isFinite(leitura.preco) || leitura.preco <= 0) {
+    registrarSemOferta(item.asin, { nome: leitura.titulo || item.nome, loja: item.loja,
+      motivo: 'loja respondeu sem preco (esgotado ou sem oferta ativa)' });
+    resumo.semOferta = (resumo.semOferta || 0) + 1;
+  }
+  resumo.lidos++;
+
+  // Estatistica do PRODUTO quando ha grupo: o gatilho compara contra o menor
+  // preco historico entre as lojas, nao contra a historia daquela loja so.
+  const stats = estatisticasParaGatilho(item);
+  const { nicho, curado } = nichoDoProduto(item, leitura.titulo);
+  const av = avaliar(item, leitura, stats, nicho, curado);
+  resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
+  const soSerie = item.origemSemeadura === 'captura' && !_cfg.vigilancia?.captura?.geraCandidato;
+  // Radar do Keepa: alem do avaliar, so vira candidato com as linhas de
+  // preco dizendo imperdivel ou boa (queda real contra o preco cheio).
+  if (av.passou && !soSerie && item.origemSemeadura === 'keepa-radar') {
+    let cls = null;
+    try { cls = vereditoLinhas(item.asin, leitura.preco)?.classe || null; } catch { cls = null; }
+    if (cls !== 'imperdivel' && cls !== 'boa') {
+      resumo.radarBarrados = (resumo.radarBarrados || 0) + 1;
+      resumo.porMotivo['radar keepa: linhas ' + (cls || 'sem base')] = (resumo.porMotivo['radar keepa: linhas ' + (cls || 'sem base')] || 0) + 1;
+      return;
+    }
+    av.origemRadar = 'keepa';
+    av.classeLinhas = cls;
+  }
+  if (av.passou && !soSerie) { enfileirar(av); resumo.candidatos++; aprovadosRodada.push({ av, item }); }
+}
+
+// ── RADAR DO KEEPA (21/11/2026) ─────────────────────────────────────────────
+/**
+ * Produtos que o /deal do Keepa apontou com queda. Entram na vigilancia (origem
+ * 'keepa-radar', fora da vitrine, geram candidato), o preco e lido agora na
+ * Creators API e a leitura passa pela MESMA avaliacao da varredura — e, alem
+ * dela, pelas linhas de preco (so imperdivel/boa). O candidato vai para a fila
+ * do publicador, que decide modo, janela, cota e roteamento como sempre.
+ */
+export async function avaliarAgoraAmazon(itens, { origem = 'keepa-radar' } = {}) {
+  const resumo = { lidos: 0, falhas: 0, candidatos: 0, porMotivo: {}, erros: [] };
+  const aprovados = [];
+  const agora = new Date().toISOString();
+  const alvo = [];
+  for (const x of itens || []) {
+    const asin = String(x?.asin || '').trim().toUpperCase();
+    if (!RE_ASIN_AMAZON.test(asin)) continue;
+    const vit = itemVitrine(asin);
+    if (vit) { alvo.push(vit); continue; }
+    let it = _capt[asin];
+    if (!it) {
+      it = _capt[asin] = { asin, loja: 'Amazon', nome: String(x.nome || '').slice(0, 120), url: 'https://www.amazon.com.br/dp/' + asin,
+                           criadoEm: agora, capturadoEm: agora, capturas: 1, origemSemeadura: origem };
+    } else {
+      it.capturadoEm = agora;
+      if (it.origemSemeadura === 'captura') it.origemSemeadura = origem;
+    }
+    alvo.push(it);
+  }
+  agendarGravarCapt();
+  for (let i = 0; i < alvo.length; i += 10) {
+    const lote = alvo.slice(i, i + 10);
+    try {
+      const mapa = await lerPrecosAmazon(lote);
+      for (const item of lote) {
+        const leitura = mapa.get(item.asin);
+        if (!leitura) { resumo.falhas++; continue; }
+        try { processarLeituraVarredura(item, leitura, resumo, aprovados); }
+        catch (e) { resumo.falhas++; if (resumo.erros.length < 10) resumo.erros.push({ asin: item.asin, erro: e.message }); }
+      }
+    } catch (e) {
+      resumo.falhas += lote.length;
+      if (resumo.erros.length < 10) resumo.erros.push({ erro: e.message });
+    }
+    if (i + 10 < alvo.length) await new Promise(r => setTimeout(r, _cfg.varredura.pausaMs));
+  }
+  podarFila();
+  try { avisarCandidatos(aprovados); } catch (e) { /* aviso nunca segura o radar */ }
+  gravarShardCorrente();
+  gravar(ARQ_ESTADO, _estado);
+  resumo.aprovados = aprovados.map(({ av }) => ({ asin: av.asin, nome: av.nome || null, preco: av.preco ?? null, classe: av.classeLinhas || null }));
+  return resumo;
 }
 
 // ── VARREDURA ────────────────────────────────────────────────────────────────
@@ -2315,49 +2430,7 @@ export async function varrer({ manual = false } = {}) {
   // Grava a leitura na serie e decide se vira candidato. Compartilhado pelos
   // dois caminhos de leitura (lote da Amazon e item a item das outras lojas)
   // para que a REGRA seja uma so — duplicar isso seria criar duas verdades.
-  const processar = (item, leitura) => {
-    // Cupom vigente AGORA, para a serie efetiva. Calculado na varredura porque
-    // e aqui que se sabe qual era o cupom naquele instante — reconstruir isso
-    // depois seria impossivel: cupom expira e some da base.
-    let descontoAgora = 0;
-    if (_cfg.publicacao.aplicarCupom && Number.isFinite(leitura.preco)) {
-      try { descontoAgora = cupomVinculado(item, leitura.preco)?.desconto || 0; }
-      catch (e) { descontoAgora = 0; }
-    }
-    // A loja tem uma oferta suspeita na frente (ML): o preco dela pode ja estar
-    // na serie, de varreduras anteriores a trava. Sai antes de a leitura boa
-    // entrar — registrarPreco guarda o MINIMO do dia e manteria o falso.
-    if (leitura.ofertaSuspeita?.preco) {
-      try {
-        const ex = expurgarLeiturasDaSerie(item.asin, { preco: leitura.ofertaSuspeita.preco });
-        if (ex.removidos?.length) resumo.expurgadas = (resumo.expurgadas || 0) + ex.removidos.length;
-      } catch (e) { console.warn('[PRECOS] Expurgo de ' + item.asin + ' falhou:', e.message); }
-      resumo.suspeitas = (resumo.suspeitas || 0) + 1;
-    }
-    registrarPreco(item.asin, {
-      nome: leitura.titulo || item.nome, loja: item.loja,
-      preco: leitura.preco, precoDe: leitura.precoDe, disponivel: leitura.disponivel,
-      itemId: leitura.itemId || null,
-      precoEfetivo: Number.isFinite(leitura.preco) ? leitura.preco - descontoAgora : null,
-    });
-    // Loja respondeu sem preco = sem oferta ativa. Marca para a ultima leitura
-    // boa parar de se passar por preco atual (ver registrarSemOferta).
-    if (!Number.isFinite(leitura.preco) || leitura.preco <= 0) {
-      registrarSemOferta(item.asin, { nome: leitura.titulo || item.nome, loja: item.loja,
-        motivo: 'loja respondeu sem preco (esgotado ou sem oferta ativa)' });
-      resumo.semOferta = (resumo.semOferta || 0) + 1;
-    }
-    resumo.lidos++;
-
-    // Estatistica do PRODUTO quando ha grupo: o gatilho compara contra o menor
-    // preco historico entre as lojas, nao contra a historia daquela loja so.
-    const stats = estatisticasParaGatilho(item);
-    const { nicho, curado } = nichoDoProduto(item, leitura.titulo);
-    const av = avaliar(item, leitura, stats, nicho, curado);
-    resumo.porMotivo[av.motivo] = (resumo.porMotivo[av.motivo] || 0) + 1;
-    const soSerie = item.origemSemeadura === 'captura' && !_cfg.vigilancia?.captura?.geraCandidato;
-    if (av.passou && !soSerie) { enfileirar(av); resumo.candidatos++; aprovadosRodada.push({ av, item }); }
-  };
+  const processar = (item, leitura) => processarLeituraVarredura(item, leitura, resumo, aprovadosRodada);
 
   const falhar = (item, msg) => {
     resumo.falhas++;

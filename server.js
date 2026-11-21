@@ -88,7 +88,7 @@ import {
   recusarCandidato, curadoriaEstado, curadoriaRemover,
   conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie, relatorioLinhas,
 } from './monitor-precos.js';
-import { registrarRotasKeepa } from './keepa.js';
+import { registrarRotasKeepa, consultarKeepaAgora } from './keepa.js';
 import {
   carregarNotaOferta, configNotaOferta, salvarConfigNotaOferta, registrarCapturaFonte,
   avaliarNotaOferta, relatorioNotas,
@@ -10313,6 +10313,15 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // Produto com serie madura so sai sozinho se o preco caiu de verdade. Em
     // 'sombra' so registra; em 'ativo' o vetado vai para a fila com o motivo,
     // e o operador ainda pode aprovar na mao.
+    // Amazon sem historico do Keepa: busca agora (ate 3 s, 1 token) para o
+    // filtro julgar com a serie do Keepa em vez de "serie curta" (21/11/2026).
+    if (p.loja === 'Amazon' && p.asin && !oferta.dadosExtraidos.precoDeReferencia) {
+      try {
+        const _k = await consultarKeepaAgora(p.asin);
+        if (_k?.consultou) console.log('[KEEPA] #' + oferta.id + ' ' + p.asin + ' consultado na hora — '
+          + (_k.ok ? _k.dias + ' dia(s) de historico' : (_k.motivo || 'sem historico')));
+      } catch (e) { /* Keepa nunca segura o pipeline */ }
+    }
     let _filtro = null;
     if (!oferta.dadosExtraidos.precoDeReferencia) {
       try {

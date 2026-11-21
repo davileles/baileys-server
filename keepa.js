@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import {
   importarSerieKeepa, gravarShardsKeepa, asinsAmazonConhecidos, definirGanchoCaptura,
-  vereditoLinhas, historicoDe,
+  vereditoLinhas, historicoDe, epcDe, avaliarAgoraAmazon,
 } from './monitor-precos.js';
 
 const BASE = 'https://api.keepa.com';
@@ -41,6 +41,23 @@ const CFG_PADRAO = {
   // Divergencia tolerada entre o preco atual do Keepa e a nossa ultima leitura
   // antes de recusar o historico do produto (unidade errada, variacao trocada).
   divergenciaMax: 0.5,
+  // Tokens que o import em lote deixa livres: a consulta na hora (produto novo
+  // capturado) e o radar passam na frente do import (21/11/2026).
+  reservaTokens: 60,
+  consultaNaHora: { ativo: true, esperaMs: 3000 },
+  // Radar (21/11/2026, decisao do Davi: ATIVO): o /deal aponta quedas por
+  // categoria; cada ASIN novo ganha o historico do Keepa e passa pela mesma
+  // avaliacao do monitor + linhas de preco (so imperdivel/boa). O candidato vai
+  // para a fila do publicador do monitor (modo, janela, cota, roteamento).
+  radar: {
+    ativo: true, intervaloMin: 20, inicio: 8, fim: 21, periodo: 1, porCategoria: 20, dedupeHoras: 24,
+    categorias: [
+      { nome: 'Bebidas', id: 19778003011, deltaMinPct: 15 },
+      { nome: 'Bebês', id: 17242603011, deltaMinPct: 20 },
+      { nome: 'Ferramentas', id: 16957182011, deltaMinPct: 20 },
+      { nome: 'Gerais', id: null, deltaMinPct: 30 },   // sem categoria, criterio mais duro; exclui as de cima
+    ],
+  },
 };
 
 let _e = carregar();
@@ -51,12 +68,16 @@ function carregar() {
   try {
     if (existsSync(ARQ)) {
       const d = JSON.parse(readFileSync(ARQ, 'utf-8'));
-      return { cfg: { ...CFG_PADRAO, ...(d.cfg || {}), quedas: { ...CFG_PADRAO.quedas, ...(d.cfg?.quedas || {}) } },
+      return { cfg: { ...CFG_PADRAO, ...(d.cfg || {}), quedas: { ...CFG_PADRAO.quedas, ...(d.cfg?.quedas || {}) },
+                      consultaNaHora: { ...CFG_PADRAO.consultaNaHora, ...(d.cfg?.consultaNaHora || {}) },
+                      radar: { ...CFG_PADRAO.radar, ...(d.cfg?.radar || {}) } },
                fila: Array.isArray(d.fila) ? d.fila : [], job: d.job || null, tokens: d.tokens || null,
-               resultados: d.resultados || {} };
+               resultados: d.resultados || {}, radar: d.radar || { vistos: {}, ultima: null, historico: [] } };
     }
   } catch (e) { console.warn('[KEEPA] Estado ilegivel, recomecando:', e.message); }
-  return { cfg: { ...CFG_PADRAO, quedas: { ...CFG_PADRAO.quedas } }, fila: [], job: null, tokens: null, resultados: {} };
+  return { cfg: { ...CFG_PADRAO, quedas: { ...CFG_PADRAO.quedas }, consultaNaHora: { ...CFG_PADRAO.consultaNaHora },
+                 radar: { ...CFG_PADRAO.radar } },
+           fila: [], job: null, tokens: null, resultados: {}, radar: { vistos: {}, ultima: null, historico: [] } };
 }
 function salvar() {
   try {
@@ -171,12 +192,33 @@ function aplicarProduto(prod, { gravarSerie = true } = {}) {
 }
 
 // ── JOB DE IMPORTACAO ───────────────────────────────────────────────────────
+// Produto com clique no nosso link (ledger de EPC) vai primeiro: e o que a
+// gente ja sabe que vende. Ordem estavel para o resto.
+function cliquesDe(asin) { try { return epcDe(asin)?.cliques || 0; } catch { return 0; } }
+function ordenarFilaPorCliques() {
+  const pos = new Map(_e.fila.map((a, i) => [a, i]));
+  _e.fila.sort((a, b) => (cliquesDe(b) - cliquesDe(a)) || (pos.get(a) - pos.get(b)));
+}
+
+let _shardTimer = null;
+function agendarShards() {
+  if (_shardTimer) return;
+  _shardTimer = setTimeout(() => { _shardTimer = null; try { gravarShardsKeepa(); } catch (e) { console.warn('[KEEPA] Shards:', e.message); } }, 60000);
+  if (_shardTimer.unref) _shardTimer.unref();
+}
+
+function registrarResultado(asin, r) {
+  _e.resultados[asin] = { ok: r.ok, motivo: r.motivo || null, dias: r.dias || 0, razao: r.razao ?? null, em: new Date().toISOString() };
+  const i = _e.fila.indexOf(asin);
+  if (i >= 0) _e.fila.splice(i, 1);
+}
 export function montarFila({ reimportar = false, limite = null } = {}) {
   const conhecidos = asinsAmazonConhecidos();
   const ja = new Set(_e.fila);
   let novos = conhecidos.filter(x => (reimportar || !x.importadoEm) && !ja.has(x.asin)).map(x => x.asin);
   if (Number.isFinite(limite) && limite > 0) novos = novos.slice(0, limite);
   _e.fila.push(...novos);
+  ordenarFilaPorCliques();
   salvar();
   return { adicionados: novos.length, naFila: _e.fila.length, conhecidos: conhecidos.length };
 }
@@ -185,13 +227,15 @@ async function rodarFila() {
   if (_rodando) return;
   _rodando = true; _parar = false;
   const job = _e.job = { inicio: new Date().toISOString(), fim: null, ok: 0, falhas: 0, recusados: 0, erros: [], ultimoLote: null };
+  ordenarFilaPorCliques();
   salvar();
   try {
     while (_e.fila.length && !_parar) {
       if (!chave()) { job.erros.push('chave removida'); break; }
       const disp = _e.tokens?.restantes;
       // Sem saldo conhecido: lote pequeno para descobrir. Saldo baixo: espera a recarga.
-      let tam = Number.isFinite(disp) ? Math.min(LOTE_MAX, Math.max(0, disp)) : 10;
+      const reserva = Math.max(0, Number(_e.cfg.reservaTokens) || 0);
+      let tam = Number.isFinite(disp) ? Math.min(LOTE_MAX, Math.max(0, disp - reserva)) : 10;
       if (tam < 1) { await dormir(Math.min(Math.max(_e.tokens?.recargaEmMs || 60000, 5000), 120000)); _e.tokens.restantes = null; continue; }
       const lote = _e.fila.slice(0, tam);
       let prods;
@@ -208,11 +252,10 @@ async function rodarFila() {
       for (const p of prods) {
         vistos.add(p.asin);
         const r = aplicarProduto(p);
-        _e.resultados[p.asin] = { ok: r.ok, motivo: r.motivo || null, dias: r.dias || 0, razao: r.razao ?? null, em: new Date().toISOString() };
+        registrarResultado(p.asin, r);
         if (r.ok) job.ok++; else job.recusados++;
       }
-      for (const a of lote) if (!vistos.has(a)) _e.resultados[a] = { ok: false, motivo: 'Keepa nao devolveu', em: new Date().toISOString() };
-      _e.fila.splice(0, lote.length);
+      for (const a of lote) if (!vistos.has(a)) registrarResultado(a, { ok: false, motivo: 'Keepa nao devolveu' });
       job.ultimoLote = { em: new Date().toISOString(), tamanho: lote.length, devolvidos: prods.length };
       gravarShardsKeepa();
       salvar();
@@ -261,6 +304,133 @@ export async function quedasPorCategoria({ categoria = null, deltaMinPct = null,
   };
 }
 
+// ── CONSULTA NA HORA (21/11/2026) ───────────────────────────────────────────
+// Produto da Amazon capturado num grupo-fonte sem historico do Keepa: busca o
+// historico ANTES do filtro de disparo julgar (1 token). Espera no maximo
+// esperaMs; passou disso, o filtro segue com o que tem e o historico chega
+// para a proxima vez. Nunca lanca erro.
+const _emVoo = new Map();
+export async function consultarKeepaAgora(asin, esperaMs = null) {
+  try {
+    asin = String(asin || '').trim().toUpperCase();
+    const cn = _e.cfg.consultaNaHora || {};
+    if (!/^B[A-Z0-9]{9}$/.test(asin) || !chave() || cn.ativo === false) return { consultou: false, motivo: 'desligado' };
+    const r0 = _e.resultados[asin];
+    if (r0 && (r0.ok || (Date.now() - Date.parse(r0.em || 0)) < 7 * 86400000)) return { consultou: false, motivo: 'ja consultado', ok: !!r0.ok };
+    if (Number.isFinite(_e.tokens?.restantes) && _e.tokens.restantes < 1
+        && (Date.now() - Date.parse(_e.tokens.em || 0)) < 60000) return { consultou: false, motivo: 'sem token' };
+    let p = _emVoo.get(asin);
+    if (!p) {
+      p = (async () => {
+        const [prod] = await buscarProdutos([asin]);
+        const r = prod ? aplicarProduto(prod) : { ok: false, motivo: 'Keepa nao devolveu' };
+        registrarResultado(asin, r);
+        agendarShards(); salvar();
+        return r;
+      })().catch(e => ({ ok: false, motivo: e.message })).finally(() => _emVoo.delete(asin));
+      _emVoo.set(asin, p);
+    }
+    const lim = Number(esperaMs ?? cn.esperaMs) || 3000;
+    const r = await Promise.race([p, dormir(lim).then(() => null)]);
+    if (!r) return { consultou: true, motivo: 'demorou mais que ' + lim + ' ms (segue em segundo plano)' };
+    return { consultou: true, ok: r.ok, dias: r.dias || 0, motivo: r.motivo || null };
+  } catch (e) { return { consultou: false, motivo: e.message }; }
+}
+
+// ── RADAR (21/11/2026, ATIVO) ───────────────────────────────────────────────
+let _radarRodando = false;
+function horaSP() { return Number(new Date().toLocaleString('en-US', { timeZone: 'America/Sao_Paulo', hour: 'numeric', hour12: false })) % 24; }
+
+async function dealsDaCategoria(cat, rc, excluir) {
+  const selecao = {
+    page: 0, domainId: DOMINIO_BR, priceTypes: [0],
+    dateRange: [0, 1, 2, 3].includes(Number(rc.periodo)) ? Number(rc.periodo) : 1,
+    deltaPercentRange: [Number(cat.deltaMinPct) || 20, 100],
+    isRangeEnabled: true, isFilterEnabled: true, sortType: 4,
+  };
+  if (cat.id) selecao.includeCategories = [Number(cat.id)];
+  else if (excluir.length) selecao.excludeCategories = excluir;
+  const d = await chamar('/deal', {}, { metodo: 'POST', corpo: selecao });
+  return (Array.isArray(d?.deals?.dr) ? d.deals.dr : []).map(x => {
+    const cur = Array.isArray(x.current) ? x.current : [];
+    return { asin: x.asin, titulo: x.title || '', preco: Number(cur[0]) > 0 ? cur[0] / 100 : null,
+             quedaPct: Array.isArray(x.deltaPercent) ? x.deltaPercent : null };
+  });
+}
+
+export async function rodarRadarKeepa({ manual = false } = {}) {
+  const rc = _e.cfg.radar || {};
+  if (_radarRodando) return { ok: false, erro: 'radar ja rodando' };
+  if (!chave()) return { ok: false, erro: 'KEEPA_API_KEY nao configurada' };
+  if (!manual && rc.ativo === false) return { ok: false, erro: 'radar desligado' };
+  _radarRodando = true;
+  const t0 = Date.now();
+  const rel = { em: new Date().toISOString(), manual, porCategoria: {}, novos: 0, historicos: 0, avaliacao: null, erros: [] };
+  try {
+    const agora = Date.now();
+    const ttl = (Number(rc.dedupeHoras) || 24) * 3600000;
+    const vistos = _e.radar.vistos || (_e.radar.vistos = {});
+    for (const [a, ts] of Object.entries(vistos)) if (agora - ts > ttl) delete vistos[a];
+    const cats = Array.isArray(rc.categorias) ? rc.categorias : [];
+    const excluir = cats.filter(x => x.id).map(x => Number(x.id));
+    const escolhidos = new Map();
+    for (const cat of cats) {
+      try {
+        const lista = await dealsDaCategoria(cat, rc, excluir);
+        const novos = lista.filter(x => x.asin && x.preco && !vistos[x.asin] && !escolhidos.has(x.asin))
+          .slice(0, Number(rc.porCategoria) || 20);
+        for (const x of novos) escolhidos.set(x.asin, { ...x, categoria: cat.nome });
+        rel.porCategoria[cat.nome] = { quedas: lista.length, novos: novos.length };
+      } catch (e) {
+        rel.porCategoria[cat.nome] = { erro: e.message };
+        if (rel.erros.length < 10) rel.erros.push(cat.nome + ': ' + e.message);
+      }
+    }
+    const itens = [...escolhidos.values()];
+    rel.novos = itens.length;
+    // Historico do Keepa para quem ainda nao tem (o radar pode usar a reserva).
+    const semHist = itens.filter(x => !_e.resultados[x.asin]?.ok).map(x => x.asin);
+    for (let i = 0; i < semHist.length; i += LOTE_MAX) {
+      const lote = semHist.slice(i, i + LOTE_MAX);
+      try {
+        const prods = await buscarProdutos(lote);
+        for (const p of prods) { const r = aplicarProduto(p); registrarResultado(p.asin, r); if (r.ok) rel.historicos++; }
+      } catch (e) { if (rel.erros.length < 10) rel.erros.push('historico: ' + e.message); }
+    }
+    if (semHist.length) agendarShards();
+    for (const x of itens) vistos[x.asin] = agora;
+    if (itens.length) {
+      rel.avaliacao = await avaliarAgoraAmazon(itens.map(x => ({ asin: x.asin, nome: x.titulo })));
+      const ok = new Set((rel.avaliacao.aprovados || []).map(a => a.asin));
+      rel.candidatos = itens.filter(x => ok.has(x.asin)).map(x => ({ asin: x.asin, titulo: x.titulo.slice(0, 80), categoria: x.categoria,
+        preco: x.preco, classe: (rel.avaliacao.aprovados.find(a => a.asin === x.asin) || {}).classe || null }));
+    }
+    rel.duracaoSeg = Math.round((Date.now() - t0) / 1000);
+    rel.tokens = _e.tokens?.restantes ?? null;
+    _e.radar.ultima = rel;
+    _e.radar.historico = [{ em: rel.em, novos: rel.novos, candidatos: (rel.candidatos || []).length }, ...(_e.radar.historico || [])].slice(0, 200);
+    salvar();
+    console.log('[KEEPA] Radar — ' + rel.novos + ' queda(s) nova(s), ' + (rel.candidatos || []).length + ' candidato(s) para o publicador'
+      + Object.entries(rel.porCategoria).map(([k, v]) => ' · ' + k + ' ' + (v.erro ? 'erro' : v.novos + '/' + v.quedas)).join(''));
+    return { ok: true, ...rel };
+  } finally { _radarRodando = false; }
+}
+
+let _radarTimer = null;
+function iniciarRadar() {
+  if (_radarTimer) return;
+  _radarTimer = setInterval(() => {
+    const rc = _e.cfg.radar || {};
+    if (!chave() || rc.ativo === false || _radarRodando) return;
+    const h = horaSP();
+    if (h < (Number(rc.inicio) || 0) || h >= (Number(rc.fim) || 24)) return;
+    const ult = Date.parse(_e.radar?.ultima?.em || 0) || 0;
+    if (Date.now() - ult < (Number(rc.intervaloMin) || 20) * 60000) return;
+    rodarRadarKeepa().catch(e => console.warn('[KEEPA] Radar falhou:', e.message));
+  }, 60000);
+  if (_radarTimer.unref) _radarTimer.unref();
+}
+
 // ── ROTAS ───────────────────────────────────────────────────────────────────
 export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
   // Toda rota do Keepa gasta token da assinatura (ou mostra o estado dela):
@@ -282,6 +452,8 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
     const r = Object.values(_e.resultados);
     res.json({ ok: true, configurado: keepaConfigurado(), rodando: _rodando, cfg: _e.cfg, tokens: _e.tokens,
                naFila: _e.fila.length, job: _e.job,
+               radar: { rodando: _radarRodando, ultima: _e.radar?.ultima || null, historico: (_e.radar?.historico || []).slice(0, 30),
+                        vistos24h: Object.keys(_e.radar?.vistos || {}).length },
                resultados: { total: r.length, ok: r.filter(x => x.ok).length, recusados: r.filter(x => !x.ok).length,
                              exemplosRecusados: Object.entries(_e.resultados).filter(([, x]) => !x.ok).slice(0, 15)
                                .map(([asin, x]) => ({ asin, motivo: x.motivo })) } });
@@ -296,6 +468,24 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
       if (Array.isArray(b.quedas.categorias)) _e.cfg.quedas.categorias = b.quedas.categorias.map(Number).filter(Boolean);
       if (Number.isFinite(Number(b.quedas.deltaMinPct))) _e.cfg.quedas.deltaMinPct = Number(b.quedas.deltaMinPct);
       if ([0, 1, 2, 3].includes(Number(b.quedas.periodo))) _e.cfg.quedas.periodo = Number(b.quedas.periodo);
+    }
+    if (Number.isFinite(Number(b.reservaTokens)) && b.reservaTokens >= 0 && b.reservaTokens <= 1000) _e.cfg.reservaTokens = Number(b.reservaTokens);
+    if (b.consultaNaHora && typeof b.consultaNaHora === 'object') {
+      if (typeof b.consultaNaHora.ativo === 'boolean') _e.cfg.consultaNaHora.ativo = b.consultaNaHora.ativo;
+      const em = Number(b.consultaNaHora.esperaMs);
+      if (Number.isFinite(em) && em >= 500 && em <= 15000) _e.cfg.consultaNaHora.esperaMs = em;
+    }
+    if (b.radar && typeof b.radar === 'object') {
+      const r = _e.cfg.radar;
+      if (typeof b.radar.ativo === 'boolean') r.ativo = b.radar.ativo;
+      for (const k of ['intervaloMin', 'inicio', 'fim', 'periodo', 'porCategoria', 'dedupeHoras']) {
+        const v = Number(b.radar[k]);
+        if (b.radar[k] !== undefined && Number.isFinite(v) && v >= 0 && v <= 1440) r[k] = v;
+      }
+      if (Array.isArray(b.radar.categorias)) {
+        r.categorias = b.radar.categorias.filter(x => x && x.nome).map(x => ({ nome: String(x.nome).slice(0, 40),
+          id: x.id ? Number(x.id) : null, deltaMinPct: Number(x.deltaMinPct) || 20 }));
+      }
     }
     salvar();
     res.json({ ok: true, cfg: _e.cfg });
@@ -323,6 +513,11 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
     res.json({ ok: true, ...f, rodando: true });
   }));
 
+  app.post('/keepa/radar/rodar', soRaiz(async (req, res) => {
+    try { res.json(await rodarRadarKeepa({ manual: true })); }
+    catch (e) { res.status(500).json({ ok: false, erro: e.message, tokens: _e.tokens }); }
+  }));
+
   app.post('/keepa/parar', soRaiz((req, res) => { _parar = true; res.json({ ok: true, naFila: _e.fila.length }); }));
 
   app.get('/keepa/quedas', soRaiz(async (req, res) => {
@@ -344,4 +539,5 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
 
   // Fila que ficou de um boot anterior volta a rodar sozinha (so com chave).
   if (chave() && _e.fila.length) setTimeout(() => rodarFila().catch(() => {}), 90000);
+  iniciarRadar();
 }
