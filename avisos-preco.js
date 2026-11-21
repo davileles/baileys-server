@@ -134,6 +134,7 @@ function estruturar(bruto) {
     mensagens: Array.isArray(e.mensagens) ? e.mensagens : [],
     atendimentos: e.atendimentos && typeof e.atendimentos === 'object' ? e.atendimentos : {},
     buscaMl: e.buscaMl && typeof e.buscaMl === 'object' ? e.buscaMl : {},
+    boasVindas: e.boasVindas && typeof e.boasVindas === 'object' ? e.boasVindas : {},
     boasVindasGrupos: e.boasVindasGrupos && typeof e.boasVindasGrupos === 'object' ? e.boasVindasGrupos : {},
   };
 }
@@ -743,6 +744,7 @@ export function observarMensagemAvisos(apelido, msg, ctx = {}) {
     responder(jid, 'Pronto! 🔔 Vou te avisar por aqui quando o preço cair:\n\n' + lista
       + '\n\nSalve este número como *Tico — Tica Promos* para não perder nenhum aviso.'
       + '\n\nPor aqui você pode:\n• mandar *MEUS ALERTAS* para ver sua lista;\n• colar o link de outro produto para criar um alerta;\n• responder *SAIR* para parar todos.');
+    gruposDepoisDoAlerta(jid, numeros);
   } catch (e) { console.warn('[AVISOS] Mensagem recebida: ' + e.message); }
 }
 
@@ -903,10 +905,12 @@ function textoBoasVindas(temAlertas) {
     + (temAlertas ? '\n\nPara ver os alertas que você já tem, mande *MEUS ALERTAS*.' : '');
 }
 
-// Boas-vindas de quem não é cliente (21/11/2026, pedido do Davi): o Tico se
-// apresenta, lembra dos grupos do Tica Promos (um link por nicho, pelo
-// distribuidor — nunca convite fixo) e pede o link do produto. Sem busca por
-// nome: o link é o que dá à pessoa a noção certa do preço.
+// Boas-vindas e grupos (21/11/2026, pedido do Davi). Quem não é cliente e
+// escreve pela 1ª vez sem link: o Tico se apresenta e pede o link (sem busca
+// por nome — o link dá à pessoa a noção certa do preço). Os grupos do Tica
+// Promos vão DEPOIS que o alerta fica pronto, numa mensagem à parte, 1×/30 dias,
+// um link por nicho pelo distribuidor (nunca convite fixo). Aluno do Clube do
+// Viajante identificado pela inclusao-cdv.js não recebe os grupos do Tica.
 const GRUPOS_BOAS_VINDAS = [
   ['🛒', 'Ofertas gerais', 'geral'],
   ['🎟️', 'Só cupons', 'cupons'],
@@ -914,12 +918,16 @@ const GRUPOS_BOAS_VINDAS = [
   ['👶', 'Bebê e Kids', 'babykids'],
   ['🔧', 'Ferramentas', 'ferramentas'],
 ];
-const BOAS_VINDAS_GRUPOS_MS = 30 * MS_DIA;
-function textoBoasVindasGrupos() {
+const BOAS_VINDAS_MS = 30 * MS_DIA;
+const MEMBRO_CDV_MS = 24 * MS_H;
+const _membroCdvJid = new Map();   // jid → ts (visto com ctx.membroCdv)
+function textoBoasVindasTico() {
   return 'Oi! 👋 Eu sou o Tico, seu monitor de preços.\n\n'
-    + 'Antes de me contar o produto que você quer acompanhar, não deixe de entrar nos nossos grupos de promoções:\n\n'
-    + GRUPOS_BOAS_VINDAS.map(([ic, nome, slug]) => ic + ' *' + nome + '*: https://ir.ticapromos.com.br/' + slug + '?o=tico').join('\n')
-    + '\n\nAgora me manda o link do produto (Amazon, Mercado Livre ou Shopee) que eu fico de olho no preço pra você. 🔎';
+    + 'Me manda o link do produto que você quer acompanhar (Amazon, Mercado Livre ou Shopee) que eu fico de olho no preço pra você. 🔎';
+}
+function textoGruposTica() {
+  return 'Enquanto eu fico de olho no seu produto, entre também nos nossos grupos de promoções — todo dia tem oferta boa por lá:\n\n'
+    + GRUPOS_BOAS_VINDAS.map(([ic, nome, slug]) => ic + ' *' + nome + '*: https://ir.ticapromos.com.br/' + slug + '?o=tico').join('\n');
 }
 function textoPedirLink(nome) {
   const pn = String(nome || '').trim().split(/\s+/)[0] || '';
@@ -928,15 +936,25 @@ function textoPedirLink(nome) {
 function chavesBoasVindas(jid, numeros) {
   return [jid, ...(numeros || []).map(n => 't:' + String(n).slice(-8))].filter(Boolean);
 }
-function boasVindasGruposDevida(jid, numeros) {
-  const bv = E().boasVindasGrupos;
-  return !chavesBoasVindas(jid, numeros).some(k => Date.now() - (bv[k] || 0) < BOAS_VINDAS_GRUPOS_MS);
+function marcaDevida(campo, jid, numeros) {
+  const m = E()[campo];
+  return !chavesBoasVindas(jid, numeros).some(k => Date.now() - (m[k] || 0) < BOAS_VINDAS_MS);
 }
-function marcarBoasVindasGrupos(jid, numeros) {
-  const bv = E().boasVindasGrupos;
-  for (const k of chavesBoasVindas(jid, numeros)) bv[k] = Date.now();
-  for (const [k, em] of Object.entries(bv)) if (Date.now() - em > BOAS_VINDAS_GRUPOS_MS) delete bv[k];
+function marcar(campo, jid, numeros) {
+  const m = E()[campo];
+  for (const k of chavesBoasVindas(jid, numeros)) m[k] = Date.now();
+  for (const [k, em] of Object.entries(m)) if (Date.now() - em > BOAS_VINDAS_MS) delete m[k];
   gravar();
+}
+function ehMembroCdv(jid) {
+  const t = _membroCdvJid.get(jid);
+  return !!t && Date.now() - t < MEMBRO_CDV_MS;
+}
+// Depois de o alerta ficar pronto (pela conversa ou ativado pelo site).
+function gruposDepoisDoAlerta(jid, numeros) {
+  if (ehMembroCdv(jid) || !marcaDevida('boasVindasGrupos', jid, numeros)) return;
+  marcar('boasVindasGrupos', jid, numeros);
+  falar(jid, textoGruposTica());
 }
 
 function textoAjuda(temAlertas) {
@@ -981,6 +999,10 @@ async function tratarConversa(jid, numeros, texto, pushName, contato, ctx = {}) 
   }
   const ehCliente = !!contato || abertos.length > 0;
   const membroCdv = ctx && ctx.membroCdv ? ctx.membroCdv : null;
+  if (membroCdv) {
+    _membroCdvJid.set(jid, Date.now());
+    if (_membroCdvJid.size > 3000) _membroCdvJid.delete(_membroCdvJid.keys().next().value);
+  }
 
   // Escolheu "alerta de preço" no menu do Clube do Viajante: pede o link.
   if (ctx && ctx.pedirLink && !pendenteDe(jid) && !RE_URL.test(texto)) {
@@ -988,11 +1010,12 @@ async function tratarConversa(jid, numeros, texto, pushName, contato, ctx = {}) 
     falar(jid, textoPedirLink(membroCdv && membroCdv.nome));
     return;
   }
-  // Primeiro contato de quem não é cliente (nem do Tico, nem do CDV): boas-vindas
-  // com os grupos e o pedido do link, 1×/30 dias. Quem já chega com link segue direto.
-  if (!ehCliente && !membroCdv && !pendenteDe(jid) && !RE_URL.test(texto) && boasVindasGruposDevida(jid, numeros)) {
-    marcarBoasVindasGrupos(jid, numeros);
-    falar(jid, textoBoasVindasGrupos());
+  // Primeiro contato de quem não é cliente (nem do Tico, nem do CDV): o Tico se
+  // apresenta e pede o link, 1×/30 dias. Quem já chega com link segue direto.
+  // Os grupos vão depois que o alerta fica pronto (gruposDepoisDoAlerta).
+  if (!ehCliente && !membroCdv && !pendenteDe(jid) && !RE_URL.test(texto) && marcaDevida('boasVindas', jid, numeros)) {
+    marcar('boasVindas', jid, numeros);
+    falar(jid, textoBoasVindasTico());
     return;
   }
 
@@ -1132,6 +1155,7 @@ function aplicarAlvoPendente({ jid, numeros, contato, pushName, pend, resp }) {
   _criacaoPendente.delete(jid);
   const r = criarPedidoDaConversa({ jid, numeros, contato, pushName, item: pend.item, leitura: pend.leitura, alvo });
   falar(jid, r.texto);
+  gruposDepoisDoAlerta(jid, numeros);
   return true;
 }
 
