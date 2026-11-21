@@ -38,6 +38,7 @@ import { gzipSync, gunzipSync } from 'zlib';
 import https from 'https';
 import forge from 'node-forge';
 import danfse from './danfse.cjs';
+import { registrarMedidor } from './memoria.js';
 
 // ── Caminhos e estado ─────────────────────────────────────────────────────────
 let DIR = './sessao';
@@ -594,6 +595,7 @@ export function assinarDps(infXml, id, cert) {
 // conta as chamadas desde o boot (aparece em /memoria via registrarMedidor).
 let _agentSefin = null, _agentSefinCert = null;
 export const chamadasSefin = { total: 0, desde: new Date().toISOString() };
+registrarMedidor('chamadasSefin (conexoes reaproveitadas)', () => ({ itens: chamadasSefin.total }));
 function agentSefin(cert) {
   if (_agentSefin && _agentSefinCert === cert.certB64) return _agentSefin;
   try { _agentSefin?.destroy(); } catch (_) {}

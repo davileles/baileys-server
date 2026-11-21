@@ -15,7 +15,8 @@
 // estrutura do codigo crescendo — os medidores mostram qual.
 
 import v8 from 'node:v8';
-import { readFileSync } from 'node:fs';
+import * as _fs from 'node:fs';
+const { readFileSync } = _fs;
 
 // ── Memoria vista pelo sistema (20/11/2026) ──────────────────────────────────
 // process.memoryUsage() so mostra o processo. O Railway cobra pelo contêiner
@@ -46,10 +47,41 @@ export function memoriaDoSistema() {
       ? { total: Math.round(atual / 1048576 * 10) / 10, anon: val('anon'), cacheArquivos: val('file'),
           kernel: val('kernel'), sock: val('sock'), shmem: val('shmem'), arquivoSujo: val('file_dirty') }
       : { total: Math.round(atual / 1048576 * 10) / 10, anon: val('total_rss'), cacheArquivos: val('total_cache') };
+    // 21/11/2026: em 20/11 o total (1,89 GB) passava ~0,9 GB da soma anon + file + kernel.
+    // detalhe = todas as linhas do memory.stat em MB (slab, percpu, pagetables, zswap,
+    // active/inactive_file...); semClassificacao = total - (anon + file + kernel).
+    const det = {};
+    for (const linha of stat.split('\n')) {
+      const m = /^(\w+) (\d+)$/.exec(linha.trim());
+      if (!m) continue;
+      const v = Number(m[2]);
+      if (/^(pg|thp_|workingset_|numa_|hierarchical_)/.test(m[1])) { if (v) det[m[1]] = v; continue; }
+      det[m[1]] = Math.round(v / 1048576 * 10) / 10;
+    }
+    cgroup.detalhe = det;
+    const kern = v2 ? (det.kernel ?? ((det.slab || 0) + (det.percpu || 0) + (det.kernel_stack || 0) + (det.pagetables || 0))) : 0;
+    cgroup.semClassificacao = Math.round((cgroup.total - (cgroup.anon || 0) - (cgroup.cacheArquivos || 0) - (kern || 0)) * 10) / 10;
+    if (v2) {
+      const pico = Number((_ler('/sys/fs/cgroup/memory.peak') || '').trim());
+      if (pico) cgroup.pico = Math.round(pico / 1048576 * 10) / 10;
+      const ev = _ler('/sys/fs/cgroup/memory.events');
+      if (ev) cgroup.eventos = Object.fromEntries(ev.trim().split('\n').map(l => l.split(' ')).map(([k, v]) => [k, Number(v)]));
+      const sw = Number((_ler('/sys/fs/cgroup/memory.swap.current') || '').trim());
+      if (sw) cgroup.swap = Math.round(sw / 1048576 * 10) / 10;
+    }
   }
+  // Outros processos no conteiner (ffmpeg, filhos do sharp, npm...): nome e RSS.
+  let outrosProcessos = null;
+  try {
+    outrosProcessos = _fs.readdirSync('/proc').filter(n => /^\d+$/.test(n) && Number(n) !== process.pid).map(pid => {
+      const s = _ler('/proc/' + pid + '/status');
+      if (!s) return null;
+      return { pid: Number(pid), nome: (/^Name:\s+(.+)$/m.exec(s) || [])[1] || '?', rss: _kbLinha(s, 'VmRSS') || 0 };
+    }).filter(x => x && x.rss > 0).sort((a, b) => b.rss - a.rss).slice(0, 10);
+  } catch {}
   const maps = _ler('/proc/self/maps') || '';
   return {
-    processo, cgroup,
+    processo, cgroup, outrosProcessos,
     alocador: { jemalloc: /jemalloc/.test(maps), ldPreload: process.env.LD_PRELOAD || null,
                 mallocArenaMax: process.env.MALLOC_ARENA_MAX || null },
   };
