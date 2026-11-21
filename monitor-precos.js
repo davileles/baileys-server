@@ -2519,6 +2519,17 @@ function processarLeituraVarredura(item, leitura, resumo, aprovadosRodada) {
   // Radar do Keepa: alem do avaliar, so vira candidato com as linhas de
   // preco dizendo imperdivel ou boa (queda real contra o preco cheio).
   if (av.passou && !soSerie && item.origemSemeadura === 'keepa-radar') {
+    const barrarRadar = (m) => { resumo.radarBarrados = (resumo.radarBarrados || 0) + 1; resumo.porMotivo[m] = (resumo.porMotivo[m] || 0) + 1; };
+    // Queda de 50%+ no radar = quase sempre preco de vitrine que ninguem
+    // pagava (areia Maxxis R$ 841 -> R$ 188). Sai fora, sem card (21/11/2026).
+    try {
+      const tq = quedaAnormal({ asin: item.asin, preco: leitura.preco });
+      if (tq.anormal) { barrarRadar('radar keepa: queda anormal (' + tq.quedaPct + '%)'); return; }
+    } catch { /* sem serie: segue a regra */ }
+    // Teto de candidatos por rodada (o /deal vem ordenado da maior queda).
+    if (Number(resumo.limiteRadar) > 0 && aprovadosRodada.length >= Number(resumo.limiteRadar)) {
+      barrarRadar('radar keepa: limite de ' + resumo.limiteRadar + ' por rodada'); return;
+    }
     let cls = null;
     const pPago = Number.isFinite(av.precoEfetivo) && av.precoEfetivo > 0 ? Math.min(av.precoEfetivo, leitura.preco) : leitura.preco;
     try { cls = vereditoLinhas(item.asin, pPago)?.classe || null; } catch { cls = null; }
@@ -2541,8 +2552,8 @@ function processarLeituraVarredura(item, leitura, resumo, aprovadosRodada) {
  * dela, pelas linhas de preco (so imperdivel/boa). O candidato vai para a fila
  * do publicador, que decide modo, janela, cota e roteamento como sempre.
  */
-export async function avaliarAgoraAmazon(itens, { origem = 'keepa-radar' } = {}) {
-  const resumo = { lidos: 0, falhas: 0, candidatos: 0, porMotivo: {}, erros: [] };
+export async function avaliarAgoraAmazon(itens, { origem = 'keepa-radar', maxCandidatos = null } = {}) {
+  const resumo = { lidos: 0, falhas: 0, candidatos: 0, porMotivo: {}, erros: [], limiteRadar: Number(maxCandidatos) || null };
   const aprovados = [];
   const agora = new Date().toISOString();
   const alvo = [];

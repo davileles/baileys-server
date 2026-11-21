@@ -60,8 +60,14 @@ const CFG_PADRAO = {
   // categoria; cada ASIN novo ganha o historico do Keepa e passa pela mesma
   // avaliacao do monitor + linhas de preco (so imperdivel/boa). O candidato vai
   // para a fila do publicador do monitor (modo, janela, cota, roteamento).
+  // Preco de vitrine (21/11/2026, decisao do Davi): dia de preco so entra no
+  // historico se houve sinal de venda perto dele (ranking de vendas da Amazon
+  // melhorou em ate 'janelaDias'). Meses parados num preco que ninguem pagava
+  // nao viram "preco normal". Sem dado de ranking no Keepa = nao filtra.
+  filtroVendas: { ativo: true, janelaDias: 7 },
   radar: {
     ativo: true, intervaloMin: 20, inicio: 8, fim: 21, periodo: 1, porCategoria: 20, dedupeHoras: 24,
+    maxCandidatos: 5,   // teto de candidatos por rodada (21/11/2026)
     categorias: [
       { nome: 'Bebidas', id: 19778003011, deltaMinPct: 15 },
       { nome: 'Bebês', id: 17242603011, deltaMinPct: 20 },
@@ -81,13 +87,15 @@ function carregar() {
       const d = JSON.parse(readFileSync(ARQ, 'utf-8'));
       return { cfg: { ...CFG_PADRAO, ...(d.cfg || {}), quedas: { ...CFG_PADRAO.quedas, ...(d.cfg?.quedas || {}) },
                       consultaNaHora: { ...CFG_PADRAO.consultaNaHora, ...(d.cfg?.consultaNaHora || {}) },
-                      radar: { ...CFG_PADRAO.radar, ...(d.cfg?.radar || {}) } },
+                      radar: { ...CFG_PADRAO.radar, ...(d.cfg?.radar || {}) },
+                      filtroVendas: { ...CFG_PADRAO.filtroVendas, ...(d.cfg?.filtroVendas || {}) } },
                fila: Array.isArray(d.fila) ? d.fila : [], job: d.job || null, tokens: d.tokens || null,
-               resultados: d.resultados || {}, radar: d.radar || { vistos: {}, ultima: null, historico: [] } };
+               resultados: d.resultados || {}, radar: d.radar || { vistos: {}, ultima: null, historico: [] },
+               migracoes: d.migracoes || {} };
     }
   } catch (e) { console.warn('[KEEPA] Estado ilegivel, recomecando:', e.message); }
   return { cfg: { ...CFG_PADRAO, quedas: { ...CFG_PADRAO.quedas }, consultaNaHora: { ...CFG_PADRAO.consultaNaHora },
-                 radar: { ...CFG_PADRAO.radar } },
+                 radar: { ...CFG_PADRAO.radar }, filtroVendas: { ...CFG_PADRAO.filtroVendas } },
            fila: [], job: null, tokens: null, resultados: {}, radar: { vistos: {}, ultima: null, historico: [] } };
 }
 function salvar() {
@@ -168,15 +176,53 @@ function minimoDiario(csv, desdeTs) {
   return out;
 }
 
+// Dias com sinal de venda: o ranking de vendas (csv[3]) so MELHORA quando o
+// produto vende; parado ou piorando por semanas = ninguem comprando.
+function diasComVenda(csvRank, desdeTs) {
+  if (!Array.isArray(csvRank) || csvRank.length < 4) return null;   // sem dado: nao julga
+  const out = new Set();
+  let ant = null;
+  for (let i = 0; i + 1 < csvRank.length; i += 2) {
+    const r = Number(csvRank[i + 1]);
+    if (!(r > 0)) { ant = null; continue; }
+    const ts = tsKeepa(csvRank[i]);
+    if (ant !== null && r < ant && ts >= desdeTs - 14 * 86400000) out.add(diaSP(ts));
+    ant = r;
+  }
+  return out;
+}
+
+function filtrarPorVendas(serie, vendas, janelaDias) {
+  if (!vendas) return { serie, removidos: 0 };
+  const lista = [...vendas].map(d => Date.parse(d + 'T12:00:00-03:00')).sort((a, b) => a - b);
+  const jan = Math.max(1, Number(janelaDias) || 7) * 86400000;
+  const corteRecente = diaSP(Date.now() - 2 * 86400000);   // os 2 ultimos dias ficam sempre
+  const out = {};
+  let removidos = 0;
+  for (const [d, v] of Object.entries(serie)) {
+    if (d >= corteRecente) { out[d] = v; continue; }
+    const t = Date.parse(d + 'T12:00:00-03:00');
+    if (lista.some(x => Math.abs(x - t) <= jan)) out[d] = v; else removidos++;
+  }
+  return { serie: out, removidos };
+}
+
 function serieDoProduto(prod, fonte, dias = DIAS_HISTORICO) {
   const desde = Date.now() - dias * 86400000;
   const amazon = minimoDiario(prod?.csv?.[0], desde);
   const novo = minimoDiario(prod?.csv?.[1], desde);
-  if (fonte === 'amazon') return amazon;
-  if (fonte === 'novo') return novo;
-  const out = { ...novo };
-  for (const [d, v] of Object.entries(amazon)) out[d] = out[d] === undefined ? v : Math.min(out[d], v);
-  return out;
+  let out;
+  if (fonte === 'amazon') out = amazon;
+  else if (fonte === 'novo') out = novo;
+  else {
+    out = { ...novo };
+    for (const [d, v] of Object.entries(amazon)) out[d] = out[d] === undefined ? v : Math.min(out[d], v);
+  }
+  const fv = _e.cfg.filtroVendas || {};
+  if (fv.ativo === false) return out;
+  const r = filtrarPorVendas(out, diasComVenda(prod?.csv?.[3], desde), fv.janelaDias);
+  serieDoProduto.ultimoRemovidos = r.removidos;
+  return r.serie;
 }
 
 // Ultimo valor de um csv do Keepa (-1 = sem valor).
@@ -224,13 +270,14 @@ function aplicarProduto(prod, { gravarSerie = true } = {}) {
   if (!dias) return { asin, ok: false, motivo: 'sem historico de preco no Keepa' };
   const c = conferir(asin, serie);
   if (!c.ok) return { asin, ok: false, motivo: 'divergente (Keepa R$ ' + c.atual + ' x nosso R$ ' + c.nosso + ')', ...c, dias };
+  const semVenda = serieDoProduto.ultimoRemovidos || 0;
   const n = gravarSerie ? importarSerieKeepa(asin, serie, { nome: prod.title || '' }) : dias;
   let ref = null;
   if (gravarSerie) {
     try { ref = referenciaLonga(prod, _e.cfg.fonte); registrarReferenciaLonga(asin, ref); }
     catch (e) { console.warn('[KEEPA] Referencia longa de ' + asin + ':', e.message); }
   }
-  return { asin, ok: true, dias: n, ref, ...c };
+  return { asin, ok: true, dias: n, diasSemVenda: semVenda, ref, ...c };
 }
 
 // ── JOB DE IMPORTACAO ───────────────────────────────────────────────────────
@@ -436,7 +483,8 @@ export async function rodarRadarKeepa({ manual = false } = {}) {
     const itens = [...escolhidos.values()];
     rel.novos = itens.length;
     // Historico do Keepa para quem ainda nao tem (o radar pode usar a reserva).
-    const semHist = itens.filter(x => !_e.resultados[x.asin]?.ok).map(x => x.asin);
+    // Sempre rebusca: o historico precisa vir com o filtro de vendas e fresco.
+    const semHist = itens.map(x => x.asin);
     for (let i = 0; i < semHist.length; i += LOTE_MAX) {
       const lote = semHist.slice(i, i + LOTE_MAX);
       try {
@@ -447,7 +495,8 @@ export async function rodarRadarKeepa({ manual = false } = {}) {
     if (semHist.length) agendarShards();
     for (const x of itens) vistos[x.asin] = agora;
     if (itens.length) {
-      rel.avaliacao = await avaliarAgoraAmazon(itens.map(x => ({ asin: x.asin, nome: x.titulo })));
+      rel.avaliacao = await avaliarAgoraAmazon(itens.map(x => ({ asin: x.asin, nome: x.titulo })),
+        { maxCandidatos: Number(rc.maxCandidatos) || null });
       const ok = new Set((rel.avaliacao.aprovados || []).map(a => a.asin));
       rel.candidatos = itens.filter(x => ok.has(x.asin)).map(x => ({ asin: x.asin, titulo: x.titulo.slice(0, 80), categoria: x.categoria,
         preco: x.preco, classe: (rel.avaliacao.aprovados.find(a => a.asin === x.asin) || {}).classe || null }));
@@ -523,10 +572,15 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
       const em = Number(b.consultaNaHora.esperaMs);
       if (Number.isFinite(em) && em >= 500 && em <= 15000) _e.cfg.consultaNaHora.esperaMs = em;
     }
+    if (b.filtroVendas && typeof b.filtroVendas === 'object') {
+      if (typeof b.filtroVendas.ativo === 'boolean') _e.cfg.filtroVendas.ativo = b.filtroVendas.ativo;
+      const j = Number(b.filtroVendas.janelaDias);
+      if (Number.isFinite(j) && j >= 1 && j <= 60) _e.cfg.filtroVendas.janelaDias = j;
+    }
     if (b.radar && typeof b.radar === 'object') {
       const r = _e.cfg.radar;
       if (typeof b.radar.ativo === 'boolean') r.ativo = b.radar.ativo;
-      for (const k of ['intervaloMin', 'inicio', 'fim', 'periodo', 'porCategoria', 'dedupeHoras']) {
+      for (const k of ['intervaloMin', 'inicio', 'fim', 'periodo', 'porCategoria', 'dedupeHoras', 'maxCandidatos']) {
         const v = Number(b.radar[k]);
         if (b.radar[k] !== undefined && Number.isFinite(v) && v >= 0 && v <= 1440) r[k] = v;
       }
@@ -586,6 +640,16 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
     } catch (e) { res.status(500).json({ ok: false, erro: e.message, tokens: _e.tokens }); }
   }));
 
+  // Uma vez (21/11/2026): o historico importado antes do filtro de vendas e
+  // rebuscado para tirar o preco de vitrine. Vai para o fim da fila.
+  if (chave() && !(_e.migracoes || {}).filtroVendas) {
+    try {
+      const r = montarFila({ reimportar: true });
+      _e.migracoes = { ...(_e.migracoes || {}), filtroVendas: new Date().toISOString() };
+      salvar();
+      console.log('[KEEPA] Reimport com filtro de vendas — ' + r.adicionados + ' ASIN(s) na fila (' + r.naFila + ' no total).');
+    } catch (e) { console.warn('[KEEPA] Reimport com filtro de vendas falhou:', e.message); }
+  }
   // Fila que ficou de um boot anterior volta a rodar sozinha (so com chave).
   // Desde 21/11/2026 o boot tambem enfileira quem ainda nao tem a referencia
   // longa (12 meses + tabela): uma passada so, ordenada por cliques, deixando
