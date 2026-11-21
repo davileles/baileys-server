@@ -3182,13 +3182,13 @@ function seloDaOferta(p, preco) {
     return v && v.texto ? String(v.texto) : '';
   } catch { return ''; }
 }
-// A linha do selo: "🔥 OFERTA IMPERDÍVEL · Menor preço dos últimos 63 dias".
+// O selo tem linha propria no template ({{selo_oferta}}, logo abaixo do
+// titulo — decisao do Davi em 21/11/2026). A linha do {{menor_preco}} fica com
+// o recorde de dias ou o ultimo envio; so perde a "queda contra as ultimas
+// semanas" quando o selo ja diz "N% abaixo do preço normal" (mesmo numero, outra base).
 function juntarSelo(selo, resto) {
-  if (!selo) return resto || '';
-  // O selo ja diz "N% abaixo do preço normal": a queda contra as ultimas
-  // semanas repetiria o mesmo numero com outra base.
-  if (/abaixo do preço normal/.test(selo) && /abaixo do preço das últimas semanas/.test(resto || '')) resto = '';
-  return resto ? selo + ' · ' + resto : selo;
+  if (selo && /abaixo do preço normal/.test(selo) && /abaixo do preço das últimas semanas/.test(resto || '')) return '';
+  return resto || '';
 }
 function quedaHabitual(p, preco) {
   const chave = p?.chaveSerie || p?.asin;
@@ -3448,7 +3448,7 @@ export const VARIAVEIS_TEMPLATE = [
   { chave:'preco_de',      desc:'Preço de lista (vazio quando não há)' },
   { chave:'menor_preco',   desc:'Ex: "Menor preço dos últimos 63 dias" — pela série do monitor; sem recorde, vira "42% abaixo do preço das últimas semanas" (queda ≥ 15% contra a mediana 30d); vazio sem nenhum dos dois' },
   { chave:'queda_habitual', desc:'Só a frase "42% abaixo do preço das últimas semanas" (vazia sem queda relevante)' },
-  { chave:'selo_oferta',   desc:'Ex: "🔥 OFERTA IMPERDÍVEL" ou "✅ BOA OFERTA" — pelas três linhas de preço (preço normal, patamar de promoção, mínimo de 90 dias); também vai na frente da linha do {{menor_preco}}. Vazio quando a oferta é comum ou sem histórico' },
+  { chave:'selo_oferta',   desc:'Ex: "🔥 OFERTA IMPERDÍVEL" ou "✅ BOA OFERTA" — pelas três linhas de preço (preço normal, patamar de promoção, mínimo de 90 dias); fica numa linha própria abaixo do título. Vazio quando a oferta é comum ou sem histórico' },
   { chave:'menor_preco_dias', desc:'Só o número de dias do selo de menor preço' },
   { chave:'vs_ultimo_envio', desc:'Ex: "R$ 24,62 mais barato que no último envio" — contra o preço (com cupom) da última vez que o produto saiu nos grupos (até 60 dias); vazio sem queda de 2% e R$ 1. Também entra em {{menor_preco}} quando não há selo de dias nem queda contra o habitual' },
   { chave:'ultimo_envio_preco', desc:'Preço (com cupom) do último envio do produto, quando está mais barato agora' },
