@@ -6106,8 +6106,12 @@ async function _despacharOfertaParaDestinos(mensagem, imagem, oferta, opcoes = {
     // "o classificador nao confirmou" (19/11/2026: 7 casos lidos como erro).
     if (_nichoFonte && trilhas().length && _rota.nichoBarrado && _rota.nichoBarrado === _nichoFonte) {
       const _motCur = oferta?.dadosExtraidos?.curadoriaNicho?.motivo || 'reprovada';
-      throw new Error('curadoria do nicho ' + _nichoFonte + ' barrou: ' + _motCur
+      const _eCur = new Error('curadoria do nicho ' + _nichoFonte + ' barrou: ' + _motCur
         + ' — marque a trilha a mao se quiser enviar.');
+      // Marca desconhecida em fonte so do nicho (21/11/2026, decisao do Davi):
+      // o auto-envio descarta em silencio, sem card no bot (ver catch do radar).
+      _eCur.curadoriaNicho = _nichoFonte;
+      throw _eCur;
     }
     if (_nichoFonte && trilhas().length) {
       throw new Error('fora do nicho ' + _nichoFonte + '? o classificador nao confirmou a categoria'
@@ -10435,6 +10439,20 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
           filaPendentes.unshift(oferta);
           salvarFila();
           console.log('[FRESCOR] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA — ' + e.message);
+          continue;
+        }
+        // Curadoria do grupo de nicho reprovou (marca fora da lista em
+        // tsp/categorias.json) numa fonte dedicada ao nicho: descarta sem card
+        // (21/11/2026, decisao do Davi — o bot lotava de marca desconhecida).
+        // CURADORIA_SEM_CARD=0 volta a mandar card.
+        if (e.curadoriaNicho && String(process.env.CURADORIA_SEM_CARD ?? '1') !== '0') {
+          oferta.status = 'rejeitado';
+          oferta.motivoFila = 'curadoria do nicho: ' + (oferta.dadosExtraidos?.curadoriaNicho?.motivo || 'reprovada');
+          oferta.descartadaPorCuradoria = true;
+          filaPendentes.unshift(oferta);
+          salvarFila();
+          console.log('[CURADORIA] Oferta #' + oferta.id + ' ' + (p.asin || '?') + ' DESCARTADA sem card — '
+            + oferta.motivoFila);
           continue;
         }
         // Falhou o envio: cai para a fila em vez de perder a oferta. A causa fica
