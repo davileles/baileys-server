@@ -26,7 +26,7 @@
 // extenso); quem decide e escreve as mensagens é o código.
 
 import { existsSync, readFileSync } from 'fs';
-import { ultimaRelacaoAvisos } from './avisos-preco.js';
+import { ultimaRelacaoAvisos, observarMensagemAvisos } from './avisos-preco.js';
 
 const MS_MIN = 60e3, MS_H = 3600e3;
 const CONVERSA_TTL = 48 * MS_H;
@@ -40,6 +40,13 @@ const POS_CONVERSA_MS = 30 * 24 * MS_H;
 const POS_AGRADECE_MS = 7 * 24 * MS_H;
 const RE_INTENCAO_AVISOS = /(amazon|amzn|mercadoli|meli\.la|shopee|shope\.ee|magalu|magazineluiza)|\balertas?\b|\bavisos? de preco|^\s*(sair|parar|cancelar)\b|\bcomprei\b|\bpedido\s*n?\W*\d{4}/;
 const RE_AGRADECE = /^(muit[oa]\s+)?(obrigad|obg|brigad|valeu|vlw|grat[oa]|gratidao|show|top|perfeito|otimo|maravilh|beleza|blz|ok\b|okay|certo|combinado|amem|deus\s+(te\s+)?abenc|tmj|joia|legal|massa|entendi|ta\s+bom|tudo\s+certo|consegui|deu\s+certo|que\s+bom|oba)/;
+// Quem está no cadastro do CDV e fala de grupo/link/acesso: é inclusão (21/11/2026).
+const RE_QUER_GRUPOS = /\bgrupos?\b|\blinks?\b|convite|\bentrar\b|\bacesso\b|removid|adicion/;
+const RE_MENU_1 = /^\s*(1|um|op[cç][aã]o\s*1|1\s*[-–.)])\s*[.!]*\s*$/i;
+const RE_MENU_2 = /^\s*(2|dois|op[cç][aã]o\s*2|2\s*[-–.)])\s*[.!]*\s*$/i;
+const RE_MENU_ALERTA = /alerta|pre[cç]o|produto|monitor/;
+const MENU_RESPOSTA_MS = 2 * MS_H;
+const MENU_REPETE_MS = 24 * MS_H;
 const RE_GATILHO = /\bentrar\b.{0,20}\bgrupos?\b.{0,40}\bclube\s+do\s+viajante\b/;
 const RE_SIM = /^\s*(sim|s|salvei|ja salvei|já salvei|pronto|ok|okay|feito|salvo|isso|claro|positivo)\b/i;
 const RE_EMAIL = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
@@ -141,22 +148,95 @@ export function observarInclusaoCdv(apelido, sock, msg) {
       // salvo pedido claro de alerta de preço ou alerta mais recente que o CDV.
       const telJid = [k.senderPn, k.remoteJidAlt, k.remoteJid].map(v => String(v || '')).find(v => v.endsWith('@s.whatsapp.net'));
       const d8 = telJid ? telJid.split('@')[0].replace(/\D/g, '').slice(-8) : String((conv && conv.telefone) || '').slice(-8);
+      // Resposta ao menu do CDV (1 = grupos, 2 = alerta de preço).
+      const menu = (e.menuCdv || {})[jid];
+      if (menu && Date.now() - (menu.em || 0) < MENU_RESPOSTA_MS) {
+        const t = norm(texto);
+        if (RE_MENU_1.test(texto) || RE_QUER_GRUPOS.test(t)) {
+          delete e.menuCdv[jid]; gravar();
+          tratar(apelido, sock, msg, jid, texto, true).catch(err => console.warn('[INCLUSAO] Conversa: ' + err.message));
+          return true;
+        }
+        if (RE_MENU_2.test(texto) || RE_MENU_ALERTA.test(t)) {
+          menu.em = 0; gravar();   // não reabre a escolha; o 24 h segue pelo menuVistoEm
+          observarMensagemAvisos(apelido, msg, { membroCdv: { nome: menu.nome || '' }, pedirLink: !RE_URL_LOJA.test(texto) });
+          return true;
+        }
+      }
       const pc = e.posCdv || {};
       const desde = Math.max(conv ? (conv.ultimaRespostaEm || conv.atualizadoEm || 0) : 0, pc['j:' + jid] || 0, d8 ? (pc['t:' + d8] || 0) : 0);
-      if (!desde || Date.now() - desde > POS_CONVERSA_MS) return false;
       if (RE_INTENCAO_AVISOS.test(norm(texto))) return false;
+      if (!desde || Date.now() - desde > POS_CONVERSA_MS) return rotearPorCadastro(apelido, sock, msg, jid, texto);
       const jids = [k.remoteJid, k.remoteJidAlt, k.senderPn].map(v => String(v || '')).filter(Boolean);
       if (ultimaRelacaoAvisos(jids, telJid ? telJid.split('@')[0] : '') > desde) return false;
       // Só fica com o CDV o que é claramente dele: agradecimento/emoji (7 dias)
-      // ou problema com grupo/link (30 dias). O resto volta para o Tico.
+      // ou problema com grupo/link (30 dias). O resto passa pelo cadastro.
       const tipo = tipoPosConversa(texto);
-      if (!tipo || (tipo === 'agradece' && Date.now() - desde > POS_AGRADECE_MS)) return false;
+      if (!tipo || (tipo === 'agradece' && Date.now() - desde > POS_AGRADECE_MS)) return rotearPorCadastro(apelido, sock, msg, jid, texto);
       posConversa(apelido, sock, msg, jid, texto, conv).catch(err => console.warn('[INCLUSAO] Pós-conversa: ' + err.message));
       return true;
     }
     tratar(apelido, sock, msg, jid, texto, gatilho).catch(err => console.warn('[INCLUSAO] Conversa: ' + err.message));
     return true;
   } catch (err) { console.warn('[INCLUSAO] ' + err.message); return false; }
+}
+
+// ── Quem está falando? (21/11/2026) ─────────────────────────────────────────
+// O tico-02 é do CDV (inclusão) e do Tico (alertas de preço). Mensagem solta,
+// sem a frase de entrar nos grupos: o telefone é conferido no cadastro do
+// próprio CDV (proxy /cdv/inclusao/consultar, que lê as assinaturas e as
+// exceções já gravadas — nenhuma chamada à Hubla). Cliente do CDV:
+//  - fala de grupo/link/acesso → inclusão;
+//  - mexeu com alerta de preço nas últimas 24 h → Tico (sabendo que é aluno);
+//  - resto → menu "1 grupos · 2 alerta de preço" (1×/24 h; depois, Tico).
+// Fora do cadastro, ou consulta falhou → Tico, como antes.
+const RE_URL_LOJA = /https?:\/\/\S+/i;
+const _cacheMembro = new Map();   // telefone → { em, r }
+async function clienteCdv(telefone) {
+  const c = _cacheMembro.get(telefone);
+  if (c && Date.now() - c.em < 6 * MS_H) return c.r;
+  const d = await _d.proxy('/cdv/inclusao/consultar', { telefone });
+  const r = d && (d.encontrado || (Array.isArray(d.grupos) && d.grupos.some(g => g.direito))) ? { telefone, nome: d.nome || '' } : null;
+  _cacheMembro.set(telefone, { em: Date.now(), r });
+  if (_cacheMembro.size > 3000) _cacheMembro.delete(_cacheMembro.keys().next().value);
+  return r;
+}
+function textoMenuCdv(nome) {
+  const pn = primeiroNome(nome);
+  return 'Oi' + (pn ? ', ' + pn : '') + '! 👋 Aqui é do Clube do Viajante. Como posso te ajudar?\n\n'
+    + '*1* — Entrar nos grupos do Clube do Viajante\n'
+    + '*2* — Criar um alerta de preço de um produto (Amazon, Mercado Livre ou Shopee)\n\n'
+    + 'É só responder *1* ou *2*.';
+}
+function rotearPorCadastro(apelido, sock, msg, jid, texto) {
+  const k = msg.key || {};
+  const jids = [k.remoteJid, k.remoteJidAlt, k.senderPn].map(v => String(v || '')).filter(Boolean);
+  const telJid = jids.find(v => v.endsWith('@s.whatsapp.net'));
+  const telDireto = telJid ? telJid.split('@')[0].replace(/\D/g, '') : '';
+  const relAvisos = ultimaRelacaoAvisos(jids, telDireto);
+  // Alerta em criação (pergunta de preço aberta): é do Tico, sem consulta.
+  if (Date.now() - relAvisos < 60e3 || !_d.proxy) return false;
+  (async () => {
+    let cli = null;
+    try {
+      const telefone = telDireto || await _d.telefoneDe(sock, msg);
+      if (telefone) cli = await clienteCdv(telefone);
+    } catch (err) { console.warn('[INCLUSAO] Consulta do cadastro falhou (' + err.message + '); segue para o Tico.'); }
+    if (!cli) { observarMensagemAvisos(apelido, msg); return; }
+    const ctx = { membroCdv: { nome: cli.nome } };
+    if (RE_QUER_GRUPOS.test(norm(texto))) { await tratar(apelido, sock, msg, jid, texto, true); return; }
+    const e = E();
+    e.menuCdv = e.menuCdv || {};
+    const m = e.menuCdv[jid];
+    if (Date.now() - relAvisos < 24 * MS_H || (m && Date.now() - (m.vistoEm || 0) < MENU_REPETE_MS)) { observarMensagemAvisos(apelido, msg, ctx); return; }
+    e.menuCdv[jid] = { em: Date.now(), vistoEm: Date.now(), nome: cli.nome };
+    for (const [j, x] of Object.entries(e.menuCdv)) if (Date.now() - (x.vistoEm || 0) > 7 * 24 * MS_H) delete e.menuCdv[j];
+    gravar();
+    try { await _d.enviar(apelido, jid, textoMenuCdv(cli.nome)); }
+    catch (err) { console.warn('[INCLUSAO] Menu não saiu para ' + cli.telefone + ': ' + err.message); }
+    E().historico.push({ em: new Date().toISOString(), telefone: cli.telefone, evento: 'menu', detalhe: null });
+  })().catch(err => console.warn('[INCLUSAO] Roteamento: ' + err.message));
+  return true;
 }
 
 function marcarPosCdv(conv) {

@@ -134,6 +134,7 @@ function estruturar(bruto) {
     mensagens: Array.isArray(e.mensagens) ? e.mensagens : [],
     atendimentos: e.atendimentos && typeof e.atendimentos === 'object' ? e.atendimentos : {},
     buscaMl: e.buscaMl && typeof e.buscaMl === 'object' ? e.buscaMl : {},
+    boasVindasGrupos: e.boasVindasGrupos && typeof e.boasVindasGrupos === 'object' ? e.boasVindasGrupos : {},
   };
 }
 
@@ -664,7 +665,11 @@ export function ultimaRelacaoAvisos(jids = [], telefone = '') {
   } catch (e) { return 0; }
 }
 
-export function observarMensagemAvisos(apelido, msg) {
+// ctx (21/11/2026, vindo da inclusao-cdv.js no tico-02):
+//   membroCdv {nome} = a pessoa está no cadastro do Clube do Viajante — não
+//     recebe a boas-vindas com os grupos do Tica Promos;
+//   pedirLink = escolheu "alerta de preço" no menu do CDV: o Tico pede o link.
+export function observarMensagemAvisos(apelido, msg, ctx = {}) {
   try {
     const c = E().config;
     if (!c.conta || apelido !== c.conta) return;
@@ -690,7 +695,7 @@ export function observarMensagemAvisos(apelido, msg) {
       return;
     }
     if (RE_CANCELAR.test(texto) && _criacaoPendente.has(jid)) {
-      tratarConversa(jid, numeros, texto, msg.pushName, null).catch(e => console.warn('[AVISOS] Conversa: ' + e.message));
+      tratarConversa(jid, numeros, texto, msg.pushName, null, ctx).catch(e => console.warn('[AVISOS] Conversa: ' + e.message));
       return;
     }
     if (RE_SAIR.test(texto)) { tratarSair(jid, numeros); return; }
@@ -714,7 +719,7 @@ export function observarMensagemAvisos(apelido, msg) {
         return;
       }
       // Sem ativação pendente: comandos da conversa (lista, criar por link, ajuda).
-      tratarConversa(jid, numeros, texto, msg.pushName, contatoExistente)
+      tratarConversa(jid, numeros, texto, msg.pushName, contatoExistente, ctx)
         .catch(e => console.warn('[AVISOS] Conversa: ' + e.message));
       return;
     }
@@ -898,6 +903,42 @@ function textoBoasVindas(temAlertas) {
     + (temAlertas ? '\n\nPara ver os alertas que você já tem, mande *MEUS ALERTAS*.' : '');
 }
 
+// Boas-vindas de quem não é cliente (21/11/2026, pedido do Davi): o Tico se
+// apresenta, lembra dos grupos do Tica Promos (um link por nicho, pelo
+// distribuidor — nunca convite fixo) e pede o link do produto. Sem busca por
+// nome: o link é o que dá à pessoa a noção certa do preço.
+const GRUPOS_BOAS_VINDAS = [
+  ['🛒', 'Ofertas gerais', 'geral'],
+  ['🎟️', 'Só cupons', 'cupons'],
+  ['🍻', 'Bebidas', 'bebidas'],
+  ['👶', 'Bebê e Kids', 'babykids'],
+  ['🔧', 'Ferramentas', 'ferramentas'],
+];
+const BOAS_VINDAS_GRUPOS_MS = 30 * MS_DIA;
+function textoBoasVindasGrupos() {
+  return 'Oi! 👋 Eu sou o Tico, seu monitor de preços.\n\n'
+    + 'Antes de me contar o produto que você quer acompanhar, não deixe de entrar nos nossos grupos de promoções:\n\n'
+    + GRUPOS_BOAS_VINDAS.map(([ic, nome, slug]) => ic + ' *' + nome + '*: https://ir.ticapromos.com.br/' + slug + '?o=tico').join('\n')
+    + '\n\nAgora me manda o link do produto (Amazon, Mercado Livre ou Shopee) que eu fico de olho no preço pra você. 🔎';
+}
+function textoPedirLink(nome) {
+  const pn = String(nome || '').trim().split(/\s+/)[0] || '';
+  return 'Combinado' + (pn ? ', ' + pn.charAt(0).toUpperCase() + pn.slice(1).toLowerCase() : '') + '! 🔔 Me manda o link do produto (Amazon, Mercado Livre ou Shopee) e me diz quanto você quer pagar, que eu fico de olho no preço pra você.';
+}
+function chavesBoasVindas(jid, numeros) {
+  return [jid, ...(numeros || []).map(n => 't:' + String(n).slice(-8))].filter(Boolean);
+}
+function boasVindasGruposDevida(jid, numeros) {
+  const bv = E().boasVindasGrupos;
+  return !chavesBoasVindas(jid, numeros).some(k => Date.now() - (bv[k] || 0) < BOAS_VINDAS_GRUPOS_MS);
+}
+function marcarBoasVindasGrupos(jid, numeros) {
+  const bv = E().boasVindasGrupos;
+  for (const k of chavesBoasVindas(jid, numeros)) bv[k] = Date.now();
+  for (const [k, em] of Object.entries(bv)) if (Date.now() - em > BOAS_VINDAS_GRUPOS_MS) delete bv[k];
+  gravar();
+}
+
 function textoAjuda(temAlertas) {
   return 'Oi! Eu sou o Tico, do Tica Promos 🐦\n\n'
     + 'Por aqui eu entendo só estes pedidos:\n'
@@ -928,7 +969,7 @@ function lerValor(t) {
   return n > 0 ? arred(n) : null;
 }
 
-async function tratarConversa(jid, numeros, texto, pushName, contato) {
+async function tratarConversa(jid, numeros, texto, pushName, contato, ctx = {}) {
   anotarConversa(jid, 'cliente', texto);
   const abertos = pedidosAbertosDe(jid, numeros, contato);
 
@@ -939,6 +980,21 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
     return;
   }
   const ehCliente = !!contato || abertos.length > 0;
+  const membroCdv = ctx && ctx.membroCdv ? ctx.membroCdv : null;
+
+  // Escolheu "alerta de preço" no menu do Clube do Viajante: pede o link.
+  if (ctx && ctx.pedirLink && !pendenteDe(jid) && !RE_URL.test(texto)) {
+    rastrear(jid, 'menu-cdv', 'pediu alerta de preço');
+    falar(jid, textoPedirLink(membroCdv && membroCdv.nome));
+    return;
+  }
+  // Primeiro contato de quem não é cliente (nem do Tico, nem do CDV): boas-vindas
+  // com os grupos e o pedido do link, 1×/30 dias. Quem já chega com link segue direto.
+  if (!ehCliente && !membroCdv && !pendenteDe(jid) && !RE_URL.test(texto) && boasVindasGruposDevida(jid, numeros)) {
+    marcarBoasVindasGrupos(jid, numeros);
+    falar(jid, textoBoasVindasGrupos());
+    return;
+  }
 
   if (RE_OI.test(texto) && !pendenteDe(jid)) {
     falar(jid, textoBoasVindas(ehCliente));
@@ -1000,7 +1056,7 @@ async function tratarConversa(jid, numeros, texto, pushName, contato) {
   }
 
   // Fora dos comandos: a IA entende o pedido e o código executa.
-  if (await conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente })) return;
+  if (await conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente, membroCdv })) return;
 
   // Sem IA (falhou ou desligada): pergunta pendente ganha uma nova chance e
   // depois é largada — ninguém fica preso nela.
@@ -1114,7 +1170,8 @@ Outros caminhos que você pode indicar: ofertas do dia em ticapromos.com.br; gru
 Regras:
 - Nunca invente preço, desconto, produto, cupom ou prazo. Os dados que você tem estão no CONTEXTO.
 - Não prometa que o preço vai cair.
-- Se a pessoa quiser criar um alerta e não mandou link, peça o link do produto.
+- Se a pessoa quiser criar um alerta e não mandou link, peça o link do produto. Não procure, não sugira nem compare produtos pelo nome (nada de "que tal o modelo X?"): o alerta só nasce do link que a própria pessoa manda.
+- Se o CONTEXTO disser que a pessoa é aluna do Clube do Viajante, trate pelo primeiro nome; para assuntos do Clube (grupos, acesso, painel), diga que é só mandar "quero entrar nos grupos do Clube do Viajante".
 - Se não entender, diga com naturalidade o que você consegue fazer.
 
 Responda SÓ com um JSON, sem texto fora dele:
@@ -1233,12 +1290,12 @@ function contextoParaIa(jid, abertos, pend) {
   return l.join('\n');
 }
 
-async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente }) {
+async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente, membroCdv = null }) {
   if (!_deps.ia || !podeChamarIa(jid)) return false;
   const pend = pendenteDe(jid);
   let r = null;
   try {
-    r = await _deps.ia(IA_SISTEMA, 'CONTEXTO:\n' + contextoParaIa(jid, abertos, pend) + '\n\nMENSAGEM DA PESSOA: ' + String(texto).slice(0, 800), 400);
+    r = await _deps.ia(IA_SISTEMA, 'CONTEXTO:\n' + (membroCdv ? 'A PESSOA É ALUNA DO CLUBE DO VIAJANTE' + (membroCdv.nome ? ' (primeiro nome: ' + String(membroCdv.nome).trim().split(/\s+/)[0] + ')' : '') + '.\n' : '') + contextoParaIa(jid, abertos, pend) + '\n\nMENSAGEM DA PESSOA: ' + String(texto).slice(0, 800), 400);
   } catch (e) { console.warn('[AVISOS] IA falhou: ' + e.message); }
   if (!r || typeof r !== 'object' || !r.acao) return false;
   const resposta = String(r.resposta || '').trim().slice(0, 700);
