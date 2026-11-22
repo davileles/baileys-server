@@ -3080,8 +3080,13 @@ async function tentarPublicar() {
       return;
     }
 
-    const item = itemVitrine(escolhido.asin);
-    if (!item) { removerDaFila(escolhido.asin); return; }
+    const item = itemPublicavel(escolhido.asin);
+    if (!item) {
+      removerDaFila(escolhido.asin);
+      console.log('[PRECOS] Fora da fila: ' + (escolhido.nome || escolhido.asin)
+        + ' — produto nao esta mais na vitrine nem na vigilancia de captura.');
+      return;
+    }
 
     const r = await dispararMonitorado(item, escolhido);
     removerDaFila(escolhido.asin);
@@ -3117,6 +3122,14 @@ async function tentarPublicar() {
 
 function removerDaFila(asin) {
   _estado.fila = _estado.fila.filter(f => f.asin !== asin);
+}
+
+// Produto que o publicador pode disparar: o da vitrine ou o da vigilancia de
+// captura (onde moram os candidatos do radar do Keepa, fora da vitrine). Ate
+// 22/11/2026 o publicador so procurava na vitrine: o candidato do radar nao era
+// achado, saia da fila calado a cada minuto e nenhum chegou aos grupos.
+function itemPublicavel(asin) {
+  return itemVitrine(asin) || _capt[asin] || null;
 }
 
 function registrarDisparo(reg) {
@@ -3290,7 +3303,7 @@ export async function cardsDaFila({ asins = null } = {}) {
   const filtro = Array.isArray(asins) && asins.length ? new Set(asins.map(String)) : null;
   const lista = _estado.fila
     .filter(f => !filtro || filtro.has(String(f.asin)))
-    .map(f => ({ av: f, item: itemVitrine(f.asin) }))
+    .map(f => ({ av: f, item: itemPublicavel(f.asin) }))
     .filter(x => x.item);
   // ASIN pedido que ja saiu da fila (a varredura seguinte refaz a fila): o
   // candidato e remontado pela serie — preco de agora contra mediana 30d.
@@ -3325,7 +3338,7 @@ export async function cardsDaFila({ asins = null } = {}) {
  * disparo automatico. Falha de leitura devolve ok:false e quem chama decide.
  */
 export async function conferirPrecoCard(asin, precoCard) {
-  const item = itemVitrine(asin);
+  const item = itemPublicavel(asin);
   if (!item) return { ok: false, motivo: 'produto saiu da vitrine' };
   if (!_deps) return { ok: false, motivo: 'monitor nao inicializado' };
   const mt = await montarItemMonitor(item, { rastrear: false });
@@ -3503,8 +3516,8 @@ export function descartarCandidato(asin) {
 /** Publica um candidato AGORA, ignorando janela e espacamento (nao a cota). */
 export async function publicarAgora(asin) {
   const cand = _estado.fila.find(f => f.asin === asin);
-  const item = itemVitrine(asin);
-  if (!item) return { ok: false, motivo: 'produto nao esta na vitrine' };
+  const item = itemPublicavel(asin);
+  if (!item) return { ok: false, motivo: 'produto nao esta na vitrine nem na vigilancia de captura' };
   if (!_deps) return { ok: false, motivo: 'monitor nao inicializado' };
   if (!_deps.whatsappPronto()) return { ok: false, motivo: 'WhatsApp nao conectado' };
 
@@ -3512,7 +3525,7 @@ export async function publicarAgora(asin) {
   removerDaFila(asin);
   if (r.ok) {
     const nicho = cand?.nicho || nichoDoProduto(item, _hist[asin]?.n).nicho;
-    consumirCota(item.loja, nicho);
+    consumirCota(item.loja, nicho, cand?.origemRadar === 'keepa');
     _estado.ultimoEnvioEm = Date.now();
     registrarDisparo({ ...(cand || { asin, nome: item.nome, loja: item.loja }), manual: true,
                        precoEnviado: r.preco, grupos: r.grupos, cupom: r.cupom, ok: true });
