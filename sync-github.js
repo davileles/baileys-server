@@ -437,7 +437,11 @@ export function agendarPush(local) {
 // voltando); (3) o SIGTERM continua mandando o que estiver pendente.
 const MB = 1048576;
 const JANELA_GRANDE_TETO_MS = 30 * 60000;
+// Historico do Keepa/Descontinho muda a cada lote do import: sobe no maximo
+// a cada 15 min (21/11/2026, egress). O SIGTERM continua mandando o pendente.
+const JANELA_PRECOS_EXTERNOS_MS = 15 * 60000;
 function janelaDoArquivo(local) {
+  if (/^precos_(keepa|descontinho)_/.test(String(local).split('/').pop())) return JANELA_PRECOS_EXTERNOS_MS;
   try {
     const bytes = statSync(SESSAO_DIR + '/' + local).size;
     if (bytes <= MB) return DEBOUNCE_MS;

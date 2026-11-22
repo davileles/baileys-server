@@ -35,7 +35,19 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from '
 import { createHash } from 'crypto';
 import { agendarPush } from './sync-github.js';
 import { gerarImagemAviso } from './cartao-aviso.js';
-import { lerPrecoProduto, lerPrecosAmazonEmLote, estatisticas as estatisticasMonitor } from './monitor-precos.js';
+import { lerPrecoProduto, lerPrecosAmazonEmLote, estatisticas as estatisticasMonitor, historicoDe as historicoMonitor } from './monitor-precos.js';
+
+// Amazon sem historico: pede o do Keepa antes de sugerir o preco (1 token,
+// espera curta). Import tardio: keepa.js nao pode virar dependencia de boot.
+async function garantirHistoricoKeepa(item) {
+  if (!item || item.loja !== 'Amazon' || !/^B[A-Z0-9]{9}$/.test(String(item.asin || ''))) return;
+  try {
+    const st = estatisticasMonitor(item.asin);
+    if (st && st.dias >= 30) return;
+    const { consultarKeepaAgora } = await import('./keepa.js');
+    await consultarKeepaAgora(item.asin, 3000);
+  } catch (e) { /* sem Keepa, segue com o que tem */ }
+}
 import { resolverLinhaVitrine, buscarProdutos as buscarProdutosAmazon, normalizar as normalizarAmazon, buscarAmazonPorTermo, listarCuponsBase, cupomVigente, lerParcelamentoAmazon } from './radar-amazon.js';
 import { ehLinkShopee, extrairIdsShopee, buscarProdutoShopee, normalizarShopee, credenciaisShopeeOk, buscarShopeePorTermo } from './radar-shopee.js';
 import { ehLinkMl, resolverLinhaVitrineMl, buscarDadosProdutoMl, tokenAffOk, cupomDaPaginaParaCatalogoMl, buscarMlPorTermo } from './radar-ml.js';
@@ -435,6 +447,7 @@ export async function previaDoLink(url, ip) {
   if (r.erro) return { ok: false, erro: r.erro };
   const { item, leitura } = r;
   const preco = Number(leitura?.preco);
+  await garantirHistoricoKeepa(item);
   const hist = historicoParaSugestao(item.asin);
   const resp = {
     ok: true,
@@ -1071,6 +1084,7 @@ async function tratarConversa(jid, numeros, texto, pushName, contato, ctx = {}) 
     }
     const preco = Number(r.leitura?.preco) > 0 ? arred(r.leitura.preco) : null;
     const titulo = String(r.leitura?.titulo || r.item.nome || '').slice(0, 200);
+    if (preco) await garantirHistoricoKeepa(r.item);
     const sug = preco ? sugestaoDePreco(preco, historicoParaSugestao(r.item.asin)) : null;
     _criacaoPendente.set(jid, { item: r.item, leitura: r.leitura, sugestao: sug, titulo, em: Date.now() });
     if (_criacaoPendente.size > 2000) _criacaoPendente.delete(_criacaoPendente.keys().next().value);
@@ -1660,8 +1674,17 @@ function sessaoConsulta(token) {
   return s;
 }
 
-function serieDoProduto(prod) {
-  const dias = Object.entries(prod?.dias || {}).sort(([a], [b]) => a.localeCompare(b)).map(([d, p]) => ({ d, p }));
+function serieDoProduto(prod, chave) {
+  // Grafico: a serie dos avisos, completada com a do monitor (nossa + Keepa)
+  // nos dias sem leitura dos avisos — o grafico ja nasce com meses de dados.
+  const mapa = { ...(prod?.dias || {}) };
+  try {
+    const h = chave ? historicoMonitor(chave) : null;
+    const corte = diaSP(Date.now() - 120 * MS_DIA);
+    for (const s of [h?.serie || [], h?.serieKeepa || []])
+      for (const { d, v } of s) if (d >= corte && mapa[d] === undefined && v > 0) mapa[d] = v;
+  } catch (e) { /* grafico com o que tem */ }
+  const dias = Object.entries(mapa).sort(([a], [b]) => a.localeCompare(b)).map(([d, p]) => ({ d, p }));
   const leituras = (prod?.leituras || []).map(x => ({ em: x.em, p: x.p }));
   const todos = [...dias.map(x => x.p), ...leituras.map(x => x.p)];
   return {
@@ -1691,7 +1714,7 @@ export function listaConsulta(token) {
         melhor: (() => { const mo = prod.asin ? melhorOferta(prod) : null; return mo ? { preco: mo.preco, loja: mo.prod.loja, cupom: mo.cupom || null, precoCartao: mo.precoCartao || null } : null; })(),
         lidoEm: prod.lidoEm || null, criadoEm: p.criadoEm, expiraEm: p.expiraEm,
         avisos: (p.avisos || []).map(a => ({ em: a.em, preco: a.preco, tipo: a.tipo })),
-        serie: serieDoProduto(prod),
+        serie: serieDoProduto(prod, p.produto),
       };
     }),
   };

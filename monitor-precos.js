@@ -216,6 +216,8 @@ const CFG_PADRAO = {
     // Cota DIARIA por loja. O pedido inicial e 10 por loja; sobe em tela sem
     // deploy quando o volume convencional der espaco.
     cotaPorLoja: { 'Amazon': 10, 'Shopee': 10, 'Mercado Livre': 10 },
+    cotaRadar: 5,            // radar do Keepa: cota propria, fora da cota da loja (21/11/2026)
+    cupomSemPatamarPct: 20,  // queda com cupom a partir daqui dispensa o menor patamar de 90 dias
     // Cota DIARIA por nicho (soma das lojas). Sem isto o dia inteiro vira o
     // nicho que tiver mais produto cadastrado.
     cotaPorNicho: { geral: 18, bebidas: 6, infantil: 6, ferramentas: 6 },
@@ -933,6 +935,8 @@ function estruturarCfg(bruto) {
   out.publicacao.considerarCupom = p.considerarCupom !== false;
   out.publicacao.cotaPorLoja  = mapaNumerico(p.cotaPorLoja,  CFG_PADRAO.publicacao.cotaPorLoja,  0, 500);
   out.publicacao.cotaPorNicho = mapaNumerico(p.cotaPorNicho, CFG_PADRAO.publicacao.cotaPorNicho, 0, 500);
+  out.publicacao.cotaRadar = limitar(p.cotaRadar, 0, 100, CFG_PADRAO.publicacao.cotaRadar);
+  out.publicacao.cupomSemPatamarPct = limitar(p.cupomSemPatamarPct, 0, 100, CFG_PADRAO.publicacao.cupomSemPatamarPct);
 
   const cu = p.curado || {};
   out.publicacao.curado.intervaloMin = limitar(cu.intervaloMin, 0, 1440, CFG_PADRAO.publicacao.curado.intervaloMin);
@@ -1842,7 +1846,12 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
 
   // Vence a leitura que APROVA. Se as duas aprovam, vence a de queda maior — e
   // ela que descreve melhor o tamanho real da oportunidade.
-  const okB = aprova(mBruto), okE = aprova(mEfet);
+  // Queda grande com cupom (>= cupomSemPatamarPct) nao precisa ser o menor
+  // preco de 90 dias (21/11/2026): o cupom de hoje e a oportunidade.
+  const cupomSemPatamar = Number(_cfg.publicacao.cupomSemPatamarPct ?? 20);
+  const aprovaE = (m) => aprova(m) || (!!m && !!cupomAtual && cupomSemPatamar > 0
+    && m.quedaPct >= Math.max(cupomSemPatamar, r.quedaMinPct) && m.quedaRs >= r.quedaMinReais);
+  const okB = aprova(mBruto), okE = aprovaE(mEfet);
   let venc = null, via = null;
   if (okB && okE) { const b = mBruto.quedaPct >= mEfet.quedaPct; venc = b ? mBruto : mEfet; via = b ? 'preco' : 'cupom'; }
   else if (okB)   { venc = mBruto; via = 'preco'; }
@@ -1862,8 +1871,13 @@ export function avaliar(item, leitura, stats, nicho, curado = false) {
   if (!venc) {
     // O motivo relata a leitura BRUTA (a que sempre existe); quando a efetiva
     // chegou perto, o operador ve os dois numeros no modo sombra.
-    const m = mBruto;
+    // Relata a leitura que chegou mais perto (com cupom, se for ela).
+    const usaE = mEfet && (!mBruto || mEfet.quedaPct > mBruto.quedaPct);
+    const m = usaE ? mEfet : mBruto;
     if (!m) return { ...detalhe, passou: false, motivo: 'sem referencia' };
+    if (usaE && m.quedaPct >= r.quedaMinPct && m.quedaRs >= r.quedaMinReais)
+      return { ...detalhe, passou: false, motivo: 'com cupom: queda de ' + m.quedaPct + '%, mas nao esta no menor patamar de 90 dias'
+        + (cupomSemPatamar > 0 ? ' (sem patamar so a partir de ' + cupomSemPatamar + '%)' : '') };
     if (m.quedaPct < r.quedaMinPct)
       return { ...detalhe, passou: false, motivo: 'queda de ' + m.quedaPct + '% < ' + r.quedaMinPct + '%'
         + (mEfet ? ' (com cupom: ' + mEfet.quedaPct + '%)' : '') };
@@ -2244,6 +2258,21 @@ export function filtroDisparo(args = {}) {
       const pPago = leitura.precoComCupom || Number(args.preco);
       const v = vereditoLinhas(args.asin, pPago);
       r.linhas = v;
+      // Linhas na decisao (21/11/2026, aprovado pelo Davi):
+      // (1) filtro sem serie para julgar + linhas dizendo "falsa" = veta;
+      // (2) Amazon: linhas imperdivel/boa (12 meses, tabela, filtro de vendas)
+      //     derrubam o veto da serie de 30 dias. Queda anormal nunca muda.
+      const cfgF = _cfg.filtroDisparo || CFG_PADRAO.filtroDisparo;
+      const cfgL = _cfg.linhas || {};
+      if (cfgF.modo === 'ativo' && !r.quedaAnormal) {
+        if (cfgL.vetaFalsaSemSerie !== 0 && !r.julgavel && !r.veto && v.classe === 'falsa') {
+          Object.assign(r, { julgavel: true, nivel: 'falsoDesconto', veto: true, bloqueia: true, soNicho: false, porLinhas: true,
+            motivo: 'linhas de preco: ' + (v.motivo || 'preco no patamar normal') });
+        } else if (cfgL.aprovaAmazon !== 0 && r.veto && args.loja === 'Amazon' && (v.classe === 'imperdivel' || v.classe === 'boa')) {
+          Object.assign(r, { veto: false, bloqueia: false, soNicho: false, porLinhas: true, vetoOriginal: r.nivel,
+            nivel: null, motivo: 'linhas de preco: ' + v.classe + ' (' + (v.motivo || '') + ') — vence o veto da serie de 30 dias' });
+        }
+      }
       registrarLinhaCaptura({ em: new Date().toISOString(), asin: args.asin, loja: args.loja || null,
         nome: String(args.nome || '').slice(0, 90), preco: pPago, precoEtiqueta: Number(args.preco),
         cupom: leitura.cupomCodigo || null, classe: v.classe, motivo: v.motivo,
@@ -2944,25 +2973,29 @@ function podarFila() {
 function garantirCotasDoDia() {
   const dia = diaSP();
   if (_estado.cotas.dia !== dia) {
-    _estado.cotas = { dia, porLoja: {}, porNicho: {} };
+    _estado.cotas = { dia, porLoja: {}, porNicho: {}, radar: 0 };
   }
   return _estado.cotas;
 }
 
-function cotaDisponivel(loja, nicho) {
+function cotaDisponivel(loja, nicho, radar = false) {
   const c = garantirCotasDoDia();
   const limLoja  = _cfg.publicacao.cotaPorLoja?.[loja];
   const limNicho = _cfg.publicacao.cotaPorNicho?.[nicho];
-  if (limLoja !== undefined && (c.porLoja[loja] || 0) >= limLoja)
+  if (radar) {
+    const limR = Number(_cfg.publicacao.cotaRadar ?? 5);
+    if ((c.radar || 0) >= limR) return { ok: false, motivo: 'cota diaria do radar Keepa esgotada (' + limR + ')' };
+  } else if (limLoja !== undefined && (c.porLoja[loja] || 0) >= limLoja)
     return { ok: false, motivo: 'cota diaria de ' + loja + ' esgotada (' + limLoja + ')' };
   if (limNicho !== undefined && (c.porNicho[nicho] || 0) >= limNicho)
     return { ok: false, motivo: 'cota diaria do nicho ' + nicho + ' esgotada (' + limNicho + ')' };
   return { ok: true };
 }
 
-function consumirCota(loja, nicho) {
+function consumirCota(loja, nicho, radar = false) {
   const c = garantirCotasDoDia();
-  c.porLoja[loja]   = (c.porLoja[loja] || 0) + 1;
+  if (radar) c.radar = (c.radar || 0) + 1;
+  else c.porLoja[loja] = (c.porLoja[loja] || 0) + 1;
   c.porNicho[nicho] = (c.porNicho[nicho] || 0) + 1;
 }
 
@@ -3021,7 +3054,7 @@ function escolherDaFila() {
     for (const f of _estado.fila) {
       if (f.curado) continue;   // curado nunca ocupa o slot do geral
       if (anormal(f)) { bloqueios.push('queda anormal (' + f.asin + ') aguardando revisao'); continue; }
-      const c = cotaDisponivel(f.loja, f.nicho);
+      const c = cotaDisponivel(f.loja, f.nicho, f.origemRadar === 'keepa');
       if (c.ok) return { escolhido: f, viaCurado: false, bloqueios };
       bloqueios.push(c.motivo);
     }
@@ -3058,7 +3091,7 @@ async function tentarPublicar() {
       // grupo nichado nao gasta a cota do grupo geral — se gastasse, um dia
       // movimentado de ferramentas mataria as ofertas do geral sem que uma
       // unica mensagem tivesse chegado la.
-      if (r.espelhouNoGeral) consumirCota(escolhido.loja, escolhido.nicho);
+      if (r.espelhouNoGeral) consumirCota(escolhido.loja, escolhido.nicho, escolhido.origemRadar === 'keepa');
       if (viaCurado) _estado.ultimoEnvioCuradoEm = Date.now();
       if (!viaCurado || r.espelhouNoGeral) _estado.ultimoEnvioEm = Date.now();
 
@@ -3315,7 +3348,7 @@ export function registrarEnvioCard(snap = {}, { grupos = null, preco = null, cup
   marcarProdutoDisparado(item);
   const cand = _estado.fila.find(f => f.asin === asin) || snap;
   if (snap.espelhouNoGeral !== false) {
-    consumirCota(item.loja || snap.loja, cand.nicho || snap.nicho);
+    consumirCota(item.loja || snap.loja, cand.nicho || snap.nicho, cand.origemRadar === 'keepa');
     _estado.ultimoEnvioEm = Date.now();
   }
   if (snap.curado) _estado.ultimoEnvioCuradoEm = Date.now();

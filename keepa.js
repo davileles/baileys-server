@@ -352,7 +352,7 @@ async function rodarFila() {
       }
       for (const a of lote) if (!vistos.has(a)) registrarResultado(a, { ok: false, motivo: 'Keepa nao devolveu' });
       job.ultimoLote = { em: new Date().toISOString(), tamanho: lote.length, devolvidos: prods.length };
-      gravarShardsKeepa();
+      agendarShards();   // grava o disco no maximo 1x/min (antes: a cada lote)
       salvar();
       await dormir(1500);
     }
