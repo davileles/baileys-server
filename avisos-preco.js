@@ -366,6 +366,11 @@ export function sugestaoDePreco(precoAtual, hist) {
   if (hist?.min90 && hist.min90 < atual && hist.min90 >= atual * 0.7) {
     return { valor: arred(Math.floor(hist.min90)), motivo: 'menor preço dos últimos ' + Math.min(90, hist.dias) + ' dias' };
   }
+  // Hoje já é o menor preço do período: 10% abaixo seria um valor que o produto
+  // nunca atingiu. Sugere um passo curto (5%), alcançável numa queda comum.
+  if (hist?.min90 && hist.min90 >= atual) {
+    return { valor: arred(Math.floor(atual * 0.95)), motivo: '5% abaixo de hoje, que já é o menor preço dos últimos ' + Math.min(90, hist.dias) + ' dias' };
+  }
   return { valor: arred(Math.floor(atual * 0.9)), motivo: '10% abaixo do preço atual' };
 }
 
@@ -1433,7 +1438,11 @@ function textoPerguntaAlvo(item, titulo, preco, sug) {
   if (h.min90 && h.min90 < preco) {
     l.push('📉 Nos últimos ' + Math.min(90, h.dias) + ' dias, o menor preço que vi foi ' + brl(h.min90) + ' (' + Math.round((1 - h.min90 / preco) * 100) + '% abaixo de hoje).');
   } else if (h.min90) {
-    l.push('📉 Nos últimos ' + Math.min(90, h.dias) + ' dias ele não ficou mais barato que isso.');
+    l.push('📉 É o menor preço dos últimos ' + Math.min(90, h.dias) + ' dias.');
+    // Média recente bem acima de hoje mostra que é uma boa hora de comprar.
+    if (h.mediana30 && h.mediana30 >= preco * 1.03) {
+      l.push('📊 No último mês ele costumava ficar em torno de ' + brl(h.mediana30) + '. Hoje está ' + Math.round((1 - preco / h.mediana30) * 100) + '% abaixo disso.');
+    }
   } else {
     l.push('📉 Ainda não tenho o histórico de preço dele, então começo a acompanhar a partir de agora.');
   }
