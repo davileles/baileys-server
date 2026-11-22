@@ -33,6 +33,11 @@ import { ultimaRelacaoAvisos, observarMensagemAvisos, contasDoRodizioTico, conta
 
 const MS_MIN = 60e3, MS_H = 3600e3;
 const CONVERSA_TTL = 48 * MS_H;
+// Quem ficou esperando a equipe (ex.: assinatura vencida) continua com a
+// conversa por 7 dias: se a assinatura voltar e a pessoa escrever, o bot
+// confere de novo sozinho (22/11/2026).
+const AGUARDANDO_TTL = 7 * 24 * MS_H;
+function ttlConversa(c) { return c && c.etapa === 'aguardando_equipe' ? AGUARDANDO_TTL : CONVERSA_TTL; }
 // Depois que a conversa termina, a pessoa continua sendo "do CDV" no número
 // dela por 30 dias para agradecimento (7 dias) e problema com grupo/link; o resto
 // segue para os avisos de preço (18/11/2026 —
@@ -93,8 +98,7 @@ function gravar() {
   _timerGravar = setTimeout(() => {
     try {
       const e = E();
-      const corte = Date.now() - CONVERSA_TTL;
-      for (const [k, c] of Object.entries(e.conversas)) if ((c.atualizadoEm || 0) < corte && c.etapa !== 'na_fila') delete e.conversas[k];
+      for (const [k, c] of Object.entries(e.conversas)) if ((c.atualizadoEm || 0) < Date.now() - ttlConversa(c) && c.etapa !== 'na_fila') delete e.conversas[k];
       e.historico = (e.historico || []).slice(-200);
       for (const [t, em] of Object.entries(e.bvEnviadas || {})) if (Date.now() - em > 7 * 24 * MS_H) delete e.bvEnviadas[t];
       for (const [t, em] of Object.entries(e.posCdv || {})) if (Date.now() - em > POS_CONVERSA_MS) delete e.posCdv[t];
@@ -194,7 +198,9 @@ function _observar(apelido, sock, msg) {
         if (c0) { delete e.conversas[k0]; c0.jid = jid; e.conversas[jid] = c0; conv = c0; }
       }
     }
-    const ativa = conv && conv.etapa !== 'fim' && Date.now() - (conv.atualizadoEm || 0) < CONVERSA_TTL;
+    const idadeConv = conv ? Date.now() - (conv.atualizadoEm || 0) : Infinity;
+    const ativa = conv && conv.etapa !== 'fim' && (idadeConv < CONVERSA_TTL
+      || (conv.etapa === 'aguardando_equipe' && idadeConv < AGUARDANDO_TTL && !RE_INTENCAO_AVISOS.test(norm(texto))));
     const gatilho = RE_GATILHO.test(norm(texto));
     if (!gatilho && !ativa) {
       // Conversa já encerrada (ou de até 30 dias atrás): segue sendo do CDV,
@@ -355,8 +361,10 @@ async function tratar(apelido, sock, msg, jid, texto, gatilho) {
       // segue o fluxo normal de inclusão (só os grupos que ainda faltam).
       if (/grupo|link|entrar|consegu|abr[eiu]|erro|\bnao\b|ajuda/.test(norm(texto))) await consultarPorTelefone(conv);
     } else if (conv.etapa === 'aguardando_equipe') {
-      if (Date.now() - (conv.ultimaRespostaEm || 0) > 2 * MS_H) await responder(conv, 'A equipe já foi avisada e vai te responder por aqui. Se quiser tentar com outro e-mail, mande o e-mail da compra.');
       if (RE_EMAIL.test(texto)) { conv.etapa = 'email'; await etapaEmail(conv, texto); }
+      else if (!(await rechecarAguardando(conv)) && Date.now() - (conv.ultimaRespostaEm || 0) > 2 * MS_H) {
+        await responder(conv, 'A equipe já foi avisada e vai te responder por aqui. Se quiser tentar com outro e-mail, mande o e-mail da compra.');
+      }
     }
   } finally { gravar(); }
 }
@@ -385,6 +393,39 @@ async function posConversa(apelido, sock, msg, jid, texto, conv) {
   const c = conv || { jid, conta: apelido, telefone };
   c.jid = jid; c.conta = apelido || c.conta;
   await responder(c, 'Por nada! 😊 Aproveite os grupos do Clube do Viajante. Boas viagens! ✈️');
+}
+
+// Pessoa parada em 'aguardando_equipe' que volta a escrever (ex.: "renovei,
+// agora está ativa"): confere de novo sem pedir nada — primeiro pelo telefone,
+// depois pelo e-mail que ela já informou. Com direito, segue o fluxo normal
+// (pelo e-mail, manda o código de confirmação). No máximo 1× a cada 10 min.
+// Devolve true quando respondeu à pessoa. (22/11/2026)
+async function rechecarAguardando(conv) {
+  if (Date.now() - (conv.rechecadoEm || 0) < 10 * MS_MIN) return false;
+  conv.rechecadoEm = Date.now();
+  try {
+    const d = await _d.proxy('/cdv/inclusao/consultar', { telefone: conv.telefone });
+    if (d && d.grupos && d.grupos.some(g => g.direito)) {
+      conv.nome = d.nome || conv.nome || '';
+      registrar(conv, 'rechecado_com_direito', 'telefone');
+      await avisarOperador('*Inclusão nos grupos — assinatura voltou* ✅\n\n' + rotuloPessoa(conv) + ' voltou a escrever e agora tem acesso aos grupos. Segui com a inclusão; não precisa fazer nada.');
+      await seguirComDireito(conv, d, false);
+      return true;
+    }
+  } catch (err) { console.warn('[INCLUSAO] Reconsulta por telefone falhou: ' + err.message); return false; }
+  if (!conv.email) return false;
+  let r;
+  try { r = await _d.proxy('/cdv/inclusao/codigo', { telefone: conv.telefone, email: conv.email }); }
+  catch (err) { console.warn('[INCLUSAO] Reconsulta por e-mail falhou: ' + err.message); return false; }
+  if (!r || !r.encontrado || r.semDireito || r.semEmail) return false;
+  conv.nome = r.nome || conv.nome || '';
+  conv.etapa = 'codigo';
+  conv.tentativas = 0;
+  registrar(conv, 'rechecado_com_direito', conv.email);
+  await responder(conv, 'Conferi de novo e agora sua assinatura está ativa! ✅\n\nPara confirmar que o e-mail é seu, mandei um código de 6 dígitos para ' + (r.emailMascarado || conv.email) + '.\n\n'
+    + 'Me responda aqui com o código (vale 15 minutos). Se não chegar, olhe a caixa de spam.');
+  await avisarOperador('*Inclusão nos grupos — assinatura voltou* ✅\n\n' + rotuloPessoa(conv) + ' voltou a escrever e o e-mail ' + conv.email + ' agora dá acesso aos grupos. Mandei o código de confirmação; não precisa fazer nada.');
+  return true;
 }
 
 async function consultarPorTelefone(conv) {
