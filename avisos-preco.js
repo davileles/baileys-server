@@ -593,6 +593,28 @@ export function rotearTico({ atual = '', contar = true } = {}) {
   if (!numero) return { ok: false, erro: 'número de ' + conta + ' não lido' };
   return { ok: true, conta, numero, numeroFormatado: formatarTelefone(numero) };
 }
+// ── Mesmo número para alertas e inclusão do CDV (22/11/2026) ────────────────
+// A inclusão nos grupos do CDV (inclusao-cdv.js) roda nos mesmos números do
+// rodízio do Tico e usa o mesmo dono por pessoa: quem fala com um tico nos
+// alertas faz a inclusão por ele, e vice-versa.
+export function contasDoRodizioTico() { return poolContas(); }
+export function contaAptaTico(conta) { return contaApta(String(conta || '').trim().toLowerCase()); }
+export function registrarDonoTico(jid, numeros = [], conta) {
+  try { definirDono(jid, (numeros || []).map(digitosDeJid).filter(Boolean), conta); } catch (e) {}
+}
+// Número para uma mensagem que o servidor começa (boas-vindas, Balcão): o dono
+// da pessoa se estiver apto; senão o número do rodízio com mais folga (e ele
+// passa a ser o dono). null = nenhum número apto agora.
+export function contaParaPessoaTico(jid, telefone = '') {
+  try {
+    const nums = [telefone].map(digitosDeJid).filter(Boolean);
+    const dono = donoDe(jid, nums);
+    if (dono && dono.conta && contaApta(dono.conta)) return dono.conta;
+    const conta = escolherConta({ contar: true });
+    if (conta) definirDono(jid, nums, conta);
+    return conta || null;
+  } catch (e) { return null; }
+}
 function estadoRodizio() {
   const r = rodizioHoje();
   return poolContas().map(a => {

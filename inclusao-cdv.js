@@ -1,8 +1,11 @@
 // ── INCLUSÃO DE EX-ALUNOS NOS GRUPOS DO CDV PELO WHATSAPP (desde 18/11/2026) ──
 // Quem saiu (ou foi removido) dos grupos do Clube do Viajante não consegue voltar
 // pelo link: o WhatsApp só deixa voltar por inclusão de admin. O Davi deixa um
-// link wa.me para o número do CDV (tico-02, `config.conta`) com a mensagem pronta
-// "Quero entrar nos grupos do Clube do Viajante". A frase abre esta conversa:
+// link wa.me para o número do CDV com a mensagem pronta "Quero entrar nos grupos
+// do Clube do Viajante". Desde 22/11/2026 qualquer tico do rodízio dos alertas
+// de preço (tico-02 a tico-05, `contasDoRodizioTico`) atende a conversa, com o
+// mesmo dono por pessoa dos alertas: a conversa e a inclusão ficam no número com
+// que a pessoa falou. A frase abre esta conversa:
 //
 //  1. o telefone que está conversando é o que entra nos grupos. O proxy
 //     (`POST /cdv/inclusao/consultar`) diz a que grupos ele tem direito, com as
@@ -26,12 +29,12 @@
 // extenso); quem decide e escreve as mensagens é o código.
 
 import { existsSync, readFileSync } from 'fs';
-import { ultimaRelacaoAvisos, observarMensagemAvisos } from './avisos-preco.js';
+import { ultimaRelacaoAvisos, observarMensagemAvisos, contasDoRodizioTico, contaAptaTico, registrarDonoTico, contaParaPessoaTico } from './avisos-preco.js';
 
 const MS_MIN = 60e3, MS_H = 3600e3;
 const CONVERSA_TTL = 48 * MS_H;
-// Depois que a conversa termina, a pessoa continua sendo "do CDV" no tico-02
-// por 30 dias para agradecimento (7 dias) e problema com grupo/link; o resto
+// Depois que a conversa termina, a pessoa continua sendo "do CDV" no número
+// dela por 30 dias para agradecimento (7 dias) e problema com grupo/link; o resto
 // segue para os avisos de preço (18/11/2026 —
 // uma ex-aluna respondeu "muito obrigada" à inclusão e o Tico respondeu
 // falando de alerta de preço). Conversa solta (ex.: falar de uma oferta dias
@@ -58,6 +61,10 @@ const UFS = {
 };
 const CONFIG_PADRAO = {
   ativo: true,
+  // Números que atendem a inclusão (22/11/2026): vazio = os mesmos do rodízio
+  // dos alertas de preço (avisos-preco.js, `contas`). `conta` é só a reserva
+  // para mensagem que o servidor começa quando o rodízio não tem número apto.
+  contas: [],
   conta: 'tico-02',
   maxPessoasDia: 10,
   pausaGrupoMs: [150000, 210000],   // ~3 min entre um grupo e outro
@@ -124,13 +131,50 @@ function hojeE() {
 
 export function configInclusaoCdv() { return { ...E().config }; }
 
+function contasInclusao() {
+  const c = E().config;
+  let l = Array.isArray(c.contas) && c.contas.length ? c.contas : (() => { try { return contasDoRodizioTico(); } catch (e) { return []; } })();
+  l = l.map(x => String(x || '').trim().toLowerCase()).filter(x => x && x !== 'principal' && !/^(camp|aviso)-/.test(x));
+  if (!l.length && c.conta) l = [String(c.conta).trim().toLowerCase()];
+  return [...new Set(l)];
+}
+// Número para uma mensagem que o servidor começa (boas-vindas, Balcão): o dono
+// da pessoa no rodízio do Tico; senão o número com mais folga; senão a reserva
+// `config.conta`, se conectada. null = ninguém pode agora.
+function contaParaSaida(jid, telefone) {
+  let c = null;
+  try { c = contaParaPessoaTico(jid, telefone); } catch (e) { c = null; }
+  if (c && contasInclusao().includes(c)) return c;
+  for (const a of contasInclusao()) { try { if (contaAptaTico(a)) return a; } catch (e) {} }
+  const f = E().config.conta;
+  if (f && _d.contaConectada && _d.contaConectada(f)) return f;
+  return null;
+}
+function algumNumeroDisponivel() {
+  return contasInclusao().some(a => { try { return contaAptaTico(a) || (_d.contaConectada && _d.contaConectada(a)); } catch (e) { return false; } });
+}
+function numeroDosGrupos() {
+  for (const a of contasInclusao()) { const n = _d.numeroDaConta && _d.numeroDaConta(a); if (n) return n; }
+  return null;
+}
+
 // Chamado pelo server.js para TODA mensagem recebida pelas contas. Devolve true
 // quando a mensagem pertence a este fluxo (o chamador então não a repassa aos
 // avisos de preço, que dividem o número com o CDV).
 export function observarInclusaoCdv(apelido, sock, msg) {
+  const meu = _observar(apelido, sock, msg);
+  // A conversa ficou com o CDV: a pessoa passa a ser deste número também nos
+  // alertas (o dono é o mesmo nos dois assuntos).
+  if (meu) {
+    const k = msg?.key || {};
+    registrarDonoTico(String(k.remoteJid || ''), [k.remoteJidAlt, k.senderPn, k.remoteJid].map(v => String(v || '')).filter(Boolean), apelido);
+  }
+  return meu;
+}
+function _observar(apelido, sock, msg) {
   try {
     const e = E();
-    if (!e.config.ativo || apelido !== e.config.conta) return false;
+    if (!e.config.ativo || !contasInclusao().includes(String(apelido || '').toLowerCase())) return false;
     const k = msg?.key;
     if (!k || k.fromMe || !msg.message) return false;
     const jid = String(k.remoteJid || '');
@@ -191,7 +235,7 @@ export function observarInclusaoCdv(apelido, sock, msg) {
 }
 
 // ── Quem está falando? (21/11/2026) ─────────────────────────────────────────
-// O tico-02 é do CDV (inclusão) e do Tico (alertas de preço). Mensagem solta,
+// Cada tico do rodízio é do CDV (inclusão) e do Tico (alertas de preço). Mensagem solta,
 // sem a frase de entrar nos grupos: o telefone é conferido no cadastro do
 // próprio CDV (proxy /cdv/inclusao/consultar, que lê as assinaturas e as
 // exceções já gravadas — nenhuma chamada à Hubla). Cliente do CDV:
@@ -289,6 +333,12 @@ async function tratar(apelido, sock, msg, jid, texto, gatilho) {
   }
   conv.atualizadoEm = Date.now();
   if (conv.pushName !== msg.pushName && msg.pushName) conv.pushName = msg.pushName;
+  // A pessoa escreveu para outro tico: a conversa (e a inclusão) passa para ele,
+  // porque só a conta que recebeu a mensagem pode incluir.
+  if (apelido && conv.conta !== apelido) {
+    conv.conta = apelido;
+    for (const f of e.fila) if (f.jid === conv.jid) f.conta = apelido;
+  }
   try {
     if (conv.etapa === 'email') await etapaEmail(conv, texto);
     else if (conv.etapa === 'codigo') await etapaCodigo(conv, texto);
@@ -333,7 +383,7 @@ async function posConversa(apelido, sock, msg, jid, texto, conv) {
   const telefone = (conv && conv.telefone) || await _d.telefoneDe(sock, msg);
   if (!telefone) return;
   const c = conv || { jid, conta: apelido, telefone };
-  c.jid = jid; c.conta = c.conta || apelido;
+  c.jid = jid; c.conta = apelido || c.conta;
   await responder(c, 'Por nada! 😊 Aproveite os grupos do Clube do Viajante. Boas viagens! ✈️');
 }
 
@@ -569,7 +619,8 @@ async function enfileirar(conv, ufs) {
 
 // ── Boas-vindas de quem acabou de assinar (desde 18/11/2026) ─────────────────
 // O webhook da Hubla (customer.member_added) agenda; 2 min depois (tempo de o
-// proxy gravar a assinatura) o tico-02 manda o texto de boas-vindas e, numa
+// proxy gravar a assinatura) o tico da pessoa (dono no rodízio; sem dono, o com
+// mais folga) manda o texto de boas-vindas e, numa
 // segunda mensagem, os grupos: link de convite para quem nunca foi removido,
 // inclusão pela fila (com SIM depois de salvar o número) para quem um admin
 // removeu (o link não abre para essa pessoa), grupos por estado perguntados ao
@@ -612,15 +663,17 @@ async function processarBoasVindas() {
   const i = fila.findIndex(b => b.quando <= Date.now());
   if (i < 0) return;
   const b = fila[i];
-  const conta = e.config.conta;
-  if (!_d.contaConectada(conta)) {
+  const jid = await _d.jidDoTelefone(b.telefone);
+  const conta = contaParaSaida(jid, b.telefone);
+  if (!conta) {
     b.tentativas++;
     if (b.tentativas < 12) { b.quando = Date.now() + 5 * MS_MIN; gravar(); return; }
-    // conta fora do ar há 1 h: a boas-vindas sai pela principal, com a frase do fluxo
+    // nenhum tico no ar há 1 h: a boas-vindas sai pela principal, com a frase do fluxo
     fila.splice(i, 1);
     try {
+      const num = numeroDosGrupos();
       await _d.enviarPrincipal(b.telefone, textoBoasVindasCdv(b.nome, b.premium) + '\n\nPara entrar nos grupos, chame o nosso número dos grupos'
-        + (_d.numeroDaConta(conta) ? ' (' + _d.numeroDaConta(conta) + ')' : '') + ' e mande: *Quero entrar nos grupos do Clube do Viajante*');
+        + (num ? ' (' + num + ')' : '') + ' e mande: *Quero entrar nos grupos do Clube do Viajante*');
     } catch (err) { console.warn('[INCLUSAO] Boas-vindas pela principal falhou: ' + err.message); }
     (e.bvEnviadas || (e.bvEnviadas = {}))[b.telefone] = Date.now();
     gravar();
@@ -632,7 +685,6 @@ async function processarBoasVindas() {
   if (!temDireito && b.tentativas === 0) { b.tentativas = 1; b.quando = Date.now() + BV_RETENTATIVA_MS; gravar(); return; }
   fila.splice(i, 1);
   (e.bvEnviadas || (e.bvEnviadas = {}))[b.telefone] = Date.now();
-  const jid = await _d.jidDoTelefone(b.telefone);
   const conv = { jid, conta, telefone: b.telefone, nome: (d && d.nome) || b.nome || '', etapa: 'boas_vindas', tentativas: 0,
     criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'boas-vindas' };
   e.conversas[jid] = conv;
@@ -689,7 +741,7 @@ async function processarBoasVindas() {
 // ── Balcão: aviso de aprovação e de retirada (desde 18/11/2026) ──────────────
 // O proxy chama quando o Davi aprova uma verificação no gestor (balcao.js) e
 // quando o Tico tira alguém do grupo do Balcão por falta de verificação
-// (index.js do painel-cdv). Mensagens saem da conta da inclusão (tico-02).
+// (index.js do painel-cdv). Mensagens saem do tico da pessoa (dono no rodízio).
 // Aprovado: já está no grupo → só a confirmação; nunca saiu → link de convite;
 // saiu/foi removido (o link não abre) → "salve o número e responda SIM" e a
 // inclusão segue pela fila lenta, como no fluxo normal.
@@ -707,19 +759,18 @@ export function avisarBalcaoAprovadoCdv({ telefones, nome }) {
   const e = E();
   const tels = [...new Set((telefones || []).map(_telNorm).filter(Boolean))];
   if (!tels.length) return { ok: false, erro: 'telefone inválido' };
-  const conta = e.config.conta;
   if (!e.config.ativo) return { ok: false, erro: 'inclusão pelo WhatsApp desligada (/cdv/inclusao/config)' };
-  if (!_d.contaConectada || !_d.contaConectada(conta)) {
-    avisarOperador('*Balcão — aprovação sem aviso* ⚠️\n\n' + (nome || '+' + tels[0]) + ' foi aprovado(a) no Balcão, mas o ' + conta
-      + ' está desconectado. Avise a pessoa e inclua no grupo manualmente.');
-    return { ok: false, erro: conta + ' desconectado: avisei o grupo do operador' };
+  if (!algumNumeroDisponivel()) {
+    avisarOperador('*Balcão — aprovação sem aviso* ⚠️\n\n' + (nome || '+' + tels[0]) + ' foi aprovado(a) no Balcão, mas nenhum tico da inclusão ('
+      + contasInclusao().join(', ') + ') está conectado. Avise a pessoa e inclua no grupo manualmente.');
+    return { ok: false, erro: 'nenhum tico conectado: avisei o grupo do operador' };
   }
   if (_balcaoRepetido('aprovado', tels[0], 10 * MS_MIN)) return { ok: true, repetido: true };
   _avisarAprovado(tels, nome || '').catch(err => {
     console.warn('[INCLUSAO] Balcão aprovado: ' + err.message);
     avisarOperador('*Balcão — aprovação sem aviso* ⚠️\n\n' + (nome || '+' + tels[0]) + ': ' + err.message);
   });
-  return { ok: true, agendado: true, conta, telefone: tels[0] };
+  return { ok: true, agendado: true, contas: contasInclusao(), telefone: tels[0] };
 }
 
 async function _avisarAprovado(tels, nome) {
@@ -739,9 +790,13 @@ async function _avisarAprovado(tels, nome) {
   const jid = await _d.jidDoTelefone(tel);
   const abertura = 'Oi' + (pn ? ', ' + pn : '') + '! Sua verificação do *Balcão do Clube do Viajante* foi aprovada ✅';
   const existente = e.conversas[jid];
-  const conv = (existente && existente.etapa !== 'fim') ? existente
-    : { jid, conta: e.config.conta, telefone: tel, nome: d.nome || nome, etapa: 'fim', tentativas: 0, criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'balcao-aprovado' };
+  const ativa = existente && existente.etapa !== 'fim';
+  const conta = ativa && existente.conta && contaAptaTico(existente.conta) ? existente.conta : contaParaSaida(jid, tel);
+  if (!conta) throw new Error('nenhum tico da inclusão conectado agora');
+  const conv = ativa ? existente
+    : { jid, conta, telefone: tel, nome: d.nome || nome, etapa: 'fim', tentativas: 0, criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'balcao-aprovado' };
   conv.atualizadoEm = Date.now();
+  conv.conta = conta;
   if (!g || !g.direito) {
     conv.etapa = 'fim';
     e.conversas[jid] = conv;
@@ -800,13 +855,15 @@ export function avisarBalcaoRemovidoCdv({ telefone, nome, grupo, formulario }) {
   const e = E();
   const tel = _telNorm(telefone);
   if (!tel) return { ok: false, erro: 'telefone inválido' };
-  const conta = e.config.conta;
-  if (!_d.contaConectada || !_d.contaConectada(conta)) return { ok: false, erro: conta + ' desconectado' };
+  if (!algumNumeroDisponivel()) return { ok: false, erro: 'nenhum tico da inclusão conectado' };
   if (_balcaoRepetido('removido', tel, 24 * MS_H)) return { ok: true, repetido: true };
   (async () => {
     const jid = await _d.jidDoTelefone(tel);
     const pn = primeiroNome(nome);
-    const conv = e.conversas[jid] && e.conversas[jid].etapa !== 'fim' ? e.conversas[jid]
+    const ativa = e.conversas[jid] && e.conversas[jid].etapa !== 'fim';
+    const conta = ativa && e.conversas[jid].conta && contaAptaTico(e.conversas[jid].conta) ? e.conversas[jid].conta : contaParaSaida(jid, tel);
+    if (!conta) throw new Error('nenhum tico da inclusão conectado agora');
+    const conv = ativa ? e.conversas[jid]
       : { jid, conta, telefone: tel, nome: nome || '', etapa: 'fim', tentativas: 0, criadoEm: Date.now(), atualizadoEm: Date.now(), origem: 'balcao-removido' };
     await responder(conv, 'Oi' + (pn ? ', ' + pn : '') + '! Você foi retirado(a) do grupo ' + (grupo ? '*' + grupo + '*' : 'do *Balcão*')
       + ' porque ainda não encontramos a sua verificação do Balcão aprovada. O Balcão é só para membros verificados, para a segurança de todos nas negociações.\n\n'
@@ -906,7 +963,8 @@ export function estadoInclusaoCdv() {
   const conversas = Object.values(e.conversas).sort((a, b) => (b.atualizadoEm || 0) - (a.atualizadoEm || 0)).slice(0, 100)
     .map(c => ({ telefone: c.telefone, nome: c.nome || c.pushName || '', etapa: c.etapa, email: c.email || null,
       atualizadoEm: c.atualizadoEm ? new Date(c.atualizadoEm).toISOString() : null }));
-  return { config: { ...e.config }, pausado: e.pausado, atual: e.atual, fila: e.fila, hoje: hojeE(), conversas,
+  const contas = contasInclusao().map(a => { let apta = false; try { apta = contaAptaTico(a); } catch (er) {} return { apelido: a, apta }; });
+  return { config: { ...e.config }, contas, pausado: e.pausado, atual: e.atual, fila: e.fila, hoje: hojeE(), conversas,
     boasVindasAgendadas: (e.boasVindas || []).map(b => ({ telefone: b.telefone, nome: b.nome, premium: b.premium,
       quando: new Date(b.quando).toISOString(), tentativas: b.tentativas })),
     historico: (e.historico || []).slice(-50).reverse(), mensagemGatilho: 'Quero entrar nos grupos do Clube do Viajante' };
@@ -916,6 +974,7 @@ export function configurarInclusaoCdv(p) {
   const c = { ...e.config };
   if (typeof p.ativo === 'boolean') c.ativo = p.ativo;
   if (p.conta) c.conta = String(p.conta).trim();
+  if (Array.isArray(p.contas)) c.contas = [...new Set(p.contas.map(x => String(x || '').trim().toLowerCase()).filter(x => x && x !== 'principal' && !/^(camp|aviso)-/.test(x)))];
   if (Number.isFinite(Number(p.maxPessoasDia))) c.maxPessoasDia = Math.max(1, Math.min(30, Math.round(Number(p.maxPessoasDia))));
   if (Array.isArray(p.pausaGrupoMs) && p.pausaGrupoMs.length === 2) {
     const [a, b] = p.pausaGrupoMs.map(Number);
@@ -946,6 +1005,6 @@ export function iniciarInclusaoCdv(deps) {
   E();
   setInterval(() => { ciclo().catch(() => {}); }, 60e3).unref?.();
   setTimeout(() => { ciclo().catch(() => {}); }, 3 * 60e3).unref?.();
-  console.log('[INCLUSAO] Inclusão nos grupos do CDV pelo WhatsApp: ' + (E().config.ativo ? 'ligada' : 'desligada') + ' na conta ' + E().config.conta
+  console.log('[INCLUSAO] Inclusão nos grupos do CDV pelo WhatsApp: ' + (E().config.ativo ? 'ligada' : 'desligada') + ' nos números ' + contasInclusao().join(', ')
     + ' (' + E().fila.length + ' na fila).');
 }
