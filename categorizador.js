@@ -222,6 +222,17 @@ function _absorvido(termo, termosDosOutros) {
   });
 }
 
+// Palavra que, sozinha no titulo, ja diz a prateleira (22/11/2026, regra do
+// Davi: "se o titulo cita ferramenta, ja e Ferramentas"). Vence palavra comum
+// de outra prateleira ("Cinto Porta Ferramentas" tem "cinto", de Moda), mas
+// nao vence o bloqueio da propria prateleira ("kit ferramentas confeitaria")
+// nem prioridade maior ("maleta de ferramentas infantil" segue Infantil).
+// A taxonomia pode trocar a lista pelo campo keywordsFortes da categoria.
+const KEYWORDS_FORTES_PADRAO = { ferramentas: ['ferramenta'] };
+function keywordsFortesDe(id, def) {
+  return Array.isArray(def?.keywordsFortes) ? def.keywordsFortes : (KEYWORDS_FORTES_PADRAO[id] || []);
+}
+
 function porTitulo(titulo) {
   const t = normSing(titulo);
   if (!t) return null;
@@ -229,9 +240,10 @@ function porTitulo(titulo) {
   // Primeiro passo: o que cada prateleira casou no titulo.
   const casados = [];
   for (const [id, def] of Object.entries(_taxo.categorias || {})) {
+    const fortes    = keywordsFortesDe(id, def).filter(k => contemTermo(t, k));
     const marcas    = (def.marcas || []).filter(k => contemTermo(t, k));
-    const positivas = (def.keywords || []).filter(k => contemTermo(t, k));
-    if (positivas.length || marcas.length) casados.push({ id, def, marcas, positivas });
+    const positivas = [...new Set([...(def.keywords || []).filter(k => contemTermo(t, k)), ...fortes])];
+    if (positivas.length || marcas.length) casados.push({ id, def, marcas, positivas, forte: fortes.length > 0 });
   }
 
   let melhor = null;
@@ -261,13 +273,16 @@ function porTitulo(titulo) {
       // sandalia infantil e as duas coisas, e quem decide qual grupo recebe e a
       // taxonomia, nao a contagem de palavras. Marca conta em dobro no empate.
       _p: Number(def.prioridade) || 0,
+      _f: c.forte ? 1 : 0,
       _n: positivas.length + marcas.length * 2,
     };
+    if (c.forte && !marcas.length) cand.sinal = 'titulo-forte:' + normSing(keywordsFortesDe(id, def).find(k => contemTermo(t, k)) || positivas[0]);
     if (!melhor || melhor.categoria === null
         || cand._p > melhor._p
-        || (cand._p === melhor._p && cand._n > melhor._n)) melhor = cand;
+        || (cand._p === melhor._p && (cand._f || 0) > (melhor._f || 0))
+        || (cand._p === melhor._p && (cand._f || 0) === (melhor._f || 0) && cand._n > melhor._n)) melhor = cand;
   }
-  if (melhor) { delete melhor._n; delete melhor._p; }
+  if (melhor) { delete melhor._n; delete melhor._p; delete melhor._f; }
   return melhor;
 }
 
