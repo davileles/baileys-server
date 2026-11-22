@@ -10168,9 +10168,26 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // ANTES da classificacao, para que este mesmo item ja decida por breadcrumb
     // e nao por palavra no titulo. Amazon tem caminho proprio (enriquecimento
     // em background); aqui a pagina ja foi aberta pelo radar, entao e de graca.
-    if (p.trilha?.caminho && p.asin) {
-      try { semearCacheTrilhas({ [p.asin]: { ...p.trilha, fonte: 'pagina-' + String(p.loja || '').toLowerCase() } }); }
+    // O radar do ML devolve a trilha em TEXTO ("Ferramentas > ... > Bolsas"); o
+    // teste antigo so via { caminho } e a trilha do ML nunca chegava aqui
+    // (22/11/2026: "Bolsa de Ferramentas" e "Cinto Porta Ferramentas" da Loucos
+    // por Promos saiam como Moda pela palavra do titulo).
+    const _trilhaP = typeof p.trilha === 'string' ? { caminho: p.trilha } : (p.trilha?.caminho ? p.trilha : null);
+    if (_trilhaP?.caminho && p.asin) {
+      try { semearCacheTrilhas({ [p.asin]: { categoria: _trilhaP.categoria || _trilhaP.caminho.split('>')[0].trim(), ..._trilhaP, fonte: 'pagina-' + String(p.loja || '').toLowerCase() } }); }
       catch (e) { /* cache e conveniencia: falha aqui nunca segura o pipeline */ }
+    }
+    // Amazon sem historico do Keepa: busca agora (ate 3 s, 1 token). Vem ANTES
+    // da classificacao (22/11/2026): a resposta traz a arvore de categorias do
+    // produto, que entra no cache de trilhas — o produto que aparece pela
+    // primeira vez ja decide o nicho pela categoria da Amazon, nao so pelo
+    // titulo. O filtro de disparo, mais abaixo, segue usando o historico.
+    if (p.loja === 'Amazon' && p.asin && !oferta.dadosExtraidos.precoDeReferencia) {
+      try {
+        const _k = await consultarKeepaAgora(p.asin);
+        if (_k?.consultou) console.log('[KEEPA] #' + oferta.id + ' ' + p.asin + ' consultado na hora — '
+          + (_k.ok ? _k.dias + ' dia(s) de historico' : (_k.motivo || 'sem historico')));
+      } catch (e) { /* Keepa nunca segura o pipeline */ }
     }
 
     // ── VEREDITO PELO HISTORICO DE PRECO (SOMBRA) ─────────────────────────
@@ -10203,7 +10220,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
       }
     } catch (e) { /* sombra nunca segura o pipeline */ }
 
-    const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja });
+    const _cls = classificarProduto({ titulo: p.titulo, asin: p.asin, loja: p.loja, trilha: _trilhaP?.caminho || null });
     oferta.dadosExtraidos.categoria          = _cls.categoria;
     oferta.dadosExtraidos.categoriaNome      = _cls.nome;
     oferta.dadosExtraidos.categoriaConfianca = _cls.confianca;
@@ -10323,15 +10340,7 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
     // Produto com serie madura so sai sozinho se o preco caiu de verdade. Em
     // 'sombra' so registra; em 'ativo' o vetado vai para a fila com o motivo,
     // e o operador ainda pode aprovar na mao.
-    // Amazon sem historico do Keepa: busca agora (ate 3 s, 1 token) para o
-    // filtro julgar com a serie do Keepa em vez de "serie curta" (21/11/2026).
-    if (p.loja === 'Amazon' && p.asin && !oferta.dadosExtraidos.precoDeReferencia) {
-      try {
-        const _k = await consultarKeepaAgora(p.asin);
-        if (_k?.consultou) console.log('[KEEPA] #' + oferta.id + ' ' + p.asin + ' consultado na hora — '
-          + (_k.ok ? _k.dias + ' dia(s) de historico' : (_k.motivo || 'sem historico')));
-      } catch (e) { /* Keepa nunca segura o pipeline */ }
-    }
+    // Amazon: o Keepa ja foi consultado na hora antes da classificacao (acima).
     // Shopee sem consulta recente: historico do Descontinho (ate 2,5 s, API
     // publica). Erro, prazo estourado ou fonte fora = segue sem (21/11/2026).
     if (p.loja === 'Shopee' && p.asin && !oferta.dadosExtraidos.precoDeReferencia) {

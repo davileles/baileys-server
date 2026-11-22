@@ -210,19 +210,45 @@ function porTrilha(caminho) {
 // Bloqueio vence positiva: "Taca de Vinho Cristal" tem "vinho" e nao e bebida.
 // Quando isso acontece a categoria fica indefinida de proposito — ir para a
 // fila de aprovacao e o comportamento certo, chutar nao e.
+// Termo que so casou por estar DENTRO de um termo maior de outra prateleira
+// nao conta (22/11/2026): "Bolsa de Ferramentas Tramontina" casava "bolsa"
+// (Moda) e "bolsa de ferramentas" (Ferramentas) e a Moda vencia no empate. O
+// termo mais longo descreve o produto; o curto e so parte dele.
+function _absorvido(termo, termosDosOutros) {
+  const a = normSing(termo);
+  return termosDosOutros.some(b => {
+    const nb = normSing(b);
+    return nb.length > a.length && (' ' + nb + ' ').includes(' ' + a + ' ');
+  });
+}
+
 function porTitulo(titulo) {
   const t = normSing(titulo);
   if (!t) return null;
 
-  let melhor = null;
+  // Primeiro passo: o que cada prateleira casou no titulo.
+  const casados = [];
   for (const [id, def] of Object.entries(_taxo.categorias || {})) {
-    // Marca e um sinal mais forte que palavra solta: "Mustela" so aparece em
-    // produto infantil, enquanto "hidratante" aparece em qualquer prateleira.
     const marcas    = (def.marcas || []).filter(k => contemTermo(t, k));
     const positivas = (def.keywords || []).filter(k => contemTermo(t, k));
+    if (positivas.length || marcas.length) casados.push({ id, def, marcas, positivas });
+  }
+
+  let melhor = null;
+  for (const c of casados) {
+    const { id, def } = c;
+    const outros = casados.filter(o => o.id !== c.id).flatMap(o => [...o.positivas, ...o.marcas]);
+    // Marca e um sinal mais forte que palavra solta: "Mustela" so aparece em
+    // produto infantil, enquanto "hidratante" aparece em qualquer prateleira.
+    const marcas    = c.marcas.filter(k => !_absorvido(k, outros));
+    const positivas = c.positivas.filter(k => !_absorvido(k, outros));
     if (!positivas.length && !marcas.length) continue;
     const bloqueada = (def.bloqueio || []).find(b => contemTermo(t, b));
-    if (bloqueada) {
+    // Marca da prateleira + palavra da prateleira vencem o bloqueio
+    // (22/11/2026): "Klein Tools Alicate ... com faca" caia no bloqueio "faca"
+    // do grupo Ferramentas. So a marca nao basta — "Faca Tramontina" segue
+    // barrada, porque Tramontina tambem faz cozinha.
+    if (bloqueada && !(marcas.length && positivas.length)) {
       if (!melhor) melhor = { categoria: null, confianca: 0.3, _p: -1, _n: -1,
         sinal: 'bloqueio:' + normSing(bloqueada) + ' vs ' + normSing(marcas[0] || positivas[0]) };
       continue;
@@ -257,8 +283,11 @@ export function classificarProduto({ titulo, asin, loja, trilha } = {}) {
     // 0. Trilha informada por quem chama (ex.: path_from_root da API do ML).
     // Vem antes do cache porque e a trilha DESTE produto, agora — o cache e
     // memoria de uma leitura anterior, que pode ser de outro anuncio.
-    if (trilha) {
-      const r = porTrilha(trilha);
+    // Aceita a trilha em texto ("A > B > C", como o radar do ML devolve) ou
+    // como { caminho }.
+    const _trilha = typeof trilha === 'string' ? trilha : (trilha?.caminho || '');
+    if (_trilha) {
+      const r = porTrilha(_trilha);
       if (r) return { ...r, nome: _taxo.categorias[r.categoria]?.nome || r.categoria };
     }
 

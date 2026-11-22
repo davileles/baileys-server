@@ -22,6 +22,7 @@ import {
   vereditoLinhas, historicoDe, epcDe, avaliarAgoraAmazon, registrarReferenciaLonga,
 } from './monitor-precos.js';
 import { registrarOkFonte, registrarFalhaFonte, fonteFora, estadoFontes } from './saude-fontes.js';
+import { semearCacheTrilhas } from './categorizador.js';
 
 // Saude (21/11/2026): queda do Keepa avisa o grupo do operador; as ofertas
 // seguem saindo sem o historico dele (regra do Davi).
@@ -267,6 +268,15 @@ async function buscarProdutos(asins) {
 function aplicarProduto(prod, { gravarSerie = true } = {}) {
   const asin = prod?.asin;
   if (!asin) return { asin: null, ok: false, motivo: 'sem asin' };
+  // Arvore de categorias da Amazon que vem na mesma resposta (22/11/2026):
+  // vira trilha no cache do classificador de nicho. Assim o produto que
+  // aparece pela primeira vez decide o nicho pela categoria da loja, e nao so
+  // pelo titulo (o enriquecimento pela pagina so valia a partir da 2a captura).
+  try {
+    const arv = Array.isArray(prod.categoryTree)
+      ? prod.categoryTree.map(x => String(x?.name || '').trim()).filter(Boolean) : [];
+    if (arv.length) semearCacheTrilhas({ [asin]: { categoria: arv[0], caminho: arv.slice(0, 5).join(' > '), fonte: 'keepa' } });
+  } catch (e) { /* cache de trilha e conveniencia */ }
   const serie = serieDoProduto(prod, _e.cfg.fonte);
   const dias = Object.keys(serie).length;
   if (!dias) return { asin, ok: false, motivo: 'sem historico de preco no Keepa' };
