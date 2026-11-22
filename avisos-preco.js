@@ -94,6 +94,18 @@ const CFG_PADRAO = {
   // Pergunta "conseguiu comprar?" depois de um aviso sem resposta (06/11/2026).
   perguntaCompra: true,
   perguntaCompraHoras: 8,
+  // Rodízio dos números do Tico (22/11/2026): depois que o link do Tico nos
+  // grupos derrubou o tico-02, a conversa nova vai para o número com folga e
+  // quem já falou com um número segue sempre nele (roteador
+  // ir.ticapromos.com.br/tico no proxy + dono por telefone aqui). Só entra no
+  // rodízio o número conectado E com o QR do envio (wa-envio) logado; caiu,
+  // sai do rodízio até voltar.
+  contas: ['tico-02', 'tico-03', 'tico-04', 'tico-05'],
+  // Conversas novas por número por hora: acima disso o roteador prefere outro.
+  tetoNovasHora: 25,
+  // Dono da conversa fora do ar há mais que isto: o Tico passa a falar com a
+  // pessoa por outro número do rodízio (avisando a troca). 0 = só espera.
+  reatribuirAposH: 24,
 };
 
 const RE_ATIVAR = /pedido\s*n?[ºo°.]?\s*#?\s*(\d{4,6})/i;
@@ -135,6 +147,7 @@ function estruturar(bruto) {
   const e = bruto && typeof bruto === 'object' ? bruto : {};
   const cfg = { ...clonar(CFG_PADRAO), ...(e.config || {}) };
   cfg.intervaloHoras = { ...CFG_PADRAO.intervaloHoras, ...((e.config || {}).intervaloHoras || {}) };
+  if (!Array.isArray(cfg.contas)) cfg.contas = clonar(CFG_PADRAO.contas);
   return {
     config: cfg,
     seq: Number(e.seq) || 0,
@@ -149,6 +162,11 @@ function estruturar(bruto) {
     boasVindas: e.boasVindas && typeof e.boasVindas === 'object' ? e.boasVindas : {},
     boasVindasGrupos: e.boasVindasGrupos && typeof e.boasVindasGrupos === 'object' ? e.boasVindasGrupos : {},
     gruposPosAlerta: e.gruposPosAlerta && typeof e.gruposPosAlerta === 'object' ? e.gruposPosAlerta : {},
+    // Rodízio (22/11/2026): dono de cada conversa ('j:<jid>' / 't:<8 últimos dígitos>'
+    // → {conta, em}), desde quando cada número está fora e a carga do dia.
+    donos: e.donos && typeof e.donos === 'object' ? e.donos : {},
+    foraDesde: e.foraDesde && typeof e.foraDesde === 'object' ? e.foraDesde : {},
+    rodizio: e.rodizio && typeof e.rodizio === 'object' ? e.rodizio : { dia: '', porConta: {} },
   };
 }
 
@@ -474,8 +492,139 @@ export async function previaDoLink(url, ip) {
 }
 
 // ── Número dos avisos ────────────────────────────────────────────────────────
+// ── Rodízio dos números do Tico (22/11/2026) ────────────────────────────────
+const TICO_ROTEADOR = process.env.TICO_ROTEADOR || 'https://ir.ticapromos.com.br/tico';
+const TEXTO_TROCA = 'Oi! Aqui é o Tico, do Tica Promos 🐦\n\nO número que você usava comigo saiu do ar, então seus alertas de preço agora chegam por este aqui. Salve como *Tico — Tica Promos* para não perder nenhum aviso.';
+
+function poolContas() {
+  const c = E().config;
+  const out = [];
+  for (const a of (Array.isArray(c.contas) ? c.contas : [])) {
+    const s = String(a || '').trim().toLowerCase();
+    if (s && s !== 'principal' && !/^camp-/.test(s) && !out.includes(s)) out.push(s);
+  }
+  if (!out.length && c.conta) out.push(String(c.conta).trim());
+  return out;
+}
+// Número apto = Baileys conectado + QR do envio (wa-envio) logado. Guarda
+// desde quando cada número está fora (para a troca de dono depois de reatribuirAposH).
+function contaApta(a) {
+  if (!a) return false;
+  let ok = false;
+  try { ok = _deps.contaApta ? !!_deps.contaApta(a) : !!_deps.contaConectada?.(a); } catch (e) { ok = false; }
+  const fd = E().foraDesde;
+  if (ok) { if (fd[a]) { delete fd[a]; gravar(); } }
+  else if (!fd[a]) { fd[a] = new Date().toISOString(); gravar(); }
+  return ok;
+}
+function contasAptas() { return poolContas().filter(contaApta); }
+function chavesDono(jid, numeros = []) {
+  const ks = [];
+  if (jid) ks.push('j:' + jid);
+  const nums = [...numeros, digitosDeJid(jid), ...((contatoPorJid(jid) || {}).numeros || [])];
+  for (const n of nums) {
+    const d = String(n || '').replace(/\D/g, '');
+    if (d.length >= 10) ks.push('t:' + d.slice(-8));
+  }
+  return [...new Set(ks)];
+}
+function donoDe(jid, numeros = []) {
+  const d = E().donos;
+  let melhor = null;
+  for (const k of chavesDono(jid, numeros)) {
+    const v = d[k];
+    if (v && v.conta && (!melhor || Date.parse(v.em || 0) > Date.parse(melhor.em || 0))) melhor = v;
+  }
+  return melhor;
+}
+function definirDono(jid, numeros, conta, extra = {}) {
+  if (!jid || !conta) return;
+  const d = E().donos;
+  const atual = donoDe(jid, numeros);
+  const agora = new Date().toISOString();
+  // Mesmo dono há pouco: não regrava a cada mensagem.
+  if (atual && atual.conta === conta && !Object.keys(extra).length && Date.now() - Date.parse(atual.em || 0) < 6 * MS_H) return;
+  const v = { conta, em: agora, ...(atual && atual.conta === conta && atual.trocaEm ? { trocaEm: atual.trocaEm } : {}), ...extra };
+  for (const k of chavesDono(jid, numeros)) d[k] = v;
+  const ks = Object.keys(d);
+  if (ks.length > 30000) {
+    ks.sort((a, b) => Date.parse(d[a].em || 0) - Date.parse(d[b].em || 0));
+    for (const k of ks.slice(0, ks.length - 25000)) delete d[k];
+  }
+  gravar();
+}
+function rodizioHoje() {
+  const r = E().rodizio;
+  const dia = diaSP();
+  if (r.dia !== dia) { r.dia = dia; r.porConta = {}; }
+  return r;
+}
+// Escolhe o número de uma conversa nova: o que já é da pessoa (cookie do
+// roteador) se estiver apto; senão o apto com menos conversas novas no dia,
+// preferindo quem está abaixo do teto da hora. Nunca recusa: sem folga em
+// ninguém, vai o menos carregado.
+function escolherConta({ atual = '', contar = true } = {}) {
+  const aptas = contasAptas();
+  if (!aptas.length) return null;
+  const a0 = String(atual || '').trim().toLowerCase();
+  if (a0 && aptas.includes(a0)) return a0;
+  const r = rodizioHoje();
+  const h = String(horaSP());
+  const teto = Number(E().config.tetoNovasHora) || 0;
+  const carga = a => r.porConta[a] || { dia: 0, hora: {} };
+  const esc = aptas.slice().sort((x, y) => {
+    const cx = carga(x), cy = carga(y);
+    const hx = cx.hora[h] || 0, hy = cy.hora[h] || 0;
+    const ox = teto && hx >= teto ? 1 : 0, oy = teto && hy >= teto ? 1 : 0;
+    return (ox - oy) || (cx.dia - cy.dia) || (hx - hy) || x.localeCompare(y);
+  })[0];
+  if (contar) {
+    const cc = r.porConta[esc] = r.porConta[esc] || { dia: 0, hora: {} };
+    cc.dia++; cc.hora[h] = (cc.hora[h] || 0) + 1;
+    gravar();
+  }
+  return esc;
+}
+// GET /avisos-preco/rodizio — usado pelo roteador ir.ticapromos.com.br/tico.
+export function rotearTico({ atual = '', contar = true } = {}) {
+  const conta = escolherConta({ atual, contar });
+  if (!conta) return { ok: false, erro: 'nenhum número do Tico conectado' };
+  const numero = normalizarTelefone(_deps.numeroDaConta?.(conta));
+  if (!numero) return { ok: false, erro: 'número de ' + conta + ' não lido' };
+  return { ok: true, conta, numero, numeroFormatado: formatarTelefone(numero) };
+}
+function estadoRodizio() {
+  const r = rodizioHoje();
+  return poolContas().map(a => {
+    const apta = contaApta(a);
+    let numero = null; try { numero = normalizarTelefone(_deps.numeroDaConta?.(a)); } catch (e) {}
+    const donos = new Set(Object.entries(E().donos).filter(([k, v]) => k.startsWith('t:') && v.conta === a).map(([k]) => k)).size;
+    return { apelido: a, apta, numero: numero ? formatarTelefone(numero) : null, foraDesde: E().foraDesde[a] || null,
+      novasHoje: (r.porConta[a] || {}).dia || 0, conversas: donos };
+  });
+}
+// Para qual número vai uma mensagem da fila (null = nenhum pode agora).
+function contaParaEnvio(item) {
+  const c = E().config;
+  const dono = donoDe(item.jid);
+  // Sem dono gravado = conversa de antes do rodízio: era do número único (c.conta).
+  const conta = item.conta || (dono && dono.conta) || c.conta || null;
+  if (conta && contaApta(conta)) return { conta, troca: false };
+  const limite = (Number(c.reatribuirAposH) || 0) * MS_H;
+  const fora = conta ? Date.parse(E().foraDesde[conta] || '') : NaN;
+  if (!conta || (limite > 0 && fora && Date.now() - fora > limite)) {
+    const nova = escolherConta({ contar: false });
+    if (nova) return { conta: nova, troca: !!conta };
+  }
+  return null;
+}
+
 export function numeroDosAvisos() {
   const c = E().config;
+  // Com rodízio: o número de um Tico que está no ar (o principal dos avisos se apto).
+  const aptas = contasAptas();
+  const pref = aptas.includes(c.conta) ? c.conta : (escolherConta({ contar: false }) || null);
+  if (pref) { try { const n = normalizarTelefone(_deps.numeroDaConta?.(pref)); if (n) return n; } catch (e) {} }
   if (!c.conta) return null;
   const fixo = normalizarTelefone(c.numeroPublico);
   if (fixo) return fixo;
@@ -487,6 +636,8 @@ function linkAtivacao(codigo) {
   if (!n) return null;
   // Sem emoji: o wa.me troca caractere fora do plano básico por "�". Igual ao da página.
   const texto = 'Oi, Tico! Quero receber os alertas de preço do Tica Promos (pedido ' + codigo + ')';
+  // Pelo roteador (22/11/2026): a pessoa cai no Tico dela ou no que tem folga.
+  if (TICO_ROTEADOR) return TICO_ROTEADOR + '?text=' + encodeURIComponent(texto);
   return 'https://wa.me/' + n + '?text=' + encodeURIComponent(texto);
 }
 
@@ -692,7 +843,7 @@ export function ultimaRelacaoAvisos(jids = [], telefone = '') {
 export function observarMensagemAvisos(apelido, msg, ctx = {}) {
   try {
     const c = E().config;
-    if (!c.conta || apelido !== c.conta) return;
+    if (!apelido || (apelido !== c.conta && !poolContas().includes(apelido))) return;
     const k = msg?.key;
     if (!k || k.fromMe || !msg.message) return;
     const jid = String(k.remoteJid || '');
@@ -709,6 +860,8 @@ export function observarMensagemAvisos(apelido, msg, ctx = {}) {
     if (humano) estenderAtendimento(jid);
 
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
+    // Quem escreveu para este número passa a ser dele (a resposta sai daqui).
+    definirDono(jid, numeros, apelido);
 
     if (humano && !RE_SAIR.test(texto) && !RE_SAIR_UM.test(texto) && !RE_ATIVAR.test(texto)) {
       rastrear(jid, 'atendimento-humano', 'sem resposta automática');
@@ -846,7 +999,7 @@ export function enviarMensagemOperador(id, textoBruto) {
   const texto = String(textoBruto || '').trim().slice(0, 2000);
   if (!texto) return { ok: false, erro: 'mensagem vazia' };
   const c = E().config;
-  if (!c.conta || !_deps.contaConectada?.(c.conta)) return { ok: false, erro: 'número dos avisos (' + (c.conta || 'nenhum') + ') desconectado' };
+  if (!contaParaEnvio({ jid: p.jid, resposta: true })) return { ok: false, erro: 'o número do Tico desta conversa (' + ((donoDe(p.jid) || {}).conta || c.conta || 'nenhum') + ') está desconectado' };
   estenderAtendimento(p.jid);
   _criacaoPendente.delete(p.jid);
   anotarConversa(p.jid, 'tico', texto);
@@ -1658,7 +1811,7 @@ export function pedirCodigoConsulta(telefoneBruto, ip) {
     if (aguardando) return { ok: false, erro: 'Seus alertas ainda não foram ativados. Mande a mensagem de ativação para o Tico no WhatsApp e tente de novo.' };
     return generico;
   }
-  if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) return { ok: false, erro: 'O WhatsApp do Tico está fora do ar agora. Tente de novo em alguns minutos.' };
+  if (!contaParaEnvio({ jid: contato.jid, resposta: true })) return { ok: false, erro: 'O WhatsApp do Tico está fora do ar agora. Tente de novo em alguns minutos.' };
   const codigo = String(100000 + Math.floor(Math.random() * 900000));
   _codigosConsulta.set(tel, { codigo, exp: Date.now() + 10 * 60000, tentativas: 0 });
   enfileirarEnvio(contato.jid, 'Seu código para ver seus alertas no site: *' + codigo + '*\n\nVale por 10 minutos. Se não foi você que pediu, é só ignorar.', { resposta: true });
@@ -1767,41 +1920,60 @@ function enfileirarEnvio(jid, texto, meta = {}) {
   processarFila();
 }
 
+let _avisoFilaParadaEm = 0;
 async function processarFila() {
   if (_enviando) return;
   _enviando = true;
   try {
     while (_filaEnvio.length) {
       const c = E().config;
-      if (!c.conta || !_deps.contaConectada?.(c.conta)) {
-        console.warn('[AVISOS] Conta dos avisos (' + (c.conta || 'nenhuma') + ') desconectada — ' + _filaEnvio.length + ' mensagem(ns) esperando.');
-        rastrear(_filaEnvio[0]?.jid || '', 'conta-desconectada', c.conta || 'nenhuma');
+      // Rodízio: cada mensagem sai pelo número dono da conversa. Dono fora do
+      // ar = a mensagem espera (as outras seguem); depois de reatribuirAposH
+      // ela sai por outro número com o aviso da troca.
+      let item = _filaEnvio.find(it => !!contaParaEnvio(it));
+      if (!item) {
+        if (Date.now() - _avisoFilaParadaEm > 10 * 60000) {
+          _avisoFilaParadaEm = Date.now();
+          console.warn('[AVISOS] Nenhum número do Tico apto para as ' + _filaEnvio.length + ' mensagem(ns) da fila (rodízio: ' + poolContas().join(', ') + ').');
+        }
+        rastrear(_filaEnvio[0]?.jid || '', 'conta-desconectada', (donoDe(_filaEnvio[0]?.jid || '') || {}).conta || c.conta || 'nenhuma');
         break;
       }
-      const item = _filaEnvio[0];
       if (!item.resposta) {
         const [a, b] = c.espacoEntreEnviosS;
         const espera = (a + Math.random() * Math.max(0, b - a)) * 1000 - (Date.now() - _ultimoEnvioEm);
         if (espera > 0) await new Promise(r => setTimeout(r, espera));
       }
-      _filaEnvio.shift();
+      const idx = _filaEnvio.indexOf(item);
+      if (idx < 0) continue;
+      const alvo = contaParaEnvio(item);
+      if (!alvo) continue;
+      _filaEnvio.splice(idx, 1);
+      const contaEnvio = alvo.conta;
+      const dono = donoDe(item.jid);
+      const avisarTroca = alvo.troca && !(dono && dono.conta === contaEnvio && dono.trocaEm);
+      const textoFinal = avisarTroca ? TEXTO_TROCA + '\n\n' + item.texto : item.texto;
       try {
         let img = null;
         if (typeof item.imagem === 'function') { try { img = await item.imagem(); } catch (e) { img = null; } }
         if (img) {
-          try { await _deps.enviarDm(c.conta, item.jid, { imagem: img, legenda: item.texto }); }
+          try { await _deps.enviarDm(contaEnvio, item.jid, { imagem: img, legenda: textoFinal }); }
           catch (e) {
             console.warn('[AVISOS] Envio com imagem falhou (' + e.message + ') — indo só o texto.');
-            await _deps.enviarDm(c.conta, item.jid, item.texto);
+            await _deps.enviarDm(contaEnvio, item.jid, textoFinal);
           }
-        } else await _deps.enviarDm(c.conta, item.jid, item.texto);
+        } else await _deps.enviarDm(contaEnvio, item.jid, textoFinal);
         _ultimoEnvioEm = Date.now();
-        registrarMensagem(item.jid, item.de || 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, imagem: !!img, manual: !!item.manual });
+        if (alvo.troca) {
+          definirDono(item.jid, [], contaEnvio, { trocaEm: new Date().toISOString() });
+          console.log('[AVISOS] Conversa com ' + mascarar(digitosDeJid(item.jid) || item.jid) + ' passou para ' + contaEnvio + ' (número antigo fora do ar).');
+        } else if (!dono) definirDono(item.jid, [], contaEnvio);
+        registrarMensagem(item.jid, item.de || 'tico', textoFinal, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, imagem: !!img, manual: !!item.manual, conta: contaEnvio });
         if (item.aoEnviar) { try { item.aoEnviar(); } catch (e) {} }
       } catch (e) {
-        console.warn('[AVISOS] Envio para ' + mascarar(digitosDeJid(item.jid) || item.jid) + ' falhou: ' + e.message);
-        rastrear(item.jid, 'envio-falhou', e.message);
-        registrarMensagem(item.jid, item.de || 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, falhou: String(e.message || e).slice(0, 160) });
+        console.warn('[AVISOS] Envio para ' + mascarar(digitosDeJid(item.jid) || item.jid) + ' por ' + contaEnvio + ' falhou: ' + e.message);
+        rastrear(item.jid, 'envio-falhou', contaEnvio + ': ' + e.message);
+        registrarMensagem(item.jid, item.de || 'tico', item.texto, { pedido: item.pedidoId || null, aviso: !!item.pedidoId, falhou: String(e.message || e).slice(0, 160), conta: contaEnvio });
         if (item.aoFalhar) { try { item.aoFalhar(e); } catch (e2) {} }
       }
       if (item.resposta) await new Promise(r => setTimeout(r, 2500));
@@ -2095,7 +2267,7 @@ function avisoPendente(pedido) {
   let motivo = 'sai na próxima varredura';
   if (pedido.pausado) motivo = 'pedido pausado';
   else if (_filaEnvio.some(f => f.pedidoId === pedido.id)) motivo = 'na fila de envio';
-  else if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) motivo = 'número dos alertas desconectado';
+  else if (!contaParaEnvio({ jid: pedido.jid })) motivo = 'número do Tico desta pessoa (' + ((donoDe(pedido.jid) || {}).conta || cfg.conta || '—') + ') desconectado';
   else if (!dentroDaJanela()) motivo = 'fora da janela (' + cfg.janelaIni + 'h–' + cfg.janelaFim + 'h)';
   else if (Date.now() - Date.parse(mo.prod.ult?.em || 0) > 8 * MS_H) motivo = 'leitura com mais de 8 h, aguardando nova leitura';
   else {
@@ -2125,7 +2297,7 @@ export async function dispararPedidoAgora(id, { previa = false } = {}) {
   if (pedido.status !== 'ativo' || !pedido.jid) return { ok: false, erro: 'pedido não está ativo' };
   if (_filaEnvio.some(f => f.pedidoId === pedido.id)) return { ok: false, erro: 'já está na fila de envio' };
   const cfg = E().config;
-  if (!cfg.conta || !_deps.contaConectada?.(cfg.conta)) return { ok: false, erro: 'número dos alertas (' + (cfg.conta || 'nenhum') + ') desconectado' };
+  if (!contaParaEnvio({ jid: pedido.jid })) return { ok: false, erro: 'número do Tico desta pessoa (' + ((donoDe(pedido.jid) || {}).conta || cfg.conta || 'nenhum') + ') desconectado' };
   const prod = E().produtos[pedido.produto];
   if (!prod) return { ok: false, erro: 'produto sem link vinculado' };
   const mo = melhorOferta(prod);
@@ -2200,7 +2372,7 @@ export async function varrerAvisos({ manual = false } = {}) {
       if (devidos.length) res.lidos = await lerProdutos(devidos);
     }
     // 3. Avisos, só na janela e com a conta conectada.
-    if (cfg.conta && dentroDaJanela() && _deps.contaConectada?.(cfg.conta)) {
+    if (dentroDaJanela() && contasAptas().length) {
       const jaNaFila = new Set(_filaEnvio.filter(f => f.pedidoId).map(f => f.pedidoId));
       const paraGrupos = new Map();   // produto da loja → { item, cupom, tipo, clientes, preco, alvo }
       for (const pedido of E().pedidos) {
@@ -2666,7 +2838,8 @@ export function estadoAvisos() {
     ok: true,
     config: st.config,
     numero: numeroDosAvisos(),
-    contaConectada: st.config.conta ? !!_deps.contaConectada?.(st.config.conta) : false,
+    contaConectada: contasAptas().length > 0,
+    rodizio: estadoRodizio(),
     contasDisponiveis: (_deps.listarContas?.() || []).sort((a, b) => a.apelido.localeCompare(b.apelido, 'pt-BR')),
     resumo: {
       porStatus,
@@ -2703,7 +2876,8 @@ export function estadoAvisos() {
         avisoPendente: avisoPendente(p),
         // Situação do envio deste pedido (para o painel acompanhar o "Disparar agora").
         naFila: (() => { const i = _filaEnvio.findIndex(f => f.pedidoId === p.id); return i < 0 ? null : { posicao: i + 1, total: _filaEnvio.length }; })(),
-        contaAvisosConectada: !!(st.config.conta && _deps.contaConectada?.(st.config.conta)),
+        contaAvisosConectada: !!(p.jid ? contaParaEnvio({ jid: p.jid }) : contasAptas().length),
+        contaTico: p.jid ? ((donoDe(p.jid) || {}).conta || st.config.conta || null) : null,
         ultimaFalhaEnvio: p.ultimaFalhaEnvio || null,
         ultimaMensagem: um || null,
         atendimentoAte: p.jid && st.atendimentos[p.jid] && Date.parse(st.atendimentos[p.jid]) > Date.now() ? st.atendimentos[p.jid] : null,
@@ -2727,6 +2901,12 @@ export function salvarConfigAvisos(parcial = {}) {
       for (const p of E().pedidos) if (p.status === 'aguardando') p.expiraEm = prazo;
     }
   }
+  if ('contas' in parcial) {
+    const l = Array.isArray(parcial.contas) ? parcial.contas : String(parcial.contas || '').split(',');
+    c.contas = [...new Set(l.map(s => String(s || '').trim().toLowerCase()).filter(s => /^[a-z0-9_-]{2,24}$/.test(s) && s !== 'principal'))];
+  }
+  if ('tetoNovasHora' in parcial) c.tetoNovasHora = Math.round(num(parcial.tetoNovasHora, 0, 500, c.tetoNovasHora));
+  if ('reatribuirAposH' in parcial) c.reatribuirAposH = num(parcial.reatribuirAposH, 0, 720, c.reatribuirAposH);
   if ('numeroPublico' in parcial) c.numeroPublico = normalizarTelefone(parcial.numeroPublico) || '';
   if ('limitePorCliente' in parcial) c.limitePorCliente = Math.round(num(parcial.limitePorCliente, 1, 50, c.limitePorCliente));
   if ('janelaIni' in parcial) c.janelaIni = Math.round(num(parcial.janelaIni, 0, 23, c.janelaIni));
@@ -2754,7 +2934,7 @@ export function salvarConfigAvisos(parcial = {}) {
     c.intervaloHoras = ih;
   }
   gravar();
-  if (c.conta) processarFila();
+  if (_filaEnvio.length) processarFila();
   return c;
 }
 

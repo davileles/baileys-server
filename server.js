@@ -200,7 +200,7 @@ import { iniciarAvisosPreco, carregarAvisosPreco, observarMensagemAvisos, previa
          salvarConfigAvisos, acaoPedido as avisosAcaoPedido, varrerAvisos, vincularLinkPedido, dispararPedidoAgora, previaDisparoPedido,
          pedirCodigoConsulta, entrarConsulta, listaConsulta, pararPelaConsulta, rastroConversas,
          acaoEquivalente, trabalhoOutrasLojas, conferirPrecoCardAviso, mensagensDoPedido,
-         enviarMensagemOperador, encerrarAtendimento, numeroDosAvisos, retomarBuscaMlAposVerificacao } from './avisos-preco.js';
+         enviarMensagemOperador, encerrarAtendimento, numeroDosAvisos, retomarBuscaMlAposVerificacao, rotearTico } from './avisos-preco.js';
 // ── LINKS RASTREADOS (ir.ticapromos.com.br/<loja>/<codigo>-<grupo>) ──────────
 import { rastrearParaGrupo, resolverCodigo, estadoRastreio, gruposDosEnviosDoDia } from './links-rastreio.js';
 
@@ -28173,6 +28173,16 @@ function _contaAvisosConectada(apelido) {
   const c = contasExtras.get(contaIdDe(TENANT_PADRAO, apelido));
   return !!(c?.conectado && c.sock);
 }
+// Rodizio do Tico (22/11/2026): numero apto = Baileys conectado e, se a conta
+// envia pelo wa-envio, QR do envio logado. Caiu/deslogou = fora do rodizio.
+function _contaAvisosApta(apelido) {
+  if (!_contaAvisosConectada(apelido)) return false;
+  const a = String(apelido || '').toLowerCase();
+  if (a === 'principal') return true;
+  const m = motorEnvioDaConta(a);
+  if (m.ligado && m.sondado && !m.conectado) return false;
+  return true;
+}
 function _numeroDaContaAvisos(apelido) {
   const s = apelido === 'principal' ? sock : contasExtras.get(contaIdDe(TENANT_PADRAO, apelido))?.sock;
   const id = String(s?.user?.id || '');
@@ -28204,6 +28214,7 @@ iniciarAvisosPreco({
   cardGrupos: criarCardAvisoPreco,
   enviarDm: _enviarDmAvisos,
   contaConectada: _contaAvisosConectada,
+  contaApta: _contaAvisosApta,
   numeroDaConta: _numeroDaContaAvisos,
   listarContas: _listarContasAvisos,
   montarAmazon: montarOfertasVitrine,
@@ -28396,6 +28407,14 @@ function _ipDaReq(req) {
 }
 // Publicas (pagina do tica-site). Nada de dado pessoal na resposta.
 app.get('/avisos-preco/info', (req, res) => { res.json(avisosInfoPublica()); });
+// Roteador do Tico (22/11/2026): o proxy (ir.ticapromos.com.br/tico) pergunta
+// qual numero atende. ?atual=<apelido do cookie> mantem a pessoa no Tico dela;
+// ?preview=1 (robo de previa) nao conta como conversa nova. So devolve numero publico.
+app.get('/avisos-preco/rodizio', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const r = rotearTico({ atual: String(req.query.atual || '').slice(0, 24), contar: req.query.preview !== '1' });
+  res.status(r.ok ? 200 : 503).json(r);
+});
 app.post('/avisos-preco/previa', async (req, res) => {
   try { res.json(await avisosPrevia(req.body?.url, _ipDaReq(req))); }
   catch (e) { res.status(500).json({ ok:false, erro:'Falha ao ler o link.' }); }
