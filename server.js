@@ -1872,6 +1872,9 @@ async function conectarConta(id) {
       if (u.qr) c.qr = await QRCode.toDataURL(u.qr);
       if (u.connection === 'open') {
         c.conectado = true; c.qr = null; c.conectando = false; c.tentativas = 0;
+        // Reconectou depois de um logout: o aviso "deslogada" deixa de valer
+        // (antes ficava gravado e o painel mostrava a conta como deslogada).
+        if (c.ultimoErro && /^deslogad/i.test(c.ultimoErro)) limparErroConta(c);
         console.log('[CONTA:' + id + '] ✓ conectada.');
         setTimeout(ficarInvisivel, 5000);
       }
