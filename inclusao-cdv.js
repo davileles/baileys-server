@@ -102,6 +102,15 @@ function diaSP(ms = Date.now()) { return new Date(ms - 3 * MS_H).toISOString().s
 function horaSP(ms = Date.now()) { return new Date(ms - 3 * MS_H).getUTCHours(); }
 function primeiroNome(n) { const p = String(n || '').trim().split(/\s+/)[0]; return p ? p.charAt(0).toUpperCase() + p.slice(1).toLowerCase() : ''; }
 function lista(nomes) { return nomes.map(n => '• ' + n).join('\n'); }
+// Grupos a que a pessoa tem direito e em que já está (ordem alfabética), para a
+// mensagem mostrar o acesso inteiro e não só o que falta (22/11/2026). Checagem
+// falhou (presentes null) = lista vazia: melhor não mostrar do que mostrar errado.
+function nomesJaEsta(liberados, presentes) {
+  if (!presentes) return [];
+  return liberados.filter(g => presentes.has(g.jid)).map(g => g.nome)
+    .sort((a, b) => String(a).localeCompare(String(b), 'pt-BR'));
+}
+function blocoJaEsta(nomes) { return nomes.length ? '✅ *Você já está em:*\n' + lista(nomes) : ''; }
 function textoDe(msg) {
   const m = msg?.message || {};
   return String(m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.ephemeralMessage?.message?.conversation
@@ -453,18 +462,20 @@ async function seguirComDireito(conv, d, atualizado) {
   conv.balcao = balcao ? { verificado: !!balcao.verificado, pendente: !!balcao.verificacaoPendente, jaEsta: !!(presentes && presentes.has(balcao.jid)),
     formulario: d.formularioBalcao || '' } : null;
   const notaBalcao = balcaoNota(conv);
+  const jaEsta = blocoJaEsta(nomesJaEsta(liberados, presentes));
   const inicio = atualizado ? 'Pronto, atualizei seu cadastro com este número.' : 'Oi' + (pn ? ', ' + pn : '') + '! Encontrei seu acesso.';
   if (!conv.fixos.length && !conv.estadosDisp.length) {
     conv.etapa = 'fim';
     registrar(conv, 'ja_esta_em_todos');
-    await responder(conv, inicio + ' Você já está em todos os grupos a que tem direito 👍' + (notaBalcao ? '\n\n' + notaBalcao : ''));
+    await responder(conv, [inicio + ' Você já está em todos os grupos a que tem direito 👍', jaEsta, notaBalcao].filter(Boolean).join('\n\n'));
     return;
   }
   conv.etapa = 'salvo';
   conv.tentativas = 0;
   const partes = [inicio];
-  if (conv.fixos.length) partes.push('Vou te adicionar nestes grupos:\n' + lista(conv.fixos.map(g => g.nome)));
-  if (conv.estadosDisp.length) partes.push((conv.fixos.length ? 'E' : 'Você') + ' também pode entrar nos grupos de emissões por estado (vou perguntar quais logo depois).');
+  if (jaEsta) partes.push(jaEsta);
+  if (conv.fixos.length) partes.push('👉 *Vou te adicionar em:*\n' + lista(conv.fixos.map(g => g.nome)));
+  if (conv.estadosDisp.length) partes.push('📍 *Grupos de emissões por estado:* cada um recebe as passagens com saída daquele estado. Pergunto quais você quer logo depois.');
   partes.push('⚠️ *Só conseguimos te adicionar depois que você salvar este número na sua agenda.*\n\nSalvou? Responda *SIM*.');
   await responder(conv, partes.join('\n\n'));
 }
@@ -472,8 +483,8 @@ async function seguirComDireito(conv, d, atualizado) {
 function balcaoNota(conv) {
   const b = conv.balcao;
   if (!b || b.verificado || b.jaEsta) return '';
-  if (b.pendente) return 'Sobre o Balcão: sua verificação está em análise. Assim que for aprovada, você entra no grupo.';
-  return 'Sobre o Balcão: para entrar nele é preciso antes preencher o formulário de verificação' + (b.formulario ? ': ' + b.formulario : '') + '. Depois da aprovação, você entra no grupo.';
+  if (b.pendente) return '🤝 *Balcão:* sua verificação está em análise. Assim que for aprovada, você entra no grupo.';
+  return '🤝 *Balcão:* para entrar é preciso antes preencher o formulário de verificação' + (b.formulario ? ': ' + b.formulario : '') + '. Depois da aprovação, você entra no grupo.';
 }
 
 async function etapaSalvo(conv, texto) {
@@ -654,19 +665,21 @@ async function processarBoasVindas() {
     .sort((a, b2) => a.uf.localeCompare(b2.uf));
   conv.balcao = balcao ? { verificado: !!balcao.verificado, pendente: !!balcao.verificacaoPendente, jaEsta: !!(presentes && presentes.has(balcao.jid)),
     formulario: d.formularioBalcao || '' } : null;
-  const partes = [];
-  if (links.length) partes.push('*Seus grupos* — é só tocar para entrar:\n' + links.map(l => '• ' + l.nome + ': ' + l.link).join('\n'));
+  const nomesPresentes = nomesJaEsta(liberados, presentes);
+  const partes = ['*Seus grupos do Clube do Viajante' + (b.premium ? ' Premium' : '') + '* ✈️'];
+  if (nomesPresentes.length) partes.push(blocoJaEsta(nomesPresentes));
+  if (links.length) partes.push('👉 *Falta entrar* — é só tocar:\n' + links.map(l => '• ' + l.nome + ': ' + l.link).join('\n'));
   if (adicionar.length || conv.estadosDisp.length) {
     const quais = [];
-    if (adicionar.length) quais.push('Eu mesmo te adiciono em:\n' + lista(adicionar.map(g => g.nome)));
-    if (conv.estadosDisp.length) quais.push((adicionar.length ? 'E você' : 'Você') + ' também pode entrar nos grupos de emissões por estado (pergunto quais logo depois).');
+    if (adicionar.length) quais.push('👉 *Eu mesmo te adiciono em:*\n' + lista(adicionar.map(g => g.nome)));
+    if (conv.estadosDisp.length) quais.push('📍 *Grupos de emissões por estado:* cada um recebe as passagens com saída daquele estado. Pergunto quais você quer logo depois.');
     partes.push(quais.join('\n\n') + '\n\n⚠️ *Só conseguimos te adicionar depois que você salvar este número na sua agenda.* Salvou? Responda *SIM*.');
     conv.etapa = 'salvo';
   }
+  if (!links.length && !adicionar.length && !conv.estadosDisp.length) partes.push('Você já está em todos os grupos a que tem direito 👍');
   const nota = balcaoNota(conv);
   if (nota) partes.push(nota);
   if (links.length) partes.push('Se algum link não abrir, me responda aqui que eu te ajudo.');
-  if (!partes.length) partes.push('Você já está nos grupos a que tem direito 👍');
   await new Promise(r => setTimeout(r, 4000));
   await responder(conv, partes.join('\n\n'));
   registrar(conv, 'boas_vindas_grupos', 'links ' + links.length + ', adicionar ' + adicionar.length + ', estados ' + conv.estadosDisp.length);
