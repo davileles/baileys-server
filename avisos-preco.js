@@ -148,6 +148,7 @@ function estruturar(bruto) {
     buscaMl: e.buscaMl && typeof e.buscaMl === 'object' ? e.buscaMl : {},
     boasVindas: e.boasVindas && typeof e.boasVindas === 'object' ? e.boasVindas : {},
     boasVindasGrupos: e.boasVindasGrupos && typeof e.boasVindasGrupos === 'object' ? e.boasVindasGrupos : {},
+    gruposPosAlerta: e.gruposPosAlerta && typeof e.gruposPosAlerta === 'object' ? e.gruposPosAlerta : {},
   };
 }
 
@@ -921,9 +922,9 @@ function textoBoasVindas(temAlertas) {
 // Boas-vindas e grupos (21/11/2026, pedido do Davi). Quem não é cliente e
 // escreve pela 1ª vez sem link: o Tico se apresenta e pede o link (sem busca
 // por nome — o link dá à pessoa a noção certa do preço). Os grupos do Tica
-// Promos vão DEPOIS que o alerta fica pronto, numa mensagem à parte, 1×/30 dias,
+// Promos vão DEPOIS que o alerta fica pronto, numa mensagem à parte, 1×/15 dias,
 // um link por nicho pelo distribuidor (nunca convite fixo). Aluno do Clube do
-// Viajante identificado pela inclusao-cdv.js não recebe os grupos do Tica.
+// Viajante também recebe (22/11/2026); só a boas-vindas é pulada para ele.
 const GRUPOS_BOAS_VINDAS = [
   ['🛒', 'Ofertas gerais', 'geral'],
   ['🎟️', 'Só cupons', 'cupons'],
@@ -932,6 +933,7 @@ const GRUPOS_BOAS_VINDAS = [
   ['🔧', 'Ferramentas', 'ferramentas'],
 ];
 const BOAS_VINDAS_MS = 30 * MS_DIA;
+const GRUPOS_POS_ALERTA_MS = 15 * MS_DIA;   // grupos após o alerta: 1×/15 dias (22/11/2026)
 const MEMBRO_CDV_MS = 24 * MS_H;
 const _membroCdvJid = new Map();   // jid → ts (visto com ctx.membroCdv)
 function textoBoasVindasTico() {
@@ -949,9 +951,9 @@ function textoPedirLink(nome) {
 function chavesBoasVindas(jid, numeros) {
   return [jid, ...(numeros || []).map(n => 't:' + String(n).slice(-8))].filter(Boolean);
 }
-function marcaDevida(campo, jid, numeros) {
+function marcaDevida(campo, jid, numeros, janela = BOAS_VINDAS_MS) {
   const m = E()[campo];
-  return !chavesBoasVindas(jid, numeros).some(k => Date.now() - (m[k] || 0) < BOAS_VINDAS_MS);
+  return !chavesBoasVindas(jid, numeros).some(k => Date.now() - (m[k] || 0) < janela);
 }
 function marcar(campo, jid, numeros) {
   const m = E()[campo];
@@ -964,9 +966,16 @@ function ehMembroCdv(jid) {
   return !!t && Date.now() - t < MEMBRO_CDV_MS;
 }
 // Depois de o alerta ficar pronto (pela conversa ou ativado pelo site).
+// Marca própria (22/11/2026): a 'boasVindasGrupos' era gravada pela boas-vindas
+// antiga (que já levava os grupos) e travava por 30 dias a mensagem pós-alerta
+// de quem falou com o Tico no dia 21/11. O motivo de não enviar vai ao rastro
+// (GET /avisos-preco/conversas) para o diagnóstico não depender de palpite.
+// Vai para todo mundo que termina um alerta, aluno do Clube do Viajante ou não
+// (pedido do Davi em 22/11/2026), no máximo 1× a cada 15 dias por pessoa.
 function gruposDepoisDoAlerta(jid, numeros) {
-  if (ehMembroCdv(jid) || !marcaDevida('boasVindasGrupos', jid, numeros)) return;
-  marcar('boasVindasGrupos', jid, numeros);
+  if (!marcaDevida('gruposPosAlerta', jid, numeros, GRUPOS_POS_ALERTA_MS)) { rastrear(jid, 'grupos-tica', 'não enviado: já recebeu nos últimos 15 dias'); return; }
+  marcar('gruposPosAlerta', jid, numeros);
+  rastrear(jid, 'grupos-tica', 'enviado após o alerta');
   falar(jid, textoGruposTica());
 }
 
