@@ -3088,7 +3088,28 @@ async function tentarPublicar() {
       return;
     }
 
-    const r = await dispararMonitorado(item, escolhido);
+    if (escolhido.origemRadar === 'keepa' && _checaVendaRadar) {
+      const v = await _checaVendaRadar(escolhido.asin);
+      if (v && v.ok === false) {
+        removerDaFila(escolhido.asin);
+        registrarDisparo({ ...escolhido, ok: false, motivo: 'radar keepa: sem venda registrada em 90 dias' });
+        console.log('[PRECOS] Fora da fila (radar): ' + escolhido.nome + ' — sem venda registrada em 90 dias ('
+          + (v.vendas90 ?? 0) + ' sinal(is) de venda).');
+        gravar(ARQ_ESTADO, _estado);
+        return;
+      }
+    }
+
+    let r;
+    try {
+      r = await dispararMonitorado(item, escolhido);
+    } catch (e) {
+      // Oferta que outro caminho acabou de mandar nos mesmos grupos: a trava de
+      // repeticao recusa. Antes o item ficava na fila e o publicador tentava o
+      // mesmo produto a cada minuto (23/11/2026, 08h15-08h33, 18 tentativas).
+      if (!e?.ofertaRepetida && !e?.ofertaVencida) throw e;
+      r = { ok: false, motivo: e.message };
+    }
     removerDaFila(escolhido.asin);
 
     if (r.ok) {
@@ -3128,6 +3149,11 @@ function removerDaFila(asin) {
 // captura (onde moram os candidatos do radar do Keepa, fora da vitrine). Ate
 // 22/11/2026 o publicador so procurava na vitrine: o candidato do radar nao era
 // achado, saia da fila calado a cada minuto e nenhum chegou aos grupos.
+// Checagem de venda do candidato do radar (registrada pelo keepa.js; sem ela,
+// nada muda). Evita soltar produto que ninguem compra — importado sem ranking.
+let _checaVendaRadar = null;
+export function registrarChecagemVendaRadar(fn) { _checaVendaRadar = typeof fn === 'function' ? fn : null; }
+
 function itemPublicavel(asin) {
   return itemVitrine(asin) || _capt[asin] || null;
 }

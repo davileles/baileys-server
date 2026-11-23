@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import {
   importarSerieKeepa, gravarShardsKeepa, asinsAmazonConhecidos, definirGanchoCaptura,
   vereditoLinhas, historicoDe, epcDe, avaliarAgoraAmazon, registrarReferenciaLonga,
+  registrarChecagemVendaRadar,
 } from './monitor-precos.js';
 import { registrarOkFonte, registrarFalhaFonte, fonteFora, estadoFontes } from './saude-fontes.js';
 import { semearCacheTrilhas } from './categorizador.js';
@@ -69,6 +70,11 @@ const CFG_PADRAO = {
   radar: {
     ativo: true, intervaloMin: 20, inicio: 8, fim: 21, periodo: 1, porCategoria: 20, dedupeHoras: 24,
     maxCandidatos: 5,   // teto de candidatos por rodada (21/11/2026)
+    // Produto sem venda registrada (ranking que nao melhora em 90 dias, ou sem
+    // ranking nenhum) fica fora do radar (23/11/2026, decisao do Davi): eram
+    // fechaduras importadas (Kwikset, Schlage) com "49,7% abaixo" e zero venda
+    // em 365 dias. exigirVenda:false desliga.
+    exigirVenda: true, minVendas90: 1,
     categorias: [
       { nome: 'Bebidas', id: 19778003011, deltaMinPct: 15 },
       { nome: 'Bebês', id: 17242603011, deltaMinPct: 20 },
@@ -92,7 +98,7 @@ function carregar() {
                       filtroVendas: { ...CFG_PADRAO.filtroVendas, ...(d.cfg?.filtroVendas || {}) } },
                fila: Array.isArray(d.fila) ? d.fila : [], job: d.job || null, tokens: d.tokens || null,
                resultados: d.resultados || {}, radar: d.radar || { vistos: {}, ultima: null, historico: [] },
-               migracoes: d.migracoes || {} };
+               migracoes: d.migracoes || {}, vendas: d.vendas || {} };
     }
   } catch (e) { console.warn('[KEEPA] Estado ilegivel, recomecando:', e.message); }
   return { cfg: { ...CFG_PADRAO, quedas: { ...CFG_PADRAO.quedas }, consultaNaHora: { ...CFG_PADRAO.consultaNaHora },
@@ -208,6 +214,43 @@ function filtrarPorVendas(serie, vendas, janelaDias) {
     if (lista.some(x => Math.abs(x - t) <= jan)) out[d] = v; else removidos++;
   }
   return { serie: out, removidos };
+}
+
+// Sinais de venda nos ultimos `dias`: quantas vezes o ranking de vendas
+// melhorou. Sem ranking nenhum conta como zero (produto que ninguem compra ou
+// importado sem ranking no Brasil).
+function vendasRecentes(prod, dias = 90) {
+  const desde = Date.now() - dias * 86400000;
+  const v = diasComVenda(prod?.csv?.[3], desde);
+  if (!v) return 0;
+  const corte = diaSP(desde);
+  return [...v].filter(d => d >= corte).length;
+}
+function anotarVendas(prod) {
+  if (!prod?.asin) return null;
+  const n = vendasRecentes(prod, 90);
+  (_e.vendas || (_e.vendas = {}))[prod.asin] = { n, em: Date.now() };
+  return n;
+}
+function vendaSuficiente(n) {
+  const rc = _e.cfg.radar || {};
+  if (rc.exigirVenda === false || n === null || n === undefined) return true;
+  return n >= (Number(rc.minVendas90) || 1);
+}
+// Conferida pelo publicador do monitor antes de soltar candidato do radar.
+// Cache de 3 dias; sem chave, Keepa fora ou erro = libera (fonte caida nunca
+// trava disparo).
+async function vendaRadarOk(asin) {
+  try {
+    const c = _e.vendas?.[asin];
+    if (c && Date.now() - c.em < 3 * 86400000) return { ok: vendaSuficiente(c.n), vendas90: c.n };
+    if (!chave() || fonteFora('keepa')) return { ok: true, motivo: 'sem Keepa' };
+    const [prod] = await buscarProdutos([asin]);
+    if (!prod) return { ok: true, motivo: 'Keepa nao devolveu' };
+    const n = anotarVendas(prod);
+    salvar();
+    return { ok: vendaSuficiente(n), vendas90: n };
+  } catch (e) { return { ok: true, motivo: e.message }; }
 }
 
 function serieDoProduto(prod, fonte, dias = DIAS_HISTORICO) {
@@ -501,16 +544,19 @@ export async function rodarRadarKeepa({ manual = false } = {}) {
       const lote = semHist.slice(i, i + LOTE_MAX);
       try {
         const prods = await buscarProdutos(lote);
-        for (const p of prods) { const r = aplicarProduto(p); registrarResultado(p.asin, r); if (r.ok) rel.historicos++; }
+        for (const p of prods) { const r = aplicarProduto(p); registrarResultado(p.asin, r); if (r.ok) rel.historicos++; anotarVendas(p); }
       } catch (e) { if (rel.erros.length < 10) rel.erros.push('historico: ' + e.message); }
     }
     if (semHist.length) agendarShards();
     for (const x of itens) vistos[x.asin] = agora;
-    if (itens.length) {
-      rel.avaliacao = await avaliarAgoraAmazon(itens.map(x => ({ asin: x.asin, nome: x.titulo })),
+    const semVenda = itens.filter(x => !vendaSuficiente(_e.vendas?.[x.asin]?.n));
+    rel.semVenda = semVenda.map(x => ({ asin: x.asin, titulo: x.titulo.slice(0, 80), vendas90: _e.vendas?.[x.asin]?.n ?? null }));
+    const avaliaveis = itens.filter(x => vendaSuficiente(_e.vendas?.[x.asin]?.n));
+    if (avaliaveis.length) {
+      rel.avaliacao = await avaliarAgoraAmazon(avaliaveis.map(x => ({ asin: x.asin, nome: x.titulo })),
         { maxCandidatos: Number(rc.maxCandidatos) || null });
       const ok = new Set((rel.avaliacao.aprovados || []).map(a => a.asin));
-      rel.candidatos = itens.filter(x => ok.has(x.asin)).map(x => ({ asin: x.asin, titulo: x.titulo.slice(0, 80), categoria: x.categoria,
+      rel.candidatos = avaliaveis.filter(x => ok.has(x.asin)).map(x => ({ asin: x.asin, titulo: x.titulo.slice(0, 80), categoria: x.categoria,
         preco: x.preco, classe: (rel.avaliacao.aprovados.find(a => a.asin === x.asin) || {}).classe || null }));
     }
     rel.duracaoSeg = Math.round((Date.now() - t0) / 1000);
@@ -519,6 +565,7 @@ export async function rodarRadarKeepa({ manual = false } = {}) {
     _e.radar.historico = [{ em: rel.em, novos: rel.novos, candidatos: (rel.candidatos || []).length }, ...(_e.radar.historico || [])].slice(0, 200);
     salvar();
     console.log('[KEEPA] Radar — ' + rel.novos + ' queda(s) nova(s), ' + (rel.candidatos || []).length + ' candidato(s) para o publicador'
+      + (rel.semVenda.length ? ', ' + rel.semVenda.length + ' sem venda registrada (fora)' : '')
       + Object.entries(rel.porCategoria).map(([k, v]) => ' · ' + k + ' ' + (v.erro ? 'erro' : v.novos + '/' + v.quedas)).join(''));
     return { ok: true, ...rel };
   } finally { _radarRodando = false; }
@@ -674,4 +721,5 @@ export function registrarRotasKeepa(app, { exigeRaiz = null } = {}) {
     if (_e.fila.length && !_rodando) rodarFila().catch(() => {});
   }, 90000);
   iniciarRadar();
+  registrarChecagemVendaRadar(vendaRadarOk);
 }
