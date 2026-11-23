@@ -10930,6 +10930,22 @@ function textoDataHojeOferta() {
   return 'Data de hoje: ' + p(h.dia) + '/' + p(h.mes) + '/' + h.ano
     + '. Quando a origem trouxer data sem ano (ex.: "02 de dezembro"), use o ano em que essa data ainda não passou.';
 }
+const _MESES_PT_OFERTA = ['janeiro', 'fevereiro', 'marco', 'abril', 'maio', 'junho', 'julho',
+  'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+// 24/11/2024, 24-11-24, "24 de novembro de 2024", "24 nov 2024", "novembro de 2024".
+function _anoEscritoNaDataOferta(origem, dia, mes, ano) {
+  const t = String(origem || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+  if (!t) return false;
+  const a4 = String(ano), a2 = a4.slice(2);
+  const d = '0?' + dia, m = '0?' + mes;
+  const nome = _MESES_PT_OFERTA[mes - 1], abrev = nome.slice(0, 3);
+  const res = [
+    `\\b${d}\\s*[/.-]\\s*${m}\\s*[/.-]\\s*(?:${a4}|${a2})\\b`,
+    `\\b${d}\\s*(?:de\\s*)?(?:${nome}|${abrev})\\.?\\s*(?:de\\s*)?${a4}\\b`,
+    `\\b(?:${nome}|${abrev})\\.?\\s*(?:de\\s*)?${a4}\\b`,
+  ];
+  return res.some((r) => new RegExp(r).test(t));
+}
 function corrigirAnoPrazoOferta(prazo, textoOrigem) {
   const s = String(prazo || '');
   if (!s) return s;
@@ -10944,7 +10960,9 @@ function corrigirAnoPrazoOferta(prazo, textoOrigem) {
     if (ano * 10000 + mes * 100 + dia >= hojeNum) return tudo;
     const diasPassados = (Date.UTC(h.ano, h.mes - 1, h.dia) - Date.UTC(ano, mes - 1, dia)) / 864e5;
     if (diasPassados <= 60) return tudo;
-    if (new RegExp('\\b' + ano + '\\b').test(origem)) return tudo;
+    // Ano escrito na origem JUNTO da data (23/11/2026: "2024" solto no texto
+    // deixava passar o 24/11/2024 chutado pela IA).
+    if (_anoEscritoNaDataOferta(origem, dia, mes, ano)) return tudo;
     let novo = h.ano;
     if (novo * 10000 + mes * 100 + dia < hojeNum) novo += 1;
     return dd + '/' + mm + '/' + novo;
