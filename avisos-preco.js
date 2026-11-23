@@ -167,12 +167,16 @@ function estruturar(bruto) {
     donos: e.donos && typeof e.donos === 'object' ? e.donos : {},
     foraDesde: e.foraDesde && typeof e.foraDesde === 'object' ? e.foraDesde : {},
     rodizio: e.rodizio && typeof e.rodizio === 'object' ? e.rodizio : { dia: '', porConta: {} },
+    // Alerta em criação (o Tico perguntou o preço desejado) — sobrevive a deploy
+    // e à troca de número do Tico (23/11/2026).
+    criacao: e.criacao && typeof e.criacao === 'object' ? e.criacao : {},
   };
 }
 
 export function carregarAvisosPreco() {
   try {
     _estado = estruturar(existsSync(caminho()) ? JSON.parse(readFileSync(caminho(), 'utf-8')) : null);
+    try { _criacaoPendente.hidratar(_estado.criacao); } catch (e) {}
   } catch (e) {
     console.warn('[AVISOS] Falha ao ler ' + ARQ + ': ' + e.message);
     if (!_estado) _estado = estruturar(null);
@@ -288,7 +292,44 @@ function novoCodigo() {
 // Um contato é quem já mandou mensagem para o número dos avisos. Guardamos o
 // JID da conversa (para onde responder) e os números conhecidos dele (para
 // reconhecer um pedido novo do mesmo telefone sem pedir nova ativação).
-function contatoPorJid(jid) { return E().contatos.find(c => c.jid === jid) || null; }
+function contatoPorJid(jid) {
+  if (!jid) return null;
+  return E().contatos.find(c => c.jid === jid) || E().contatos.find(c => Array.isArray(c.jids) && c.jids.includes(jid)) || null;
+}
+function anotarJid(c, jid) {
+  if (!c || !jid) return false;
+  if (!Array.isArray(c.jids)) c.jids = [];
+  if (c.jids.includes(jid)) return false;
+  c.jids.push(jid);
+  if (c.jids.length > 10) c.jids = c.jids.slice(-10);
+  return true;
+}
+// 23/11/2026: a mesma pessoa pode chegar por LID (@lid) num Tico e pelo
+// telefone noutro. Liga as identidades no contato e completa o telefone dos
+// pedidos que ficaram sem (criados por LID sem o número junto).
+function vincularPessoa(jid, numeros = []) {
+  const c = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean);
+  if (!c) return null;
+  let mudou = anotarJid(c, c.jid) | anotarJid(c, jid);
+  if (!Array.isArray(c.numeros)) c.numeros = [];
+  for (const n of numeros) for (const v of variantesTelefone(n)) if (!c.numeros.includes(v)) { c.numeros.push(v); mudou = true; }
+  if (c.numeros[0]) {
+    for (const p of E().pedidos) {
+      if (!p.telefone && p.jid && c.jids.includes(p.jid)) { p.telefone = c.numeros[0]; mudou = true; }
+    }
+  }
+  if (mudou) gravar();
+  return c;
+}
+// Todas as identidades (jids) conhecidas da pessoa: contato + pedidos do mesmo telefone.
+function jidsDaPessoa(jid, numeros = []) {
+  const s = new Set(jid ? [jid] : []);
+  const c = contatoPorJid(jid) || numeros.map(contatoPorTelefone).find(Boolean);
+  if (c) { if (c.jid) s.add(c.jid); for (const j of c.jids || []) s.add(j); }
+  const nums = new Set([...numeros, ...((c && c.numeros) || [])].flatMap(n => [...variantesTelefone(n)]));
+  if (nums.size) for (const p of E().pedidos) if (p.jid && [...variantesTelefone(p.telefone)].some(v => nums.has(v))) s.add(p.jid);
+  return s;
+}
 function contatoPorTelefone(tel) {
   const vs = variantesTelefone(tel);
   if (!vs.size) return null;
@@ -300,6 +341,7 @@ function registrarContato(jid, numeros, nome) {
     for (const n of numeros) { c = contatoPorTelefone(n); if (c) break; }
   }
   if (!c) { c = { jid, numeros: [], criadoEm: new Date().toISOString() }; E().contatos.push(c); }
+  anotarJid(c, c.jid); anotarJid(c, jid);
   c.jid = jid;
   for (const n of numeros) for (const v of variantesTelefone(n)) if (!c.numeros.includes(v)) c.numeros.push(v);
   if (nome && !c.nome) c.nome = String(nome).slice(0, 60);
@@ -310,7 +352,7 @@ function registrarContato(jid, numeros, nome) {
 
 function pedidosDoContato(c) {
   if (!c) return [];
-  return E().pedidos.filter(p => p.jid === c.jid
+  return E().pedidos.filter(p => p.jid === c.jid || (Array.isArray(c.jids) && c.jids.includes(p.jid))
     || (p.status === 'aguardando' && (c.numeros || []).some(n => variantesTelefone(p.telefone).has(n))));
 }
 
@@ -884,6 +926,13 @@ export function observarMensagemAvisos(apelido, msg, ctx = {}) {
     const numeros = [jid, k.remoteJidAlt, k.senderPn].map(digitosDeJid).filter(Boolean);
     // Quem escreveu para este número passa a ser dele (a resposta sai daqui).
     definirDono(jid, numeros, apelido);
+    // Mesma pessoa por outra identidade (LID × telefone): liga e traz o alerta em criação.
+    vincularPessoa(jid, numeros);
+    if (!_criacaoPendente.has(jid)) {
+      for (const j of jidsDaPessoa(jid, numeros)) {
+        if (j !== jid && _criacaoPendente.has(j)) { const pp = _criacaoPendente.get(j); _criacaoPendente.delete(j); _criacaoPendente.set(jid, pp); break; }
+      }
+    }
 
     if (humano && !RE_SAIR.test(texto) && !RE_SAIR_UM.test(texto) && !RE_ATIVAR.test(texto)) {
       rastrear(jid, 'atendimento-humano', 'sem resposta automática');
@@ -965,7 +1014,24 @@ function tratarSair(jid, numeros) {
 // ── Conversa com o Tico (sem IA: comandos fixos) ────────────────────────────
 // MEUS ALERTAS → lista numerada; SAIR n → para só aquele; link de produto →
 // cria alerta (o Tico pergunta o preço); qualquer outra coisa → ajuda.
-const _criacaoPendente = new Map();   // jid → { item, leitura, sugestao, em }
+// Gravado no estado (E().criacao) a cada mudança: deploy ou troca de Tico no
+// meio da pergunta do preço não perdem o alerta (23/11/2026).
+class MapCriacao extends Map {
+  set(k, v) { super.set(k, v); this._gravar(); return this; }
+  delete(k) { const r = super.delete(k); if (r) this._gravar(); return r; }
+  hidratar(obj) {
+    super.clear();
+    for (const [k, v] of Object.entries(obj || {})) if (v && Date.now() - Number(v.em || 0) < 30 * 60000) super.set(k, v);
+  }
+  _gravar() {
+    if (!_estado) return;
+    const o = {};
+    for (const [k, v] of this) if (Date.now() - Number(v.em || 0) < 30 * 60000) o[k] = v;
+    _estado.criacao = o;
+    gravar();
+  }
+}
+const _criacaoPendente = new MapCriacao();   // jid → { item, leitura, sugestao, em }
 const _respostasPorJid = new Map();   // jid → [ts] (trava contra laço com outro robô)
 const _ajudaPorJid = new Map();       // jid → ts da última ajuda a quem não é cliente
 
@@ -1073,7 +1139,7 @@ export function rastroConversas({ tel = '', n = 80 } = {}) {
 function pedidosAbertosDe(jid, numeros, contato) {
   const vs = new Set([...(numeros || []), ...((contato && contato.numeros) || [])].flatMap(n => [...variantesTelefone(n)]));
   return E().pedidos
-    .filter(p => !ehFinal(p.status) && ((jid && p.jid === jid) || (contato?.jid && p.jid === contato.jid) || [...variantesTelefone(p.telefone)].some(v => vs.has(v))))
+    .filter(p => !ehFinal(p.status) && ((jid && p.jid === jid) || (contato?.jid && p.jid === contato.jid) || (Array.isArray(contato?.jids) && contato.jids.includes(p.jid)) || [...variantesTelefone(p.telefone)].some(v => vs.has(v))))
     .sort((a, b) => String(a.criadoEm).localeCompare(String(b.criadoEm)));
 }
 
@@ -1509,12 +1575,31 @@ function contextoParaIa(jid, abertos, pend) {
   } else l.push('ALERTAS DA PESSOA: nenhum.');
   const pc = perguntaCompraPendente(abertos);
   if (pc) l.push('PERGUNTA PENDENTE: o Tico perguntou se a pessoa conseguiu comprar o alerta ' + (abertos.indexOf(pc) + 1) + ' (' + encurtar(pc.titulo, 60) + ').');
-  const h = (_historicoConversa.get(jid) || []).slice(0, -1);
+  // 23/11/2026: a conversa vem do histórico gravado da PESSOA (todas as
+  // identidades, qualquer número do Tico, 30 dias), não só da memória de 6 h
+  // daquele jid — trocar de Tico ou reiniciar o servidor não apaga o contexto.
+  const h = historicoDaPessoa(jid);
   if (h.length) {
-    l.push('CONVERSA RECENTE:');
-    for (const x of h.slice(-6)) l.push((x.de === 'tico' ? 'Tico: ' : 'Pessoa: ') + x.t.replace(/\s+/g, ' ').slice(0, 300));
+    l.push('CONVERSA ANTERIOR (pode ter sido por outro número do Tico; mais recente por último):');
+    for (const x of h) l.push(x.quando + (x.de === 'tico' ? 'Tico: ' : x.de === 'operador' ? 'Equipe: ' : 'Pessoa: ') + x.t.replace(/\s+/g, ' ').slice(0, 300));
   }
   return l.join('\n');
+}
+
+function historicoDaPessoa(jid, n = 8) {
+  const jids = jidsDaPessoa(jid);
+  const corte = Date.now() - 30 * MS_DIA;
+  let ms = E().mensagens.filter(m => jids.has(m.jid) && !m.falhou && Date.parse(m.em) >= corte);
+  // A mensagem que está sendo respondida já foi gravada: fica de fora.
+  if (ms.length && ms[ms.length - 1].de === 'cliente') ms = ms.slice(0, -1);
+  let out = ms.slice(-n).map(m => {
+    const ts = Date.parse(m.em);
+    const quando = Date.now() - ts > 6 * MS_H ? '(' + new Date(ts - 3 * MS_H).toISOString().slice(5, 10).split('-').reverse().join('/') + ') ' : '';
+    return { de: m.de === 'cliente' ? 'cliente' : (m.de === 'operador' ? 'operador' : 'tico'), t: String(m.t || ''), quando };
+  });
+  // Sem histórico gravado (conversa anterior a ele): memória da sessão.
+  if (!out.length) out = (_historicoConversa.get(jid) || []).slice(0, -1).slice(-6).map(x => ({ ...x, quando: '' }));
+  return out;
 }
 
 async function conversarComIa({ jid, numeros, contato, pushName, texto, abertos, ehCliente, membroCdv = null }) {
@@ -1956,7 +2041,12 @@ async function processarFila() {
       if (!item) {
         if (Date.now() - _avisoFilaParadaEm > 10 * 60000) {
           _avisoFilaParadaEm = Date.now();
-          console.warn('[AVISOS] Nenhum número do Tico apto para as ' + _filaEnvio.length + ' mensagem(ns) da fila (rodízio: ' + poolContas().join(', ') + ').');
+          // 23/11/2026: a mensagem espera o número DONO da conversa; o texto
+          // antigo ("nenhum apto") parecia todos os Ticos fora.
+          const donos = [...new Set(_filaEnvio.map(it => it.conta || (donoDe(it.jid) || {}).conta || c.conta || '—'))];
+          const aptas = contasAptas();
+          console.warn('[AVISOS] Fila do Tico parada: ' + _filaEnvio.length + ' mensagem(ns) esperando o número dono voltar (' + donos.join(', ') + ')'
+            + ' — troca de número depois de ' + (Number(c.reatribuirAposH) || 0) + ' h fora; aptos agora: ' + (aptas.join(', ') || 'nenhum') + '.');
         }
         rastrear(_filaEnvio[0]?.jid || '', 'conta-desconectada', (donoDe(_filaEnvio[0]?.jid || '') || {}).conta || c.conta || 'nenhuma');
         break;
@@ -2437,6 +2527,9 @@ export async function varrerAvisos({ manual = false } = {}) {
           // estava acima do desejado. Fica gravado para o painel dizer isso em vez
           // de "sai na próxima varredura".
           pedido.conferencia = { em: new Date().toISOString(), base: baseConferencia(mo), preco: m.preco, precoCartao: m.precoCartao || null, cupom: mo.cupom || null, erro: null };
+          // Cupom que a loja não confirmou: sai da conta deste produto até a
+          // página ser conferida de novo (não repete a mesma recusa toda hora).
+          if (mo.cupom && mo.prod.cupomMl && m.preco > mo.preco * 1.05) mo.prod.cupomMlRecusado = { em: mo.prod.cupomMl.em, cupom: mo.cupom, precoLoja: m.preco, recusadoEm: new Date().toISOString() };
           console.log('[AVISOS] Pedido ' + pedido.id + ': conta dava ' + brl(mo.preco) + ', loja relida a ' + brl(m.preco) + ' — acima do desejado, nada enviado.');
           continue;
         }
@@ -2495,11 +2588,28 @@ function cupomDoConferido(c) {
   return c.semCodigo ? PREFIXO_CUPOM_PAGINA + (c.rotulo || '') : null;
 }
 
+// 23/11/2026 (AV55, AV36, AV30): cupom "R$ 250 OFF sem código" com compra
+// mínima acima do preço entrava na conta (R$ 312,90 → R$ 62,90; R$ 115 →
+// R$ 0,01) e a releitura da loja recusava a cada hora. Cupom que tira mais de
+// CUPOM_MAX_PCT do preço não conta, e cupom que a loja já recusou na releitura
+// fica fora até a próxima conferência da página trazer outro.
+const CUPOM_MAX_PCT = 0.6;
+function cupomMlUtil(p) {
+  const c = p?.cupomMl;
+  if (!c) return null;
+  if (p.cupomMlRecusado && p.cupomMlRecusado.em === c.em) return null;
+  return c;
+}
 function precoEfetivo(p, maxIdadeMs = Infinity) {
   if (!p?.ult?.preco || p.ult.disponivel === false) return null;
   if (Date.now() - Date.parse(p.ult.em) > maxIdadeMs) return null;
+  const precoEtiqueta = p.ult.preco;
+  const r = precoEfetivoBruto(p, cupomMlUtil(p));
+  if (r && r.cupom && r.preco < precoEtiqueta * (1 - CUPOM_MAX_PCT)) return { preco: precoEtiqueta, cupom: null };
+  return r;
+}
+function precoEfetivoBruto(p, c) {
   let preco = p.ult.preco, cupom = null;
-  const c = p.cupomMl;
   // Pix x cartao (06/11/2026, pedido 7653): a pagina do ML declara o preco no
   // cartao e o desconto do Pix. O aviso conta o menor (Pix) e mostra os dois.
   // So vale com a leitura da pagina fresca e o preco no cartao batendo (5%).

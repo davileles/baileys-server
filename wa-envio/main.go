@@ -310,6 +310,13 @@ func (c *Conta) recriarCliente(motivo string) {
 		log.Printf("[CONTA:%s] renovacao de cache: falha ao conectar (tentativa %d): %v", c.ID, tentativa, err)
 		time.Sleep(time.Duration(tentativa) * 5 * time.Second)
 	}
+	// 23/11/2026: Connect() volta antes do login do socket novo terminar. Soltar
+	// o envioMu aqui fazia o envio que esperava ver IsLoggedIn()=false e falhar
+	// como "conta nao pareada" (cai no Baileys do mesmo numero). Segura o envio
+	// ate o login confirmar.
+	if !esperarLogin(novo, 15*time.Second) {
+		log.Printf("[CONTA:%s] renovacao de cache: login do cliente novo nao confirmou em 15s", c.ID)
+	}
 	log.Printf("[CONTA:%s] cache de aparelhos renovado em %s (%s)", c.ID, time.Since(inicio).Round(time.Millisecond), motivo)
 	registrarEvento(c.ID, "cache-renovado", motivo)
 }
@@ -538,6 +545,20 @@ func (c *Conta) estado(comNumero bool) estadoConta {
 	return e
 }
 
+// esperarLogin: espera o socket ficar conectado E logado (handshake concluido).
+func esperarLogin(cli *whatsmeow.Client, ate time.Duration) bool {
+	fim := time.Now().Add(ate)
+	for {
+		if cli.IsConnected() && cli.IsLoggedIn() {
+			return true
+		}
+		if time.Now().After(fim) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func (c *Conta) cliente() *whatsmeow.Client {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -579,6 +600,11 @@ func (c *Conta) enviar(ctx context.Context, p pedidoEnvio) (whatsmeow.SendRespon
 	c.envioMu.Lock()
 	defer c.envioMu.Unlock()
 	cli := c.cliente()
+	// Aparelho pareado (Store.ID) reconectando: espera o login voltar (ate 8 s)
+	// antes de dar o envio como falho.
+	if cli != nil && cli.Store != nil && cli.Store.ID != nil && !(cli.IsConnected() && cli.IsLoggedIn()) {
+		esperarLogin(cli, 8*time.Second)
+	}
 	if cli == nil || !cli.IsLoggedIn() {
 		return whatsmeow.SendResponse{}, &erroEnvio{"conexao", 503, errors.New("conta nao pareada")}
 	}
