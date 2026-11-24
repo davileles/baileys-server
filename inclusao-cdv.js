@@ -314,7 +314,7 @@ async function avisarOperador(texto) {
 }
 function rotuloPessoa(conv) { return '+' + conv.telefone + (conv.nome ? ' (' + conv.nome + ')' : conv.pushName ? ' (' + conv.pushName + ')' : ''); }
 function registrar(conv, evento, detalhe) {
-  E().historico.push({ em: new Date().toISOString(), telefone: conv.telefone, evento, detalhe: detalhe || null });
+  E().historico.push({ em: new Date().toISOString(), telefone: conv.telefone, conta: conv.conta || null, evento, detalhe: detalhe || null });
 }
 
 async function tratar(apelido, sock, msg, jid, texto, gatilho) {
@@ -1002,7 +1002,7 @@ async function acompanhar() {
 export function estadoInclusaoCdv() {
   const e = E();
   const conversas = Object.values(e.conversas).sort((a, b) => (b.atualizadoEm || 0) - (a.atualizadoEm || 0)).slice(0, 100)
-    .map(c => ({ telefone: c.telefone, nome: c.nome || c.pushName || '', etapa: c.etapa, email: c.email || null,
+    .map(c => ({ telefone: c.telefone, nome: c.nome || c.pushName || '', etapa: c.etapa, email: c.email || null, conta: c.conta || null,
       atualizadoEm: c.atualizadoEm ? new Date(c.atualizadoEm).toISOString() : null }));
   const contas = contasInclusao().map(a => { let apta = false; try { apta = contaAptaTico(a); } catch (er) {} return { apelido: a, apta }; });
   return { config: { ...e.config }, contas, pausado: e.pausado, atual: e.atual, fila: e.fila, hoje: hojeE(), conversas,
