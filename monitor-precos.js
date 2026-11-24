@@ -193,6 +193,22 @@ const CFG_PADRAO = {
     // na analise de 20/11, Johnnie Walker 18, purificador e fone estavam no
     // menor preco de 90 dias mas so 3-7% abaixo do normal).
     minDescontoImperdivelPct: 8,
+    // Preco normal RECENTE (24/11/2026, analise dos envios de 23/11): a mediana
+    // de 12 meses do Keepa e a tabela da Amazon ficaram acima do preco que o
+    // produto pratica ha semanas (martelete Bosch parado em R$ 650 desde 03/11
+    // saiu "imperdivel 14% abaixo" contra a mediana de 12 meses de R$ 759,90).
+    // O preco cheio passa a considerar tambem a mediana das LEITURAS (dias sem
+    // captura) dos ultimos 30 dias, com pelo menos 'minCheio30' leituras.
+    // cheioRecente:0 desliga sem deploy.
+    cheioRecente: 1,
+    minCheio30: 5,
+    // Boa oferta exige pelo menos N% abaixo do preco cheio (JW Black 1L saiu
+    // com 3% de queda como selo).
+    minDescontoBoaPct: 5,
+    // Amazon: imperdivel/boa so derruba o veto da serie de 30 dias se o preco
+    // pago estiver pelo menos N% abaixo da mediana de 30 dias (23/11: 17 das
+    // 51 liberadas sairam exatamente na mediana). 0 desliga a exigencia.
+    aprovaAmazonMinQueda30Pct: 5,
     // Referencia longa (21/11/2026, analise de 1.125 ofertas de 07-21/11): a
     // mediana de 90 dias so enxerga ~4 meses e, perto da Black Friday, pega
     // tanto promocao de julho quanto preco inflado de setembro. O preco cheio
@@ -2077,10 +2093,12 @@ function linhasDePreco(h) {
   const cfg = _cfg.linhas || CFG_PADRAO.linhas;
   const hoje = diaSP();
   const corte90 = diaSP(Date.now() - 90 * 86400000);
-  const leit = [], promo = [], todos = [];
+  const corte30 = diaSP(Date.now() - 30 * 86400000);
+  const leit = [], promo = [], todos = [], leit30 = [];
   const dias = new Set([...Object.keys(h.dias || {}), ...Object.keys(h.diasK || {})]);
   for (const d of dias) {
     if (d < corte90 || d >= hoje) continue;
+    const nLeit = leit.length;
     const geral = h.dias?.[d] ?? h.diasK?.[d];
     if (Number.isFinite(geral)) todos.push(geral);
     const cap = h.diasC?.[d];
@@ -2092,6 +2110,7 @@ function linhasDePreco(h) {
       const l = h.diasK?.[d] ?? h.dias?.[d];
       if (Number.isFinite(l)) leit.push(l);
     }
+    if (d >= corte30 && leit.length > nLeit) leit30.push(leit[leit.length - 1]);
   }
   const r2 = v => Number.isFinite(v) ? Math.round(v * 100) / 100 : null;
   const cheio90 = leit.length >= cfg.minCheio ? r2(medianaDe(leit)) : null;
@@ -2105,8 +2124,12 @@ function linhasDePreco(h) {
   let cheio = cheio90, baseCheio = cheio90 ? '90d' : null;
   if (cheioLongo && (!cheio || cheioLongo < cheio)) { cheio = cheioLongo; baseCheio = '12m'; }
   if (tabela && (!cheio || tabela < cheio)) { cheio = tabela; baseCheio = 'tabela'; }
+  const cheio30 = cfg.cheioRecente !== 0 && leit30.length >= (cfg.minCheio30 ?? 5) ? medianaDe(leit30) : null;
+  if (cheio30 && (!cheio || cheio30 < cheio)) { cheio = cheio30; baseCheio = '30d'; }
   return {
     cheio: r2(cheio),
+    cheio30: r2(cheio30),
+    nCheio30: leit30.length,
     baseCheio,
     cheio90,
     cheioLongo: r2(cheioLongo),
@@ -2142,7 +2165,9 @@ export function vereditoLinhas(asin, preco) {
     return { ...base, classe: 'imperdivel', motivo: 'no menor preco de 90 dias' };
   if (longeDoCheio && patamarPromo && p <= patamarPromo * (1 - cfg.imperdivelAbaixoPromoPct / 100))
     return { ...base, classe: 'imperdivel', motivo: 'abaixo do patamar de promocao' };
-  if (patamarPromo && p <= patamarPromo * (1 + cfg.promoFolgaPct / 100))
+  // Boa tambem exige distancia minima do preco cheio, quando ele e conhecido.
+  const longeParaBoa = descontoRealPct === null || descontoRealPct >= (cfg.minDescontoBoaPct ?? 5);
+  if (longeParaBoa && patamarPromo && p <= patamarPromo * (1 + cfg.promoFolgaPct / 100))
     return { ...base, classe: 'boa', motivo: 'no patamar de promocao' };
   if (cheio && p >= cheio * (1 - cfg.falsoAteCheioPct / 100))
     return { ...base, classe: 'falsa', motivo: 'no preco cheio ou acima' };
@@ -2268,7 +2293,8 @@ export function filtroDisparo(args = {}) {
         if (cfgL.vetaFalsaSemSerie !== 0 && !r.julgavel && !r.veto && v.classe === 'falsa') {
           Object.assign(r, { julgavel: true, nivel: 'falsoDesconto', veto: true, bloqueia: true, soNicho: false, porLinhas: true,
             motivo: 'linhas de preco: ' + (v.motivo || 'preco no patamar normal') });
-        } else if (cfgL.aprovaAmazon !== 0 && r.veto && args.loja === 'Amazon' && (v.classe === 'imperdivel' || v.classe === 'boa')) {
+        } else if (cfgL.aprovaAmazon !== 0 && r.veto && args.loja === 'Amazon' && (v.classe === 'imperdivel' || v.classe === 'boa')
+                   && quedaContraMediana30Ok(pPago, r.mediana30, cfgL.aprovaAmazonMinQueda30Pct ?? 5)) {
           Object.assign(r, { veto: false, bloqueia: false, soNicho: false, porLinhas: true, vetoOriginal: r.nivel,
             nivel: null, motivo: 'linhas de preco: ' + v.classe + ' (' + (v.motivo || '') + ') — vence o veto da serie de 30 dias' });
         }
@@ -2282,6 +2308,14 @@ export function filtroDisparo(args = {}) {
     }
   } catch (e) { /* linhas nunca derrubam o filtro */ }
   return r;
+}
+
+// Preco pago pelo menos 'minPct'% abaixo da mediana de 30 dias (sem mediana
+// conhecida ou minPct 0 = nao exige).
+function quedaContraMediana30Ok(pPago, mediana30, minPct) {
+  const m = Number(mediana30), p = Number(pPago), min = Number(minPct);
+  if (!(min > 0) || !(m > 0) || !(p > 0)) return true;
+  return (1 - p / m) * 100 >= min;
 }
 
 function filtroDisparoBase({ asin, loja, nome, preco, precoDe, cupom = null, precoFinal = null }) {

@@ -5983,6 +5983,9 @@ function resumoRotaOferta(o) {
 // ultimos REPETIDA_GRUPO_MIN (30) minutos nao sai de novo NAQUELE grupo; os
 // outros grupos recebem normalmente. Retomada/outbox (semPortao) e quem pede
 // opcoes.ignorarRepeticao ficam de fora. Memoria em RAM: zera no deploy.
+// Janela da trava de repeticao das ofertas de grupo-fonte (24/11/2026).
+const REENVIO_FONTE_DIAS = process.env.REENVIO_FONTE_DIAS !== undefined
+  ? Number(process.env.REENVIO_FONTE_DIAS) : 15;
 const REPETIDA_GRUPO_MIN = process.env.REPETIDA_GRUPO_MIN !== undefined
   ? Number(process.env.REPETIDA_GRUPO_MIN) : 30;
 const _envioRecenteGrupo = new Map();   // chave|jid -> ts
@@ -10391,6 +10394,36 @@ async function processarRadarMarketplace(jid, texto, opcoes = {}) {
         && !_filtro?.bloqueia
         && !oferta.cupomAmbiguo && !oferta.cupomResgatePendente && !oferta.cupomPaginaAusente
         && !oferta.precoDivergente && !oferta.precoDoPost?.retem && !oferta.revisaoDeEdicao;
+    // ── REPETICAO DE GRUPO-FONTE (24/11/2026, aprovado pelo Davi) ──
+    // O dedup do radar so olha 24 h. Em 23/11 sairam 29 produtos que ja tinham
+    // ido aos grupos nos 15 dias anteriores pelo mesmo preco ou mais caro
+    // (cadeirinha Safety 1st R$ 1.157 em 11/11 e R$ 1.257 em 23/11; gin
+    // Tanqueray R$ 39,92 em 21/11 e R$ 49,90 em 23/11). Mesma regra do monitor:
+    // oferta que ia sair sozinha e ja saiu em REENVIO_FONTE_DIAS (15) a preco
+    // igual ou menor (tolerancia de 1%) e descartada sem card. Edicao de post e
+    // aprovacao manual nao passam por aqui. REENVIO_FONTE_DIAS=0 desliga.
+    if (_elegivelAuto && !opcoes.edicao && REENVIO_FONTE_DIAS > 0 && p.asin) {
+      try {
+        const _pAgora = _precoGate > 0 ? _precoGate : Number(p.preco);
+        const _rep = Number.isFinite(_pAgora) && _pAgora > 0
+          ? enviosRecentesDoProduto(p.asin, REENVIO_FONTE_DIAS)
+              .filter(e => _pAgora >= e.preco * 0.99)
+              .sort((a, b) => a.preco - b.preco)[0]
+          : null;
+        if (_rep) {
+          const _dd = Math.max(0, Math.floor((Date.now() - Date.parse(_rep.em)) / 86400000));
+          oferta.status = 'rejeitado';
+          oferta.motivoFila = 'ja enviado ha ' + _dd + 'd a R$ ' + _rep.preco.toFixed(2).replace('.', ',')
+            + ' (mesmo preco ou menor; janela ' + REENVIO_FONTE_DIAS + 'd)';
+          oferta.descartadaPorRepeticao = true;
+          filaPendentes.unshift(oferta);
+          salvarFila();
+          console.log('[REENVIO] Oferta #' + oferta.id + ' ' + p.asin + ' DESCARTADA — ' + oferta.motivoFila
+            + ' · agora R$ ' + _pAgora.toFixed(2).replace('.', ',') + ' (' + (p.titulo || '').slice(0, 50) + ')');
+          continue;
+        }
+      } catch (e) { /* trava de repeticao nunca segura o pipeline por erro */ }
+    }
     // ── NOTA DA OFERTA (18/11/2026, nota-oferta.js) ──
     // Nota de 0 a 100 na hora da captura, sem fila e sem teto por hora. Em
     // 'sombra' so registra (GET /mkt/notas). Em 'ativo', oferta que sairia
