@@ -87,6 +87,7 @@ import {
   julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
   conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie, relatorioLinhas,
+  vereditoLinhas,
 } from './monitor-precos.js';
 import { registrarRotasKeepa, consultarKeepaAgora } from './keepa.js';
 import { registrarRotasDescontinho, historicoShopeeNaHora } from './descontinho.js';
@@ -22702,8 +22703,23 @@ function _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom, codigoFi
   else if (atual?.semLeitura) { veredito = 'sem_leitura'; variacaoPct = null; }
   const menor = todos.reduce((m, r) => (!m || _precoDivulgadoEnvio(r) < _precoDivulgadoEnvio(m)) ? r : m, null);
 
+  // Linhas de preco (24/11/2026, pedido do Davi): o mesmo veredito do filtro de
+  // disparo e do selo (serie nossa + Keepa/Descontinho), sobre o preco que o
+  // cliente paga (com cupom). Na montagem e so informacao: quem exclui e o
+  // operador (botao "Remover comuns e falsas"); nada e barrado no envio.
+  let linhas = null;
+  if (atual && atual.disponivel !== false && !atual.semLeitura) {
+    try {
+      const v = vereditoLinhas(asin, atual.precoDivulgado || atual.preco);
+      if (v) linhas = { classe: v.classe, motivo: v.motivo || null, descontoRealPct: v.descontoRealPct ?? null,
+                        cheio: v.cheio ?? null, baseCheio: v.baseCheio || null,
+                        patamarPromo: v.patamarPromo ?? null, minAnterior: v.minAnterior ?? null,
+                        fonteExterna: h?.fonteK || (h?.diasK && Object.keys(h.diasK).length ? 'keepa' : null) };
+    } catch { linhas = null; }
+  }
+
   return {
-    veredito, variacaoPct,
+    veredito, variacaoPct, linhas,
     viaGrupo: !proprios.length && !!doGrupo.length,
     ultimoEnvio: _resumoEnvio(ref),
     menorEnviado: _resumoEnvio(menor),
@@ -22712,6 +22728,48 @@ function _comparativoItem(asin, { envios, porAsin, porGrupo, modoCupom, codigoFi
     min90: stats?.min90 ?? null,
     mediana30: stats?.mediana30 ?? null,
   };
+}
+
+const HIST_MONTAGEM_PRAZO_MS = 8000, HIST_MONTAGEM_MAX = 60;
+function _lojaComparativo(asin, item) {
+  const l = String(item?.loja || historicoDe(asin)?.loja || '').toLowerCase();
+  if (l.includes('amazon')) return 'amazon';
+  if (l.includes('shopee')) return 'shopee';
+  return null;
+}
+async function _historicoExternoNaMontagem(pedidos, porAsin) {
+  const amz = [], shp = [];
+  for (const a of pedidos) {
+    const loja = _lojaComparativo(a, porAsin.get(a));
+    if (loja === 'amazon' && /^B[A-Z0-9]{9}$/i.test(a)) amz.push(a);
+    else if (loja === 'shopee' && /^\d{6,}$/.test(a)) shp.push(a);
+  }
+  const res = { amazon: { pedidos: amz.length, consultados: 0, comHistorico: 0, pendentes: 0 },
+                shopee: { pedidos: shp.length, consultados: 0, comHistorico: 0, pendentes: 0 } };
+  const fim = Date.now() + HIST_MONTAGEM_PRAZO_MS;
+  async function rodar(lista, conc, fn, r) {
+    const fila = lista.slice(0, HIST_MONTAGEM_MAX);
+    r.pendentes += lista.length - fila.length;
+    async function trab() {
+      while (fila.length) {
+        const a = fila.shift();
+        const resta = fim - Date.now();
+        if (resta < 300) { r.pendentes++; continue; }
+        let x = null;
+        try { x = await fn(a, resta); } catch { x = null; }
+        if (!x) continue;
+        if (x.consultou || x.usado) r.consultados++;
+        if (x.ok || x.usado) r.comHistorico++;
+        if (/segundo plano|prazo/.test(String(x.motivo || ''))) r.pendentes++;
+      }
+    }
+    await Promise.all(Array.from({ length: conc }, trab));
+  }
+  await Promise.all([
+    rodar(amz, 4, (a, resta) => consultarKeepaAgora(a, Math.min(3000, resta)), res.amazon),
+    rodar(shp, 2, (a) => historicoShopeeNaHora(a), res.shopee),
+  ]);
+  return res;
 }
 
 app.post('/vitrine/comparativo', async (req, res) => {
@@ -22737,11 +22795,22 @@ app.post('/vitrine/comparativo', async (req, res) => {
     const corte90 = Date.now() - 90 * 86400000;
     const itens = {};
 
+    // Historico de fora na hora (24/11/2026): com historico:true (o painel manda
+    // na primeira carga da montagem), produto da Amazon sem Keepa e da Shopee
+    // sem Descontinho e consultado antes do veredito das linhas — mesma regra
+    // da captura dos grupos-fonte. Prazo total curto; o que nao chegar segue em
+    // segundo plano e aparece no proximo comparativo. Fonte fora = segue sem.
+    let historico = null;
+    if (req.body?.historico === true) {
+      try { historico = await _historicoExternoNaMontagem(pedidos, porAsin); }
+      catch (e) { historico = { erro: e.message }; }
+    }
+
     const _ctxComp = { envios, porAsin, porGrupo, modoCupom, codigoFixo, cupItem, corte90 };
     for (const asin of pedidos) {
       itens[asin] = _comparativoItem(asin, _ctxComp);
     }
-    res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, cupomModo: modoCupom, itens });
+    res.json({ ok:true, total: pedidos.length, tolerancia: COMP_TOLERANCIA * 100, cupomModo: modoCupom, historico, itens });
   } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 
