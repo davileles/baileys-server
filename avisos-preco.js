@@ -391,7 +391,27 @@ function registrarLeitura(p, leitura) {
     if (p.leituras.length > 60) p.leituras = p.leituras.slice(-60);
   }
   p.lidoEm = p.ult.em;
-  p.falhas = 0; p.falhaMotivo = null;
+  p.falhas = 0; p.falhaMotivo = null; p.falhaEm = null;
+}
+
+// Leitura que falhou (25/11/2026). Regra do Davi: "sem oferta na loja" só
+// quando a loja mostra que não há oferta; quando nós é que não conseguimos ler
+// (extensão sem resposta, página sem preço, API fechada), o texto diz isso e o
+// último preço lido continua valendo. Falha de leitura não conta como leitura:
+// o produto é tentado de novo em FALHA_RETENTAR_MS, não no intervalo da loja.
+const FALHA_RETENTAR_MS = 60 * 60000;
+function anotarFalhaLeitura(p, motivo, { semOferta = false } = {}) {
+  p.falhas = (p.falhas || 0) + 1;
+  p.falhaMotivo = motivo;
+  const agora = new Date().toISOString();
+  if (semOferta) { p.lidoEm = agora; p.falhaEm = null; }
+  else p.falhaEm = agora;
+}
+function motivoDaFalhaLeitura(e) {
+  if (e?.semOfertaLoja) return 'sem oferta na loja (fora do catálogo de afiliados da Shopee)';
+  const m = String(e?.message || e || '');
+  if (/ML_SO_API|nao cobre este anuncio|pagina/i.test(m)) return 'não consegui ler o preço agora (a página do Mercado Livre não abriu pela extensão) — mantido o último preço lido';
+  return 'não consegui ler o preço agora (' + m.slice(0, 80) + ') — mantido o último preço lido';
 }
 
 function itemDoProduto(p) {
@@ -2131,6 +2151,7 @@ function devidosParaLeitura() {
 }
 
 function vencidos(p) {
+  if (p.falhaEm && Date.now() - Date.parse(p.falhaEm) < FALHA_RETENTAR_MS) return false;
   const h = Number(E().config.intervaloHoras[p.loja]) || 4;
   return !p.lidoEm || Date.now() - Date.parse(p.lidoEm) >= h * MS_H - 5 * 60000;
 }
@@ -2146,7 +2167,7 @@ async function lerProdutos(lista) {
       for (const p of lote) {
         const l = mapa.get(p.asin);
         if (l && l.preco > 0) { registrarLeitura(p, l); lidos++; }
-        else { p.falhas = (p.falhas || 0) + 1; p.falhaMotivo = 'sem preço na Amazon'; p.lidoEm = new Date().toISOString(); }
+        else anotarFalhaLeitura(p, 'não consegui ler o preço agora (a API da Amazon não devolveu este produto) — mantido o último preço lido');
       }
     } catch (e) {
       console.warn('[AVISOS] Leitura Amazon falhou: ' + e.message);
@@ -2157,9 +2178,10 @@ async function lerProdutos(lista) {
     try {
       const l = await lerPrecoProduto(itemDoProduto(p));
       if (l && l.preco > 0) { registrarLeitura(p, l); lidos++; }
-      else { p.falhas = (p.falhas || 0) + 1; p.falhaMotivo = 'sem oferta na loja'; p.lidoEm = new Date().toISOString(); }
+      else if (l && l.disponivel === false) anotarFalhaLeitura(p, 'sem oferta na loja (a loja mostra o produto indisponível)', { semOferta: true });
+      else anotarFalhaLeitura(p, 'não consegui ler o preço agora (a página abriu sem preço) — mantido o último preço lido');
     } catch (e) {
-      p.falhas = (p.falhas || 0) + 1; p.falhaMotivo = String(e.message || e).slice(0, 120); p.lidoEm = new Date().toISOString();
+      anotarFalhaLeitura(p, motivoDaFalhaLeitura(e), { semOferta: !!e?.semOfertaLoja });
     }
     await new Promise(r => setTimeout(r, 1500 + Math.random() * 1500));
   }

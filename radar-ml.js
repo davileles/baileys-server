@@ -74,6 +74,7 @@ export function estadoMl() {
   if (!tokAtual()) carregarToken();
   const _tok = tokAtual();   // leitura local do operador do contexto
   return {
+    apiOfertasCatalogo: estadoBloqueioItemsMl(),
     credenciais: credenciaisMlOk(),
     tag: tagMl(),
     autorizado: !!_tok?.refresh_token,
@@ -149,7 +150,33 @@ async function tokenValido() {
   return tokAtual().access_token;
 }
 
+// ── DISJUNTOR DA API DE OFERTAS DO CATALOGO (25/11/2026) ─────────────────
+// Desde 23/11/2026 o ML responde 403 PolicyAgent (PA_UNAUTHORIZED_RESULT_FROM_
+// POLICIES) a /products/{id}/items para o nosso app — token valido, reconectar
+// em /ml/conectar nao resolve; /products/{id}, categorias e highlights seguem
+// 200. Cada chamada bloqueada so gastava tempo (a varredura do monitor levava
+// 47 min) e enchia o log. Com o 403 da politica, a rota fica fechada por
+// ML_ITEMS_BLOQUEIO_H (6) horas: quem chama recebe erro com bloqueioItems e
+// segue direto para a pagina pela extensao. Passado o prazo, a 1a chamada real
+// testa de novo. ML_ITEMS_BLOQUEIO_H=0 desliga.
+const ITEMS_BLOQUEIO_MS = Number(process.env.ML_ITEMS_BLOQUEIO_H ?? 6) * 3600000;
+const RE_CAMINHO_ITEMS = /^\/products\/[^/?]+\/items(\?|$)/i;
+let _bloqueioItems = { ate: 0, desde: null, ultimoEm: null, vezes: 0, pulados: 0 };
+function erroBloqueioItems() {
+  const e = new Error('ML 403: API de ofertas do catalogo bloqueada pelo ML (PolicyAgent) — leitura pela pagina');
+  e.bloqueioItems = true;
+  return e;
+}
+export function apiItemsMlBloqueada() { return ITEMS_BLOQUEIO_MS > 0 && Date.now() < _bloqueioItems.ate; }
+export function estadoBloqueioItemsMl() {
+  return { ativo: apiItemsMlBloqueada(), ate: _bloqueioItems.ate ? new Date(_bloqueioItems.ate).toISOString() : null,
+           desde: _bloqueioItems.desde, ultimoEm: _bloqueioItems.ultimoEm, vezes: _bloqueioItems.vezes,
+           puladosDesdeBoot: _bloqueioItems.pulados };
+}
+
 async function apiMl(caminho) {
+  const ehItems = RE_CAMINHO_ITEMS.test(caminho);
+  if (ehItems && apiItemsMlBloqueada()) { _bloqueioItems.pulados++; throw erroBloqueioItems(); }
   let token = await tokenValido();
   let res = await fetch(API + caminho, {
     headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
@@ -165,6 +192,17 @@ async function apiMl(caminho) {
     });
   }
   const d = await res.json().catch(() => null);
+  if (ehItems && res.status === 403 && ITEMS_BLOQUEIO_MS > 0
+      && (d?.code === 'PA_UNAUTHORIZED_RESULT_FROM_POLICIES' || d?.blocked_by === 'PolicyAgent')) {
+    const agora = Date.now();
+    if (!_bloqueioItems.desde || agora - Date.parse(_bloqueioItems.ultimoEm || 0) > ITEMS_BLOQUEIO_MS * 2) _bloqueioItems.desde = new Date(agora).toISOString();
+    _bloqueioItems.ate = agora + ITEMS_BLOQUEIO_MS;
+    _bloqueioItems.ultimoEm = new Date(agora).toISOString();
+    _bloqueioItems.vezes++;
+    console.warn('[ML] /products/{id}/items bloqueada pelo ML (403 PolicyAgent) — preco do ML so pela pagina ate '
+      + new Date(_bloqueioItems.ate).toLocaleTimeString('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit' }));
+    throw erroBloqueioItems();
+  }
   if (!res.ok) throw new Error('ML ' + res.status + ': ' + (d?.message || d?.error || 'erro'));
   return d;
 }
@@ -914,7 +952,7 @@ async function dadosViaApiMl(urlResolvida, urlOriginal, opcoes = {}) {
       lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
     } catch (e) {
       if (/\b404\b/.test(e.message)) continue;
-      console.warn('[ML] API oficial /products/' + catalogo + '/items:', e.message);
+      if (!e?.bloqueioItems) console.warn('[ML] API oficial /products/' + catalogo + '/items:', e.message);
       return null;
     }
     const escolhido = alvo
@@ -1028,7 +1066,7 @@ async function trilhaPorCatalogoMl(catalogoId) {
     const r = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=1');
     return await trilhaDeCategoriaMl((r?.results || [])[0]?.category_id);
   } catch (e) {
-    console.warn('[ML] trilha por catalogo ' + cat + ':', e.message);
+    if (!e?.bloqueioItems) console.warn('[ML] trilha por catalogo ' + cat + ':', e.message);
     return null;
   }
 }
@@ -1076,7 +1114,7 @@ export async function precoOfertaCatalogoMl(id, itemId = null) {
   let ofertas;
   try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=50'); }
   catch (e) {
-    if (/\b404\b/.test(e.message)) return null;
+    if (/\b404\b/.test(e.message) || e?.bloqueioItems) return null;
     throw e;
   }
   const lista = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
@@ -1096,6 +1134,7 @@ export async function precoCatalogoApiMl(id) {
   try { ofertas = await apiMl('/products/' + encodeURIComponent(cat) + '/items?limit=20'); }
   catch (e) {
     if (/\b404\b/.test(e.message)) return null;      // id de anuncio, nao de catalogo
+    if (e?.bloqueioItems) return null;                // API fechada: segue pela pagina
     throw e;
   }
   let resto = (ofertas?.results || []).filter(r => Number(r?.price) > 0);
@@ -1182,7 +1221,7 @@ export async function catalogoSemOfertaMl(id) {
       catch (e) { if (!/\b404\b/.test(e.message)) throw e; }
     }
   } catch (e) {
-    console.warn('[ML] conferencia de oferta do catalogo ' + cat + ' falhou:', e.message);
+    if (!e?.bloqueioItems) console.warn('[ML] conferencia de oferta do catalogo ' + cat + ' falhou:', e.message);
     return false;                           // soluco de infra nao derruba o item
   }
   _cacheSemOferta.set(cat, { v: semOferta, em: Date.now() });
@@ -1501,10 +1540,14 @@ async function paginaPelaExtensaoMlBruta(alvoUrl) {
   } catch (e) { return null; }
 }
 
+// Alertas de preco leem em segundo plano: esperam ate 75 s na fila da extensao
+// (25/11/2026 — com a API de ofertas fechada, a fila cresceu e os 20 s padrao
+// viravam "sem resposta no prazo" em boa parte das leituras dos alertas).
+const ESPERA_PAGINA_POR_MOTIVO = { avisos: Number(process.env.ML_PAGINA_ESPERA_AVISOS_MS || 75000) };
 async function paginaPelaExtensaoMl(alvoUrl, motivo = 'leitura') {
   if (!extensaoPaginasOnline()) return null;
   try {
-    const r = await pedirPaginaMl(alvoUrl, { motivo });
+    const r = await pedirPaginaMl(alvoUrl, ESPERA_PAGINA_POR_MOTIVO[motivo] ? { motivo, esperaMs: ESPERA_PAGINA_POR_MOTIVO[motivo] } : { motivo });
     if (!r) return null;
     if (r.bloqueada) {
       console.warn('[ML] Pagina pela extensao veio bloqueada (antibot no Chrome do operador): ' + alvoUrl);

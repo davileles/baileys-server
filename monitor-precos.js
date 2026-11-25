@@ -1616,7 +1616,7 @@ async function lerPreco(item, { motivoPagina = 'monitor' } = {}) {
       // Catalogo so com oferta suspeita: nao ha preco confiavel, e a pagina
       // mostraria o mesmo anuncio — falha deste item, com o laudo.
       if (e?.ofertaSuspeita) throw e;
-      console.warn('[MONITOR] API oficial ML falhou para ' + item.asin + ': ' + e.message + ' — tentando a pagina');
+      if (!e?.bloqueioItems) console.warn('[MONITOR] API oficial ML falhou para ' + item.asin + ': ' + e.message + ' — tentando a pagina');
     }
     if (viaApi) return { preco: viaApi.preco, precoDe: viaApi.precoDe, disponivel: true, titulo: null, fonte: 'api',
                          itemId: viaApi.itemId || null,

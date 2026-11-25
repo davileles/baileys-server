@@ -50,7 +50,10 @@ const [JAN_INI, JAN_FIM] = String(process.env.ML_PAGINA_JANELA || '8-23').split(
 // (captura dos grupos-fonte, montagem de disparo, Catalogo, alertas de preco,
 // clique manual) sempre passa pela extensao quando precisa. Os freios que
 // seguem valendo para todos: janela, extensao online e parada na verificacao.
-const TETO_MONITOR = Number(process.env.ML_PAGINA_TETO_MONITOR ?? TETO_DIA);
+// 25/11/2026: com a API de ofertas do catalogo fechada pelo ML, todo preco do
+// ML do monitor depende da pagina; o padrao do teto do monitor subiu de 200
+// para 400 (decisao do Davi). ML_PAGINA_TETO_MONITOR na env ainda vale mais.
+const TETO_MONITOR = Number(process.env.ML_PAGINA_TETO_MONITOR ?? 400);
 
 let _seq = 0;
 const _fila = [];               // [{ id, url, criadoEm, resolve, timer, entregueEm }]
@@ -192,7 +195,10 @@ function proximoParaEntregar() {
   const livre = p => !p.entregueEm && !p.forcar && !motivoIndisponivelPaginasMl(p.motivo);
   const p = _fila.find(p => !p.entregueEm && p.forcar)
     || _fila.find(p => livre(p) && p.motivo === 'manual')
-    || _fila.find(p => livre(p) && p.motivo !== 'monitor' && p.motivo !== 'busca')
+    || _fila.find(p => livre(p) && p.motivo !== 'monitor' && p.motivo !== 'busca' && p.motivo !== 'avisos')
+    // Alertas de preco (25/11/2026): leitura em segundo plano, atras do que vai
+    // ser divulgado agora e a frente da busca e do monitor.
+    || _fila.find(p => livre(p) && p.motivo === 'avisos')
     // Busca de outras lojas dos avisos de preço (07/11/2026): atrás das páginas
     // de produto, à frente só do monitor.
     || _fila.find(p => livre(p) && p.motivo === 'busca')
