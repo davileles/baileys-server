@@ -1856,6 +1856,7 @@ async function conectarConta(id) {
         try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author, apelidoDaConta(id)); }
         catch (e) { console.error('[MEMBROS] Erro no handler (' + id + '):', e.message); }
         sgEventoParticipantes(apelidoDaConta(id), s, u);
+        shieldEntradaBloqueada(apelidoDaConta(id), s, u);
         avisarEntradaCdv(s, u);
         registrarSaidaCdv(s, u);
       });
@@ -13702,6 +13703,7 @@ async function conectar() {
       try { registrarMovimentoMembros(u?.id, u?.participants, u?.action, u?.author); }
       catch(e) { console.error('[MEMBROS] Erro no handler:', e.message); }
       sgEventoParticipantes('principal', sock, u);
+      shieldEntradaBloqueada('principal', sock, u);
       avisarEntradaCdv(sock, u);
       registrarSaidaCdv(sock, u);
     });
@@ -15459,6 +15461,7 @@ async function shieldObservar(msg, contaId, sockDe) {
   const modo = shieldModoDe(jid);
   if (modo === 'off') return;
   if (!new Set(censoAlvos()).has(jid)) return;
+  if (await shieldIntruso(msg, contaId, sockDe)) return;   // nao-admin postando em grupo so-admins
   const texto = shieldTextoDe(msg);
   if (!texto) return;                                       // nao age no que nao le
   const achado = shieldAnalisar(texto);
@@ -15571,6 +15574,276 @@ app.post('/shield/falso-positivo/:id', (req, res) => {
   v.falsoPositivo = true; s.falsosPositivos.unshift({ id: v.id, em: new Date().toISOString(), remetente: v.remetente, grupo: v.grupo, nota: String(req.body?.nota || '').slice(0, 200) });
   s.falsosPositivos = s.falsosPositivos.slice(0, 200); _shieldSalvar();
   res.json({ ok: true, violacao: v, dica: 'para reincluir a pessoa use a gestao de grupos (acao add)' });
+});
+
+// ── SHIELD · INTRUSO EM GRUPO SO-ADMINS + LISTA DE BLOQUEIO (25/11/2026) ─────
+// Pedido do Davi: ha relatos de gente que entra num grupo do Tica Promos em
+// modo "so admins enviam" e consegue postar mesmo sem ser admin. Regra: em
+// grupo de destino (censoAlvos) com announce ligado, QUALQUER postagem de quem
+// nao e admin nem numero da casa = intruso -> apaga a mensagem, remove do grupo,
+// bloqueia o contato e poe o numero na lista de bloqueio. Quem esta na lista e
+// removido na hora em que entra em qualquer grupo do Tica Promos (e, ao entrar
+// na lista, sai dos outros grupos em que ja estava). Reacao e voto em enquete
+// nao contam (membro comum pode). Antes de agir, confirma com metadata FRESCA
+// do grupo (admin recem-promovido ou grupo recem-aberto nao viram intruso).
+// Executor: contas tico admin do grupo, nunca a principal (permitirPrincipal).
+// Modo proprio em intruso.modo (protect por padrao; observe so registra);
+// porGrupo 'off' desliga tudo naquele grupo. Teto diario de acoes (tetoDia).
+const SHIELD_TIPOS_POSTAGEM = ['conversation', 'extendedTextMessage', 'imageMessage', 'videoMessage', 'ptvMessage', 'audioMessage',
+  'documentMessage', 'stickerMessage', 'contactMessage', 'contactsArrayMessage', 'locationMessage', 'liveLocationMessage',
+  'pollCreationMessage', 'pollCreationMessageV2', 'pollCreationMessageV3', 'groupInviteMessage', 'buttonsMessage', 'listMessage',
+  'templateMessage', 'interactiveMessage', 'eventMessage', 'productMessage', 'orderMessage', 'albumMessage'];
+const SHIELD_INTRUSO_PADRAO = { ativo: true, modo: 'protect', tetoDia: 60, varrerOutrosGrupos: true };
+function _shieldIntrusoCfg() {
+  const s = _shieldCarregar();
+  s.intruso = { ...SHIELD_INTRUSO_PADRAO, ...(s.intruso || {}) };
+  if (!Array.isArray(s.listaBloqueio)) s.listaBloqueio = [];
+  return s.intruso;
+}
+// Tipo da postagem (desembrulha efemera/visualizacao unica/documento com legenda); null = nao e postagem.
+function shieldTipoPostagem(msg) {
+  let m = msg?.message || {};
+  for (let i = 0; i < 4; i++) {
+    const w = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message
+      || m.viewOnceMessageV2Extension?.message || m.documentWithCaptionMessage?.message;
+    if (!w) break;
+    m = w;
+  }
+  return SHIELD_TIPOS_POSTAGEM.find(k => m[k]) || null;
+}
+// Todos os ids (telefone e LID) das nossas contas conectadas.
+function _shieldIdsDaCasa() {
+  const ids = new Set();
+  try {
+    for (const n of _idsDaContaSock(sock)) ids.add(n);
+    for (const c of contasExtras.values()) if (c.sock) for (const n of _idsDaContaSock(c.sock)) ids.add(n);
+  } catch (e) {}
+  return ids;
+}
+function _shieldEhDaCasa(ids) {
+  const casa = _shieldIdsDaCasa();
+  if (ids.some(n => casa.has(n))) return true;
+  return ids.some(n => n.length <= 13 && _gmNumeroDaCasa(n));   // LID tem 14+ digitos: so telefone vai ao cadastro
+}
+function shieldNaLista(ids) {
+  _shieldIntrusoCfg();
+  const set = new Set(ids.filter(Boolean));
+  return _shieldCarregar().listaBloqueio.find(b => (b.ids || []).some(n => set.has(n))) || null;
+}
+function shieldPorNaLista(ids, dados = {}) {
+  _shieldIntrusoCfg();
+  const s = _shieldCarregar();
+  const limpos = [...new Set(ids.map(_gmDigitos).filter(Boolean))];
+  if (!limpos.length) return null;
+  let b = shieldNaLista(limpos);
+  if (b) { b.ids = [...new Set([...(b.ids || []), ...limpos])]; if (!b.tel && dados.tel) b.tel = dados.tel; }
+  else {
+    b = { ids: limpos, tel: dados.tel || null, em: new Date().toISOString(), motivo: String(dados.motivo || 'manual').slice(0, 200),
+      grupo: dados.grupo || null, nome: dados.nome || null, removidoDe: [] };
+    s.listaBloqueio.unshift(b);
+    s.listaBloqueio = s.listaBloqueio.slice(0, 5000);
+  }
+  _shieldSalvar();
+  return b;
+}
+function _shieldContarAcao() {
+  const s = _shieldCarregar(); const cfg = _shieldIntrusoCfg();
+  const hoje = _gmHoje();
+  if (!s.acoesDia || s.acoesDia.data !== hoje) s.acoesDia = { data: hoje, n: 0 };
+  if (s.acoesDia.n >= (+cfg.tetoDia || 60)) return false;
+  s.acoesDia.n++;
+  return true;
+}
+// Acha conta tico (ou principal, se permitido) que e admin do grupo e o participante-alvo la dentro.
+async function _shieldExecutorDoGrupo(jid, ids) {
+  const s = _shieldCarregar();
+  const cands = _gaCandidatosExecutor(TENANT_PADRAO, '__shield__').filter(c => c.id !== 'principal' || s.permitirPrincipal);
+  const pref = (s.executores || []).map(x => String(x).toLowerCase());
+  const ord = (c) => { const i = pref.indexOf(c.id.toLowerCase()); return i === -1 ? 99 : i; };
+  cands.sort((a, b) => ord(a) - ord(b));
+  for (const cnd of cands) {
+    try {
+      const md = (await _gmRetrato(cnd.sock, false))[jid];
+      if (!md) continue;
+      const eu = _gmEuNoGrupo(cnd.sock, md);
+      if (!eu?.admin) continue;
+      const p = (md.participants || []).find(p => _gmIdsParticipante(p).some(n => ids.includes(n))) || null;
+      return { exec: cnd, part: p };
+    } catch (e) {}
+  }
+  return { exec: null, part: null };
+}
+// Apaga (opcional), remove e bloqueia. Devolve o que fez.
+async function _shieldExpulsar(jid, ids, { msgKey = null, alvoId = null, bloquear = true } = {}) {
+  const s = _shieldCarregar();
+  if (!_shieldContarAcao()) return { por: null, feitos: 'teto diario de acoes do Shield atingido — nada feito' };
+  const { exec, part } = await _shieldExecutorDoGrupo(jid, ids);
+  if (!exec) return { por: null, feitos: 'nenhuma conta nossa e admin deste grupo' + (s.permitirPrincipal ? '' : ' (principal nao permitida)') };
+  const alvo = part?.id || alvoId;
+  const feitos = [];
+  if (msgKey?.id && s.apagarMensagem !== false) {
+    try { await exec.sock.sendMessage(jid, { delete: { remoteJid: jid, id: msgKey.id, participant: msgKey.participant, fromMe: false } }); feitos.push('apagou'); }
+    catch (e) { feitos.push('apagar falhou: ' + e.message); }
+  }
+  if (alvo && (part || msgKey)) {
+    try {
+      const r = await exec.sock.groupParticipantsUpdate(jid, [alvo], 'remove');
+      feitos.push(String(r?.[0]?.status || '') === '200' ? 'removeu' : 'remover status ' + (r?.[0]?.status || '?'));
+    } catch (e) { feitos.push('remover falhou: ' + e.message); }
+  } else feitos.push('ja nao estava no grupo');
+  if (bloquear && alvo) {
+    try { await exec.sock.updateBlockStatus(alvo, 'block'); feitos.push('bloqueou'); }
+    catch (e) { feitos.push('bloquear falhou: ' + e.message); }
+  }
+  _gmInvalidarRetratos();
+  await new Promise(r => setTimeout(r, 3000));   // ritmo: nunca uma rajada de remocoes
+  return { por: exec.id, feitos: feitos.join(', ') };
+}
+// Numero que acabou de entrar na lista: sai dos outros grupos do Tica Promos em que ja estava.
+async function _shieldVarrerOutrosGrupos(b, exceto) {
+  const cfg = _shieldIntrusoCfg();
+  if (!b || !cfg.varrerOutrosGrupos) return;
+  const alvos = censoAlvos().filter(j => j !== exceto && shieldModoDe(j) !== 'off');
+  const achados = new Set();
+  for (const c of _gaCandidatosExecutor(TENANT_PADRAO, '__shield__')) {
+    let mapa = {};
+    try { mapa = await _gmRetrato(c.sock, false); } catch (e) { continue; }
+    for (const j of alvos) {
+      const md = mapa[j];
+      if (md && (md.participants || []).some(p => _gmIdsParticipante(p).some(n => b.ids.includes(n)))) achados.add(j);
+    }
+  }
+  for (const j of achados) {
+    const r = await _shieldExpulsar(j, b.ids, { bloquear: false });
+    b.removidoDe = [...(b.removidoDe || []), { grupo: j, nome: NOMES_GRUPOS.get(j) || null, em: new Date().toISOString(), por: r.por, acao: r.feitos }].slice(-50);
+    _shieldSalvar();
+    console.log('[SHIELD] Lista de bloqueio: ' + (b.tel || b.ids[0]) + ' tirado de ' + (NOMES_GRUPOS.get(j) || j) + ' · ' + r.feitos);
+  }
+}
+const _shieldIntrusoVistos = new Map();   // msgId -> true (intruso) | false (nao e)
+// true = tratou como intruso (o Shield de link nao precisa olhar).
+async function shieldIntruso(msg, contaId, sockDe) {
+  const cfg = _shieldIntrusoCfg();
+  if (!cfg.ativo) return false;
+  const jid = msg?.key?.remoteJid || '';
+  const tipo = shieldTipoPostagem(msg);
+  if (!tipo) return false;
+  // So mensagem recente: sincronizacao apos reconexao traz postagem antiga de
+  // quando o grupo estava aberto ou a pessoa ainda era admin.
+  const tsMsg = Number(msg.messageTimestamp?.toNumber ? msg.messageTimestamp.toNumber() : msg.messageTimestamp) || 0;
+  if (!tsMsg || Date.now() / 1000 - tsMsg > 600) return false;
+  const remetente = msg.key?.participant || msg.participant || '';
+  const remetentePn = msg.key?.participantPn || msg.participantPn || '';
+  const ids = [remetente, remetentePn].map(_gmDigitos).filter(Boolean);
+  if (!ids.length || _shieldEhDaCasa(ids)) return false;
+  const mid = msg.key?.id || '';
+  if (!mid) return false;
+  if (_shieldIntrusoVistos.has(mid)) return _shieldIntrusoVistos.get(mid) === true;
+  _shieldIntrusoVistos.set(mid, false);
+  if (_shieldIntrusoVistos.size > 5000) for (const k of _shieldIntrusoVistos.keys()) { _shieldIntrusoVistos.delete(k); if (_shieldIntrusoVistos.size < 4000) break; }
+  // Cache primeiro (barato, cobre todo envio normal dos admins)...
+  let md = null;
+  try { md = (await _gmRetrato(sockDe, false))[jid] || null; } catch (e) {}
+  if (md && !md.announce) return false;
+  let part = (md?.participants || []).find(p => _gmIdsParticipante(p).some(n => ids.includes(n))) || null;
+  if (part?.admin) return false;
+  // ...e so com suspeita, metadata fresca do grupo para confirmar (falha fechado).
+  try { md = await sockDe.groupMetadata(jid); } catch (e) { return false; }
+  if (!md?.announce) return false;
+  part = (md.participants || []).find(p => _gmIdsParticipante(p).some(n => ids.includes(n))) || null;
+  if (part?.admin) return false;
+  _shieldIntrusoVistos.set(mid, true);
+
+  const s = _shieldCarregar();
+  const modo = cfg.modo === 'observe' ? 'observe' : 'protect';
+  const agora = Date.now();
+  const tel = _gmTelefoneDe(part) || (remetentePn ? _gmDigitos(remetentePn) : (ids.find(n => n.length <= 13) || null));
+  const entrouHaMin = shieldEntrouHaMin(jid, ids);
+  const texto = shieldTextoDe(msg) || '';
+  const reg = { id: 'sh-' + agora.toString(36), em: new Date(agora).toISOString(), grupo: jid, nome: NOMES_GRUPOS.get(jid) || md.subject || null,
+    regra: 'intruso', remetente: ids[0], remetenteTel: tel, entrouHaMin: entrouHaMin == null ? null : +entrouHaMin.toFixed(1),
+    viu: 'nao-admin postou em grupo so-admins (' + tipo + ')', links: [], trecho: texto.slice(0, 160), tipo,
+    lidoPor: contaId, modo, acao: modo === 'protect' ? 'pendente' : 'so observado', por: null, erro: null };
+  s.violacoes.unshift(reg); s.violacoes = s.violacoes.slice(0, 500); _shieldSalvar();
+  console.warn('[SHIELD] INTRUSO em ' + (reg.nome || jid) + ': ' + (tel || ids[0]) + ' postou ' + tipo + ' sem ser admin (lido por ' + contaId + ', ' + modo + ')');
+
+  if (modo === 'protect') {
+    const b = shieldPorNaLista([...ids, ...(part ? _gmIdsParticipante(part) : [])], { tel, motivo: 'postou sem ser admin', grupo: jid, nome: reg.nome });
+    _shieldFila = _shieldFila.then(async () => {
+      const r = await _shieldExpulsar(jid, b.ids, { msgKey: msg.key, alvoId: part?.id || remetente });
+      reg.por = r.por; reg.acao = r.feitos; _shieldSalvar();
+      console.log('[SHIELD] ' + (reg.nome || jid) + ' · intruso ' + (tel || ids[0]) + ' · ' + r.feitos + (r.por ? ' (por ' + r.por + ')' : ''));
+      await _shieldVarrerOutrosGrupos(b, jid);
+    }).catch(e => { reg.erro = e.message; reg.acao = 'falhou'; _shieldSalvar(); });
+  }
+  registrarAlerta({ nivel: 'atencao', origem: 'shield', chave: 'shield:intruso:' + jid + '|' + ids[0], janelaMs: SHIELD_DEDUP_MS,
+    titulo: '🛡 Shield · intruso em ' + (reg.nome || jid.slice(0, 18)),
+    corpo: '🛡 *Shield — postagem de quem não é admin*\n\nGrupo: ' + (reg.nome || jid) + '\nNúmero: ' + (tel ? '+' + tel : ids[0])
+      + (entrouHaMin != null ? ' (entrou há ' + Math.round(entrouHaMin) + ' min)' : '') + '\nTipo: ' + tipo
+      + (texto ? '\nTrecho: ' + texto.slice(0, 120) : '') + '\n\n'
+      + (modo === 'protect' ? 'Mensagem apagada, número removido, bloqueado e posto na lista de bloqueio dos grupos.' : 'Só observado (modo OBSERVE).') }).catch(() => {});
+  return true;
+}
+// Entrada em grupo do Tica Promos de quem esta na lista: remove na hora.
+const _shieldEntradasVistas = new Map();   // grupo|id -> ts (varias contas veem o mesmo evento)
+function shieldEntradaBloqueada(apelido, s, u) {
+  try {
+    if (!u || u.action !== 'add' || !String(u.id || '').endsWith('@g.us')) return;
+    const cfg = _shieldIntrusoCfg();
+    if (!cfg.ativo || cfg.modo !== 'protect' || shieldModoDe(u.id) === 'off') return;
+    if (!censoAlvos().includes(u.id)) return;
+    for (const p of (u.participants || [])) {
+      const ids = (p && typeof p === 'object') ? [p.id, p.lid, p.jid, p.phoneNumber].map(_gmDigitos).filter(Boolean) : [_gmDigitos(p)].filter(Boolean);
+      const b = shieldNaLista(ids);
+      if (!b) continue;
+      const chave = u.id + '|' + b.ids[0];
+      if ((_shieldEntradasVistas.get(chave) || 0) > Date.now() - SHIELD_DEDUP_MS) continue;
+      _shieldEntradasVistas.set(chave, Date.now());
+      const nome = NOMES_GRUPOS.get(u.id) || u.id;
+      const alvoId = (p && typeof p === 'object') ? p.id : p;
+      _shieldFila = _shieldFila.then(async () => {
+        await new Promise(r => setTimeout(r, 4000));   // o retrato do grupo precisa ver a entrada
+        _gmInvalidarRetratos();
+        const r = await _shieldExpulsar(u.id, [...new Set([...b.ids, ...ids])], { alvoId, bloquear: false });
+        b.removidoDe = [...(b.removidoDe || []), { grupo: u.id, nome, em: new Date().toISOString(), por: r.por, acao: r.feitos, reentrada: true }].slice(-50);
+        _shieldSalvar();
+        console.log('[SHIELD] Lista de bloqueio: ' + (b.tel || b.ids[0]) + ' entrou em ' + nome + ' (visto por ' + apelido + ') · ' + r.feitos);
+        registrarAlerta({ nivel: 'atencao', origem: 'shield', chave: 'shield:reentrada:' + chave, janelaMs: SHIELD_DEDUP_MS,
+          titulo: '🛡 Shield · bloqueado entrou em ' + nome,
+          corpo: '🛡 *Shield — número da lista de bloqueio entrou em grupo*\n\nGrupo: ' + nome + '\nNúmero: ' + (b.tel ? '+' + b.tel : b.ids[0]) + '\nResultado: ' + r.feitos }).catch(() => {});
+      }).catch(e => console.warn('[SHIELD] reentrada: ' + e.message));
+    }
+  } catch (e) { console.warn('[SHIELD] Erro no evento de entrada:', e.message); }
+}
+app.get('/shield/lista-bloqueio', (req, res) => {
+  _shieldIntrusoCfg();
+  const s = _shieldCarregar();
+  res.json({ ok: true, intruso: s.intruso, acoesDia: s.acoesDia || null, total: s.listaBloqueio.length, lista: s.listaBloqueio.slice(0, 500) });
+});
+// POST /shield/lista-bloqueio {numero, acao:'add'|'remover', motivo?}
+app.post('/shield/lista-bloqueio', (req, res) => {
+  const b = req.body || {};
+  const num = _gmDigitos(b.numero);
+  if (!num || num.length < 10) return res.status(400).json({ ok: false, erro: 'numero com DDI e DDD (ex.: 5531999999999)' });
+  const s = _shieldCarregar(); _shieldIntrusoCfg();
+  if (b.acao === 'remover') {
+    const antes = s.listaBloqueio.length;
+    s.listaBloqueio = s.listaBloqueio.filter(x => !(x.ids || []).includes(num) && x.tel !== num);
+    _shieldSalvar();
+    return res.json({ ok: true, removidos: antes - s.listaBloqueio.length, dica: 'o contato segue bloqueado no numero que bloqueou; desbloquear pelo celular se precisar' });
+  }
+  const reg = shieldPorNaLista([num], { tel: num, motivo: b.motivo || 'incluido pelo painel' });
+  _shieldFila = _shieldFila.then(() => _shieldVarrerOutrosGrupos(reg, null)).catch(() => {});
+  res.json({ ok: true, item: reg });
+});
+// POST /shield/intruso/config {ativo?, modo?:'protect'|'observe', tetoDia?, varrerOutrosGrupos?}
+app.post('/shield/intruso/config', (req, res) => {
+  const cfg = _shieldIntrusoCfg(); const b = req.body || {};
+  if (typeof b.ativo === 'boolean') cfg.ativo = b.ativo;
+  if (b.modo === 'protect' || b.modo === 'observe') cfg.modo = b.modo;
+  if (Number.isFinite(+b.tetoDia) && +b.tetoDia >= 0) cfg.tetoDia = Math.min(500, +b.tetoDia);
+  if (typeof b.varrerOutrosGrupos === 'boolean') cfg.varrerOutrosGrupos = b.varrerOutrosGrupos;
+  _shieldSalvar(); res.json({ ok: true, intruso: cfg });
 });
 
 function _gmContas() {
