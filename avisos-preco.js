@@ -2177,7 +2177,12 @@ async function lerProdutos(lista) {
   for (const p of outros) {
     try {
       const l = await lerPrecoProduto(itemDoProduto(p));
-      if (l && l.preco > 0) { registrarLeitura(p, l); lidos++; }
+      if (l && l.preco > 0) {
+        registrarLeitura(p, l); lidos++;
+        // Mesma visita (25/11/2026): a página que acabou de dar o preço fica
+        // guardada; se o cupom está devido, confere agora sem abrir outra.
+        if (p.loja === 'Mercado Livre' && precisaConferirCupom(p)) { try { await conferirCupomMl(p); } catch (e) { /* segue */ } }
+      }
       else if (l && l.disponivel === false) anotarFalhaLeitura(p, 'sem oferta na loja (a loja mostra o produto indisponível)', { semOferta: true });
       else anotarFalhaLeitura(p, 'não consegui ler o preço agora (a página abriu sem preço) — mantido o último preço lido');
     } catch (e) {
@@ -2727,11 +2732,16 @@ function precisaConferirCupom(p) {
   if (p.loja !== 'Mercado Livre' || !p.url || !p.ult?.preco) return false;
   if (p.cupomMlTentativaEm && Date.now() - Date.parse(p.cupomMlTentativaEm) < MS_H) return false;
   const c = p.cupomMl;
-  if (!c || p.cupomMlRechecar) return true;
+  if (!c) return true;
+  // Cupom novo do ML na base (25/11/2026): reconfere no máximo 1× a cada
+  // CUPOM_ML_NOVO_MIN_H por produto. Na Black Friday entravam cupons ~15×/dia
+  // e cada produto do ML com alerta era reaberto quase de hora em hora.
+  if (p.cupomMlRechecar && Date.now() - Date.parse(c.em) >= CUPOM_ML_NOVO_MIN_H * MS_H) return true;
   if (Date.now() - Date.parse(c.em) >= CUPOM_ML_RECHECA_H * MS_H) return true;
   return c.precoRef && Math.abs(p.ult.preco - c.precoRef) / c.precoRef > 0.05;
 }
 
+const CUPOM_ML_NOVO_MIN_H = Number(process.env.AVISOS_CUPOM_NOVO_MIN_H || 3);
 async function conferirCupomMl(p, { manual = false } = {}) {
   p.cupomMlTentativaEm = new Date().toISOString();
   let r = null;

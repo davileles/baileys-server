@@ -55,6 +55,29 @@ const [JAN_INI, JAN_FIM] = String(process.env.ML_PAGINA_JANELA || '8-23').split(
 // para 400 (decisao do Davi). ML_PAGINA_TETO_MONITOR na env ainda vale mais.
 const TETO_MONITOR = Number(process.env.ML_PAGINA_TETO_MONITOR ?? 400);
 
+// Reuso de pagina recente (25/11/2026): os alertas de preco abriam a mesma
+// pagina duas vezes — uma para o preco, outra para o cupom. A pagina boa fica
+// guardada PAGINA_REUSO_MIN (30) min e quem le em segundo plano (alertas,
+// Catalogo, monitor) usa a guardada em vez de pedir outra a extensao. O que vai
+// ser divulgado agora (leitura, manual) sempre pede pagina nova.
+const REUSO_MS = Number(process.env.ML_PAGINA_REUSO_MIN ?? 30) * 60000;
+const REUSO_MAX = 25;
+const MOTIVOS_REUSO = new Set(['avisos', 'catalogo', 'monitor']);
+const _recentes = new Map();    // url -> { r, em }
+let _reusadas = 0;
+function guardarRecente(url, r) {
+  if (!(REUSO_MS > 0) || !url || !r?.html || r.bloqueada) return;
+  _recentes.delete(url);
+  _recentes.set(url, { r, em: Date.now() });
+  while (_recentes.size > REUSO_MAX) _recentes.delete(_recentes.keys().next().value);
+}
+function paginaRecente(url) {
+  const x = _recentes.get(url);
+  if (!x) return null;
+  if (Date.now() - x.em > REUSO_MS) { _recentes.delete(url); return null; }
+  return x.r;
+}
+
 let _seq = 0;
 const _fila = [];               // [{ id, url, criadoEm, resolve, timer, entregueEm }]
 const _esperando = [];          // long-polls da extensao: [{ res, timer }]
@@ -159,6 +182,10 @@ export function motivoIndisponivelPaginasMl(motivo = null) {
  */
 export function pedirPaginaMl(url, { esperaMs = ESPERA_MS, motivo = 'leitura', forcar = false } = {}) {
   // forcar: so o teste da verificacao passa por cima do freio (precisa da extensao online)
+  if (!forcar && MOTIVOS_REUSO.has(motivo)) {
+    const rec = paginaRecente(url);
+    if (rec) { _reusadas++; _estado.reusadasPorMotivo = _estado.reusadasPorMotivo || {}; _estado.reusadasPorMotivo[motivo] = (_estado.reusadasPorMotivo[motivo] || 0) + 1; return Promise.resolve(rec); }
+  }
   const porque = forcar ? (LIGADO && extensaoPaginasOnline() ? null : 'extensao_offline') : motivoIndisponivelPaginasMl(motivo);
   if (porque) { _estado.recusas = _estado.recusas || {}; const k = motivo + ':' + porque; _estado.recusas[k] = (_estado.recusas[k] || 0) + 1; return Promise.resolve(null); }
   // A mesma URL pedida duas vezes seguidas (dois grupos-fonte publicando junto)
@@ -286,7 +313,9 @@ export function registrarResultadoPaginaMl(corpo, bloqueadaFn) {
       if (_aoLiberar) Promise.resolve(_aoLiberar(v)).catch(() => {});
     }
   }
-  concluir(p, { html, url: urlFinal, status, bloqueada });
+  const resultado = { html, url: urlFinal, status, bloqueada };
+  if (!ehEncurtador) { guardarRecente(p.url, resultado); if (urlFinal && urlFinal !== p.url) guardarRecente(urlFinal, resultado); }
+  concluir(p, resultado);
   acordarExtensao();
   return { ok: true, veredito: bloqueada ? 'bloqueada' : 'ok' };
 }
@@ -298,6 +327,7 @@ export function estadoPaginasMl() {
     ultimoPollEm: _estado.ultimoPollEm ? new Date(_estado.ultimoPollEm).toISOString() : null,
     naFila: _fila.length, pollsEsperando: _esperando.length,
     hoje: _estado.hoje, teto: null, janela: JAN_INI + '-' + JAN_FIM,
+    reuso: { minutos: REUSO_MS / 60000, guardadas: _recentes.size, reusadasDesdeBoot: _reusadas, porMotivoDesdeBoot: _estado.reusadasPorMotivo || {} },
     porMotivo: _estado.porMotivo, tetoMonitor: TETO_MONITOR,
     recusasDesdeBoot: _estado.recusas || {},
     lidas: _estado.lidas, walls: _estado.walls,
