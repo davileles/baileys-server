@@ -2206,6 +2206,11 @@ function registrarLinhaCaptura(reg) {
   if (lista.length > LINHAS_MAX) lista.length = LINHAS_MAX;
 }
 
+export function linhasCapturasRecentes({ dias = 7 } = {}) {
+  const corte = Date.now() - dias * 86400000;
+  return (_estado.linhasCapturas || []).filter(x => Date.parse(x.em) >= corte);
+}
+
 export function relatorioLinhas({ dias = 7 } = {}) {
   const corte = Date.now() - dias * 86400000;
   const lista = (_estado.linhasCapturas || []).filter(x => Date.parse(x.em) >= corte);

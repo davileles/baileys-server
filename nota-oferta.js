@@ -235,6 +235,12 @@ const diaSP = (iso) => new Date(Date.parse(iso) - 3 * 3600000).toISOString().sli
 const exemplo = (r, t) => ({ em: r.em, id: r.id, titulo: r.titulo, loja: r.loja, preco: r.preco,
   fonte: r.fonteNome || r.fonte, nota: r.nota, minima: t.min, partes: r.partes });
 
+// Registros crus da nota (para cruzar com as linhas de preco, GET /mkt/notas/cruzar).
+export function registrosNotas({ dias = 7 } = {}) {
+  const corte = Date.now() - Math.max(1, Math.min(REG_DIAS, Number(dias) || 7)) * 86400000;
+  return _reg.filter(r => Date.parse(r.em) >= corte);
+}
+
 export function relatorioNotas({ dias = 7 } = {}) {
   const corte = Date.now() - Math.max(1, Math.min(REG_DIAS, Number(dias) || 7)) * 86400000;
   const regs = _reg.filter(r => Date.parse(r.em) >= corte);

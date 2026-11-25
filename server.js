@@ -86,7 +86,7 @@ import {
   registrarLeituraPreco, vigiarProdutoDivulgado, expurgarVigilancia, estatisticas as estatisticasPreco,
   julgarDisparo, vereditosDisparos, dinheiroNaMesa, filtroDisparo,
   recusarCandidato, curadoriaEstado, curadoriaRemover,
-  conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie, relatorioLinhas,
+  conferirPrecoCard, registrarEnvioCard, cardsDaFila, expurgarLeiturasDaSerie, relatorioLinhas, linhasCapturasRecentes,
   vereditoLinhas,
 } from './monitor-precos.js';
 import { registrarRotasKeepa, consultarKeepaAgora } from './keepa.js';
@@ -94,7 +94,7 @@ import { registrarRotasDescontinho, historicoShopeeNaHora } from './descontinho.
 import { definirAlertaFontes, estadoFontes } from './saude-fontes.js';
 import {
   carregarNotaOferta, configNotaOferta, salvarConfigNotaOferta, registrarCapturaFonte,
-  avaliarNotaOferta, relatorioNotas,
+  avaliarNotaOferta, relatorioNotas, registrosNotas,
 } from './nota-oferta.js';
 try { carregarNotaOferta(); } catch (e) { console.warn('[NOTA] Falha ao carregar:', e.message); }
 
@@ -23179,6 +23179,34 @@ app.get('/mkt/notas', (req, res) => {
 app.post('/mkt/notas/config', (req, res) => {
   try { res.json({ ok:true, config: salvarConfigNotaOferta(req.body || {}) }); }
   catch (e) { res.status(400).json({ ok:false, erro:e.message }); }
+});
+// GET /mkt/notas/cruzar?dias=3 — nota da oferta x classe das linhas de preco
+// (mesmo produto, julgado ate 15 min antes/depois). So leitura: serve para
+// escolher o corte antes de ligar a nota (24/11/2026).
+app.get('/mkt/notas/cruzar', (req, res) => {
+  try {
+    const dias = Math.min(8, Math.max(1, parseInt(req.query.dias, 10) || 3));
+    const linhas = linhasCapturasRecentes({ dias: dias + 1 });
+    const porAsin = new Map();
+    for (const l of linhas) { if (!l.asin) continue; (porAsin.get(l.asin) || porAsin.set(l.asin, []).get(l.asin)).push(l); }
+    const faixa = n => { const f = Math.min(90, Math.floor(n / 10) * 10); return f + '-' + (f === 90 ? 100 : f + 9); };
+    const tabela = {}, porCorte = {}, cortes = [40, 50, 60, 65, 70, 75, 80];
+    let casadas = 0, semLinha = 0;
+    const exemplos = { falsaAlta: [], boaBaixa: [] };
+    for (const r of registrosNotas({ dias })) {
+      if (!r.elegivel) continue;
+      const cand = (porAsin.get(r.asin) || []).filter(l => Math.abs(Date.parse(l.em) - Date.parse(r.em)) <= 15 * 60000);
+      if (!cand.length) { semLinha++; continue; }
+      cand.sort((a, b) => Math.abs(Date.parse(a.em) - Date.parse(r.em)) - Math.abs(Date.parse(b.em) - Date.parse(r.em)));
+      const cl = cand[0].classe || 'sem base'; casadas++;
+      const t = tabela[cl] || (tabela[cl] = {}); const fx = faixa(r.nota); t[fx] = (t[fx] || 0) + 1;
+      for (const k of cortes) { const p = porCorte[k] || (porCorte[k] = {}); const q = p[cl] || (p[cl] = { passam: 0, barradas: 0 }); r.nota >= k ? q.passam++ : q.barradas++; }
+      const ex = { em: r.em, id: r.id, titulo: r.titulo, loja: r.loja, preco: r.preco, nota: r.nota, classe: cl, motivoLinhas: cand[0].motivo, partes: r.partes };
+      if (cl === 'falsa' && r.nota >= 70 && exemplos.falsaAlta.length < 12) exemplos.falsaAlta.push(ex);
+      if ((cl === 'imperdivel' || cl === 'boa') && r.nota < 60 && exemplos.boaBaixa.length < 12) exemplos.boaBaixa.push(ex);
+    }
+    res.json({ ok: true, dias, casadas, semLinha, tabela, porCorte, exemplos });
+  } catch (e) { res.status(500).json({ ok:false, erro:e.message }); }
 });
 app.get('/mkt/notas/config', (req, res) => res.json({ ok:true, config: configNotaOferta() }));
 
