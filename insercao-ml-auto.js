@@ -25,7 +25,7 @@
 //   CUPONS_ML_INSERCAO_AUTO=1          liga a fila (padrao desligada)
 //   CUPONS_ML_EXTENSAO_TOKEN=...       token que a extensao manda (obrigatorio)
 //   CUPONS_ML_AUTO_AGRUPAR_MIN=10      espera para juntar um pacote (0 = na hora)
-//   CUPONS_ML_AUTO_TETO=100            trava diaria de seguranca
+//   CUPONS_ML_AUTO_TETO=150            trava diaria de seguranca
 //   CUPONS_ML_AUTO_JANELA=8-23         horas (inicio inclusive, fim exclusive)
 //   CUPONS_ML_AUTO_ESPERA_MAX_MIN=180  cupom parado na fila alem disso → /inserir
 //   CUPONS_ML_AUTO_SELETORES={...}     JSON que sobrepoe os seletores da pagina
@@ -56,7 +56,7 @@ function sortearInt([a, b]) { return Math.round(sortear([a, b])); }
 // teto sorteado e sem dia de folga. As variaveis antigas
 // (CUPONS_ML_AUTO_{TETO_DIA,ATRASO_MIN,LOTE,PAUSA_MIN,FOLGA_PCT}) sao ignoradas.
 const AGRUPAR_MIN = Math.max(0, Number(process.env.CUPONS_ML_AUTO_AGRUPAR_MIN ?? 10) || 0);
-const TETO_FIXO = Math.max(1, Number(process.env.CUPONS_ML_AUTO_TETO) || 100);   // trava de seguranca, nao ritmo
+const TETO_FIXO = Math.max(1, Number(process.env.CUPONS_ML_AUTO_TETO) || 150);   // trava de seguranca, nao ritmo
 const TETO_DIA = [TETO_FIXO, TETO_FIXO];
 const [JANELA_INI, JANELA_FIM] = faixa(process.env.CUPONS_ML_AUTO_JANELA, [8, 23]);
 const LOTE_MAX = 40;
