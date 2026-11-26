@@ -1478,7 +1478,9 @@ export function calcularDesconto(reg, preco) {
     : preco * (Number(reg.valor) || 0) / 100;
 
   if (reg.tipo === 'pct' && Number(reg.limite) > 0) d = Math.min(d, Number(reg.limite));
-  d = Math.min(d, preco);                       // nunca zera ou inverte o preco
+  // Desconto que cobre o preco inteiro e cadastro errado (minimo faltando):
+  // o cupom nao se aplica, em vez de anunciar o produto por R$ 0,00.
+  if (d >= preco) return 0;
   return d > 0 ? Math.round(d * 100) / 100 : 0;
 }
 
@@ -2808,8 +2810,24 @@ export async function cupomDaPaginaAmazon(p, texto) {
   const lido = await lerCuponsPaginaAmazon(p.asin);
   if (!lido?.ok) return null;
   const citados = codigosCitadosNoPost(texto);
+  // Cruza o cupom da pagina com o cadastro da base (26/11/2026). O selo da
+  // Amazon nem sempre mostra o minimo: o BLACK150 (R$ 150 acima de R$ 1.499,
+  // restrito na base) apareceu na pagina so como "R$ 150" e zerou o preco de
+  // duas ofertas nos grupos.
+  const valePelaBase = c => {
+    const reg = c.codigo ? cupomPorCodigo('Amazon', c.codigo) : null;
+    if (!reg) return true;
+    if (cupomRestrito(reg) && !citados.includes(String(c.codigo).toUpperCase())) return false;
+    if (Number(reg.minimo) > 0 && p.preco < Number(reg.minimo)) return false;
+    if (Number(reg.maximo) > 0 && p.preco > Number(reg.maximo)) return false;
+    return true;
+  };
   const uteis = lido.cupons.filter(cupomPaginaUtil)
-    .filter(c => !(c.minimo > 0) || p.preco >= c.minimo);
+    .filter(c => !(c.minimo > 0) || p.preco >= c.minimo)
+    // Cupom em reais que cobre o preco inteiro nunca e real: e minimo de
+    // pedido que a pagina nao mostrou.
+    .filter(c => c.tipo === 'pct' || Number(c.valor) < p.preco)
+    .filter(valePelaBase);
   const descontoDe = c => c.tipo === 'pct' ? Math.round(p.preco * c.valor) / 100 : Math.min(c.valor, p.preco);
   let escolhido = null;
   if (citados.length) {
@@ -2831,7 +2849,7 @@ export async function cupomDaPaginaAmazon(p, texto) {
   }
   if (!escolhido) return null;
   const desconto = descontoDe(escolhido);
-  if (!(desconto > 0)) return null;
+  if (!(desconto > 0) || desconto >= p.preco) return null;
   const importante = escolhido.pagamento
     ? 'Cupom válido pagando com ' + escolhido.pagamento + ' — insira o código na finalização da compra'
     : escolhido.soApp
