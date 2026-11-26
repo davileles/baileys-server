@@ -142,6 +142,19 @@ const INDISPONIVEL = 'indisponivel';       // o ML disse que o cupom nao esta di
 // usou o cupom — ele segue valendo para os grupos; canal vivo.
 const RE_INDISPONIVEL = /\bINVALID_(?![16]\b)\d+\b|n[ãa]o est[áa] dispon[íi]vel|\bNOT_IN_TARGET_AUDIENCE\b|n[ãa]o se aplica a voc[êe]|\bSOLD_OUT_USER\b|j[áa] usou (este|esse|o) cupom/i;
 
+// 26/11/2026: o disjuntor abriu duas vezes no mesmo dia (15MUSICA 10:38,
+// 1BAMELI 13:11) com HTTP 403 + pagina HTML «Error! - Mercado Livre». Nas duas
+// vezes a conta tinha inserido cupom segundos antes, leu "Meus cupons" normal
+// minutos depois e, religada, inseriu o proprio 15MUSICA. Nao e restricao da
+// conta: e erro passageiro da borda do ML. Um 403 desses ISOLADO (canal vivo
+// ha pouco, nenhum outro nas ultimas 6 h) so pausa a insercao por 45 min. Se
+// repetir no MESMO cupom, so ele sai (vai para o /inserir); em cupom DIFERENTE
+// dentro das 6 h, o disjuntor abre como antes.
+const RE_403_ERRO_PAGINA = /«\s*Error!/i;
+const PAUSA_403_MS = 45 * 60000;
+const JANELA_403_MS = 6 * 60 * 60000;
+const CANAL_VIVO_403_MS = 3 * 60 * 60000;
+
 let dep = null;
 let ESTADO_PATH = './sessao/insercao_ml_auto.json';
 let _vigia = null;
@@ -169,6 +182,8 @@ let estado = {
   folgaAvisadaEm: null,
   ausenteAvisadaEm: null,
   disjuntor: null,      // { em, motivo, codigo } — enquanto existir, nada roda
+  ultimo403: null,      // { em, codigo } — ultimo 403 «Error!» tratado como passageiro
+  pausaAte: 0,          // pausa curta depois de um 403 passageiro
   resumo: [],           // desfechos da visita atual, para o card do Telegram
   ultimos: [],          // ultimos desfechos (para o /autoinserir)
 };
@@ -349,6 +364,34 @@ async function abrirDisjuntor(motivo, codigo, orientacao) {
   await enviarResumo('🧩 Inserção pela extensão — o que saiu antes do desligamento');
   try { await dep.avisarTelegram(texto); } catch (e) {}
   try { await dep.avisarOperador(texto); } catch (e) {}
+}
+
+/**
+ * 403 com pagina «Error! - Mercado Livre»: passageiro ou restricao?
+ * Devolve 'pausa' (1o isolado), 'cupom' (repetiu no mesmo cupom) ou null
+ * (abre o disjuntor como sempre).
+ */
+function avaliar403Passageiro(codigo, msg, st) {
+  if (st !== 403 || !RE_403_ERRO_PAGINA.test(String(msg || ''))) return null;
+  const agora = Date.now();
+  const ant = estado.ultimo403;
+  const recente = !!ant && agora - (ant.em || 0) < JANELA_403_MS;
+  if (recente && ant.codigo !== codigo) return null;
+  if (!recente && agora - (estado.canalOkEm || 0) > CANAL_VIVO_403_MS) return null;
+  estado.ultimo403 = { em: agora, codigo };
+  estado.pausaAte = agora + PAUSA_403_MS;
+  estado.proximaVisitaEm = Math.max(estado.proximaVisitaEm || 0, estado.pausaAte);
+  return recente ? 'cupom' : 'pausa';
+}
+async function avisar403Passageiro(tipo, codigo) {
+  const okMin = estado.canalOkEm ? Math.round((Date.now() - estado.canalOkEm) / 60000) : null;
+  const txt = tipo === 'cupom'
+    ? '⏸️ ML respondeu 403 «Error!» de novo no cupom ' + codigo + ' — só ele sai da inserção automática (vai para o /inserir). Pausa de 45 min e a automação segue.'
+    : '⏸️ ML respondeu 403 «Error!» no cupom ' + codigo + ' — parece erro passageiro'
+      + (okMin !== null ? ' (a conta inseriu/confirmou cupom há ' + okMin + ' min)' : '')
+      + '. Inserção pausada por 45 min, sem desligar. Se outro cupom tomar o mesmo erro nas próximas 6 h, aí desliga.';
+  console.warn('[CUPONS-ML-AUTO] 403 passageiro (' + tipo + ') em ' + codigo + ' — pausa até ' + hhmm(estado.pausaAte));
+  try { await dep.avisarTelegram(txt); } catch (e) {}
 }
 
 // ── VIGIA (a cada 5 min): dia, visita expirada, extensao ausente ─────────────
@@ -633,6 +676,20 @@ export async function registrarResultadoInsercaoMl({ visitaId, chave, veredito, 
   } else if (veredito === 'problema') {
     // "Tivemos um problema" foi o sintoma da restricao de set/2026 (403 com
     // HTML no input-code). Com status 403 lido da rede, nem espera repetir.
+    const passageiro = avaliar403Passageiro(codigo, msg, st);
+    if (passageiro) {
+      if (passageiro === 'cupom') {
+        marcar(reg, { insercaoMl: MANUAL, observacao: 'O ML respondeu 403 «Error!» duas vezes neste cupom — inserir à mão' });
+        registrarDesfecho(reg, '✋ 403 de novo só neste cupom — foi para o /inserir');
+        try { dep.avisarManual(); } catch (e) {}
+      } else {
+        marcar(reg, { insercaoMl: FILA });
+        registrarDesfecho(reg, '⏸️ 403 passageiro (fica na fila)');
+      }
+      salvar();
+      await avisar403Passageiro(passageiro, codigo);
+      return { ok: true };
+    }
     marcar(reg, { insercaoMl: FILA });
     estado.problemasSeguidos++;
     salvar();
@@ -736,6 +793,15 @@ async function registrarReverificacao(reg, { veredito, rc, status, mensagem, ven
     }
     // Sem prova recente de canal vivo: fica como esta e tenta amanha.
   } else if (veredito === 'problema') {
+    const passageiro = avaliar403Passageiro(codigo, msg, st);
+    if (passageiro) {
+      // tentar() ja marcou: o cupom so volta a ser reverificado amanha.
+      if (passageiro === 'cupom') delete estado.reverificar[reg.chave];
+      registrarDesfecho(reg, passageiro === 'cupom' ? '🔎✋ 403 de novo só neste cupom — sai da reverificação' : '🔎⏸️ 403 passageiro');
+      salvar();
+      await avisar403Passageiro(passageiro, codigo);
+      return { ok: true };
+    }
     estado.problemasSeguidos++;
     salvar();
     if (st === 403 || estado.problemasSeguidos >= PROBLEMAS_MAX) {
@@ -776,6 +842,7 @@ export async function finalizarVisitaInsercaoMl({ visitaId, motivo } = {}) {
   estado.visita = null;
   estado.ultimaVisitaEm = Date.now();
   sortearProximaVisita();
+  if ((estado.pausaAte || 0) > estado.proximaVisitaEm) { estado.proximaVisitaEm = estado.pausaAte; salvar(); }
   console.log('[CUPONS-ML-AUTO] Visita ' + visitaId + ' encerrada' + (motivo ? ' (' + motivo + ')' : '') + (sobras.length ? '; ' + sobras.length + ' voltaram a fila' : '') + '. Proxima ~' + hhmm(estado.proximaVisitaEm));
   if (!estado.disjuntor) await enviarResumo();
   return { ok: true, proximaEm: estado.proximaVisitaEm };
@@ -855,7 +922,7 @@ export async function religarInsercaoMlAuto() {
   if (!LIGADA) return { ok: false, erro: 'CUPONS_ML_INSERCAO_AUTO não está ligado no Railway' };
   estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0; estado.paginaMudouCodigos = [];
   estado.folgaHoje = false;   // religar a mao vale mais que o sorteio
-  estado.proximaVisitaEm = 0;
+  estado.proximaVisitaEm = 0; estado.pausaAte = 0;
   salvar();
   // Religar a mao = inserir ja: o que estava no /inserir sai na proxima consulta.
   for (const r of naFila()) estado.liberaEm[r.chave] = Math.min(estado.liberaEm[r.chave] || Infinity, Date.now());
@@ -897,6 +964,19 @@ export function iniciarInsercaoMlAuto(deps) {
       + ') e recusa do ML sobre o cupom, nao restricao da conta.');
     estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0; estado.paginaMudouCodigos = [];
     estado.proximaVisitaEm = 0;
+    reabertoNoBoot = true;
+    salvar();
+  }
+  // Disjuntor aberto por 403 «Error!» (regra antiga): hoje seria pausa de 45 min.
+  // Fecha no boot e conta esse 403 como o "ultimo" — outro cupom com o mesmo
+  // erro nas proximas 6 h reabre o disjuntor.
+  if (estado.disjuntor && RE_403_ERRO_PAGINA.test(String(estado.disjuntor.motivo || ''))) {
+    const em = Date.parse(estado.disjuntor.em) || Date.now();
+    console.log('[CUPONS-ML-AUTO] Disjuntor de ' + estado.disjuntor.em + ' fechado no boot: 403 «Error!» isolado agora so pausa 45 min.');
+    estado.ultimo403 = { em, codigo: String(estado.disjuntor.codigo || '').toUpperCase() };
+    estado.disjuntor = null; estado.falhas = 0; estado.invalidosSeguidos = 0; estado.problemasSeguidos = 0; estado.paginaMudouSeguidos = 0; estado.paginaMudouCodigos = [];
+    estado.pausaAte = Math.max(Date.now(), em + PAUSA_403_MS);
+    estado.proximaVisitaEm = estado.pausaAte;
     reabertoNoBoot = true;
     salvar();
   }
