@@ -1543,7 +1543,12 @@ async function paginaPelaExtensaoMlBruta(alvoUrl) {
 // Alertas de preco leem em segundo plano: esperam ate 75 s na fila da extensao
 // (25/11/2026 — com a API de ofertas fechada, a fila cresceu e os 20 s padrao
 // viravam "sem resposta no prazo" em boa parte das leituras dos alertas).
-const ESPERA_PAGINA_POR_MOTIVO = { avisos: Number(process.env.ML_PAGINA_ESPERA_AVISOS_MS || 75000) };
+// 'avisos-envio' (27/11/2026): releitura da loja na hora de mandar o aviso. Pede
+// pagina nova (fora do reuso de 30 min) e espera o mesmo prazo dos alertas — com
+// os 20 s da leitura comum, a extensao ocupada devolvia null e o aviso caia em
+// "leitura de pagina do ML desativada" (AV44, AV51, AV61 em 27/11).
+const _ESPERA_AVISOS = Number(process.env.ML_PAGINA_ESPERA_AVISOS_MS || 75000);
+const ESPERA_PAGINA_POR_MOTIVO = { avisos: _ESPERA_AVISOS, 'avisos-envio': _ESPERA_AVISOS };
 async function paginaPelaExtensaoMl(alvoUrl, motivo = 'leitura') {
   if (!extensaoPaginasOnline()) return null;
   try {
@@ -3085,7 +3090,7 @@ export async function montarOfertasMlVitrine(itens, codigoCupom = null, opcoes =
     }
 
     let dados;
-    try { dados = await buscarDadosProdutoMl(bruta, { id: salvo.asin }); }
+    try { dados = await buscarDadosProdutoMl(bruta, { id: salvo.asin, motivoPagina: opcoes.motivoPagina }); }
     catch (e) {
       // Oferta suspeita no catalogo: descarta de vez. O card do nosso link abre
       // o MESMO catalogo e mostraria o mesmo anuncio — nao e caminho alternativo.

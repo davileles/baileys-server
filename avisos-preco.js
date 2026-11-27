@@ -2256,7 +2256,7 @@ async function montarLink(p, cupom = null) {
   let montado = null;
   if (p.loja === 'Amazon') montado = await _deps.montarAmazon([p.asin], 'nenhum');
   else if (p.loja === 'Shopee') montado = await _deps.montarShopee([item], 'nenhum');
-  else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], cupomParaMontagem(cupom) || 'nenhum');
+  else if (p.loja === 'Mercado Livre') montado = await _deps.montarMl([item], cupomParaMontagem(cupom) || 'nenhum', { motivoPagina: 'avisos-envio' });
   const o = montado?.prontos?.[0];
   if (!o?.produto?.link) {
     const d = montado?.descartados?.[0];

@@ -15,7 +15,7 @@
 //
 // Requisitos no Railway:
 //   GITHUB_TOKEN        PAT com escrita no repositorio de dados
-//   GITHUB_REPO_DADOS   ex: davileles/cdv-tsp-dados
+//   GITHUB_REPO_DADOS   ex: davileles/dados
 // ═══════════════════════════════════════════════════════════════════════════
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs';
@@ -24,7 +24,7 @@ import { createHash } from 'crypto';
 const SESSAO_DIR = './sessao';
 // Funcoes, nao constantes: o repositorio de dados pode ser trocado pelo painel
 // e precisa valer no proximo push, sem restart.
-function repoDados()  { return process.env.GITHUB_REPO_DADOS || 'davileles/cdv-tsp-dados'; }
+function repoDados()  { return process.env.GITHUB_REPO_DADOS || 'davileles/dados'; }
 function pastaDados() { return process.env.GITHUB_PASTA_DADOS || 'tsp'; }
 // 3 min (era 10 s ate 13/11/2026). Cada envio manda o ARQUIVO INTEIRO em
 // base64 para a Contents API (nao ha envio parcial), e arquivos de ~1 MB que
@@ -264,6 +264,27 @@ async function api(caminho, opcoes = {}) {
   return res;
 }
 
+// Arquivo acima de 1 MB (27/11/2026): a Contents API devolve o metadado com
+// encoding "none" e content vazio — o boot dava "Unexpected end of JSON input"
+// em avisos_preco.json, vitrine.json, rastreio.json e monitor_precos_estado.json
+// e, num volume novo, esses arquivos nao voltariam nunca. O conteudo vem entao
+// pelo blob (git/blobs/{sha}, ate 100 MB). Regra que ja valia continua: com o
+// arquivo no disco, o grande NAO e restaurado por cima (o volume e a fonte da
+// verdade e o repo pode estar ate 30 min atras — janelaDoArquivo); o blob so
+// entra quando o arquivo local nao existe.
+function semConteudoInline(dados) {
+  return !!dados && (dados.encoding === 'none' || !dados.content) && !!dados.sha;
+}
+async function conteudoPeloBlob(sha) {
+  const res = await fetch('https://api.github.com/repos/' + repoDados() + '/git/blobs/' + sha, {
+    headers: { 'Authorization': 'Bearer ' + process.env.GITHUB_TOKEN, 'Accept': 'application/vnd.github+json' },
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok) throw new Error('blob HTTP ' + res.status);
+  const b = await res.json();
+  return Buffer.from(b.content || '', b.encoding === 'utf-8' ? 'utf-8' : 'base64').toString('utf-8');
+}
+
 /**
  * Baixa os arquivos do repositorio e reescreve ./sessao.
  * Arquivo ausente no repo e normal na primeira execucao: mantem o local e ele
@@ -276,7 +297,7 @@ export async function baixarDoGitHub() {
   }
   if (!existsSync(SESSAO_DIR)) mkdirSync(SESSAO_DIR, { recursive: true });
 
-  let baixados = 0; const ausentes = [], erros = [];
+  let baixados = 0; const ausentes = [], erros = [], grandesMantidos = [];
   async function baixarUm(local) {
     try {
       const res = await api(remotoDe(local));
@@ -284,9 +305,13 @@ export async function baixarDoGitHub() {
       if (!res.ok) { erros.push(local + ': HTTP ' + res.status); return; }
       const dados = await res.json();
       _shas.set(remotoDe(local), dados.sha);
-      const conteudo = Buffer.from(dados.content, 'base64').toString('utf-8');
-      JSON.parse(conteudo);                       // nao sobrescreve o local com lixo
       const destino = SESSAO_DIR + '/' + local;
+      let conteudo;
+      if (semConteudoInline(dados)) {
+        if (existsSync(destino)) { grandesMantidos.push(local); return; }
+        conteudo = await conteudoPeloBlob(dados.sha);
+      } else conteudo = Buffer.from(dados.content, 'base64').toString('utf-8');
+      JSON.parse(conteudo);                       // nao sobrescreve o local com lixo
       const dir = destino.slice(0, destino.lastIndexOf('/'));
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       writeFileSync(destino, conteudo, 'utf-8');
@@ -305,8 +330,10 @@ export async function baixarDoGitHub() {
     }
   }
   console.log('[SYNC] Boot — ' + baixados + ' arquivo(s) do GitHub, ' + ausentes.length +
-    ' ausente(s) no repo' + (erros.length ? ', ' + erros.length + ' erro(s): ' + erros.join('; ') : '') + '.');
-  return { baixados, ausentes, erros };
+    ' ausente(s) no repo'
+    + (grandesMantidos.length ? ', ' + grandesMantidos.length + ' acima de 1 MB mantido(s) do disco' : '')
+    + (erros.length ? ', ' + erros.length + ' erro(s): ' + erros.join('; ') : '') + '.');
+  return { baixados, ausentes, erros, grandesMantidos };
 }
 
 /**
@@ -323,9 +350,13 @@ export async function baixarArquivoDoGitHub(local) {
     if (!res.ok) return false;
     const dados = await res.json();
     _shas.set(remotoDe(local), dados.sha);
-    const conteudo = Buffer.from(dados.content, 'base64').toString('utf-8');
-    JSON.parse(conteudo);                       // nao grava lixo no disco
     const destino = SESSAO_DIR + '/' + local;
+    let conteudo;
+    if (semConteudoInline(dados)) {
+      if (existsSync(destino)) return false;    // grande com disco: vale o disco
+      conteudo = await conteudoPeloBlob(dados.sha);
+    } else conteudo = Buffer.from(dados.content, 'base64').toString('utf-8');
+    JSON.parse(conteudo);                       // nao grava lixo no disco
     const dir = destino.slice(0, destino.lastIndexOf('/'));
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(destino, conteudo, 'utf-8');
